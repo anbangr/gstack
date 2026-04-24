@@ -566,10 +566,21 @@ describe('v0.4.1 preamble features', () => {
   const skillsWithPreamble = [...tier1Skills, ...tier2PlusSkills];
 
   for (const skill of tier2PlusSkills) {
-    test(`${skill} contains RECOMMENDATION format`, () => {
+    test(`${skill} contains AskUserQuestion Pros/Cons format`, () => {
       const content = fs.readFileSync(path.join(ROOT, skill), 'utf-8');
-      expect(content).toContain('RECOMMENDATION: Choose');
+      // v1.7.0.0 Pros/Cons format tokens. The preamble resolver
+      // (generate-ask-user-format.ts) injects all of these into every
+      // tier-2+ skill. Drop any of them and the test catches it on the
+      // next `bun test` run.
       expect(content).toContain('AskUserQuestion');
+      expect(content).toContain('Pros / cons:');
+      expect(content).toContain('Recommendation: <choice>');
+      expect(content).toContain('Net:');
+      expect(content).toContain('ELI10');
+      expect(content).toContain('Stakes if we pick wrong:');
+      // Concrete format markers must be documented in the resolver text
+      expect(content).toMatch(/✅/);
+      expect(content).toMatch(/❌/);
     });
   }
 
@@ -1103,7 +1114,9 @@ describe('Step 3.4 test coverage audit', () => {
   test('ship/SKILL.md contains Step 7', () => {
     const content = fs.readFileSync(path.join(ROOT, 'ship', 'SKILL.md'), 'utf-8');
     expect(content).toContain('Step 7: Test Coverage Audit');
-    expect(content).toContain('CODE PATH COVERAGE');
+    // The coverage diagram collapses code-path and user-flow counts onto one
+    // summary line. Verify that summary is present (labels are stable).
+    expect(content).toContain('Code paths:');
   });
 
   test('Step 3.4 includes quality scoring rubric', () => {
@@ -1153,9 +1166,11 @@ describe('Step 3.4 test coverage audit', () => {
     expect(content).toContain('Empty/zero/boundary states');
   });
 
-  test('Step 3.4 diagram includes USER FLOW COVERAGE section', () => {
+  test('Step 3.4 diagram includes user-flow coverage summary', () => {
     const content = fs.readFileSync(path.join(ROOT, 'ship', 'SKILL.md'), 'utf-8');
-    expect(content).toContain('USER FLOW COVERAGE');
+    // The diagram was compressed from separate CODE PATH COVERAGE / USER FLOW
+    // COVERAGE section headers into a single summary line. Assert on the
+    // labels that still appear on that summary line.
     expect(content).toContain('Code paths:');
     expect(content).toContain('User flows:');
   });
@@ -1165,8 +1180,9 @@ describe('Step 3.4 test coverage audit', () => {
 
 describe('ship step numbering', () => {
   // Allowed sub-steps that are resolver-generated and intentionally nested:
-  // 8.1 (Plan Verification), 8.2 (Scope Drift), 9.1 (Review Army), 9.2 (Findings Merge), 9.3 (Cross-review dedup)
-  const ALLOWED_SUBSTEPS = new Set(['8.1', '8.2', '9.1', '9.2', '9.3']);
+  // 8.1 (Plan Verification), 8.2 (Scope Drift), 9.1 (Review Army), 9.2 (Findings Merge),
+  // 9.3 (Cross-review dedup), 15.0 (WIP squash — continuous checkpoint), 15.1 (Bisectable commits).
+  const ALLOWED_SUBSTEPS = new Set(['8.1', '8.2', '9.1', '9.2', '9.3', '15.0', '15.1']);
 
   test('ship/SKILL.md.tmpl contains no unexpected fractional step numbers', () => {
     const tmpl = fs.readFileSync(path.join(ROOT, 'ship', 'SKILL.md.tmpl'), 'utf-8');
@@ -1571,22 +1587,62 @@ describe('Test failure triage in ship skill', () => {
 });
 
 describe('no compiled binaries in git', () => {
+  // Tracked files enumerated once and reused by both assertions. git ls-files -z
+  // + split is ~ms; the previous xargs-per-file shell loops blew past 5s on CI.
+  const trackedFiles: string[] = require('child_process')
+    .execSync('git ls-files -z', { cwd: ROOT, encoding: 'utf-8' })
+    .split('\0')
+    .filter(Boolean);
+
   test('git tracks no Mach-O or ELF binaries', () => {
-    const result = require('child_process').execSync(
-      'git ls-files -z | xargs -0 file --mime-type 2>/dev/null | grep -E "application/(x-mach-binary|x-executable|x-pie-executable|x-sharedlib)" || true',
-      { cwd: ROOT, encoding: 'utf-8' }
-    ).trim();
-    const files = result ? result.split('\n').map((l: string) => l.split(':')[0].trim()) : [];
-    expect(files).toEqual([]);
+    // Only mode 100755 (executable) files can be binaries we care about. Pre-filter
+    // via git ls-files -s to avoid running `file` on every text file.
+    const lsOut: string = require('child_process').execSync('git ls-files -s', {
+      cwd: ROOT,
+      encoding: 'utf-8',
+    });
+    const executableFiles = lsOut
+      .split('\n')
+      .filter(Boolean)
+      .map((line: string) => {
+        const parts = line.split(/\s+/);
+        return { mode: parts[0], file: line.split('\t')[1] };
+      })
+      .filter((e: { mode: string; file: string }) => e.mode === '100755')
+      .map((e: { mode: string; file: string }) => e.file);
+
+    if (executableFiles.length === 0) return;
+
+    // Batch-invoke `file --mime-type` across all executable files at once.
+    const result: string = require('child_process')
+      .execSync(`file --mime-type -- ${executableFiles.map((f: string) => `'${f.replace(/'/g, "'\\''")}'`).join(' ')}`, {
+        cwd: ROOT,
+        encoding: 'utf-8',
+      })
+      .trim();
+
+    const binaries = result
+      .split('\n')
+      .filter((l: string) =>
+        /application\/(x-mach-binary|x-executable|x-pie-executable|x-sharedlib)/.test(l)
+      )
+      .map((l: string) => l.split(':')[0].trim());
+
+    expect(binaries).toEqual([]);
   });
 
   test('git tracks no files larger than 2MB', () => {
-    const result = require('child_process').execSync(
-      'git ls-files -z | xargs -0 -I{} sh -c \'size=$(wc -c < "{}" 2>/dev/null | tr -d " "); [ "$size" -gt 2097152 ] 2>/dev/null && echo "{}:${size}"\' || true',
-      { cwd: ROOT, encoding: 'utf-8' }
-    ).trim();
-    const files = result ? result.split('\n').filter(Boolean) : [];
-    expect(files).toEqual([]);
+    // Pure fs.statSync — no shell spawn per file.
+    const MAX_BYTES = 2 * 1024 * 1024;
+    const oversized = trackedFiles.filter((f: string) => {
+      const full = path.join(ROOT, f);
+      try {
+        return fs.statSync(full).size > MAX_BYTES;
+      } catch {
+        return false;
+      }
+    });
+    expect(oversized).toEqual([]);
   });
 });
 

@@ -82,6 +82,42 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
   'plan-eng-review-artifact':  ['plan-eng-review/**'],
   'plan-review-report':        ['plan-eng-review/**', 'scripts/gen-skill-docs.ts'],
 
+  // Plan-mode smoke tests — gate-tier safety regression tests. Each fires when
+  // any of: the interactive skill's template, the plan-mode resolver
+  // (completion-status now owns generatePlanModeInfo), preamble composition,
+  // the Agent SDK harness, or the shared plan-mode-helpers change.
+  'plan-ceo-review-plan-mode':    ['plan-ceo-review/**', 'scripts/resolvers/preamble/generate-completion-status.ts', 'scripts/resolvers/preamble.ts', 'test/helpers/agent-sdk-runner.ts', 'test/helpers/plan-mode-helpers.ts'],
+  'plan-eng-review-plan-mode':    ['plan-eng-review/**', 'scripts/resolvers/preamble/generate-completion-status.ts', 'scripts/resolvers/preamble.ts', 'test/helpers/agent-sdk-runner.ts', 'test/helpers/plan-mode-helpers.ts'],
+  'plan-design-review-plan-mode': ['plan-design-review/**', 'scripts/resolvers/preamble/generate-completion-status.ts', 'scripts/resolvers/preamble.ts', 'test/helpers/agent-sdk-runner.ts', 'test/helpers/plan-mode-helpers.ts'],
+  'plan-devex-review-plan-mode':  ['plan-devex-review/**', 'scripts/resolvers/preamble/generate-completion-status.ts', 'scripts/resolvers/preamble.ts', 'test/helpers/agent-sdk-runner.ts', 'test/helpers/plan-mode-helpers.ts'],
+  'plan-mode-no-op':              ['plan-ceo-review/**', 'scripts/resolvers/preamble/generate-completion-status.ts', 'scripts/resolvers/preamble.ts', 'test/helpers/agent-sdk-runner.ts', 'test/helpers/plan-mode-helpers.ts'],
+  'e2e-harness-audit':            ['plan-ceo-review/**', 'plan-eng-review/**', 'plan-design-review/**', 'plan-devex-review/**', 'scripts/resolvers/preamble/generate-completion-status.ts', 'test/helpers/agent-sdk-runner.ts', 'test/helpers/plan-mode-helpers.ts'],
+  'brain-privacy-gate':           ['scripts/resolvers/preamble/generate-brain-sync-block.ts', 'scripts/resolvers/preamble.ts', 'bin/gstack-brain-sync', 'bin/gstack-brain-init', 'bin/gstack-config', 'test/helpers/agent-sdk-runner.ts'],
+
+  // AskUserQuestion format regression (RECOMMENDATION + Completeness: N/10)
+  // Fires when either template OR the two preamble resolvers change.
+  'plan-ceo-review-format-mode':      ['plan-ceo-review/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble/generate-completeness-section.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+  'plan-ceo-review-format-approach':  ['plan-ceo-review/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble/generate-completeness-section.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+  'plan-eng-review-format-coverage':  ['plan-eng-review/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble/generate-completeness-section.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+  'plan-eng-review-format-kind':      ['plan-eng-review/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble/generate-completeness-section.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+
+  // v1.7.0.0 Pros/Cons format cadence + format + negative-escape evals.
+  // Dependencies: same as format-mode + the 4 plan-review templates + overlay.
+  // All periodic-tier (non-deterministic Opus 4.7 behavior).
+  'plan-ceo-review-prosons-cadence':  ['plan-ceo-review/**', 'plan-eng-review/**', 'plan-design-review/**', 'plan-devex-review/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+  'plan-review-prosons-format':       ['plan-ceo-review/**', 'plan-eng-review/**', 'plan-design-review/**', 'plan-devex-review/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+  'plan-review-prosons-hardstop-neg': ['plan-ceo-review/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+  'plan-review-prosons-neutral-neg':  ['plan-ceo-review/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+
+  // Expanded coverage (CT3) — 6 non-plan-review skills inherit Pros/Cons via preamble
+  'ship-prosons-format':              ['ship/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+  'office-hours-prosons-format':      ['office-hours/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+  'investigate-prosons-format':       ['investigate/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+  'qa-prosons-format':                ['qa/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+  'review-prosons-format':            ['review/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+  'design-review-prosons-format':     ['design-review/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+  'document-release-prosons-format':  ['document-release/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble.ts', 'model-overlays/opus-4-7.md'],
+
   // /plan-tune (v1 observational)
   'plan-tune-inspect':         ['plan-tune/**', 'scripts/question-registry.ts', 'scripts/psychographic-signals.ts', 'scripts/one-way-doors.ts', 'bin/gstack-question-log', 'bin/gstack-question-preference', 'bin/gstack-developer-profile'],
 
@@ -192,6 +228,9 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
   'autoplan-core':  ['autoplan/**', 'plan-ceo-review/**', 'plan-eng-review/**', 'plan-design-review/**'],
   'autoplan-dual-voice': ['autoplan/**', 'codex/**', 'bin/gstack-codex-probe', 'scripts/resolvers/review.ts', 'scripts/resolvers/design.ts'],
 
+  // Multi-provider benchmark adapters — live API smoke against real claude/codex/gemini CLIs
+  'benchmark-providers-live': ['bin/gstack-model-benchmark', 'test/helpers/providers/**', 'test/helpers/benchmark-runner.ts', 'test/helpers/pricing.ts'],
+
   // Skill routing — journey-stage tests (depend on ALL skill descriptions)
   'journey-ideation':       ['*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts'],
   'journey-plan-eng':       ['*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts'],
@@ -203,6 +242,33 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
   'journey-retro':          ['*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts'],
   'journey-design-system':  ['*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts'],
   'journey-visual-qa':      ['*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts'],
+
+  // Opus 4.7 behavior evals — keys match testName: values in the test file.
+  // Routing sub-tests use template literal `routing-${c.name}` testNames,
+  // which the touchfile completeness scanner skips; they inherit selection
+  // from the file-level touchfile entry via GLOBAL_TOUCHFILES.
+  'fanout-arm-overlay-on':
+    ['model-overlays/claude.md', 'model-overlays/opus-4-7.md', 'scripts/models.ts', 'scripts/resolvers/model-overlay.ts'],
+  'fanout-arm-overlay-off':
+    ['model-overlays/claude.md', 'model-overlays/opus-4-7.md', 'scripts/models.ts', 'scripts/resolvers/model-overlay.ts'],
+
+  // Overlay efficacy harness (SDK) — measures whether overlay nudges change
+  // behavior under @anthropic-ai/claude-agent-sdk (closer to real Claude Code
+  // than `claude -p`). testNames in the file are template literals so the
+  // completeness scanner doesn't require them; these entries exist for
+  // diff-based selection accuracy.
+  'overlay-harness-opus-4-7-fanout-toy': [
+    'model-overlays/**',
+    'test/fixtures/overlay-nudges.ts',
+    'test/helpers/agent-sdk-runner.ts',
+    'scripts/resolvers/model-overlay.ts',
+  ],
+  'overlay-harness-opus-4-7-fanout-realistic': [
+    'model-overlays/**',
+    'test/fixtures/overlay-nudges.ts',
+    'test/helpers/agent-sdk-runner.ts',
+    'scripts/resolvers/model-overlay.ts',
+  ],
 };
 
 /**
@@ -262,6 +328,39 @@ export const E2E_TIERS: Record<string, 'gate' | 'periodic'> = {
   'plan-eng-review-artifact': 'periodic',
   'plan-eng-coverage-audit': 'gate',
   'plan-review-report': 'gate',
+
+  // Plan-mode handshake — deterministic safety regression, gate-tier
+  'plan-ceo-review-plan-mode': 'gate',
+  'plan-eng-review-plan-mode': 'gate',
+  'plan-design-review-plan-mode': 'gate',
+  'plan-devex-review-plan-mode': 'gate',
+  'plan-mode-no-op': 'gate',
+  'e2e-harness-audit': 'gate',
+
+  // Privacy gate for gstack-brain-sync — periodic (non-deterministic LLM call,
+  // costs ~$0.30-$0.50 per run, not needed on every commit)
+  'brain-privacy-gate': 'periodic',
+
+  // AskUserQuestion format regression — periodic (Opus 4.7 non-deterministic benchmark)
+  'plan-ceo-review-format-mode': 'periodic',
+  'plan-ceo-review-format-approach': 'periodic',
+  'plan-eng-review-format-coverage': 'periodic',
+  'plan-eng-review-format-kind': 'periodic',
+
+  // v1.7.0.0 Pros/Cons format — cadence + negative-escape evals (all periodic)
+  'plan-ceo-review-prosons-cadence': 'periodic',
+  'plan-review-prosons-format': 'periodic',
+  'plan-review-prosons-hardstop-neg': 'periodic',
+  'plan-review-prosons-neutral-neg': 'periodic',
+
+  // CT3 expanded coverage — non-plan-review skills inheriting Pros/Cons (all periodic)
+  'ship-prosons-format': 'periodic',
+  'office-hours-prosons-format': 'periodic',
+  'investigate-prosons-format': 'periodic',
+  'qa-prosons-format': 'periodic',
+  'review-prosons-format': 'periodic',
+  'design-review-prosons-format': 'periodic',
+  'document-release-prosons-format': 'periodic',
 
   // /plan-tune — gate (core v1 DX promise: plain-English intent routing)
   'plan-tune-inspect': 'gate',
@@ -355,6 +454,9 @@ export const E2E_TIERS: Record<string, 'gate' | 'periodic'> = {
   'autoplan-core': 'periodic',
   'autoplan-dual-voice': 'periodic',
 
+  // Multi-provider benchmark — periodic (requires external CLIs + auth, paid)
+  'benchmark-providers-live': 'periodic',
+
   // Skill routing — periodic (LLM routing is non-deterministic)
   'journey-ideation': 'periodic',
   'journey-plan-eng': 'periodic',
@@ -366,6 +468,14 @@ export const E2E_TIERS: Record<string, 'gate' | 'periodic'> = {
   'journey-retro': 'periodic',
   'journey-design-system': 'periodic',
   'journey-visual-qa': 'periodic',
+
+  // Opus 4.7 overlay evals — periodic (non-deterministic LLM behavior + Opus cost)
+  'fanout-arm-overlay-on': 'periodic',
+  'fanout-arm-overlay-off': 'periodic',
+
+  // Overlay efficacy harness (SDK, paid) — periodic only
+  'overlay-harness-opus-4-7-fanout-toy': 'periodic',
+  'overlay-harness-opus-4-7-fanout-realistic': 'periodic',
 };
 
 /**

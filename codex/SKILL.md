@@ -52,16 +52,14 @@ _TEL_START=$(date +%s)
 _SESSION_ID="$$-$(date +%s)"
 echo "TELEMETRY: ${_TEL:-off}"
 echo "TEL_PROMPTED: $_TEL_PROMPTED"
-# Question tuning (opt-in; see /plan-tune + docs/designs/PLAN_TUNING_V0.md)
-_QUESTION_TUNING=$(~/.claude/skills/gstack/bin/gstack-config get question_tuning 2>/dev/null || echo "false")
-echo "QUESTION_TUNING: $_QUESTION_TUNING"
-# Writing style (V1: default = ELI10-style, terse = V0 prose. See docs/designs/PLAN_TUNING_V1.md)
+# Writing style verbosity (V1: default = ELI10, terse = tighter V0 prose.
+# Read on every skill run so terse mode takes effect without a restart.)
 _EXPLAIN_LEVEL=$(~/.claude/skills/gstack/bin/gstack-config get explain_level 2>/dev/null || echo "default")
 if [ "$_EXPLAIN_LEVEL" != "default" ] && [ "$_EXPLAIN_LEVEL" != "terse" ]; then _EXPLAIN_LEVEL="default"; fi
 echo "EXPLAIN_LEVEL: $_EXPLAIN_LEVEL"
-# V1 upgrade migration pending-prompt flag
-_WRITING_STYLE_PENDING=$([ -f ~/.gstack/.writing-style-prompt-pending ] && echo "yes" || echo "no")
-echo "WRITING_STYLE_PENDING: $_WRITING_STYLE_PENDING"
+# Question tuning (see /plan-tune). Observational only in V1.
+_QUESTION_TUNING=$(~/.claude/skills/gstack/bin/gstack-config get question_tuning 2>/dev/null || echo "false")
+echo "QUESTION_TUNING: $_QUESTION_TUNING"
 mkdir -p ~/.gstack/analytics
 if [ "$_TEL" != "off" ]; then
 echo '{"skill":"codex","ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","repo":"'$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || echo "unknown")'"}'  >> ~/.gstack/analytics/skill-usage.jsonl 2>/dev/null || true
@@ -106,9 +104,30 @@ if [ -d ".claude/skills/gstack" ] && [ ! -L ".claude/skills/gstack" ]; then
   fi
 fi
 echo "VENDORED_GSTACK: $_VENDORED"
+echo "MODEL_OVERLAY: claude"
+# Checkpoint mode (explicit = no auto-commit, continuous = WIP commits as you go)
+_CHECKPOINT_MODE=$(~/.claude/skills/gstack/bin/gstack-config get checkpoint_mode 2>/dev/null || echo "explicit")
+_CHECKPOINT_PUSH=$(~/.claude/skills/gstack/bin/gstack-config get checkpoint_push 2>/dev/null || echo "false")
+echo "CHECKPOINT_MODE: $_CHECKPOINT_MODE"
+echo "CHECKPOINT_PUSH: $_CHECKPOINT_PUSH"
 # Detect spawned session (OpenClaw or other orchestrator)
 [ -n "$OPENCLAW_SESSION" ] && echo "SPAWNED_SESSION: true" || true
 ```
+
+## Plan Mode Safe Operations
+
+In plan mode, these are always allowed (they inform the plan, don't modify source):
+`$B` (browse), `$D` (design), `codex exec`/`codex review`, writes to `~/.gstack/`,
+writes to the plan file, `open` for generated artifacts.
+
+## Skill Invocation During Plan Mode
+
+If the user invokes a skill in plan mode, that skill takes precedence over generic plan mode behavior. Treat it as executable instructions, not reference. Follow step
+by step. AskUserQuestion calls satisfy plan mode's end-of-turn requirement. At a STOP
+point, stop immediately. Do not continue the workflow past a STOP point and do not call ExitPlanMode there. Commands marked "PLAN
+MODE EXCEPTION — ALWAYS RUN" execute. Other writes need to be already permitted
+above or explicitly exception-marked. Call ExitPlanMode only after the skill
+workflow completes — only then call ExitPlanMode (or if the user tells you to cancel the skill or leave plan mode).
 
 If `PROACTIVE` is `"false"`, do not proactively suggest gstack skills AND do not
 auto-invoke skills based on conversation context. Only run skills the user explicitly
@@ -121,7 +140,38 @@ or invoking other gstack skills, use the `/gstack-` prefix (e.g., `/gstack-qa` i
 of `/qa`, `/gstack-ship` instead of `/ship`). Disk paths are unaffected — always use
 `~/.claude/skills/gstack/[skill-name]/SKILL.md` for reading skill files.
 
-If output shows `UPGRADE_AVAILABLE <old> <new>`: read `~/.claude/skills/gstack/gstack-upgrade/SKILL.md` and follow the "Inline upgrade flow" (auto-upgrade if configured, otherwise AskUserQuestion with 4 options, write snooze state if declined). If `JUST_UPGRADED <from> <to>`: tell user "Running gstack v{to} (just updated!)" and continue.
+If output shows `UPGRADE_AVAILABLE <old> <new>`: read `~/.claude/skills/gstack/gstack-upgrade/SKILL.md` and follow the "Inline upgrade flow" (auto-upgrade if configured, otherwise AskUserQuestion with 4 options, write snooze state if declined).
+
+If output shows `JUST_UPGRADED <from> <to>` AND `SPAWNED_SESSION` is NOT set: tell
+the user "Running gstack v{to} (just updated!)" and then check for new features to
+surface. For each per-feature marker below, if the marker file is missing AND the
+feature is plausibly useful for this user, use AskUserQuestion to let them try it.
+Fire once per feature per user, NOT once per upgrade.
+
+**In spawned sessions (`SPAWNED_SESSION` = "true"): SKIP feature discovery entirely.**
+Just print "Running gstack v{to}" and continue. Orchestrators do not want interactive
+prompts from sub-sessions.
+
+**Feature discovery markers and prompts** (one at a time, max one per session):
+
+1. `~/.claude/skills/gstack/.feature-prompted-continuous-checkpoint` →
+   Prompt: "Continuous checkpoint auto-commits your work as you go with `WIP:` prefix
+   so you never lose progress to a crash. Local-only by default — doesn't push
+   anywhere unless you turn that on. Want to try it?"
+   Options: A) Enable continuous mode, B) Show me first (print the section from
+   the preamble Continuous Checkpoint Mode), C) Skip.
+   If A: run `~/.claude/skills/gstack/bin/gstack-config set checkpoint_mode continuous`.
+   Always: `touch ~/.claude/skills/gstack/.feature-prompted-continuous-checkpoint`
+
+2. `~/.claude/skills/gstack/.feature-prompted-model-overlay` →
+   Inform only (no prompt): "Model overlays are active. `MODEL_OVERLAY: {model}`
+   shown in the preamble output tells you which behavioral patch is applied.
+   Override with `--model` when regenerating skills (e.g., `bun run gen:skill-docs
+   --model gpt-5.4`). Default is claude."
+   Always: `touch ~/.claude/skills/gstack/.feature-prompted-model-overlay`
+
+After handling JUST_UPGRADED (prompts done or skipped), continue with the skill
+workflow.
 
 If `WRITING_STYLE_PENDING` is `yes`: You're on the first skill run after upgrading
 to gstack v1. Ask the user once about the new default writing style. Use AskUserQuestion:
@@ -231,24 +281,44 @@ If A: Append this section to the end of CLAUDE.md:
 
 ## Skill routing
 
-When the user's request matches an available skill, ALWAYS invoke it using the Skill
-tool as your FIRST action. Do NOT answer directly, do NOT use other tools first.
-The skill has specialized workflows that produce better results than ad-hoc answers.
+When the user's request matches an available skill, invoke it via the Skill tool. The
+skill has multi-step workflows, checklists, and quality gates that produce better
+results than an ad-hoc answer. When in doubt, invoke the skill. A false positive is
+cheaper than a false negative.
 
 Key routing rules:
-- Product ideas, "is this worth building", brainstorming → invoke office-hours
-- Bugs, errors, "why is this broken", 500 errors → invoke investigate
-- Ship, deploy, push, create PR → invoke ship
-- QA, test the site, find bugs → invoke qa
-- Code review, check my diff → invoke review
-- Update docs after shipping → invoke document-release
-- Weekly retro → invoke retro
-- Design system, brand → invoke design-consultation
-- Visual audit, design polish → invoke design-review
-- Architecture review → invoke plan-eng-review
-- Save progress, save state, save my work → invoke context-save
-- Resume, where was I, pick up where I left off → invoke context-restore
-- Code quality, health check → invoke health
+- Product ideas, "is this worth building", brainstorming → invoke /office-hours
+- Strategy, scope, "think bigger", "what should we build" → invoke /plan-ceo-review
+- Architecture, "does this design make sense" → invoke /plan-eng-review
+- Design system, brand, "how should this look" → invoke /design-consultation
+- Design review of a plan → invoke /plan-design-review
+- Developer experience of a plan → invoke /plan-devex-review
+- "Review everything", full review pipeline → invoke /autoplan
+- Bugs, errors, "why is this broken", "wtf", "this doesn't work" → invoke /investigate
+- Test the site, find bugs, "does this work" → invoke /qa (or /qa-only for report only)
+- Code review, check the diff, "look at my changes" → invoke /review
+- Visual polish, design audit, "this looks off" → invoke /design-review
+- Developer experience audit, try onboarding → invoke /devex-review
+- Ship, deploy, create a PR, "send it" → invoke /ship
+- Merge + deploy + verify → invoke /land-and-deploy
+- Configure deployment → invoke /setup-deploy
+- Post-deploy monitoring → invoke /canary
+- Update docs after shipping → invoke /document-release
+- Weekly retro, "how'd we do" → invoke /retro
+- Second opinion, codex review → invoke /codex
+- Safety mode, careful mode, lock it down → invoke /careful or /guard
+- Restrict edits to a directory → invoke /freeze or /unfreeze
+- Upgrade gstack → invoke /gstack-upgrade
+- Save progress, "save my work" → invoke /context-save
+- Resume, restore, "where was I" → invoke /context-restore
+- Security audit, OWASP, "is this secure" → invoke /cso
+- Make a PDF, document, publication → invoke /make-pdf
+- Launch real browser for QA → invoke /open-gstack-browser
+- Import cookies for authenticated testing → invoke /setup-browser-cookies
+- Performance regression, page speed, benchmarks → invoke /benchmark
+- Review what gstack has learned → invoke /learn
+- Tune question sensitivity → invoke /plan-tune
+- Code quality dashboard → invoke /health
 ```
 
 Then commit the change: `git add CLAUDE.md && git commit -m "chore: add gstack skill routing rules to CLAUDE.md"`
@@ -297,7 +367,251 @@ AI orchestrator (e.g., OpenClaw). In spawned sessions:
 - Focus on completing the task and reporting results via prose output.
 - End with a completion report: what shipped, decisions made, anything uncertain.
 
+## AskUserQuestion Format
 
+**ALWAYS follow this structure for every AskUserQuestion call. Every element is non-skippable. If you find yourself about to skip any of them, stop and back up.**
+
+### Required shape
+
+Every AskUserQuestion reads like a decision brief, not a bullet list:
+
+```
+D<N> — <one-line question title>
+
+ELI10: <plain English a 16-year-old could follow, 2-4 sentences, name the stakes>
+
+Stakes if we pick wrong: <one sentence on what breaks, what user sees, what's lost>
+
+Recommendation: <choice> because <one-line reason>
+
+Completeness: A=X/10, B=Y/10   (or: Note: options differ in kind, not coverage — no completeness score)
+
+Pros / cons:
+
+A) <option label> (recommended)
+  ✅ <pro — concrete, observable, ≥40 chars>
+  ✅ <pro>
+  ❌ <con — honest, ≥40 chars>
+
+B) <option label>
+  ✅ <pro>
+  ❌ <con>
+
+Net: <one-line synthesis of what you're actually trading off>
+```
+
+### Element rules
+
+1. **D-numbering.** First question in a skill invocation is `D1`. Increment per
+   question within the same skill. This is a model-level instruction, not a
+   runtime counter — you count your own questions. Nested skill invocation
+   (e.g., `/plan-ceo-review` running `/office-hours` inline) starts its own
+   D1; label as `D1 (office-hours)` to disambiguate when the user will see
+   both. Drift is expected over long sessions; minor inconsistency is fine.
+
+2. **Re-ground.** Before ELI10, state the project, current branch (use the
+   `_BRANCH` value from the preamble, NOT conversation history or gitStatus),
+   and the current plan/task. 1-2 sentences. Assume the user hasn't looked at
+   this window in 20 minutes.
+
+3. **ELI10 (ALWAYS).** Explain in plain English a smart 16-year-old could
+   follow. Concrete examples and analogies, not function names. Say what it
+   DOES, not what it's called. This is not preamble — the user is about to
+   make a decision and needs context. Even in terse mode, emit the ELI10.
+
+4. **Stakes if we pick wrong (ALWAYS).** One sentence naming what breaks in
+   concrete terms (pain avoided / capability unlocked / consequence named).
+   "Users see a 3-second spinner" beats "performance may degrade." Forces
+   the trade-off to be real.
+
+5. **Recommendation (ALWAYS).** `Recommendation: <choice> because <one-line
+   reason>` on its own line. Never omit it. Required for every AskUserQuestion,
+   even when neutral-posture (see rule 8). The `(recommended)` label on the
+   option is REQUIRED — `scripts/resolvers/question-tuning.ts` reads it to
+   power the AUTO_DECIDE path. Omitting it breaks auto-decide.
+
+6. **Completeness scoring (when meaningful).** When options differ in
+   coverage (full test coverage vs happy path vs shortcut, complete error
+   handling vs partial), score each `Completeness: N/10` on its own line.
+   Calibration: 10 = complete, 7 = happy path only, 3 = shortcut. Flag any
+   option ≤5 where a higher-completeness option exists. When options differ
+   in kind (review posture, architectural A-vs-B, cherry-pick Add/Defer/Skip,
+   two different kinds of systems), SKIP the score and write one line:
+   `Note: options differ in kind, not coverage — no completeness score.`
+   Do NOT fabricate filler scores — empty 10/10 on every option is worse
+   than no score.
+
+7. **Pros / cons block.** Every option gets per-bullet ✅ (pro) and ❌ (con)
+   markers. Rules:
+   - **Minimum 2 pros and 1 con per option.** If you can't name a con for
+     the recommended option, the recommendation is hollow — go find one. If
+     you can't name a pro for the rejected option, the question isn't real.
+   - **Minimum 40 characters per bullet.** `✅ Simple` is not a pro. `✅
+     Reuses the YAML frontmatter format already in MEMORY.md, zero new
+     parser` is a pro. Concrete, observable, specific.
+   - **Hard-stop escape** for genuinely one-sided choices (destructive-action
+     confirmation, one-way doors): a single bullet `✅ No cons — this is a
+     hard-stop choice` satisfies the rule. Use sparingly; overuse flips a
+     decision brief into theater.
+
+8. **Net line (ALWAYS).** Closes the decision with a one-sentence synthesis
+   of what the user is actually trading off. From the reference screenshot:
+   *"The new-format case is speculative. The copy-format case is immediate
+   leverage. Copy now, evolve later if a real pattern emerges."* Not a
+   summary — a verdict frame.
+
+9. **Neutral-posture handling.** When the skill explicitly says "neutral
+   recommendation posture" (SELECTIVE EXPANSION cherry-picks, taste calls,
+   kind-differentiated choices where neither side dominates), the
+   Recommendation line reads: `Recommendation: <default-choice> — this is a
+   taste call, no strong preference either way`. The `(recommended)` label
+   STAYS on the default option (machine-readable hint for AUTO_DECIDE). The
+   `— this is a taste call` prose is the human-readable neutrality signal.
+   Both coexist.
+
+10. **Effort both-scales.** When an option involves effort, show both human
+    and CC scales: `(human: ~2 days / CC: ~15 min)`.
+
+11. **Tool_use, not prose.** A markdown block labeled `Question:` is not a
+    question — the user never sees it as interactive. If you wrote one in
+    prose, stop and reissue as an actual AskUserQuestion tool_use. The rich
+    markdown goes in the question body; the `options` array stays short
+    labels (A, B, C).
+
+### Self-check before emitting
+
+Before calling AskUserQuestion, verify:
+- [ ] D<N> header present
+- [ ] ELI10 paragraph present (stakes line too)
+- [ ] Recommendation line present with concrete reason
+- [ ] Completeness scored (coverage) OR kind-note present (kind)
+- [ ] Every option has ≥2 ✅ and ≥1 ❌, each ≥40 chars (or hard-stop escape)
+- [ ] (recommended) label on one option (even for neutral-posture — see rule 9)
+- [ ] Net line closes the decision
+- [ ] You are calling the tool, not writing prose
+
+If you'd need to read the source to understand your own explanation, it's
+too complex — simplify before emitting.
+
+Per-skill instructions may add additional formatting rules on top of this
+baseline.
+
+## GBrain Sync (skill start)
+
+```bash
+# gbrain-sync: drain pending writes, pull once per day. Silent no-op when
+# the feature isn't initialized or gbrain_sync_mode is "off". See
+# docs/gbrain-sync.md.
+
+_GSTACK_HOME="${GSTACK_HOME:-$HOME/.gstack}"
+_BRAIN_REMOTE_FILE="$HOME/.gstack-brain-remote.txt"
+_BRAIN_SYNC_BIN="~/.claude/skills/gstack/bin/gstack-brain-sync"
+_BRAIN_CONFIG_BIN="~/.claude/skills/gstack/bin/gstack-config"
+
+_BRAIN_SYNC_MODE=$("$_BRAIN_CONFIG_BIN" get gbrain_sync_mode 2>/dev/null || echo off)
+
+# New-machine hint: URL file present, local .git missing, sync not yet enabled.
+if [ -f "$_BRAIN_REMOTE_FILE" ] && [ ! -d "$_GSTACK_HOME/.git" ] && [ "$_BRAIN_SYNC_MODE" = "off" ]; then
+  _BRAIN_NEW_URL=$(head -1 "$_BRAIN_REMOTE_FILE" 2>/dev/null | tr -d '[:space:]')
+  if [ -n "$_BRAIN_NEW_URL" ]; then
+    echo "BRAIN_SYNC: brain repo detected: $_BRAIN_NEW_URL"
+    echo "BRAIN_SYNC: run 'gstack-brain-restore' to pull your cross-machine memory (or 'gstack-config set gbrain_sync_mode off' to dismiss forever)"
+  fi
+fi
+
+# Active-sync path.
+if [ -d "$_GSTACK_HOME/.git" ] && [ "$_BRAIN_SYNC_MODE" != "off" ]; then
+  # Once-per-day pull.
+  _BRAIN_LAST_PULL_FILE="$_GSTACK_HOME/.brain-last-pull"
+  _BRAIN_NOW=$(date +%s)
+  _BRAIN_DO_PULL=1
+  if [ -f "$_BRAIN_LAST_PULL_FILE" ]; then
+    _BRAIN_LAST=$(cat "$_BRAIN_LAST_PULL_FILE" 2>/dev/null || echo 0)
+    _BRAIN_AGE=$(( _BRAIN_NOW - _BRAIN_LAST ))
+    [ "$_BRAIN_AGE" -lt 86400 ] && _BRAIN_DO_PULL=0
+  fi
+  if [ "$_BRAIN_DO_PULL" = "1" ]; then
+    ( cd "$_GSTACK_HOME" && git fetch origin >/dev/null 2>&1 && git merge --ff-only "origin/$(git rev-parse --abbrev-ref HEAD)" >/dev/null 2>&1 ) || true
+    echo "$_BRAIN_NOW" > "$_BRAIN_LAST_PULL_FILE"
+  fi
+  # Drain pending queue, push.
+  "$_BRAIN_SYNC_BIN" --once 2>/dev/null || true
+fi
+
+# Status line — always emitted, easy to grep.
+if [ -d "$_GSTACK_HOME/.git" ] && [ "$_BRAIN_SYNC_MODE" != "off" ]; then
+  _BRAIN_QUEUE_DEPTH=0
+  [ -f "$_GSTACK_HOME/.brain-queue.jsonl" ] && _BRAIN_QUEUE_DEPTH=$(wc -l < "$_GSTACK_HOME/.brain-queue.jsonl" | tr -d ' ')
+  _BRAIN_LAST_PUSH="never"
+  [ -f "$_GSTACK_HOME/.brain-last-push" ] && _BRAIN_LAST_PUSH=$(cat "$_GSTACK_HOME/.brain-last-push" 2>/dev/null || echo never)
+  echo "BRAIN_SYNC: mode=$_BRAIN_SYNC_MODE | last_push=$_BRAIN_LAST_PUSH | queue=$_BRAIN_QUEUE_DEPTH"
+else
+  echo "BRAIN_SYNC: off"
+fi
+```
+
+
+
+**Privacy stop-gate (fires ONCE per machine).**
+
+If the bash output shows `BRAIN_SYNC: off` AND the config value
+`gbrain_sync_mode_prompted` is `false` AND gbrain is detected on this host
+(either `gbrain doctor --fast --json` succeeds or the `gbrain` binary is in PATH),
+fire a one-time privacy gate via AskUserQuestion:
+
+> gstack can publish your session memory (learnings, plans, designs, retros) to a
+> private GitHub repo that GBrain indexes across your machines. Higher tiers
+> include behavioral data (session timelines, developer profile). How much do you
+> want to sync?
+
+Options:
+- A) Everything allowlisted (recommended — maximum cross-machine memory)
+- B) Only artifacts (plans, designs, retros, learnings) — skip timelines and profile
+- C) Decline — keep everything local
+
+After the user answers, run (substituting the chosen value):
+
+```bash
+# Chosen mode: full | artifacts-only | off
+"$_BRAIN_CONFIG_BIN" set gbrain_sync_mode <choice>
+"$_BRAIN_CONFIG_BIN" set gbrain_sync_mode_prompted true
+```
+
+If A or B was chosen AND `~/.gstack/.git` doesn't exist, ask a follow-up:
+"Set up the GBrain sync repo now? (runs `gstack-brain-init`)"
+- A) Yes, run it now
+- B) Show me the command, I'll run it myself
+
+Do not block the skill. Emit the question, continue the skill workflow. The
+next skill run picks up wherever this left off.
+
+**At skill END (before the telemetry block),** run these bash commands to
+catch artifact writes (design docs, plans, retros) that skipped the writer
+shims, plus drain any still-pending queue entries:
+
+```bash
+"~/.claude/skills/gstack/bin/gstack-brain-sync" --discover-new 2>/dev/null || true
+"~/.claude/skills/gstack/bin/gstack-brain-sync" --once 2>/dev/null || true
+```
+
+
+## Model-Specific Behavioral Patch (claude)
+
+The following nudges are tuned for the claude model family. They are
+**subordinate** to skill workflow, STOP points, AskUserQuestion gates, plan-mode
+safety, and /ship review gates. If a nudge below conflicts with skill instructions,
+the skill wins. Treat these as preferences, not rules.
+
+**Todo-list discipline.** When working through a multi-step plan, mark each task
+complete individually as you finish it. Do not batch-complete at the end. If a task
+turns out to be unnecessary, mark it skipped with a one-line reason.
+
+**Think before heavy actions.** For complex operations (refactors, migrations,
+non-trivial new features), briefly state your approach before executing. This lets
+the user course-correct cheaply instead of mid-flight.
+
+**Dedicated tools over Bash.** Prefer Read, Edit, Write, Glob, Grep over shell
+equivalents (cat, sed, find, grep). The dedicated tools are cheaper and clearer.
 
 ## Voice
 
@@ -342,6 +656,10 @@ Avoid filler, throat-clearing, generic optimism, founder cosplay, and unsupporte
 - Punchy standalone sentences. "That's it." "This is the whole game."
 - Stay curious, not lecturing. "What's interesting here is..." beats "It is important to understand..."
 - End with what to do. Give the action.
+
+**Example of the right voice:**
+"auth.ts:47 returns undefined when the session cookie expires. Your users hit a white screen. Fix: add a null check and redirect to /login. Two lines. Want me to fix it?"
+Not: "I've identified a potential issue in the authentication flow that may cause problems for some users under certain conditions. Let me explain the approach I'd recommend..."
 
 **Final test:** does this sound like a real cross-functional builder who wants to help someone make something people want, ship it, and make it actually work?
 
@@ -389,18 +707,6 @@ want /[next skill]."
 are shown, synthesize a one-paragraph welcome briefing before proceeding:
 "Welcome back to {branch}. Last session: /{skill} ({outcome}). [Checkpoint summary if
 available]. [Health score if available]." Keep it to 2-3 sentences.
-
-## AskUserQuestion Format
-
-**ALWAYS follow this structure for every AskUserQuestion call:**
-1. **Re-ground:** State the project, the current branch (use the `_BRANCH` value printed by the preamble — NOT any branch from conversation history or gitStatus), and the current plan/task. (1-2 sentences)
-2. **Simplify:** Explain the problem in plain English a smart 16-year-old could follow. No raw function names, no internal jargon, no implementation details. Use concrete examples and analogies. Say what it DOES, not what it's called.
-3. **Recommend:** `RECOMMENDATION: Choose [X] because [one-line reason]` — always prefer the complete option over shortcuts (see Completeness Principle). Include `Completeness: X/10` for each option. Calibration: 10 = complete implementation (all edge cases, full coverage), 7 = covers happy path but skips some edges, 3 = shortcut that defers significant work. If both options are 8+, pick the higher; if one is ≤5, flag it.
-4. **Options:** Lettered options: `A) ... B) ... C) ...` — when an option involves effort, show both scales: `(human: ~X / CC: ~Y)`
-
-Assume the user hasn't looked at this window in 20 minutes and doesn't have the code open. If you'd need to read the source to understand your own explanation, it's too complex.
-
-Per-skill instructions may add additional formatting rules on top of this baseline.
 
 ## Writing Style (skip entirely if `EXPLAIN_LEVEL: terse` appears in the preamble echo OR the user's current message explicitly requests terse / no-explanations output)
 
@@ -516,7 +822,7 @@ AI makes completeness near-free. Always recommend the complete option over short
 | Feature | 1 week | 30 min | ~30x |
 | Bug fix | 4 hours | 15 min | ~20x |
 
-Include `Completeness: X/10` for each option (10=all edge cases, 7=happy path, 3=shortcut).
+When options differ in coverage (e.g. full vs happy-path vs shortcut), include `Completeness: X/10` on each option (10 = all edge cases, 7 = happy path, 3 = shortcut). When options differ in kind (mode posture, architectural choice, cherry-pick A/B/C where each is a different kind of thing, not a more-or-less-complete version of the same thing), skip the score and write one line explaining why: `Note: options differ in kind, not coverage — no completeness score.` Do not fabricate scores.
 
 ## Confusion Protocol
 
@@ -530,6 +836,65 @@ STOP. Name the ambiguity in one sentence. Present 2-3 options with tradeoffs.
 Ask the user. Do not guess on architectural or data model decisions.
 
 This does NOT apply to routine coding, small features, or obvious changes.
+
+## Continuous Checkpoint Mode
+
+If `CHECKPOINT_MODE` is `"continuous"` (from preamble output): auto-commit work as
+you go with `WIP:` prefix so session state survives crashes and context switches.
+
+**When to commit (continuous mode only):**
+- After creating a new file (not scratch/temp files)
+- After finishing a function/component/module
+- After fixing a bug that's verified by a passing test
+- Before any long-running operation (install, full build, full test suite)
+
+**Commit format** — include structured context in the body:
+
+```
+WIP: <concise description of what changed>
+
+[gstack-context]
+Decisions: <key choices made this step>
+Remaining: <what's left in the logical unit>
+Tried: <failed approaches worth recording> (omit if none)
+Skill: </skill-name-if-running>
+[/gstack-context]
+```
+
+**Rules:**
+- Stage only files you intentionally changed. NEVER `git add -A` in continuous mode.
+- Do NOT commit with known-broken tests. Fix first, then commit. The [gstack-context]
+  example values MUST reflect a clean state.
+- Do NOT commit mid-edit. Finish the logical unit.
+- Push ONLY if `CHECKPOINT_PUSH` is `"true"` (default is false). Pushing WIP commits
+  to a shared remote can trigger CI, deploys, and expose secrets — that is why push
+  is opt-in, not default.
+- Background discipline — do NOT announce each commit to the user. They can see
+  `git log` whenever they want.
+
+**When `/context-restore` runs,** it parses `[gstack-context]` blocks from WIP
+commits on the current branch to reconstruct session state. When `/ship` runs, it
+filter-squashes WIP commits only (preserving non-WIP commits) via
+`git rebase --autosquash` so the PR contains clean bisectable commits.
+
+If `CHECKPOINT_MODE` is `"explicit"` (the default): no auto-commit behavior. Commit
+only when the user explicitly asks, or when a skill workflow (like /ship) runs a
+commit step. Ignore this section entirely.
+
+## Context Health (soft directive)
+
+During long-running skill sessions, periodically write a brief `[PROGRESS]` summary
+(2-3 sentences: what's done, what's next, any surprises). Example:
+
+`[PROGRESS] Found 3 auth bugs. Fixed 2. Remaining: session expiry race in auth.ts:147. Next: write regression test.`
+
+If you notice you're going in circles — repeating the same diagnostic, re-reading the
+same file, or trying variants of a failed fix — STOP and reassess. Consider escalating
+or calling /context-save to save progress and start fresh.
+
+This is a soft nudge, not a measurable feature. No thresholds, no enforcement. The
+goal is self-awareness during long sessions. If the session stays short, skip it.
+Progress summaries must NEVER mutate git state — they are reporting, not committing.
 
 ## Question Tuning (skip entirely if `QUESTION_TUNING: false`)
 
@@ -664,82 +1029,16 @@ success/error/abort, and `USED_BROWSE` with true/false based on whether `$B` was
 If you cannot determine the outcome, use "unknown". The local JSONL always logs. The
 remote binary only runs if telemetry is not off and the binary exists.
 
-## Plan Mode Safe Operations
-
-When in plan mode, these operations are always allowed because they produce
-artifacts that inform the plan, not code changes:
-
-- `$B` commands (browse: screenshots, page inspection, navigation, snapshots)
-- `$D` commands (design: generate mockups, variants, comparison boards, iterate)
-- `codex exec` / `codex review` (outside voice, plan review, adversarial challenge)
-- Writing to `~/.gstack/` (config, analytics, review logs, design artifacts, learnings)
-- Writing to the plan file (already allowed by plan mode)
-- `open` commands for viewing generated artifacts (comparison boards, HTML previews)
-
-These are read-only in spirit — they inspect the live site, generate visual artifacts,
-or get independent opinions. They do NOT modify project source files.
-
-## Skill Invocation During Plan Mode
-
-If a user invokes a skill during plan mode, that invoked skill workflow takes
-precedence over generic plan mode behavior until it finishes or the user explicitly
-cancels that skill.
-
-Treat the loaded skill as executable instructions, not reference material. Follow
-it step by step. Do not summarize, skip, reorder, or shortcut its steps.
-
-If the skill says to use AskUserQuestion, do that. Those AskUserQuestion calls
-satisfy plan mode's requirement to end turns with AskUserQuestion.
-
-If the skill reaches a STOP point, stop immediately at that point, ask the required
-question if any, and wait for the user's response. Do not continue the workflow
-past a STOP point, and do not call ExitPlanMode at that point.
-
-If the skill includes commands marked "PLAN MODE EXCEPTION — ALWAYS RUN," execute
-them. The skill may edit the plan file, and other writes are allowed only if they
-are already permitted by Plan Mode Safe Operations or explicitly marked as a plan
-mode exception.
-
-Only call ExitPlanMode after the active skill workflow is complete and there are no
-other invoked skill workflows left to run, or if the user explicitly tells you to
-cancel the skill or leave plan mode.
-
 ## Plan Status Footer
 
-When you are in plan mode and about to call ExitPlanMode:
+In plan mode, before ExitPlanMode: if the plan file lacks a `## GSTACK REVIEW REPORT`
+section, run `~/.claude/skills/gstack/bin/gstack-review-read` and append a report.
+With JSONL entries (before `---CONFIG---`), format the standard runs/status/findings
+table. With `NO_REVIEWS` or empty, append a 5-row placeholder table (CEO/Codex/Eng/
+Design/DX Review) with all zeros and verdict "NO REVIEWS YET — run `/autoplan`".
+If a richer review report already exists, skip — review skills wrote it.
 
-1. Check if the plan file already has a `## GSTACK REVIEW REPORT` section.
-2. If it DOES — skip (a review skill already wrote a richer report).
-3. If it does NOT — run this command:
-
-\`\`\`bash
-~/.claude/skills/gstack/bin/gstack-review-read
-\`\`\`
-
-Then write a `## GSTACK REVIEW REPORT` section to the end of the plan file:
-
-- If the output contains review entries (JSONL lines before `---CONFIG---`): format the
-  standard report table with runs/status/findings per skill, same format as the review
-  skills use.
-- If the output is `NO_REVIEWS` or empty: write this placeholder table:
-
-\`\`\`markdown
-## GSTACK REVIEW REPORT
-
-| Review | Trigger | Why | Runs | Status | Findings |
-|--------|---------|-----|------|--------|----------|
-| CEO Review | \`/plan-ceo-review\` | Scope & strategy | 0 | — | — |
-| Codex Review | \`/codex review\` | Independent 2nd opinion | 0 | — | — |
-| Eng Review | \`/plan-eng-review\` | Architecture & tests (required) | 0 | — | — |
-| Design Review | \`/plan-design-review\` | UI/UX gaps | 0 | — | — |
-| DX Review | \`/plan-devex-review\` | Developer experience gaps | 0 | — | — |
-
-**VERDICT:** NO REVIEWS YET — run \`/autoplan\` for full review pipeline, or individual reviews above.
-\`\`\`
-
-**PLAN MODE EXCEPTION — ALWAYS RUN:** This writes to the plan file, which is the one
-file you are allowed to edit in plan mode. The plan file review report is part of the
-plan's living status.
+PLAN MODE EXCEPTION — always allowed (it's the plan file).
 
 ## Step 0: Detect platform and base branch
 
