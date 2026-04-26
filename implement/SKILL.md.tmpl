@@ -70,12 +70,12 @@ For each phase in your living plan checklist (if in Reexamine Mode, audit ALL ph
    - Instructions: If the project uses GitHub CI/CD actions, make sure all your actions/checks are green.
    - Instructions to fail forward and only return to you when the code is written. (Do NOT instruct Gemini to run /review or /ship).
 2. **Wait for Gemini Completion**: The Gemini sub-agent will run in the shell. You just wait for the bash command to finish.
-3. **Spawn Codex Review/Ship Sub-Agent**: After Gemini finishes writing the code, you MUST spawn a dedicated Codex sub-agent. Use the `Bash` tool to run `claude -p /codex consult "<prompt>"`. The prompt must instruct the sub-agent to:
-   - Autonomously run the `/review` skill, and if there are UI changes, the `/qa` skill.
-   - Iteratively fix any bugs, lint errors, or review findings it discovers, re-running the skills until the codebase passes perfectly clean.
-   - Once the code is fully clean, run `claude -p /ship && claude -p /land-and-deploy` to automatically ship and deploy the phase's PR.
-4. **Wait for Codex Completion**: Wait for the deployment bash command to finish.
-5. **Update Living Plan**: After the Codex sub-agent successfully ships the phase, use the `Edit` tool to modify the living plan and mark the step as completed (change `[ ]` to `[x]`).
+3. **Spawn Sonnet Review/Ship Sub-Agent**: After Gemini finishes writing the code, you MUST spawn a dedicated Sonnet sub-agent. Use the `Bash` tool to run `claude -m sonnet -p "<prompt>"`. The prompt must instruct the sub-agent to:
+   - Autonomously run the `/codex review` skill (OpenAI Codex) to get an independent code review, and if there are UI changes, run the `/qa` skill.
+   - Iteratively fix any bugs, lint errors, or review findings Codex discovers, re-running the skills until the codebase passes perfectly clean.
+   - Once the code is fully clean, run `claude -m sonnet -p /ship && claude -m sonnet -p /land-and-deploy` to automatically ship and deploy the phase's PR.
+4. **Wait for Sonnet Completion**: Wait for the deployment bash command to finish.
+5. **Update Living Plan**: After the Sonnet sub-agent successfully ships the phase, use the `Edit` tool to modify the living plan and mark the step as completed (change `[ ]` to `[x]`).
 
 Do NOT stop to ask the user for permission between phases unless a sub-agent fails catastrophically or hits a safety constraint. Keep the loop going.
 
