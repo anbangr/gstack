@@ -1,7 +1,7 @@
 ---
 name: implement
 preamble-tier: 4
-version: 1.5.0
+version: 1.6.0
 description: |
   Autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -1046,7 +1046,7 @@ PLAN MODE EXCEPTION — always allowed (it's the plan file).
 # /implement — Autonomous Execution Loop
 
 You are the Execution Agent. The planning phase is over. Your job is to read the approved implementation plan and execute it autonomously in phases.
-**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/implement` orchestrator v1.5.0").**
+**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/implement` orchestrator v1.6.0").**
 
 **Execution Modes**:
 - **Normal Mode**: Synthesize a new living plan and build the feature from scratch. (Default)
@@ -1077,6 +1077,12 @@ ls -t .gstack/projects/*/*-plan-*.md 2>/dev/null | head -n 1
 4. Read the most recent plan file you find. **CRITICAL:** If you cannot find any plan file from Step 3, you MUST immediately STOP, output an error, and wait for the user. Do NOT attempt to guess the plan or invent your own checklist. You must process the ENTIRE plan, covering all weeks, phases, and milestones, not just the next immediate week.
 5. Synthesize a comprehensive "Living Implementation & Test Plan" that spans the entire project timeline. Write this plan to `plans/<project-slug>-impl-plan-<date>.md` (e.g., `plans/agnt2-impl-plan-20260426.md`). It MUST include:
    - A comprehensive phase-by-phase checklist of implementation steps spanning all weeks (using `[ ]` markdown checkboxes).
+   - **CRITICAL**: For *every* phase in the checklist, you MUST explicitly include sub-checkboxes for the execution loop. This acts as your strict state machine. Format every phase exactly like this:
+     ```markdown
+     ### Phase X: [Phase Name]
+     - [ ] **Implementation (Gemini Sub-agent)**: [Specific coding tasks to be done...]
+     - [ ] **Review & QA (Sonnet Sub-agent)**: Run /codex review and /qa, fix any bugs.
+     ```
    - A dedicated test plan strategy for verifying the behavior.
 6. Present this newly synthesized living plan to the user and **PAUSE**. Use `AskUserQuestion` to explicitly ask the user to confirm the plan before moving on to the coding loop.
 
@@ -1099,7 +1105,7 @@ For each phase in your living plan checklist that is marked as `[ ]` (if in Reex
    - Iteratively fix any bugs, lint errors, or review findings Codex discovers, re-running the bash commands until the codebase passes perfectly clean.
    - **CRITICAL**: Do NOT instruct this sub-agent to run `/ship` or `/land-and-deploy`. It should ONLY review and fix bugs on the active feature branch.
 4. **Wait for Sonnet Completion**: Run the Sonnet sub-agent synchronously in the foreground. Wait for the Bash tool to return.
-5. **Update Living Plan**: After the Sonnet sub-agent successfully reviews and fixes the phase, use the `Edit` tool to modify the living plan and mark the step as completed (change `[ ]` to `[x]`).
+5. **Update Living Plan**: As each sub-agent completes its work, you MUST immediately use the `Edit` tool to modify the living plan and check off its specific sub-checkbox. (i.e., change `[ ] **Implementation...` to `[x]` after Gemini finishes, and change `[ ] **Review...` to `[x]` after Sonnet finishes).
 
 Do NOT stop to ask the user for permission between phases unless a sub-agent fails catastrophically or hits a safety constraint. Keep the loop going.
 
