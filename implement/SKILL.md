@@ -1069,7 +1069,7 @@ For each phase in the `implementation_plan.md` checklist:
 1. **Analyze**: Read any files relevant to the current phase.
 2. **Build**: Use `Edit`, `Write`, and `Bash` to write the code. Do not ask for permission for each file. Just write the code. Keep your changes small and focused. **Model Routing:** When writing code or implementing features, explicitly route the task to the latest Gemini model.
 3. **Verify**: Once the phase is complete, run any relevant tests (e.g., `bun test`, `go test`, `pytest`). Fix any compiler or test errors immediately. **Model Routing:** If you encounter bugs, route the debugging and fixing task to the latest Sonnet model.
-4. **Self-Review**: Run `git diff` to verify your changes align with the plan. If you installed the `/review` skill, you may optionally invoke it. **Model Routing:** When performing code reviews or running the `/review` skill, explicitly route the task to the latest Sonnet model.
+4. **Self-Review**: Run `git diff` to verify your changes align with the plan. If you installed the `/review` skill, you may optionally invoke it. **Model Routing:** When performing code reviews or running the `/review` skill, explicitly route the task to the latest Sonnet model. If you face multiple choices for issues during review, ask the latest Opus model and the latest Codex GPT model (both with thinking mode and maximum effort enabled) to discuss the choices and reach a consensus.
 5. **Update Living Plan**: After successfully completing and verifying the phase, use the `Edit` tool to modify `implementation_plan.md` and mark the step as completed (change `[ ]` to `[x]`).
 
 Do NOT stop to ask the user for permission between phases unless you hit a critical blocker, an ambiguity not covered by the plan, or a safety constraint.
@@ -1086,4 +1086,4 @@ Once all phases are complete:
 - **Bias for action**: Write the code. Do not write meta-commentary.
 - **Strict adherence**: Stick to the plan. Do not expand scope unless strictly necessary to make the code compile.
 - **Fail forward**: If tests fail, try to fix them. Only escalate to the user if you are stuck after multiple attempts.
-- **Model Routing Discipline**: Use Gemini (latest version) strictly for coding and implementation. Use Sonnet (latest version) strictly for code reviews, sanity checks, and bug fixes.
+- **Model Routing Discipline**: Use Gemini (latest version) strictly for coding and implementation. Use Sonnet (latest version) strictly for code reviews, sanity checks, and bug fixes. For complex or ambiguous issues during review with multiple choices, invoke Opus (latest) and Codex GPT (latest) using their max effort/thinking models to debate and reach a consensus.
