@@ -57,7 +57,7 @@ For each phase in your newly created `plans/<project-slug>-impl-plan-<date>.md` 
    - The exact goal and phase checklist from the living plan.
    - Instructions to Build, Verify, and Self-Review the code for this specific phase. You MUST autonomously invoke the `/review` skill via the `Bash` tool (e.g., `claude -m sonnet -p /review`) to self-review your code. If your phase includes UI changes, you MUST also invoke the `/qa` skill (e.g., `claude -m sonnet -p /qa`) to verify the UI. If `/review` or `/qa` report any issues, you MUST iteratively fix them and re-run the skills until they pass cleanly.
    - Instructions: If the project uses GitHub CI/CD actions, make sure all your actions/checks are green. If not, fix the issues and check iteratively until they pass.
-   - The strict **Model Routing Discipline**: Gemini for coding, Sonnet for code reviews/bugs, Opus+Codex for debating ambiguous issues.
+   - The strict **Model Routing Discipline**: Gemini for coding, Sonnet for code reviews/bugs. If you face ambiguous issues or multiple choices for a fix, you MUST autonomously dispatch the problem to Opus and Codex via the `Bash` tool (e.g., `claude -m opus -p /claude` and `claude -p /codex`) to debate and reach a consensus.
    - Instructions to fail forward and only return to you when the phase passes tests/CI or if it is critically blocked.
 2. **Wait for Completion**: The sub-agent will do the heavy lifting (analyzing, building, testing, reviewing) in its own fresh context window. You just wait for it to finish.
 3. **Update Living Plan**: After the sub-agent successfully completes the phase and returns control to you, use the `Edit` tool to modify the living plan and mark the step as completed (change `[ ]` to `[x]`).
@@ -79,4 +79,4 @@ Once all phases are complete:
 - **Bias for action**: Write the code. Do not write meta-commentary.
 - **Strict adherence**: Stick to the plan. Do not expand scope unless strictly necessary to make the code compile.
 - **Fail forward**: If tests fail, try to fix them. Only escalate to the user if you are stuck after multiple attempts.
-- **Model Routing Discipline**: Use Gemini (latest version) strictly for coding and implementation. Use Sonnet (latest version) strictly for code reviews, sanity checks, and bug fixes. For complex or ambiguous issues during review with multiple choices, invoke Opus (latest) and Codex GPT (latest) using their max effort/thinking models to debate and reach a consensus.
+- **Model Routing Discipline**: Use Gemini (latest version) strictly for coding and implementation. Use Sonnet (latest version) strictly for code reviews, sanity checks, and bug fixes. For complex or ambiguous issues during review with multiple choices, you MUST autonomously invoke Opus (via `claude -m opus -p /claude`) and Codex (via `claude -p /codex`) using the `Bash` tool to debate and reach a consensus. Do NOT ask the user to resolve the ambiguity if the models can reach a consensus.
