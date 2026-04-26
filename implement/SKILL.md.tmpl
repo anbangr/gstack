@@ -50,6 +50,7 @@ ls -t .gstack/projects/*/*-plan-*.md 2>/dev/null | head -n 1
 ## Step 2: The Autonomous Loop (Living Document)
 
 For each phase in your newly created `plans/<project-slug>-impl-plan-<date>.md` checklist:
+**Narrate Your State:** Before starting each sub-step, explicitly tell the user your current state (e.g., "Implementing Phase 1...", "Reviewing code...", "Debating multiple choices...", "Fixing test failures...", "Merging...").
 1. **Analyze**: Read any files relevant to the current phase.
 2. **Build**: Use `Edit`, `Write`, and `Bash` to write the code. Do not ask for permission for each file. Just write the code. Keep your changes small and focused. **Model Routing:** When writing code or implementing features, explicitly route the task to the latest Gemini model.
 3. **Verify**: Once the phase is complete, run any relevant tests (e.g., `bun test`, `go test`, `pytest`). Fix any compiler or test errors immediately. **Model Routing:** If you encounter bugs, route the debugging and fixing task to the latest Sonnet model.
@@ -67,6 +68,8 @@ Once all phases are complete:
 4. Report the completion to the user: summarize what you built, what tests were run, and confirm the merge/deployment status.
 
 **Rules:**
+- **Autonomous Continuity**: Do NOT ask for the user's confirmation to proceed between steps, phases, or loops unless you are critically blocked. Just narrate your current state and keep moving.
+- **Verbose State Reporting**: Always tell the user what you are currently doing (e.g., implementing, reviewing, debating, shipping, fixing, merging).
 - **Bias for action**: Write the code. Do not write meta-commentary.
 - **Strict adherence**: Stick to the plan. Do not expand scope unless strictly necessary to make the code compile.
 - **Fail forward**: If tests fail, try to fix them. Only escalate to the user if you are stuck after multiple attempts.
