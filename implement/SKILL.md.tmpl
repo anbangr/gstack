@@ -71,9 +71,9 @@ For each phase in your living plan checklist (if in Reexamine Mode, audit ALL ph
    - Instructions to fail forward and only return to you when the code is written. (Do NOT instruct Gemini to run /review or /ship).
 2. **Wait for Gemini Completion**: The Gemini sub-agent will run in the shell. You just wait for the bash command to finish.
 3. **Spawn Sonnet Review/Ship Sub-Agent**: After Gemini finishes writing the code, you MUST spawn a dedicated Sonnet sub-agent. Use the `Bash` tool to run `claude -m sonnet -p "<prompt>"`. The prompt must instruct the sub-agent to:
-   - Autonomously run the `/codex review` skill (OpenAI Codex) to get an independent code review, and if there are UI changes, run the `/qa` skill.
-   - Iteratively fix any bugs, lint errors, or review findings Codex discovers, re-running the skills until the codebase passes perfectly clean.
-   - Once the code is fully clean, run `claude -m sonnet -p /ship && claude -m sonnet -p /land-and-deploy` to automatically ship and deploy the phase's PR.
+   - Use the `Bash` tool to run `claude -p "/codex review"` to get an independent code review. If there are UI changes, use the `Bash` tool to run `claude -m sonnet -p /qa`. **CRITICAL: Do NOT invoke the native `codex` or `qa` tools!**
+   - Iteratively fix any bugs, lint errors, or review findings Codex discovers, re-running the bash commands until the codebase passes perfectly clean.
+   - Once the code is fully clean, use the `Bash` tool to run `claude -m sonnet -p /ship && claude -m sonnet -p /land-and-deploy` to automatically ship and deploy the phase's PR. **CRITICAL: Do NOT invoke the native `ship` tool!**
 4. **Wait for Sonnet Completion**: Wait for the deployment bash command to finish.
 5. **Update Living Plan**: After the Sonnet sub-agent successfully ships the phase, use the `Edit` tool to modify the living plan and mark the step as completed (change `[ ]` to `[x]`).
 
@@ -87,7 +87,7 @@ Once all phases are complete:
 
 **Rules:**
 - **Autonomous Continuity**: Do NOT ask for the user's confirmation to proceed between steps, phases, or loops unless you are critically blocked. Just narrate your current state and keep moving.
-- **Autonomous Skill Execution**: If you or your sub-agents decide to use any other GStack skills (like `/review`, `/qa`, etc.), you MUST invoke them autonomously using the `Bash` tool and explicitly set the model (e.g., `claude -m sonnet -p /review`). Do NOT ask the user to run them.
+- **Autonomous Skill Execution**: If you or your sub-agents use other GStack skills (like `/review`, `/qa`, `/codex`, `/ship`), you MUST run them as separate processes using the `Bash` tool (e.g., `claude -m sonnet -p /review`). **CRITICAL BUG WARNING: NEVER invoke skills natively as tools (i.e., do NOT use the `review`, `qa`, `codex`, or `ship` tools directly). Invoking them as native tools just dumps their source code into your context and will permanently break the autonomous loop. Always use the Bash tool.**
 - **Verbose State Reporting**: Always tell the user what you are currently doing (e.g., implementing, reviewing, debating, shipping, fixing, merging).
 - **Bias for action**: Write the code. Do not write meta-commentary.
 - **Strict adherence**: Stick to the plan. Do not expand scope unless strictly necessary to make the code compile.
