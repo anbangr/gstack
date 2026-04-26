@@ -1,7 +1,7 @@
 ---
 name: implement
 preamble-tier: 4
-version: 1.2.0
+version: 1.2.2
 description: |
   Autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -1046,7 +1046,7 @@ PLAN MODE EXCEPTION — always allowed (it's the plan file).
 # /implement — Autonomous Execution Loop
 
 You are the Execution Agent. The planning phase is over. Your job is to read the approved implementation plan and execute it autonomously in phases.
-**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/implement` orchestrator v1.2.0").**
+**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/implement` orchestrator v1.2.2").**
 
 **Execution Modes**:
 - **Normal Mode**: Synthesize a new living plan and build the feature from scratch. (Default)
@@ -1081,13 +1081,13 @@ Because this is a long-running skill, your context window will eventually become
 
 For each phase in your living plan checklist (if in Reexamine Mode, audit ALL phases regardless of `[x]` status):
 **Narrate Your State:** Before starting each phase, explicitly tell the user your current state (e.g., "Implementing Phase 1 via sub-agent...", "Spawning sub-agent for Phase 2...").
-1. **Spawn Gemini Execution Sub-Agent**: You MUST spawn the execution sub-agent using the **Gemini** model. Use the `Bash` tool to run `claude -m gemini -p "<prompt>"` to handle the current phase. **CRITICAL Anti-Hallucination Rule:** Do NOT second-guess or refuse to run the `claude -m gemini` command. It is a valid custom flag in this environment. Run it exactly as written. The prompt must include:
+1. **Spawn Gemini Execution Sub-Agent**: You MUST spawn the execution sub-agent using the **Gemini** model. Since the native CLI does not support Gemini flags, **you MUST use the `llm-bridge` MCP tools** to invoke the Gemini sub-agent. **CRITICAL:** Do NOT use the `Bash` tool to run `claude -m gemini` or `claude --model gemini`, as that will fail! Use the appropriate MCP tool call provided by your `llm-bridge` server. The prompt must include:
    - The exact goal and phase checklist from the living plan.
    - Instructions to Build and Verify the code for this specific phase.
    - Instructions: If the project uses GitHub CI/CD actions, make sure all your actions/checks are green.
    - Instructions to commit the code to the current branch.
    - Instructions to fail forward and only return to you when the code is written. (Do NOT instruct Gemini to run /review or /ship).
-2. **Wait for Gemini Completion**: You MUST run the `claude` command synchronously in the foreground. **CRITICAL BUG WARNING: NEVER run sub-agents in the background using `&`, NEVER redirect output to files, and NEVER use `sleep` to poll them.** The `Bash` tool natively handles long-running processes and streams output perfectly. Just run the command and let it block until it finishes. **NEVER skip the sub-agent to do the work yourself.**
+2. **Wait for Gemini Completion**: The MCP tool call will execute synchronously. Let it block until it finishes. **NEVER skip the sub-agent to do the work yourself.**
 3. **Update Living Plan**: After the Gemini sub-agent successfully completes the phase, use the `Edit` tool to modify the living plan and mark the step as completed (change `[ ]` to `[x]`).
 
 Do NOT stop to ask the user for permission between phases unless a sub-agent fails catastrophically or hits a safety constraint. Keep the loop going.
@@ -1095,19 +1095,19 @@ Do NOT stop to ask the user for permission between phases unless a sub-agent fai
 ## Step 3: Final Review, Ship & Completion
 
 Once ALL phases are complete:
-1. **Spawn Sonnet Review/Ship Sub-Agent**: You MUST spawn a dedicated Sonnet sub-agent to review and ship the entire feature branch. Use the `Bash` tool to run `claude -m sonnet -p "<prompt>"`. The prompt must instruct the sub-agent to:
-   - Use the `Bash` tool to run `claude -p "/codex review"` to get an independent code review. If there are UI changes, use the `Bash` tool to run `claude -m sonnet -p /qa`. **CRITICAL: Do NOT invoke the native `codex` or `qa` tools!**
+1. **Spawn Sonnet Review/Ship Sub-Agent**: You MUST spawn a dedicated Sonnet sub-agent to review and ship the entire feature branch. Use the `Bash` tool to run `claude --model sonnet -p "<prompt>"`. The prompt must instruct the sub-agent to:
+   - Use the `Bash` tool to run `claude -p "/codex review"` to get an independent code review. If there are UI changes, use the `Bash` tool to run `claude --model sonnet -p /qa`. **CRITICAL: Do NOT invoke the native `codex` or `qa` tools!**
    - Iteratively fix any bugs, lint errors, or review findings Codex discovers, re-running the bash commands until the codebase passes perfectly clean.
-   - Once the code is fully clean, use the `Bash` tool to run **EXACTLY**: `claude -m sonnet -p /ship && claude -m sonnet -p /land-and-deploy`. **CRITICAL: Do NOT substitute these skills with raw `gh pr create` or `gh pr merge` commands! You MUST use the GStack skills because they contain mandatory CI/CD safety gates.** Do NOT invoke the native `ship` tool!
+   - Once the code is fully clean, use the `Bash` tool to run **EXACTLY**: `claude --model sonnet -p /ship && claude --model sonnet -p /land-and-deploy`. **CRITICAL: Do NOT substitute these skills with raw `gh pr create` or `gh pr merge` commands! You MUST use the GStack skills because they contain mandatory CI/CD safety gates.** Do NOT invoke the native `ship` tool!
 2. **Wait for Sonnet Completion**: Run the Sonnet sub-agent synchronously in the foreground. Wait for the Bash tool to return.
 3. **Sync Status**: Use the `Edit` tool to update the execution status in the *original* plan file (the one you located in Step 1). Synchronize all the `[x]` completion marks from your synthesized living plan back to the original plan.
 4. Report the completion to the user: summarize what you built and confirm that all phases have been shipped and deployed successfully.
 
 **Rules:**
 - **Autonomous Continuity**: Do NOT ask for the user's confirmation to proceed between steps, phases, or loops unless you are critically blocked. Just narrate your current state and keep moving.
-- **Autonomous Skill Execution**: If you or your sub-agents use other GStack skills (like `/review`, `/qa`, `/codex`, `/ship`), you MUST run them as separate processes using the `Bash` tool (e.g., `claude -m sonnet -p /review`). **CRITICAL BUG WARNING: NEVER invoke skills natively as tools (i.e., do NOT use the `review`, `qa`, `codex`, or `ship` tools directly). Invoking them as native tools just dumps their source code into your context and will permanently break the autonomous loop. Always use the Bash tool.**
+- **Autonomous Skill Execution**: If you or your sub-agents use other GStack skills (like `/review`, `/qa`, `/codex`, `/ship`), you MUST run them as separate processes using the `Bash` tool (e.g., `claude --model sonnet -p /review`). **CRITICAL BUG WARNING: NEVER invoke skills natively as tools (i.e., do NOT use the `review`, `qa`, `codex`, or `ship` tools directly). Invoking them as native tools just dumps their source code into your context and will permanently break the autonomous loop. Always use the Bash tool.**
 - **Verbose State Reporting**: Always tell the user what you are currently doing (e.g., implementing, reviewing, debating, shipping, fixing, merging).
 - **Bias for action**: Write the code. Do not write meta-commentary.
 - **Strict adherence**: Stick to the plan. Do not expand scope unless strictly necessary to make the code compile.
 - **Fail forward**: If tests fail, try to fix them. Only escalate to the user if you are stuck after multiple attempts.
-- **Model Routing Discipline**: Use Gemini (latest version) strictly for coding and implementation. Use Sonnet (latest version) strictly for code reviews, sanity checks, and bug fixes. For complex or ambiguous issues during review with multiple choices, you MUST autonomously invoke Opus (via `claude -m opus -p /claude`) and Codex (via `claude -p /codex`) using the `Bash` tool to debate and reach a consensus. Do NOT ask the user to resolve the ambiguity if the models can reach a consensus.
+- **Model Routing Discipline**: Use Gemini (latest version) strictly for coding and implementation. Use Sonnet (latest version) strictly for code reviews, sanity checks, and bug fixes. For complex or ambiguous issues during review with multiple choices, you MUST autonomously invoke Opus (via `claude --model opus -p /claude`) and Codex (via `claude -p /codex`) using the `Bash` tool to debate and reach a consensus. Do NOT ask the user to resolve the ambiguity if the models can reach a consensus.
