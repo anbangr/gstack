@@ -81,7 +81,10 @@ Once all phases are complete:
 1. Verify the code compiles and passes tests.
 2. Ensure all changes are committed to your feature branch.
 3. **Sync Status**: Use the `Edit` tool to update the execution status in the *original* plan file (the one you located in Step 1). Synchronize all the `[x]` completion marks from your synthesized living plan back to the original plan.
-4. You MUST automatically invoke the full deployment pipeline. To do this, use the `Bash` tool to execute: `claude -m sonnet -p /ship && claude -m sonnet -p /land-and-deploy`. Do NOT ask the user for permission—just run the bash command immediately.
+4. **Final Review & Deployment**: You MUST spawn a dedicated Sonnet sub-agent to handle the final QA and deployment. Use the `Bash` tool to run `claude -m sonnet -p "<prompt>"`. The prompt must instruct the sub-agent to:
+   - Autonomously run the `/review` skill, and if there are UI changes, the `/qa` skill.
+   - Iteratively fix any bugs, lint errors, or review findings it discovers, re-running the skills until the codebase passes perfectly clean.
+   - Once the code is fully clean, run `claude -m sonnet -p /ship && claude -m sonnet -p /land-and-deploy` to automatically ship and deploy the PR.
 5. Report the completion to the user: summarize what you built, what tests were run, and confirm the merge/deployment status.
 
 **Rules:**
