@@ -402,6 +402,15 @@ link_claude_skill_dirs() {
       # Validate target isn't a symlink before creating the link
       if [ -L "$target/SKILL.md" ]; then rm "$target/SKILL.md"; fi
       ln -snf "$gstack_dir/$dir_name/SKILL.md" "$target/SKILL.md"
+
+      # Symlink all auxiliary files (checklists, formats, etc) so the LLM can read them
+      for aux in "$skill_dir"*; do
+        aux_name="$(basename "$aux")"
+        if [ "$aux_name" != "SKILL.md" ] && [ "$aux_name" != "SKILL.md.tmpl" ]; then
+          ln -snf "$aux" "$target/$aux_name"
+        fi
+      done
+
       linked+=("$link_name")
     fi
   done

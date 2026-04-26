@@ -531,6 +531,25 @@ for (const currentHost of hostsToRun) {
       } else {
         fs.writeFileSync(outputPath, content);
         console.log(`GENERATED: ${relOutput}`);
+
+        // Copy auxiliary files (checklists, formats, etc) to external host directories
+        if (currentHost !== 'claude') {
+          const srcDir = path.dirname(tmplPath);
+          const destDir = path.dirname(outputPath);
+          const isRootSkill = srcDir === ROOT;
+          const entries = fs.readdirSync(srcDir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (entry.name === 'SKILL.md' || entry.name === 'SKILL.md.tmpl') continue;
+            const srcPath = path.join(srcDir, entry.name);
+            const destPath = path.join(destDir, entry.name);
+            if (entry.isDirectory()) {
+              if (isRootSkill) continue; // Do not copy root dirs like .git, node_modules, bin
+              fs.cpSync(srcPath, destPath, { recursive: true });
+            } else if (entry.isFile() && entry.name.endsWith('.md')) {
+              fs.copyFileSync(srcPath, destPath);
+            }
+          }
+        }
       }
 
       // Track token budget
