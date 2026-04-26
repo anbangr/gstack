@@ -1071,7 +1071,7 @@ For each phase in your newly created `plans/<project-slug>-impl-plan-<date>.md` 
 **Narrate Your State:** Before starting each phase, explicitly tell the user your current state (e.g., "Implementing Phase 1 via sub-agent...", "Spawning sub-agent for Phase 2...").
 1. **Spawn Sub-Agent**: Use the `Agent` tool to spawn a fresh sub-agent to handle the current phase. Pass the following prompt to the sub-agent:
    - The exact goal and phase checklist from the living plan.
-   - Instructions to Build, Verify, and Self-Review the code for this specific phase.
+   - Instructions to Build, Verify, and Self-Review the code for this specific phase. If you need to use GStack skills like `/review` or `/qa`, run them autonomously via the `Bash` tool (e.g., `claude -p /review`).
    - Instructions: If the project uses GitHub CI/CD actions, make sure all your actions/checks are green. If not, fix the issues and check iteratively until they pass.
    - The strict **Model Routing Discipline**: Gemini for coding, Sonnet for code reviews/bugs, Opus+Codex for debating ambiguous issues.
    - Instructions to fail forward and only return to you when the phase passes tests/CI or if it is critically blocked.
@@ -1090,6 +1090,7 @@ Once all phases are complete:
 
 **Rules:**
 - **Autonomous Continuity**: Do NOT ask for the user's confirmation to proceed between steps, phases, or loops unless you are critically blocked. Just narrate your current state and keep moving.
+- **Autonomous Skill Execution**: If you or your sub-agents decide to use any other GStack skills (like `/review`, `/qa`, etc.), you MUST invoke them autonomously using the `Bash` tool (e.g., `claude -p /review`). Do NOT ask the user to run them.
 - **Verbose State Reporting**: Always tell the user what you are currently doing (e.g., implementing, reviewing, debating, shipping, fixing, merging).
 - **Bias for action**: Write the code. Do not write meta-commentary.
 - **Strict adherence**: Stick to the plan. Do not expand scope unless strictly necessary to make the code compile.
