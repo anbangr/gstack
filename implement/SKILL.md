@@ -21,6 +21,8 @@ triggers:
   - build the feature
   - start coding
   - execute the plan
+  - reexamine
+  - audit the plan
 ---
 <!-- AUTO-GENERATED from SKILL.md.tmpl — do not edit directly -->
 <!-- Regenerate: bun run gen:skill-docs -->
@@ -1045,9 +1047,18 @@ PLAN MODE EXCEPTION — always allowed (it's the plan file).
 
 You are the Execution Agent. The planning phase is over. Your job is to read the approved implementation plan and execute it autonomously in phases.
 
-## Step 1: Create Feature Branch & Synthesize Living Plan
+**Execution Modes**:
+- **Normal Mode**: Synthesize a new living plan and build the feature from scratch. (Default)
+- **Reexamine Mode**: Triggered if the user asks to "reexamine", "audit", or "rerun the full process" for an implemented plan. In this mode:
+  - Do NOT synthesize a new plan and do NOT create a new branch.
+  - Locate the existing living plan (`plans/<project-slug>-impl-plan-<date>.md`).
+  - Loop through *every* phase in the existing plan (ignoring `[x]` marks).
+  - For each phase, spawn a sub-agent to audit the codebase and verify the phase was fully implemented. If missing steps are found, the sub-agent MUST fix them. If fully implemented, mark it clean.
+
+## Step 1: Create Feature Branch & Synthesize Living Plan (Skip if Reexamine Mode)
 
 Your first task is to set up your environment and synthesize a formal living plan.
+If you are in **Reexamine Mode**, skip this entire step and proceed directly to Step 2 using the existing living plan.
 1. **Create a Feature Branch**: Before doing anything else, use the `Bash` tool to create and check out a new feature branch for this implementation (e.g., `git checkout -b feat/your-feature-name`). Do NOT work directly on the `main` or `master` branch.
 2. Look for the latest deliverables from `/office-hours` or `/autoplan`. These are usually found in the `plans/` directory (e.g., `plans/<project-slug>-plan-<date>.md`), or `.gstack/projects/`.
 
@@ -1067,7 +1078,7 @@ ls -t .gstack/projects/*/*-plan-*.md 2>/dev/null | head -n 1
 
 Because this is a long-running skill, your context window will eventually become compacted, causing you to forget rules. To prevent this, you MUST delegate the execution of each phase to a fresh sub-agent.
 
-For each phase in your newly created `plans/<project-slug>-impl-plan-<date>.md` checklist:
+For each phase in your living plan checklist (if in Reexamine Mode, audit ALL phases regardless of `[x]` status):
 **Narrate Your State:** Before starting each phase, explicitly tell the user your current state (e.g., "Implementing Phase 1 via sub-agent...", "Spawning sub-agent for Phase 2...").
 1. **Spawn Sub-Agent**: Use the `Agent` tool to spawn a fresh sub-agent to handle the current phase. Pass the following prompt to the sub-agent:
    - The exact goal and phase checklist from the living plan.

@@ -1713,36 +1713,19 @@ already exists, append the new test. Output: `[FIXED + TEST] [file:line] Problem
 Apply each fix directly. For each one, output a one-line summary:
 `[AUTO-FIXED] [file:line] Problem → what you did`
 
-### Step 5c: Batch-ask about ASK items
+### Step 5c: Autonomous Debate for ASK items
 
-If there are ASK items remaining, present them in ONE AskUserQuestion:
+If there are ASK items remaining, you MUST autonomously dispatch them to Opus and Codex via the `Bash` tool to debate and reach a consensus on which option to choose.
+- For each item, present the severity label, the problem, and the recommended fix to the models.
+- Run `claude -m opus -p /claude "Debate this review finding: <problem> Options: A) Fix B) Skip"` and `claude -p /codex consult "Debate this review finding: <problem> Options: A) Fix B) Skip"`.
+- Do NOT use `AskUserQuestion`.
+- Once the models reach a consensus, apply the decision automatically.
 
-- List each item with a number, the severity label, the problem, and a recommended fix
-- For each item, provide options: A) Fix as recommended, B) Skip
-- Include an overall RECOMMENDATION
+### Step 5d: Apply consensus fixes
 
-Example format:
-```
-I auto-fixed 5 issues. 2 need your input:
+Apply fixes for items where the consensus chose "Fix." Output what was fixed.
 
-1. [CRITICAL] app/models/post.rb:42 — Race condition in status transition
-   Fix: Add `WHERE status = 'draft'` to the UPDATE
-   → A) Fix  B) Skip
-
-2. [INFORMATIONAL] app/services/generator.rb:88 — LLM output not type-checked before DB write
-   Fix: Add JSON schema validation
-   → A) Fix  B) Skip
-
-RECOMMENDATION: Fix both — #1 is a real race condition, #2 prevents silent data corruption.
-```
-
-If 3 or fewer ASK items, you may use individual AskUserQuestion calls instead of batching.
-
-### Step 5d: Apply user-approved fixes
-
-Apply fixes for items where the user chose "Fix." Output what was fixed.
-
-If no ASK items exist (everything was AUTO-FIX), skip the question entirely.
+If no ASK items exist (everything was AUTO-FIX), skip the debate entirely.
 
 ### Verification of claims
 
@@ -1762,19 +1745,15 @@ After outputting your own findings, if Greptile comments were classified in Step
 
 Before replying to any comment, run the **Escalation Detection** algorithm from greptile-triage.md to determine whether to use Tier 1 (friendly) or Tier 2 (firm) reply templates.
 
-1. **VALID & ACTIONABLE comments:** These are included in your findings — they follow the Fix-First flow (auto-fixed if mechanical, batched into ASK if not) (A: Fix it now, B: Acknowledge, C: False positive). If the user chooses A (fix), reply using the **Fix reply template** from greptile-triage.md (include inline diff + explanation). If the user chooses C (false positive), reply using the **False Positive reply template** (include evidence + suggested re-rank), save to both per-project and global greptile-history.
+1. **VALID & ACTIONABLE comments:** These are included in your findings — they follow the Fix-First flow (auto-fixed if mechanical, dispatched to Opus/Codex debate if not). If the consensus chooses to fix, reply using the **Fix reply template** from greptile-triage.md (include inline diff + explanation). If the consensus chooses false positive, reply using the **False Positive reply template** (include evidence + suggested re-rank), save to both per-project and global greptile-history.
 
-2. **FALSE POSITIVE comments:** Present each one via AskUserQuestion:
-   - Show the Greptile comment: file:line (or [top-level]) + body summary + permalink URL
-   - Explain concisely why it's a false positive
-   - Options:
-     - A) Reply to Greptile explaining why this is incorrect (recommended if clearly wrong)
-     - B) Fix it anyway (if low-effort and harmless)
-     - C) Ignore — don't reply, don't fix
+2. **FALSE POSITIVE comments:** Do NOT use AskUserQuestion. Autonomously dispatch to Opus and Codex via the `Bash` tool to decide whether to:
+   - A) Reply to Greptile explaining why this is incorrect (recommended if clearly wrong)
+   - B) Fix it anyway (if low-effort and harmless)
+   - C) Ignore — don't reply, don't fix
+   Apply the consensus decision and reply using the **False Positive reply template** from greptile-triage.md if A is chosen.
 
-   If the user chooses A, reply using the **False Positive reply template** from greptile-triage.md (include evidence + suggested re-rank), save to both per-project and global greptile-history.
-
-3. **VALID BUT ALREADY FIXED comments:** Reply using the **Already Fixed reply template** from greptile-triage.md — no AskUserQuestion needed:
+3. **VALID BUT ALREADY FIXED comments:** Reply using the **Already Fixed reply template** from greptile-triage.md.
    - Include what was done and the fixing commit SHA
    - Save to both per-project and global greptile-history
 
