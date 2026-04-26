@@ -1,7 +1,7 @@
 ---
 name: implement
 preamble-tier: 4
-version: 1.7.0
+version: 1.8.0
 description: |
   Autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -1046,7 +1046,7 @@ PLAN MODE EXCEPTION — always allowed (it's the plan file).
 # /implement — Autonomous Execution Loop
 
 You are the Execution Agent. The planning phase is over. Your job is to read the approved implementation plan and execute it autonomously in phases.
-**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/implement` orchestrator v1.7.0").**
+**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/implement` orchestrator v1.8.0").**
 
 **Execution Modes**:
 - **Normal Mode**: Synthesize a new living plan and build the feature from scratch. (Default)
@@ -1087,7 +1087,7 @@ If `TODOS.md` exists at the workspace root, treat unchecked `[ ]` items as the i
      ```markdown
      ### Phase X: [Phase Name]
      - [ ] **Implementation (Gemini Sub-agent)**: [Specific coding tasks to be done...]
-     - [ ] **Review & QA (Codex Sub-agent)**: Run `codex /gstack-review` to execute the full multi-pass review checklist and fix bugs.
+     - [ ] **Review & QA (Codex Sub-agent)**: Run `codex /gstack-review` and (if UI changed) `codex /gstack-qa` to execute the full multi-pass review checklist and fix bugs.
      ```
    - A dedicated test plan strategy for verifying the behavior.
 6. Present this newly synthesized living plan to the user and **PAUSE**. Use `AskUserQuestion` to explicitly ask the user to confirm the plan before moving on to the coding loop.
@@ -1111,8 +1111,9 @@ For each phase in your living plan checklist that is marked as `[ ]` (if in Reex
    - Explicitly instruct Gemini: "Do NOT use raw `git` commands or the `gh` CLI to ship. Do NOT skip steps or hallucinate your own review process."
 2. **Wait for Gemini Completion**: The MCP tool call will execute synchronously. Let it block until it finishes. **NEVER skip the sub-agent to do the work yourself.**
 3. **Spawn Codex Review Sub-Agent**: After Gemini finishes writing the code, you MUST use the `Bash` tool to run `codex /gstack-review`.
-   - The `gstack-review` skill (running via Codex) will natively execute the comprehensive review checklist, iteratively fix bugs, and ensure the code is production-ready.
-   - **CRITICAL**: Do NOT run `claude -p /review` or `claude --model sonnet`. You MUST use `codex /gstack-review` to offload the review process completely to the Codex orchestrator.
+   - If the implementation included UI, visual, or frontend behavior changes, you MUST also use the `Bash` tool to run `codex /gstack-qa` after the review completes.
+   - The `gstack-review` and `gstack-qa` skills (running via Codex) will natively execute the comprehensive review checklist, iteratively fix bugs, and ensure the code is production-ready.
+   - **CRITICAL**: Do NOT run `claude -p /review`, `claude -p /qa`, or `claude --model sonnet`. You MUST use `codex /gstack-review` and `codex /gstack-qa` to offload the review process completely to the Codex orchestrator.
 4. **Wait for Codex Completion**: Run the Codex process synchronously in the foreground. Wait for the Bash tool to return.
 5. **Update Living Plan**: As each sub-agent completes its work, you MUST immediately use the `Edit` tool to modify the living plan and check off its specific sub-checkbox. (i.e., change `[ ] **Implementation...` to `[x]` after Gemini finishes, and change `[ ] **Review...` to `[x]` after Codex finishes).
 6. **Context save at phase boundary**: After each phase completes (both implementation and review checked), run `claude --model sonnet -p /context-save` via the `Bash` tool. This ensures progress survives a context window compaction mid-session.
@@ -1131,9 +1132,9 @@ Once ALL phases are complete (and have been individually reviewed):
 
 **Rules:**
 - **Autonomous Continuity**: Do NOT ask for the user's confirmation to proceed between steps, phases, or loops unless you are critically blocked. Just narrate your current state and keep moving.
-- **Autonomous Skill Execution**: If you or your sub-agents use other GStack skills, you MUST run them as separate processes using the `Bash` tool. For code reviews, use `codex /gstack-review`. For shipping, use `claude --model sonnet -p /ship`. **CRITICAL BUG WARNING: NEVER invoke skills natively as tools (i.e., do NOT use the `review`, `qa`, or `ship` tools directly). Invoking them as native tools just dumps their source code into your context and will permanently break the autonomous loop. Always use the Bash tool.**
+- **Autonomous Skill Execution**: If you or your sub-agents use other GStack skills, you MUST run them as separate processes using the `Bash` tool. For code reviews and QA, use `codex /gstack-review` and `codex /gstack-qa`. For shipping, use `claude --model sonnet -p /ship`. **CRITICAL BUG WARNING: NEVER invoke skills natively as tools (i.e., do NOT use the `review`, `qa`, or `ship` tools directly). Invoking them as native tools just dumps their source code into your context and will permanently break the autonomous loop. Always use the Bash tool.**
 - **Verbose State Reporting**: Always tell the user what you are currently doing (e.g., implementing, reviewing, debating, shipping, fixing, merging).
 - **Bias for action**: Write the code. Do not write meta-commentary.
 - **Strict adherence**: Stick to the plan. Do not expand scope unless strictly necessary to make the code compile. Do NOT hallucinate elaborate alternative processes if a file or command is missing—always STOP and report the error to the user.
 - **Fail forward**: If tests fail, try to fix them. Only escalate to the user if you are stuck after multiple attempts.
-- **Model Routing Discipline**: Use Gemini strictly for coding and implementation tasks. Use Codex strictly for comprehensive code reviews and bug fixing via `/gstack-review`. Use Sonnet strictly for high-level orchestration, shipping, and deployments. Do NOT mix these responsibilities.
+- **Model Routing Discipline**: Use Gemini strictly for coding and implementation tasks. Use Codex strictly for comprehensive code reviews and bug fixing via `/gstack-review` and `/gstack-qa`. Use Sonnet strictly for high-level orchestration, shipping, and deployments. Do NOT mix these responsibilities.
