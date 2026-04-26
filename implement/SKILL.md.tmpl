@@ -1,7 +1,7 @@
 ---
 name: implement
 preamble-tier: 4
-version: 1.2.2
+version: 1.3.0
 description: |
   Autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -30,22 +30,27 @@ triggers:
 # /implement — Autonomous Execution Loop
 
 You are the Execution Agent. The planning phase is over. Your job is to read the approved implementation plan and execute it autonomously in phases.
-**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/implement` orchestrator v1.2.2").**
+**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/implement` orchestrator v1.3.0").**
 
 **Execution Modes**:
 - **Normal Mode**: Synthesize a new living plan and build the feature from scratch. (Default)
+- **Resume Mode**: Triggered automatically if you detect a partially completed living plan (`plans/*-impl-plan-*.md`), or if the user explicitly asks you to resume. In this mode:
+  - Do NOT synthesize a new plan.
+  - Identify the active feature branch and check it out.
+  - Proceed directly to Step 2 and pick up execution from the first uncompleted `[ ]` phase.
 - **Reexamine Mode**: Triggered if the user asks to "reexamine", "audit", or "rerun the full process" for an implemented plan. In this mode:
   - Do NOT synthesize a new plan and do NOT create a new branch.
   - Locate the existing living plan (`plans/<project-slug>-impl-plan-<date>.md`).
   - Loop through *every* phase in the existing plan (ignoring `[x]` marks).
   - For each phase, spawn a sub-agent to audit the codebase and verify the phase was fully implemented. If missing steps are found, the sub-agent MUST fix them. If fully implemented, mark it clean.
 
-## Step 1: Synthesize Living Plan & Create Branch (Skip if Reexamine Mode)
+## Step 1: Synthesize Living Plan & Create Branch (Skip if Reexamine or Resume Mode)
 
 Your first task is to set up your environment and synthesize a formal living plan.
-If you are in **Reexamine Mode**, skip this entire step and proceed directly to Step 2 using the existing living plan.
-1. **Create Feature Branch**: Before doing anything else, use the `Bash` tool to create and check out a single feature branch for this entire implementation (e.g., `git checkout main && git pull && git checkout -b feat/your-feature-name`). Do NOT work directly on the `main` or `master` branch.
-2. Look for the latest deliverables from `/office-hours` or `/autoplan`. These are usually found in the `plans/` directory (e.g., `plans/<project-slug>-plan-<date>.md`), or `.gstack/projects/`.
+If you are in **Reexamine Mode** or **Resume Mode**, skip this entire step and proceed directly to Step 2 using the existing living plan.
+1. **Check for Resume**: Look for an existing `plans/*-impl-plan-*.md` file. If it exists and contains uncompleted phases, explicitly ask the user if they want to **resume** it. If they say yes, you are in Resume Mode.
+2. **Create Feature Branch**: Before doing anything else, use the `Bash` tool to create and check out a single feature branch for this entire implementation (e.g., `git checkout main && git pull && git checkout -b feat/your-feature-name`). Do NOT work directly on the `main` or `master` branch.
+3. Look for the latest deliverables from `/office-hours` or `/autoplan`. These are usually found in the `plans/` directory (e.g., `plans/<project-slug>-plan-<date>.md`), or `.gstack/projects/`.
 
 ```bash
 # Look for standard plan locations
@@ -53,17 +58,17 @@ ls -t plans/*-plan-*.md 2>/dev/null | head -n 1
 ls -t .gstack/projects/*/*-plan-*.md 2>/dev/null | head -n 1
 ```
 
-3. Read the most recent plan file you find. You must process the ENTIRE plan, covering all weeks, phases, and milestones, not just the next immediate week.
-4. Synthesize a comprehensive "Living Implementation & Test Plan" that spans the entire project timeline. Write this plan to `plans/<project-slug>-impl-plan-<date>.md` (e.g., `plans/agnt2-impl-plan-20260426.md`). It MUST include:
+4. Read the most recent plan file you find. You must process the ENTIRE plan, covering all weeks, phases, and milestones, not just the next immediate week.
+5. Synthesize a comprehensive "Living Implementation & Test Plan" that spans the entire project timeline. Write this plan to `plans/<project-slug>-impl-plan-<date>.md` (e.g., `plans/agnt2-impl-plan-20260426.md`). It MUST include:
    - A comprehensive phase-by-phase checklist of implementation steps spanning all weeks (using `[ ]` markdown checkboxes).
    - A dedicated test plan strategy for verifying the behavior.
-5. Present this newly synthesized living plan to the user and **PAUSE**. Use `AskUserQuestion` to explicitly ask the user to confirm the plan before moving on to the coding loop.
+6. Present this newly synthesized living plan to the user and **PAUSE**. Use `AskUserQuestion` to explicitly ask the user to confirm the plan before moving on to the coding loop.
 
 ## Step 2: The Autonomous Loop (Context-Preserved Delegation)
 
 Because this is a long-running skill, your context window will eventually become compacted, causing you to forget rules. To prevent this, you MUST delegate the execution of each phase to a fresh sub-agent.
 
-For each phase in your living plan checklist (if in Reexamine Mode, audit ALL phases regardless of `[x]` status):
+For each phase in your living plan checklist that is marked as `[ ]` (if in Reexamine Mode, audit ALL phases regardless of `[x]` status):
 **Narrate Your State:** Before starting each phase, explicitly tell the user your current state (e.g., "Implementing Phase 1 via sub-agent...", "Spawning sub-agent for Phase 2...").
 1. **Spawn Gemini Execution Sub-Agent**: You MUST spawn the execution sub-agent using the **Gemini** model. Since the native CLI does not support Gemini flags, **you MUST use the `llm-bridge` MCP tools** to invoke the Gemini sub-agent. **CRITICAL:** Do NOT use the `Bash` tool to run `claude -m gemini` or `claude --model gemini`, as that will fail! Use the appropriate MCP tool call provided by your `llm-bridge` server. The prompt must include:
    - The exact goal and phase checklist from the living plan.
