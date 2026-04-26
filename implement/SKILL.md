@@ -1080,14 +1080,14 @@ Because this is a long-running skill, your context window will eventually become
 
 For each phase in your living plan checklist (if in Reexamine Mode, audit ALL phases regardless of `[x]` status):
 **Narrate Your State:** Before starting each phase, explicitly tell the user your current state (e.g., "Implementing Phase 1 via sub-agent...", "Spawning sub-agent for Phase 2...").
-1. **Spawn Sub-Agent**: Use the `Agent` tool to spawn a fresh sub-agent to handle the current phase. Pass the following prompt to the sub-agent:
+1. **Spawn Sub-Agent**: You MUST spawn the execution sub-agent using the **Gemini** model. Use the `Bash` tool to run `claude -m gemini -p "<prompt>"` to handle the current phase. The prompt must include:
    - The exact goal and phase checklist from the living plan.
    - Instructions to Build, Verify, and Self-Review the code for this specific phase. You MUST autonomously invoke the `/review` skill via the `Bash` tool (e.g., `claude -m sonnet -p /review`) to self-review your code. If your phase includes UI changes, you MUST also invoke the `/qa` skill (e.g., `claude -m sonnet -p /qa`) to verify the UI. If `/review` or `/qa` report any issues, you MUST iteratively fix them and re-run the skills until they pass cleanly.
    - Instructions: If the project uses GitHub CI/CD actions, make sure all your actions/checks are green. If not, fix the issues and check iteratively until they pass.
    - The strict **Model Routing Discipline**: Gemini for coding, Sonnet for code reviews/bugs. If you face ambiguous issues or multiple choices for a fix, you MUST autonomously dispatch the problem to Opus and Codex via the `Bash` tool (e.g., `claude -m opus -p /claude` and `claude -p /codex`) to debate and reach a consensus.
    - Instructions to fail forward and only return to you when the phase passes tests/CI or if it is critically blocked.
-2. **Wait for Completion**: The sub-agent will do the heavy lifting (analyzing, building, testing, reviewing) in its own fresh context window. You just wait for it to finish.
-3. **Update Living Plan**: After the sub-agent successfully completes the phase and returns control to you, use the `Edit` tool to modify the living plan and mark the step as completed (change `[ ]` to `[x]`).
+2. **Wait for Completion**: The Gemini sub-agent will run in the shell (analyzing, building, testing, reviewing). You just wait for the bash command to finish.
+3. **Update Living Plan**: After the Gemini sub-agent successfully completes the phase, use the `Edit` tool to modify the living plan and mark the step as completed (change `[ ]` to `[x]`).
 
 Do NOT stop to ask the user for permission between phases unless a sub-agent fails catastrophically or hits a safety constraint. Keep the loop going.
 
