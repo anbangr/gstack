@@ -1057,20 +1057,20 @@ ls -t plans/*-plan-*.md 2>/dev/null | head -n 1
 ls -t .gstack/projects/*/*-plan-*.md 2>/dev/null | head -n 1
 ```
 
-3. Read the most recent plan file you find.
-4. Synthesize a "Living Implementation & Test Plan". Write this plan to `implementation_plan.md` in the root of the project. It MUST include:
-   - A phase-by-phase checklist of implementation steps (using `[ ]` markdown checkboxes).
+3. Read the most recent plan file you find. You must process the ENTIRE plan, covering all weeks, phases, and milestones, not just the next immediate week.
+4. Synthesize a comprehensive "Living Implementation & Test Plan" that spans the entire project timeline. Write this plan to `plans/<project-slug>-impl-plan-<date>.md` (e.g., `plans/agnt2-impl-plan-20260426.md`). It MUST include:
+   - A comprehensive phase-by-phase checklist of implementation steps spanning all weeks (using `[ ]` markdown checkboxes).
    - A dedicated test plan strategy for verifying the behavior.
-5. Present this newly synthesized `implementation_plan.md` to the user and **PAUSE**. Use `AskUserQuestion` to get their approval before beginning the coding loop.
+5. Present this newly synthesized living plan to the user and **PAUSE**. Use `AskUserQuestion` to explicitly ask the user to confirm the plan before moving on to the coding loop.
 
 ## Step 2: The Autonomous Loop (Living Document)
 
-For each phase in the `implementation_plan.md` checklist:
+For each phase in your newly created `plans/<project-slug>-impl-plan-<date>.md` checklist:
 1. **Analyze**: Read any files relevant to the current phase.
 2. **Build**: Use `Edit`, `Write`, and `Bash` to write the code. Do not ask for permission for each file. Just write the code. Keep your changes small and focused. **Model Routing:** When writing code or implementing features, explicitly route the task to the latest Gemini model.
 3. **Verify**: Once the phase is complete, run any relevant tests (e.g., `bun test`, `go test`, `pytest`). Fix any compiler or test errors immediately. **Model Routing:** If you encounter bugs, route the debugging and fixing task to the latest Sonnet model.
 4. **Self-Review**: Run `git diff` to verify your changes align with the plan. If you installed the `/review` skill, you may optionally invoke it. **Model Routing:** When performing code reviews or running the `/review` skill, explicitly route the task to the latest Sonnet model. If you face multiple choices for issues during review, ask the latest Opus model and the latest Codex GPT model (both with thinking mode and maximum effort enabled) to discuss the choices and reach a consensus.
-5. **Update Living Plan**: After successfully completing and verifying the phase, use the `Edit` tool to modify `implementation_plan.md` and mark the step as completed (change `[ ]` to `[x]`).
+5. **Update Living Plan**: After successfully completing and verifying the phase, use the `Edit` tool to modify the living plan and mark the step as completed (change `[ ]` to `[x]`).
 
 Do NOT stop to ask the user for permission between phases unless you hit a critical blocker, an ambiguity not covered by the plan, or a safety constraint.
 
