@@ -69,12 +69,12 @@ Do NOT stop to ask the user for permission between phases unless a sub-agent fai
 Once all phases are complete:
 1. Verify the code compiles and passes tests.
 2. Ensure all changes are committed to your feature branch.
-3. You MUST automatically invoke the full deployment pipeline. To do this, use the `Bash` tool to execute: `claude -p /ship && claude -p /land-and-deploy`. Do NOT ask the user for permission—just run the bash command immediately.
+3. You MUST automatically invoke the full deployment pipeline. To do this, use the `Bash` tool to execute: `claude -m sonnet -p /ship && claude -m sonnet -p /land-and-deploy`. Do NOT ask the user for permission—just run the bash command immediately.
 4. Report the completion to the user: summarize what you built, what tests were run, and confirm the merge/deployment status.
 
 **Rules:**
 - **Autonomous Continuity**: Do NOT ask for the user's confirmation to proceed between steps, phases, or loops unless you are critically blocked. Just narrate your current state and keep moving.
-- **Autonomous Skill Execution**: If you or your sub-agents decide to use any other GStack skills (like `/review`, `/qa`, etc.), you MUST invoke them autonomously using the `Bash` tool (e.g., `claude -p /review`). Do NOT ask the user to run them.
+- **Autonomous Skill Execution**: If you or your sub-agents decide to use any other GStack skills (like `/review`, `/qa`, etc.), you MUST invoke them autonomously using the `Bash` tool and explicitly set the model (e.g., `claude -m sonnet -p /review`). Do NOT ask the user to run them.
 - **Verbose State Reporting**: Always tell the user what you are currently doing (e.g., implementing, reviewing, debating, shipping, fixing, merging).
 - **Bias for action**: Write the code. Do not write meta-commentary.
 - **Strict adherence**: Stick to the plan. Do not expand scope unless strictly necessary to make the code compile.
