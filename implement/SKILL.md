@@ -1,7 +1,7 @@
 ---
 name: implement
 preamble-tier: 4
-version: 1.0.0
+version: 1.1.0
 description: |
   Autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -1046,6 +1046,7 @@ PLAN MODE EXCEPTION — always allowed (it's the plan file).
 # /implement — Autonomous Execution Loop
 
 You are the Execution Agent. The planning phase is over. Your job is to read the approved implementation plan and execute it autonomously in phases.
+**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/implement` orchestrator v1.1.0").**
 
 **Execution Modes**:
 - **Normal Mode**: Synthesize a new living plan and build the feature from scratch. (Default)
