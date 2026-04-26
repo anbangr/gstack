@@ -47,17 +47,21 @@ ls -t .gstack/projects/*/*-plan-*.md 2>/dev/null | head -n 1
    - A dedicated test plan strategy for verifying the behavior.
 5. Present this newly synthesized living plan to the user and **PAUSE**. Use `AskUserQuestion` to explicitly ask the user to confirm the plan before moving on to the coding loop.
 
-## Step 2: The Autonomous Loop (Living Document)
+## Step 2: The Autonomous Loop (Context-Preserved Delegation)
+
+Because this is a long-running skill, your context window will eventually become compacted, causing you to forget rules. To prevent this, you MUST delegate the execution of each phase to a fresh sub-agent.
 
 For each phase in your newly created `plans/<project-slug>-impl-plan-<date>.md` checklist:
-**Narrate Your State:** Before starting each sub-step, explicitly tell the user your current state (e.g., "Implementing Phase 1...", "Reviewing code...", "Debating multiple choices...", "Fixing test failures...", "Merging...").
-1. **Analyze**: Read any files relevant to the current phase.
-2. **Build**: Use `Edit`, `Write`, and `Bash` to write the code. Do not ask for permission for each file. Just write the code. Keep your changes small and focused. **Model Routing:** When writing code or implementing features, explicitly route the task to the latest Gemini model.
-3. **Verify**: Once the phase is complete, run any relevant tests (e.g., `bun test`, `go test`, `pytest`). Fix any compiler or test errors immediately. **Model Routing:** If you encounter bugs, route the debugging and fixing task to the latest Sonnet model.
-4. **Self-Review**: Run `git diff` to verify your changes align with the plan. If you installed the `/review` skill, you may optionally invoke it. **Model Routing:** When performing code reviews or running the `/review` skill, explicitly route the task to the latest Sonnet model. If you face multiple choices for issues during review, ask the latest Opus model and the latest Codex GPT model (both with thinking mode and maximum effort enabled) to discuss the choices and reach a consensus.
-5. **Update Living Plan**: After successfully completing and verifying the phase, use the `Edit` tool to modify the living plan and mark the step as completed (change `[ ]` to `[x]`).
+**Narrate Your State:** Before starting each phase, explicitly tell the user your current state (e.g., "Implementing Phase 1 via sub-agent...", "Spawning sub-agent for Phase 2...").
+1. **Spawn Sub-Agent**: Use the `Agent` tool to spawn a fresh sub-agent to handle the current phase. Pass the following prompt to the sub-agent:
+   - The exact goal and phase checklist from the living plan.
+   - Instructions to Build, Verify, and Self-Review the code for this specific phase.
+   - The strict **Model Routing Discipline**: Gemini for coding, Sonnet for code reviews/bugs, Opus+Codex for debating ambiguous issues.
+   - Instructions to fail forward and only return to you when the phase passes tests or if it is critically blocked.
+2. **Wait for Completion**: The sub-agent will do the heavy lifting (analyzing, building, testing, reviewing) in its own fresh context window. You just wait for it to finish.
+3. **Update Living Plan**: After the sub-agent successfully completes the phase and returns control to you, use the `Edit` tool to modify the living plan and mark the step as completed (change `[ ]` to `[x]`).
 
-Do NOT stop to ask the user for permission between phases unless you hit a critical blocker, an ambiguity not covered by the plan, or a safety constraint.
+Do NOT stop to ask the user for permission between phases unless a sub-agent fails catastrophically or hits a safety constraint. Keep the loop going.
 
 ## Step 3: Completion and Deployment
 
