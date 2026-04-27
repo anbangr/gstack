@@ -762,6 +762,8 @@ For each phase in your living plan checklist that is marked as `[ ]` (if in Reex
 **File-path I/O is mandatory for ALL sub-agent calls.** Never paste large content inline. Write inputs to disk, ask the model to write outputs to disk, then read the output files. This rule applies universally — small or large tasks. The `--yolo` (Gemini) and `-s workspace-write` (Codex) modes make file I/O reliable; the older "model hangs when told to read files" failure was a non-yolo / read-only-sandbox problem and no longer applies.
 
 **Per-phase file layout (consistent paths):**
+- Test-spec input: `/tmp/build-<phase-N>-gemini-testspec-input-<iter>.md`
+- Test-spec output: `/tmp/build-<phase-N>-gemini-testspec-output-<iter>.md`
 - Input prompt: `/tmp/build-<phase-N>-gemini-input-<iter>.md`
 - Output summary: `/tmp/build-<phase-N>-gemini-output-<iter>.md`
 - Codex review input: `/tmp/build-<phase-N>-codex-input-<iter>.md`
@@ -797,7 +799,7 @@ For each phase in your living plan checklist that is marked as `[ ]` (if in Reex
    - **RECURSIVE LOOP REQUIREMENT**: If the output file's verdict is `GATE FAIL`, write a new input file (`/tmp/build-<phase-N>-codex-input-<iter+1>.md`) describing the issues to fix, re-spawn Codex with a new output path, and re-check. Repeat the review→fix→review cycle until Codex writes `GATE PASS`. Do NOT advance to step 8 (Update Living Plan) with open review findings. A single review pass is NOT sufficient — past sessions have left issues unaddressed by stopping after one pass.
 7. **Wait for Codex Completion**: Run the Codex process synchronously in the foreground. Wait for the Bash tool to return. Apply the recursive loop in step 6 until the review is fully clean.
 8. **Update Living Plan (MANDATORY — never skip)**: After both Gemini implementation and the recursive Codex review have completed cleanly, you MUST immediately use the `Edit` tool to modify the living plan and check off the specific sub-checkboxes for this phase (change `[ ] **Test Specification...` to `[x]`, `[ ] **Implementation...` to `[x]`, and `[ ] **Review...` to `[x]`). This step runs unconditionally after every phase, regardless of how trivial the phase felt — past sessions have forgotten this step under context pressure and progress tracking has drifted. Treat this as a hard requirement, not a nice-to-have. Verify there are zero remaining issues from the review before checking the box.
-9. **Context save at phase boundary**: After each phase completes (both implementation and review checked), run `claude --model sonnet -p /context-save` via the `Bash` tool. This ensures progress survives a context window compaction mid-session.
+9. **Context save at phase boundary**: After each phase completes (all three sub-checkboxes — Test Specification, Implementation, and Review — checked), run `claude --model sonnet -p /context-save` via the `Bash` tool. This ensures progress survives a context window compaction mid-session.
 
 Do NOT stop to ask the user for permission between phases unless a sub-agent fails catastrophically or hits a safety constraint. Keep the loop going.
 
