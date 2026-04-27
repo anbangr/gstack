@@ -1,7 +1,7 @@
 ---
 name: build
 preamble-tier: 4
-version: 1.11.0
+version: 1.12.0
 description: |
   Autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -29,7 +29,7 @@ triggers:
 # /build — Autonomous Execution Loop
 
 You are the Execution Agent. The planning phase is over. Your job is to read the approved implementation plan and execute it autonomously in phases.
-**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/build` orchestrator v1.11.0").**
+**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/build` orchestrator v1.12.0").**
 
 **LLM-driven loop vs. code-driven CLI** — for short plans (1-3 phases), proceed with this skill: you are the orchestrator. For long multi-week plans (5+ phases), the LLM-driven loop is unreliable: it stalls between phases ("Standing by, let me know what's next") even with explicit "don't stop" rules, and context compaction loses awareness of "I'm in the middle of a 12-week build." For those, recommend the standalone CLI: `gstack-build <plan-file>`. The CLI drives the loop in code while still spawning fresh Gemini and Codex subprocesses per phase. See `~/.claude/skills/gstack/build/orchestrator/README.md` for usage.
 
@@ -56,14 +56,32 @@ If you are in **Reexamine Mode** or **Resume Mode**, skip this entire step and p
 ```bash
 # Priority 1: TODOS.md at workspace root (canonical backlog for multi-repo workspaces)
 ls TODOS.md 2>/dev/null
-# Priority 2: Standard plan files
+# Priority 2: Standard plan files (in-repo plans/, in-repo .gstack/projects/, and sibling -gstack/ dirs)
 ls -t plans/*-plan-*.md 2>/dev/null | head -n 1
 ls -t .gstack/projects/*/*-plan-*.md 2>/dev/null | head -n 1
-# Priority 3: Sub-directory TODOS
+ls -t ../*-gstack/inbox/*-plan-*.md 2>/dev/null | head -n 1
+ls -t ../*-gstack/plans/*-plan-*.md 2>/dev/null | head -n 1
+# Priority 3: User-level gstack project home (~/.gstack/projects/<slug>/)
+eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" 2>/dev/null || true
+ls -t ~/.gstack/projects/${SLUG:-unknown}/*-plan-*.md 2>/dev/null | head -n 1
+ls -t ~/.gstack/projects/${SLUG:-unknown}/ceo-plans/*.md 2>/dev/null | head -n 1
+# Priority 4: Plan-mode workflow output (host-agent plans)
+ls -t ~/.claude/plans/*.md 2>/dev/null | head -n 3
+# Priority 5: Sub-directory TODOS
 ls -t */TODOS.md 2>/dev/null | head -n 3
 ```
 
 If `TODOS.md` exists at the workspace root, treat unchecked `[ ]` items as the implementation backlog — group them by priority label (P0, P1, P2, etc.) and ask the user which priority bands to execute. Do NOT invent a separate plan file; use TODOS.md as the living plan directly.
+
+**Plan locations covered (in priority order):**
+1. `TODOS.md` at workspace root
+2. In-repo `plans/*-plan-*.md` and `.gstack/projects/<slug>/*-plan-*.md`
+3. **Sibling `-gstack/` mirror dirs** (e.g., `../mitosis-gstack/inbox/`, `../netx-gstack/plans/`) — per the gstack outputs mirror pattern, design docs and implementation plans for product projects often live in the sibling `-gstack/` repo, not the prototype source tree
+4. `~/.gstack/projects/<slug>/*-plan-*.md` and `~/.gstack/projects/<slug>/ceo-plans/*.md` — user-level gstack project home where /office-hours and /plan-ceo-review save artifacts
+5. **`~/.claude/plans/*.md`** — host-agent plan-mode workflow output (where Claude Code's native plan files land)
+6. Sub-directory `*/TODOS.md` (multi-repo workspace fallback)
+
+When more than one candidate is found across priorities, prefer the most recent (`-mtime` order) within the highest-priority category that has a match. When the file's branch/repo basename matches the current branch/repo, that's the strongest signal — favor it.
 
 4. Read the most recent plan file you find. **CRITICAL:** If you cannot find any plan file or TODOS.md from Step 3, you MUST immediately STOP, output an error, and wait for the user. Do NOT attempt to guess the plan or invent your own checklist. You must process the ENTIRE plan, covering all weeks, phases, and milestones, not just the next immediate week.
 5. Synthesize a comprehensive "Living Implementation & Test Plan" that spans the entire project timeline. Write this plan to `plans/<project-slug>-impl-plan-<date>.md` (e.g., `plans/agnt2-impl-plan-20260426.md`). It MUST include:
