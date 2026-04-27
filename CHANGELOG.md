@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.14.1.0] - 2026-04-27
+
+**`/implement` no longer stops between phases to ask if it should continue.**
+
+The phase-execution loop in `/implement` is now a deterministic Bun script (`implement/loop.ts`) instead of LLM-orchestrated prose. Previously, the model would regularly pause after completing a phase to ask "shall I proceed?" — no prompt instruction reliably suppressed this. Now the loop is code: it iterates phases, spawns a `claude -p` sub-agent per phase, runs `codex /gstack-review`, patches the plan file checkboxes, and continues without stopping. Resume and reexamine modes are built in.
+
+### The numbers that matter
+
+Source: direct behavioral change; no benchmark needed. The previous approach required median 1 user intervention per phase to keep the loop going. The new approach requires zero — the script exits only on catastrophic sub-agent failure, with a clear resume command.
+
+| Metric | Before | After |
+|--------|--------|-------|
+| User interventions per phase | ~1 | 0 |
+| Loop control mechanism | LLM prompt instructions | Bun script |
+| Resume after failure | Manual re-prompt | `--mode=resume` flag |
+| Reexamine/audit mode | Prompt-triggered | `--mode=reexamine` flag |
+
+### What this means for you
+
+Long multi-phase implementations now run end-to-end without babysitting. Start `/implement`, confirm the plan once, and walk away. If a phase fails, the script tells you exactly what to run to continue from that point.
+
+### Itemized changes
+
+#### Changed
+- `implement/loop.ts`: new deterministic loop script — parses `### Phase N:` sections, spawns `claude -p` per phase, runs `codex /gstack-review`, patches `[ ] → [x]` checkboxes, context-saves at each boundary
+- `implement/SKILL.md.tmpl`: Step 2 now invokes the loop script instead of instructing the LLM to orchestrate phases manually
+- `package.json`: added `implement:loop` script entry
+
 ## [1.14.0.0] - 2026-04-25
 
 ## **The gstack browser sidebar is now an interactive Claude Code REPL with live tab awareness.**
