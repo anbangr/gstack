@@ -1,12 +1,12 @@
 ---
-name: implement
+name: build
 preamble-tier: 4
-version: 1.9.0
+version: 1.10.0
 description: |
   Autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
   automatically.
-  Use when asked to "implement the plan", "build the feature", or "start coding".
+  Use when asked to "build the feature", "build the plan", or "start coding".
 allowed-tools:
   - Bash
   - Read
@@ -17,10 +17,9 @@ allowed-tools:
   - Agent
   - AskUserQuestion
 triggers:
-  - implement the plan
   - build the feature
+  - build the plan
   - start coding
-  - execute the plan
   - reexamine
   - audit the plan
 ---
@@ -65,7 +64,7 @@ _QUESTION_TUNING=$(~/.claude/skills/gstack/bin/gstack-config get question_tuning
 echo "QUESTION_TUNING: $_QUESTION_TUNING"
 mkdir -p ~/.gstack/analytics
 if [ "$_TEL" != "off" ]; then
-echo '{"skill":"implement","ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","repo":"'$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || echo "unknown")'"}'  >> ~/.gstack/analytics/skill-usage.jsonl 2>/dev/null || true
+echo '{"skill":"build","ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","repo":"'$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || echo "unknown")'"}'  >> ~/.gstack/analytics/skill-usage.jsonl 2>/dev/null || true
 fi
 # zsh-compatible: use find instead of glob to avoid NOMATCH error
 for _PF in $(find ~/.gstack/analytics -maxdepth 1 -name '.pending-*' 2>/dev/null); do
@@ -90,7 +89,7 @@ else
   echo "LEARNINGS: 0"
 fi
 # Session timeline: record skill start (local-only, never sent anywhere)
-~/.claude/skills/gstack/bin/gstack-timeline-log '{"skill":"implement","event":"started","branch":"'"$_BRANCH"'","session":"'"$_SESSION_ID"'"}' 2>/dev/null &
+~/.claude/skills/gstack/bin/gstack-timeline-log '{"skill":"build","event":"started","branch":"'"$_BRANCH"'","session":"'"$_SESSION_ID"'"}' 2>/dev/null &
 # Check if CLAUDE.md has routing rules
 _HAS_ROUTING="no"
 if [ -f CLAUDE.md ] && grep -q "## Skill routing" CLAUDE.md 2>/dev/null; then
@@ -911,7 +910,7 @@ Progress summaries must NEVER mutate git state — they are reporting, not commi
 
 **After the user answers.** Log it (non-fatal — best-effort):
 ```bash
-~/.claude/skills/gstack/bin/gstack-question-log '{"skill":"implement","question_id":"<id>","question_summary":"<short>","category":"<approval|clarification|routing|cherry-pick|feedback-loop>","door_type":"<one-way|two-way>","options_count":N,"user_choice":"<key>","recommended":"<key>","session_id":"'"$_SESSION_ID"'"}' 2>/dev/null || true
+~/.claude/skills/gstack/bin/gstack-question-log '{"skill":"build","question_id":"<id>","question_summary":"<short>","category":"<approval|clarification|routing|cherry-pick|feedback-loop>","door_type":"<one-way|two-way>","options_count":N,"user_choice":"<key>","recommended":"<key>","session_id":"'"$_SESSION_ID"'"}' 2>/dev/null || true
 ```
 
 **Offer inline tune (two-way only, skip on one-way).** Add one line:
@@ -1043,10 +1042,10 @@ If a richer review report already exists, skip — review skills wrote it.
 
 PLAN MODE EXCEPTION — always allowed (it's the plan file).
 
-# /implement — Autonomous Execution Loop
+# /build — Autonomous Execution Loop
 
 You are the Execution Agent. The planning phase is over. Your job is to read the approved implementation plan and execute it autonomously in phases.
-**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/implement` orchestrator v1.8.0").**
+**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/build` orchestrator v1.10.0").**
 
 **Execution Modes**:
 - **Normal Mode**: Synthesize a new living plan and build the feature from scratch. (Default)
