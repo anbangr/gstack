@@ -190,16 +190,21 @@ export async function runCodexReview(opts: {
   command?: string;
   /** Reasoning effort: low | medium | high. Default high for reviews. */
   reasoning?: 'low' | 'medium' | 'high';
+  /** Sandbox mode. `workspace-write` lets the review loop fix bugs;
+   * `read-only` makes it report-only. Default workspace-write because the
+   * recursive loop expects fix-and-rereview. */
+  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
   const command = opts.command || '/gstack-review';
   const reasoning = opts.reasoning || 'high';
+  const sandbox = opts.sandbox || 'workspace-write';
 
   const argv = [
     'exec',
     command,
     '-s',
-    'read-only',
+    sandbox,
     '-c',
     `model_reasoning_effort="${reasoning}"`,
     '-C',
