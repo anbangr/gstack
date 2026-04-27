@@ -24,6 +24,10 @@ import { parseVerdict } from './sub-agents';
 export const DEFAULT_MAX_CODEX_ITERATIONS =
   Number(process.env.GSTACK_BUILD_CODEX_MAX_ITER) || 5;
 
+/** Maximum times Gemini may re-write tests when VERIFY_RED shows tests pass trivially. */
+export const DEFAULT_MAX_RED_SPEC_ITERATIONS =
+  Number(process.env.GSTACK_BUILD_RED_MAX_ITER) || 3;
+
 export const DEFAULT_MAX_TEST_ITERATIONS =
   Number(process.env.GSTACK_BUILD_TEST_MAX_ITER) || 5;
 
@@ -53,7 +57,8 @@ export function decideNextAction(
   phaseState: PhaseState,
   maxCodexIterations: number = DEFAULT_MAX_CODEX_ITERATIONS,
   phase?: Phase,
-  maxTestIterations: number = DEFAULT_MAX_TEST_ITERATIONS
+  maxTestIterations: number = DEFAULT_MAX_TEST_ITERATIONS,
+  maxRedSpecIterations: number = DEFAULT_MAX_RED_SPEC_ITERATIONS
 ): Action {
   switch (phaseState.status) {
     case 'pending':
@@ -90,10 +95,19 @@ export function decideNextAction(
       };
 
     case 'gemini_done':
+      // For TDD phases (testSpecDone was false), run tests after implementation.
+      // For legacy phases (testSpecDone=true), go straight to Codex review.
+      if (phase && !phase.testSpecDone) {
+        return {
+          type: 'RUN_TESTS',
+          phaseIndex: phaseState.index,
+          iteration: (phaseState.testRun?.iterations ?? 0) + 1,
+        };
+      }
       return {
-        type: 'RUN_TESTS',
+        type: 'RUN_CODEX_REVIEW',
         phaseIndex: phaseState.index,
-        iteration: (phaseState.testRun?.iterations ?? 0) + 1,
+        iteration: (phaseState.codexReview?.iterations ?? 0) + 1,
       };
 
     case 'test_fix_running': {
@@ -252,9 +266,21 @@ export function applyResult(
       next.error = 'Test verification timed out';
       return next;
     }
-    // exit !== 0 → tests fail as expected → Red! Proceed to implementation.
-    // exit === 0 → tests trivially pass → need harder tests → re-spec.
-    next.status = result.exitCode !== 0 ? 'tests_red' : 'test_spec_running';
+    if (result.exitCode !== 0) {
+      // Tests fail as expected → Red phase confirmed. Proceed to implementation.
+      next.redSpecAttempts = 0;
+      next.status = 'tests_red';
+      return next;
+    }
+    // Tests trivially pass before implementation → need harder tests.
+    const attempts = (phaseState.redSpecAttempts ?? 0) + 1;
+    next.redSpecAttempts = attempts;
+    if (attempts >= DEFAULT_MAX_RED_SPEC_ITERATIONS) {
+      next.status = 'failed';
+      next.error = `Gemini could not produce failing tests after ${attempts} attempts (GSTACK_BUILD_RED_MAX_ITER)`;
+      return next;
+    }
+    next.status = 'test_spec_running';
     return next;
   }
 

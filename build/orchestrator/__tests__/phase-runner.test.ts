@@ -64,10 +64,15 @@ describe('decideNextAction', () => {
     expect(action.type).toBe('RUN_GEMINI');
   });
 
-  it('gemini_done → RUN_TESTS iter 1', () => {
-    const action = decideNextAction(basePhase({ status: 'gemini_done' }));
+  it('gemini_done (TDD phase) → RUN_TESTS iter 1', () => {
+    const action = decideNextAction(basePhase({ status: 'gemini_done' }), 5, { testSpecDone: false } as any);
     expect(action.type).toBe('RUN_TESTS');
     if (action.type === 'RUN_TESTS') expect(action.iteration).toBe(1);
+  });
+
+  it('gemini_done (legacy phase, testSpecDone=true) → RUN_CODEX_REVIEW', () => {
+    const action = decideNextAction(basePhase({ status: 'gemini_done' }), 5, { testSpecDone: true } as any);
+    expect(action.type).toBe('RUN_CODEX_REVIEW');
   });
 
   it('codex_running with iters < max → RUN_CODEX_REVIEW iter+1', () => {
@@ -249,12 +254,14 @@ describe('findNextPhaseIndex', () => {
 describe('end-to-end happy path through the state machine', () => {
   it('pending → gemini_done → tests_green → review_clean → committed', () => {
     let s = basePhase({ status: 'pending' });
-    let a = decideNextAction(s as any, 5, { testSpecDone: true } as any);
-    expect(a.type).toBe('RUN_GEMINI');
-    s = applyResult(s, a as any, geminiSuccess());
-    expect(s.status).toBe('gemini_done');
+    // TDD phase: testSpecDone=false means test spec is needed, but we start from gemini_done
+    // to test the post-impl path; use testSpecDone=false so gemini_done routes to RUN_TESTS.
+    let a = decideNextAction(s as any, 5, { testSpecDone: false } as any);
+    expect(a.type).toBe('RUN_GEMINI_TEST_SPEC');
+    // Simulate already having gone through test-spec + verify-red + impl: jump to gemini_done.
+    s = { ...basePhase({ status: 'gemini_done' }) };
 
-    a = decideNextAction(s as any, 5, { testSpecDone: true } as any);
+    a = decideNextAction(s as any, 5, { testSpecDone: false } as any);
     expect(a.type).toBe('RUN_TESTS');
     s = applyResult(s, a as any, { stdout: '', stderr: '', exitCode: 0, timedOut: false, logPath: '', durationMs: 100, retries: 0 });
     expect(s.status).toBe('tests_green');

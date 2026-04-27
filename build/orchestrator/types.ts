@@ -68,6 +68,8 @@ export interface PhaseState {
   gemini?: SubAgentInvocation;
   /** Invocation record for the test-specification Gemini call. */
   geminiTestSpec?: SubAgentInvocation;
+  /** Number of times VERIFY_RED returned exit==0 (tests too easy). Capped by GSTACK_BUILD_RED_MAX_ITER. */
+  redSpecAttempts?: number;
   /** State of the post-testspec / post-impl test runs. */
   testRun?: {
     iterations: number;

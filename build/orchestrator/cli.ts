@@ -257,7 +257,7 @@ async function runPhase(args: {
   let phaseState = state.phases[phase.index];
 
   while (true) {
-    const action: Action = decideNextAction(phaseState, maxCodexIter);
+    const action: Action = decideNextAction(phaseState, maxCodexIter, phase, DEFAULT_MAX_TEST_ITERATIONS);
 
     if (action.type === 'DONE') return 'done';
     if (action.type === 'FAIL') {
@@ -270,6 +270,17 @@ async function runPhase(args: {
 
     if (action.type === 'MARK_COMPLETE') {
       if (!dryRun) {
+        // Flip test-spec checkbox first (if this is a TDD phase).
+        if (phase.testSpecCheckboxLine !== -1) {
+          const specFlip = flipTestSpecCheckbox(state.planFile, phase);
+          if (specFlip.error) {
+            state.failedAtPhase = phase.index;
+            state.failureReason = `plan test-spec checkbox flip failed: ${specFlip.error}`;
+            saveState(state, { noGbrain, log: console.warn });
+            console.error(`✗ Phase ${phase.number}: ${state.failureReason}`);
+            return 'failed';
+          }
+        }
         const flips = flipPhaseCheckboxes({
           planFile: state.planFile,
           implementationLine: phase.implementationCheckboxLine,
