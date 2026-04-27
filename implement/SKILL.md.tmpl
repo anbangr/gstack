@@ -76,42 +76,34 @@ If `TODOS.md` exists at the workspace root, treat unchecked `[ ]` items as the i
    - A dedicated test plan strategy for verifying the behavior.
 6. Present this newly synthesized living plan to the user and **PAUSE**. Use `AskUserQuestion` to explicitly ask the user to confirm the plan before moving on to the coding loop.
 
-## Step 2: The Autonomous Loop (Context-Preserved Delegation)
+## Step 2: Execute the Loop
 
-**ZERO-INTERRUPTION CONTRACT**: Once this loop starts, you MUST NOT stop between phases to ask for permission, confirmation, or guidance. This means you must NEVER say any of the following (or anything like them):
-- "Shall I proceed to Phase X?"
-- "Should I continue?"
-- "Ready to move on?"
-- "Let me know when you'd like me to start the next phase."
-- "Phase X is complete. Should I begin Phase Y?"
+Run the deterministic loop script. It owns all phase iteration, sub-agent spawning, Codex review, checkbox patching, and context-saving — no manual step-through needed.
 
-If you catch yourself about to type any of those phrases, delete them and immediately execute the next phase instead. The only valid reason to stop and use `AskUserQuestion` is if a sub-agent fails catastrophically and you have exhausted all self-recovery attempts, or if you hit a hard safety constraint. **Finishing a phase is not a reason to pause.** Just keep going.
+```bash
+# Normal: execute all unchecked phases
+bun run implement/loop.ts --plan=plans/<slug>-impl-plan-<date>.md
 
-Because this is a long-running skill, your context window will eventually become compacted, causing you to forget rules. To prevent this, you MUST delegate the execution of each phase to a fresh sub-agent.
+# Resume: same as normal — skip already-complete phases, continue from first [ ]
+bun run implement/loop.ts --plan=plans/<slug>-impl-plan-<date>.md --mode=resume
 
-For each phase in your living plan checklist that is marked as `[ ]` (if in Reexamine Mode, audit ALL phases regardless of `[x]` status):
-**Narrate Your State:** Before executing ANY step or sub-agent spawn in this loop, you MUST explicitly print: "Currently executing Phase [X], Step [Y]: [Name of Step]". This forced chain-of-thought is a critical guardrail to ensure you do not skip instructions.
-1. **Spawn Gemini Execution Sub-Agent**: You MUST spawn the execution sub-agent using the **Gemini** model via the `mcp__llm-bridge__ask_gemini` MCP tool. **CRITICAL:** Do NOT use the `Bash` tool to run `claude -m gemini` or `claude --model gemini`, as that will fail! The prompt must include:
-   - The exact goal and phase checklist from the living plan.
-   - **Inline code context** — paste the relevant existing code directly into the prompt. NEVER say "read the existing file" or "check the current X" or "based on the existing Y" — Gemini will try to invoke file tools and return narration instead of code.
-   - Instructions to build and verify the code for this specific phase.
-   - Instructions: if the project uses GitHub CI/CD actions, make sure all your actions/checks are green.
-   - Instructions to commit the code to the current branch.
-   - Instructions to fail forward and only return to you when the code is written. (Do NOT instruct Gemini to run /review or /ship.)
-   - **End every Gemini prompt with**: `Return ONLY the file content. No explanation. No narrative.` — this prevents verbose preamble that wastes tokens.
-   - **File batching**: Gemini handles ≤2 files per call reliably. If a phase touches 3+ files, split into parallel sub-calls, one per 1-2 files.
-   - **Large context**: If the inline code context exceeds ~500 lines, write it to `/tmp/<phase>-context.md` first and reference the path. Never send thousands of lines inline.
-   - Explicitly instruct Gemini: "Do NOT use raw `git` commands or the `gh` CLI to ship. Do NOT skip steps or hallucinate your own review process."
-2. **Wait for Gemini Completion**: The MCP tool call will execute synchronously. Let it block until it finishes. **NEVER skip the sub-agent to do the work yourself.**
-3. **Spawn Codex Review Sub-Agent**: After Gemini finishes writing the code, you MUST use the `Bash` tool to run `codex /gstack-review`.
-   - If the implementation included UI, visual, or frontend behavior changes, you MUST also use the `Bash` tool to run `codex /gstack-qa` after the review completes.
-   - The `gstack-review` and `gstack-qa` skills (running via Codex) will natively execute the comprehensive review checklist, iteratively fix bugs, and ensure the code is production-ready.
-   - **CRITICAL**: Do NOT run `claude -p /review`, `claude -p /qa`, or `claude --model sonnet`. You MUST use `codex /gstack-review` and `codex /gstack-qa` to offload the review process completely to the Codex orchestrator.
-4. **Wait for Codex Completion**: Run the Codex process synchronously in the foreground. Wait for the Bash tool to return.
-5. **Update Living Plan**: As each sub-agent completes its work, you MUST immediately use the `Edit` tool to modify the living plan and check off its specific sub-checkbox. (i.e., change `[ ] **Implementation...` to `[x]` after Gemini finishes, and change `[ ] **Review...` to `[x]` after Codex finishes).
-6. **Context save at phase boundary**: After each phase completes (both implementation and review checked), run `claude --model sonnet -p /context-save` via the `Bash` tool. This ensures progress survives a context window compaction mid-session.
+# Reexamine: re-run every phase regardless of [x] status (full audit)
+bun run implement/loop.ts --plan=plans/<slug>-impl-plan-<date>.md --mode=reexamine
+```
 
-Do NOT stop to ask the user for permission between phases. See the zero-interruption contract at the top of this step — re-read it now if you are tempted to pause.
+Use the exact plan file path you wrote in Step 1. The script will:
+1. For each unchecked `[ ] **Implementation` phase: spawn a `claude -p --dangerously-skip-permissions` sub-agent with the phase goal and commit instructions. The sub-agent uses its full tool suite and may delegate heavy coding to Gemini via `mcp__llm-bridge__ask_gemini` if available.
+2. After each implementation: run `codex /gstack-review`.
+3. Patch `[ ] → [x]` in the plan file after each sub-task.
+4. Context-save at each phase boundary.
+5. Exit when all phases are done, or exit non-zero with a clear resume command if a sub-agent fails.
+
+**Do not restart from the beginning if a phase fails.** The error output will give you the exact `--mode=resume` command to continue from where it stopped.
+
+**Mode selection:**
+- Use `--mode=resume` after a mid-run failure or interrupted session.
+- Use `--mode=reexamine` when the user says "reexamine", "audit", or "verify the implementation".
+- Default (no flag) is equivalent to `--mode=normal`.
 
 ## Step 3: Final Ship & Completion
 
@@ -124,10 +116,8 @@ Once ALL phases are complete (and have been individually reviewed):
 4. Report the completion to the user: summarize what you built and confirm that all phases have been shipped and deployed successfully.
 
 **Rules:**
-- **Autonomous Continuity**: The zero-interruption contract above is absolute. Do NOT ask for confirmation between steps, phases, or loops. Do NOT announce a phase is done and wait. Do NOT ask "shall I proceed?". Narrate your state and immediately execute the next step.
-- **Autonomous Skill Execution**: If you or your sub-agents use other GStack skills, you MUST run them as separate processes using the `Bash` tool. For code reviews and QA, use `codex /gstack-review` and `codex /gstack-qa`. For shipping, use `claude --model sonnet -p /ship`. **CRITICAL BUG WARNING: NEVER invoke skills natively as tools (i.e., do NOT use the `review`, `qa`, or `ship` tools directly). Invoking them as native tools just dumps their source code into your context and will permanently break the autonomous loop. Always use the Bash tool.**
-- **Verbose State Reporting**: Always tell the user what you are currently doing (e.g., implementing, reviewing, debating, shipping, fixing, merging).
-- **Bias for action**: Write the code. Do not write meta-commentary.
-- **Strict adherence**: Stick to the plan. Do not expand scope unless strictly necessary to make the code compile. Do NOT hallucinate elaborate alternative processes if a file or command is missing—always STOP and report the error to the user.
-- **Fail forward**: If tests fail, try to fix them. Only escalate to the user if you are stuck after multiple attempts.
-- **Model Routing Discipline**: Use Gemini strictly for coding and implementation tasks. Use Codex strictly for comprehensive code reviews and bug fixing via `/gstack-review` and `/gstack-qa`. Use Sonnet strictly for high-level orchestration, shipping, and deployments. Do NOT mix these responsibilities.
+- **Your job in Step 2 is to run the script, not to orchestrate phases yourself.** Do not re-implement the loop in prose. Pass the correct flags and let the script run.
+- **Autonomous Skill Execution**: Skills MUST run as separate processes via the `Bash` tool. For shipping, use `claude --model sonnet -p /ship`. **NEVER invoke `review`, `qa`, or `ship` as native tools** — that dumps their source into your context and breaks the session.
+- **Verbose State Reporting**: Tell the user what you are doing at each step (synthesizing, running the loop, shipping, etc.).
+- **Strict adherence**: Stick to the plan. Do not expand scope unless strictly necessary to make the code compile.
+- **Fail forward**: If the loop exits with an error, diagnose it and re-run with `--mode=resume`. Only escalate to the user if you are stuck after multiple attempts.
