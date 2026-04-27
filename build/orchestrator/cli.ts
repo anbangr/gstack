@@ -48,10 +48,11 @@ import {
   markCommitted,
   findNextPhaseIndex,
   DEFAULT_MAX_CODEX_ITERATIONS,
+  DEFAULT_MAX_TEST_ITERATIONS,
   type Action,
 } from './phase-runner';
 import { runGemini, runCodexReview, type SubAgentResult } from './sub-agents';
-import { flipPhaseCheckboxes } from './plan-mutator';
+import { flipPhaseCheckboxes, flipTestSpecCheckbox } from './plan-mutator';
 import { shipAndDeploy } from './ship';
 import type { BuildState, Phase } from './types';
 
@@ -369,6 +370,23 @@ async function runPhase(args: {
       state.phases[phase.index] = phaseState;
       saveState(state, { noGbrain, log: console.warn });
       continue;
+    }
+
+    if (action.type === 'RUN_GEMINI_TEST_SPEC') {
+      // TODO Phase 4: call runGeminiTestSpec() sub-agent
+      throw new Error('TDD: RUN_GEMINI_TEST_SPEC handler not yet implemented (Phase 4)');
+    }
+    if (action.type === 'VERIFY_RED') {
+      // TODO Phase 4: run tests, check exit code
+      throw new Error('TDD: VERIFY_RED handler not yet implemented (Phase 4)');
+    }
+    if (action.type === 'RUN_TESTS') {
+      // TODO Phase 4: run tests, check exit code
+      throw new Error('TDD: RUN_TESTS handler not yet implemented (Phase 4)');
+    }
+    if (action.type === 'RUN_GEMINI_FIX') {
+      // TODO Phase 4: call runGeminiTestSpec() to fix failing tests
+      throw new Error('TDD: RUN_GEMINI_FIX handler not yet implemented (Phase 4)');
     }
 
     // Exhaustive switch — should never reach here.
