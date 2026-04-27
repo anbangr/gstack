@@ -38,7 +38,8 @@
     "analytics": "bun run scripts/analytics.ts",
     "test:audit": "bun test test/audit-compliance.test.ts",
     "slop": "npx slop-scan scan . 2>/dev/null || echo 'slop-scan not available (install with: npm i -g slop-scan)'",
-    "slop:diff": "bun run scripts/slop-diff.ts"
+    "slop:diff": "bun run scripts/slop-diff.ts",
+    "implement:loop": "bun run implement/loop.ts"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.1.0",
