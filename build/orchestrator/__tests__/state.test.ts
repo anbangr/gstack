@@ -88,6 +88,18 @@ describe('freshState', () => {
     const s = freshState({ planFile: '/x/foo.md', branch: 'main', phases: allDone });
     expect(s.completed).toBe(true);
   });
+
+  it('does NOT mark a phase committed when testSpecDone=false even if impl+review are checked', () => {
+    const tddPhase: Phase[] = [{
+      index: 0, number: '1', name: 'TDD', body: '',
+      testSpecDone: false, testSpecCheckboxLine: 5,
+      implementationDone: true, reviewDone: true,
+      implementationCheckboxLine: 6, reviewCheckboxLine: 7,
+    }];
+    const s = freshState({ planFile: '/x/foo.md', branch: 'main', phases: tddPhase });
+    expect(s.phases[0].status).toBe('pending');
+    expect(s.completed).toBe(false);
+  });
 });
 
 describe('loadState / saveState round-trip', () => {
