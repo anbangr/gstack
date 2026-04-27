@@ -766,6 +766,8 @@ For each phase in your living plan checklist that is marked as `[ ]` (if in Reex
 - Test-spec output: `/tmp/build-<phase-N>-gemini-testspec-output-<iter>.md`
 - Input prompt: `/tmp/build-<phase-N>-gemini-input-<iter>.md`
 - Output summary: `/tmp/build-<phase-N>-gemini-output-<iter>.md`
+- Test-fix input: `/tmp/build-<phase-N>-gemini-fix-input-<iter>.md`
+- Test-fix output: `/tmp/build-<phase-N>-gemini-fix-output-<iter>.md`
 - Codex review input: `/tmp/build-<phase-N>-codex-input-<iter>.md`
 - Codex review output: `/tmp/build-<phase-N>-codex-output-<iter>.md`
 
@@ -788,7 +790,7 @@ For each phase in your living plan checklist that is marked as `[ ]` (if in Reex
 5. **Recursive Test+Fix Loop (MANDATORY — loop until green)**: After Gemini finishes implementation, run tests recursively until they all pass.
    - Run the project's test command: `cd <project-dir> && <test-cmd>`.
    - If tests **PASS** (exit 0): proceed to Codex review (step 6).
-   - If tests **FAIL**: write a new Gemini input file at `/tmp/build-<phase-N>-gemini-fix-input-<iter>.md` describing which tests failed and what the error output was. Re-spawn Gemini with the fix prompt. Re-run tests. Repeat up to 5 times (`GSTACK_BUILD_TEST_MAX_ITER`, default 5).
+   - If tests **FAIL**: write a new Gemini input file at `/tmp/build-<phase-N>-gemini-fix-input-<iter>.md` describing which tests failed and what the error output was. Re-spawn Gemini with the fix prompt, require it to write its output summary to `/tmp/build-<phase-N>-gemini-fix-output-<iter>.md`, then read that output file before re-running tests. Repeat up to 5 times (`GSTACK_BUILD_TEST_MAX_ITER`, default 5).
    - If still failing after 5 iterations: STOP, surface the failure to the user, and exit. Do NOT advance to Codex review with failing tests.
 6. **Spawn Codex Review Sub-Agent (RECURSIVE — loop until clean, file-path I/O)**: After Gemini finishes writing the code, you MUST use the `Bash` tool to run `codex exec /gstack-review` with file-path I/O.
    - **Write the review request to a file.** Put the goal of this review iteration (which phase, what changed, what to verify) into `/tmp/build-<phase-N>-codex-input-<iter>.md`. The codex CLI invocation prompt stays short.

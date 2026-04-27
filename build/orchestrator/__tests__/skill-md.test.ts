@@ -12,6 +12,8 @@ test("SKILL.md.tmpl contains TDD changes", () => {
   expect(content.includes('Test Specification (Gemini Sub-agent)')).toBe(true);
   expect(content.includes('gemini-testspec-input')).toBe(true);
   expect(content.includes('gemini-testspec-output')).toBe(true);
+  expect(content.includes('gemini-fix-input')).toBe(true);
+  expect(content.includes('gemini-fix-output')).toBe(true);
   expect(content.includes('all three sub-checkboxes')).toBe(true);
 });
 
