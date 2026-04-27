@@ -82,7 +82,11 @@ export function decideNextAction(
       };
 
     case 'test_spec_running':
-      return { type: 'RUN_GEMINI_TEST_SPEC', phaseIndex: phaseState.index, iteration: 1 };
+      return {
+        type: 'RUN_GEMINI_TEST_SPEC',
+        phaseIndex: phaseState.index,
+        iteration: (phaseState.redSpecAttempts ?? 0) + 1,
+      };
 
     case 'test_spec_done':
       return { type: 'VERIFY_RED', phaseIndex: phaseState.index };

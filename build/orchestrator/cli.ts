@@ -257,7 +257,10 @@ async function runPhase(args: {
   let phaseState = state.phases[phase.index];
 
   while (true) {
-    const action: Action = decideNextAction(phaseState, maxCodexIter, phase, DEFAULT_MAX_TEST_ITERATIONS);
+    // TODO Phase 4: pass `phase` and `DEFAULT_MAX_TEST_ITERATIONS` once TDD sub-agent
+    // handlers are implemented (RUN_GEMINI_TEST_SPEC, VERIFY_RED, RUN_TESTS, RUN_GEMINI_FIX).
+    // For now, legacy routing (no phase arg) keeps existing behavior for non-TDD builds.
+    const action: Action = decideNextAction(phaseState, maxCodexIter);
 
     if (action.type === 'DONE') return 'done';
     if (action.type === 'FAIL') {
