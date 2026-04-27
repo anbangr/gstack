@@ -26,6 +26,7 @@
  *   130 user interrupt (SIGINT)
  */
 
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -448,7 +449,7 @@ async function main() {
 
 function getCurrentBranch(): string {
   try {
-    const result = require('node:child_process').spawnSync('git', ['branch', '--show-current'], {
+    const result = spawnSync('git', ['branch', '--show-current'], {
       encoding: 'utf8',
     });
     return result.stdout?.trim() || 'unknown';

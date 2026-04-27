@@ -245,22 +245,43 @@ export async function runCodexReview(opts: {
 }
 
 /**
- * Final ship step: spawn Claude Code with /ship && /land-and-deploy.
- * Long timeout (30 min default) because deploys can wait on CI.
+ * Final ship step: spawn Claude Code with /ship, then /land-and-deploy.
+ * These are TWO sequential claude invocations, not one chained call —
+ * `&&` inside a -p argument is treated as part of the prompt, not as
+ * a shell operator. Long timeout (30 min default per phase) because
+ * deploys can wait on CI.
+ *
+ * Returns the FIRST failure, or the final /land-and-deploy result on
+ * full success. The combined log captures both invocations.
  */
 export async function runShip(opts: {
   cwd: string;
   slug: string;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
-  const logPath = path.join(logDir(opts.slug), 'ship.log');
 
-  return spawnCaptured({
+  const shipLog = path.join(logDir(opts.slug), 'ship.log');
+  const shipResult = await spawnCaptured({
     bin: CLAUDE_BIN,
-    argv: ['--model', 'sonnet', '-p', '/ship && /land-and-deploy'],
+    argv: ['--model', 'sonnet', '-p', '/ship'],
     cwd: opts.cwd,
     timeoutMs: SHIP_TIMEOUT_MS,
-    logPath,
+    logPath: shipLog,
+    closeStdin: false,
+  });
+
+  // Bail out before /land-and-deploy if /ship failed.
+  if (shipResult.timedOut || shipResult.exitCode !== 0) {
+    return shipResult;
+  }
+
+  const deployLog = path.join(logDir(opts.slug), 'land-and-deploy.log');
+  return spawnCaptured({
+    bin: CLAUDE_BIN,
+    argv: ['--model', 'sonnet', '-p', '/land-and-deploy'],
+    cwd: opts.cwd,
+    timeoutMs: SHIP_TIMEOUT_MS,
+    logPath: deployLog,
     closeStdin: false,
   });
 }
