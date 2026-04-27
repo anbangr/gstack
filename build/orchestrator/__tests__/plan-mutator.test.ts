@@ -175,4 +175,3 @@ describe('flipTestSpecCheckbox', () => {
     expect(result.alreadyChecked).toBe(true);
   });
 });
-

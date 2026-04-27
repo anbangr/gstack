@@ -56,7 +56,7 @@ export function parsePlan(content: string): ParseResult {
         `Phase ${p.number} ("${p.name}") at line ${currentPhaseStartLine + 1} is missing a Review checkbox`
       );
     }
-    
+
     // Test specification checkbox is optional for legacy plans
     if (p.testSpecCheckboxLine == null) {
       p.testSpecCheckboxLine = -1;
