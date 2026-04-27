@@ -142,12 +142,13 @@ export function _testWritePlan(content: string): string {
  * Flip the Test Specification checkbox for a phase from [ ] to [x].
  * Uses the same atomic write-to-temp-and-rename pattern.
  */
-export function flipTestSpecCheckbox(planFile: string, phase: Phase): void {
+export function flipTestSpecCheckbox(planFile: string, phase: Phase): FlipResult {
   if (phase.testSpecCheckboxLine > 0) {
-    flipCheckbox({
+    return flipCheckbox({
       planFile,
       lineNumber: phase.testSpecCheckboxLine,
       expectedMarker: '**Test Specification',
     });
   }
+  return { flipped: false, alreadyChecked: true };
 }

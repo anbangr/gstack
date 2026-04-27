@@ -18,6 +18,7 @@ import * as os from 'os';
 import * as path from 'path';
 import type { BuildState, Phase, PhaseState } from './types';
 import { isGbrainAvailable, gbrainPut, gbrainGet } from './gbrain';
+import { isPhaseComplete } from './parser';
 
 export interface PersistOptions {
   /** Skip gbrain entirely. Useful for tests and the --no-gbrain CLI flag. */
