@@ -273,8 +273,9 @@ async function runPhase(args: {
 
     if (action.type === 'MARK_COMPLETE') {
       if (!dryRun) {
-        // Flip test-spec checkbox first (if this is a TDD phase).
-        if (phase.testSpecCheckboxLine !== -1) {
+        // Flip test-spec checkbox only if the test-spec step actually ran (Phase 4+).
+        // Without the real TDD handlers wired, geminiTestSpec is never set, so we skip.
+        if (phase.testSpecCheckboxLine !== -1 && phaseState.geminiTestSpec) {
           const specFlip = flipTestSpecCheckbox(state.planFile, phase);
           if (specFlip.error) {
             state.failedAtPhase = phase.index;
