@@ -376,8 +376,12 @@ export function parseVerdict(stdout: string): Verdict {
 
 export function detectTestCmd(cwd: string): string | null {
   if (fs.existsSync(path.join(cwd, 'package.json'))) {
-    const pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8'));
-    if (pkg.scripts && pkg.scripts.test) return pkg.scripts.test;
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8'));
+      if (pkg.scripts && pkg.scripts.test) return pkg.scripts.test;
+    } catch {
+      console.warn('  ⚠ package.json is not valid JSON; skipping npm/bun test detection');
+    }
   }
   if (fs.existsSync(path.join(cwd, 'pytest.ini'))) return 'pytest';
   if (fs.existsSync(path.join(cwd, 'pyproject.toml'))) {

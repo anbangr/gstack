@@ -1,8 +1,5 @@
 /**
  * Integration test: dry-run a synthetic 2-phase TDD plan through the CLI.
- *
- * Red (before Phase 5 impl): "Test Specification" not in stdout — cli logs
- *   "writing test spec" instead. Phase 5 impl updates the log message.
  */
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import * as fs from "node:fs";
