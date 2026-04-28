@@ -7,6 +7,43 @@
 > next bumps. When syncing from upstream after their next release, give this
 > entry a real version + date.
 
+## **Dual implementor mode for `gstack-build` — Gemini + Codex tournament with Opus judge (build skill v1.15.0)**
+
+`gstack-build --dual-impl` runs every phase as a tournament: Gemini and GPT-Codex each implement the same task in their own isolated git worktree, in parallel; tests run on both worktrees in parallel; Claude Opus judges the diffs and picks a winner; the winning commits are cherry-picked back onto the main branch and the existing TDD pipeline (test+fix loop → Codex review) takes over from there. This eliminates single-model blind spots — if one implementor takes a structurally wrong approach, the other usually doesn't, and the judge sees both side-by-side.
+
+### Added
+- `--dual-impl` CLI flag (opt-in). When set, every phase parsed gets `dualImpl=true` (no per-plan frontmatter needed).
+- `build/orchestrator/worktree.ts` — `createWorktrees`, `applyWinner` (cherry-pick + patch fallback), `teardownWorktrees` (idempotent). Worktree paths use `os.tmpdir()` and timestamped branch names. 50MB maxBuffer on every git invocation.
+- New `PhaseStatus` values: `dual_impl_running`, `dual_impl_done`, `dual_tests_running`, `dual_judge_pending`, `dual_judge_running`, `dual_winner_pending`.
+- New `Action` types: `RUN_DUAL_IMPL`, `RUN_DUAL_TESTS`, `RUN_JUDGE_OPUS`, `APPLY_WINNER`.
+- `DualImplState` + `DualImplTestResult` interfaces on `PhaseState`.
+- `ApplyResultExtra` optional 4th parameter to `applyResult` for dual-impl data (worktree init, test results, judge verdict).
+- `sub-agents.ts`: `runCodexImpl`, `runJudgeOpus`, `parseFailureCount`, `parseJudgeVerdict`, `buildCodexImplArgv`. Codex sandbox defaults to `workspace-write`; override via `GSTACK_BUILD_CODEX_IMPL_SANDBOX`. Judge model overridable via `GSTACK_BUILD_JUDGE_MODEL`.
+- `cli.ts`: `buildCodexImplPromptBody`, `buildJudgePrompt`, `readWorktreeDiff`, `countCommitsSinceBase`. Four runPhase handlers for the new actions, with parallel `Promise.all` dispatch for both impl and test phases.
+- New env vars: `GSTACK_BUILD_JUDGE_TIMEOUT` (600000ms), `GSTACK_BUILD_JUDGE_MODEL` (`claude-opus-4-7`), `GSTACK_BUILD_CODEX_IMPL_SANDBOX` (`workspace-write`).
+- README "Dual Implementor Mode" section with auto-select rules, worktree isolation, and recovery semantics.
+- Integration test: dry-run a 2-phase plan with `--dual-impl` and assert "Dual Impl", "Dual Tests", "Judge Opus", "Apply Winner" all appear.
+
+### Fail-closed paths (state machine)
+- `dual_winner_pending` without `selectedImplementor` → FAIL (state corruption protection).
+- `RUN_DUAL_IMPL` without `dualImplInit` extra → status=failed.
+- Both dual-impl test runs timed out → status=failed (no test evidence to pick a winner).
+- Both failed AND both have no parseable failure count → status=failed.
+- `parseJudgeVerdict` returns `verdict: null` when WINNER line is missing or not anchored at start of line; CLI handler treats null as hard failure.
+- `readWorktreeDiff` returns `null` on git failure; judge handler fails closed if either diff is null.
+- `RUN_DUAL_IMPL` validates each implementor produced committed work via `countCommitsSinceBase`; "neither committed" fails the phase early (uncommitted edits would pass tests but applyWinner would have nothing to cherry-pick).
+
+### Recovery semantics
+- `RUN_DUAL_IMPL` post-create work is wrapped in try/catch/finally — any error tears down worktrees so they don't leak.
+- `APPLY_WINNER` PRESERVES worktrees on cherry-pick failure (the only copy of the winner's code) and surfaces paths/branches + manual cleanup commands in the error message. Teardown only on successful apply.
+- All dual-impl state persists in `BuildState`, so resuming after Ctrl-C or crash works end-to-end.
+
+### Changed
+- `build/SKILL.md.tmpl` (and regenerated `build/SKILL.md`) bumped to v1.15.0.
+- `parsePlan(content, opts)` accepts `{ dualImpl?: boolean }` and stamps `dualImpl: true` on every emitted Phase when set.
+- `WorktreePair` field names align with `DualImplState` (`geminiWorktreePath`/`codexWorktreePath`) so callers can spread directly.
+- 147 tests pass (was 105 in v1.14.0); 42 new tests cover types, worktree primitives, dual-impl state transitions, fail-closed paths, sub-agent invocation shape, and end-to-end dry-run.
+
 ## **TDD integration for `gstack-build` — Red→Green enforced by state machine (build skill v1.14.0)**
 
 `gstack-build` previously ran a 2-step loop per phase (Gemini implements → Codex reviews). Tests were optional and written ad-hoc. This adds TDD as a structural constraint: failing tests must be written before implementation begins, and tests must pass before Codex review runs. The state machine enforces the sequence — skipping is not possible.
