@@ -483,42 +483,69 @@ export async function runTests(opts: {
 
 /**
  * Count failing test cases in a test runner's stdout.
- * Picks the larger of "✗ count" (bun-style) vs "FAIL count" (jest/pytest-style)
- * — different runners use different markers; whichever is stronger wins.
- * Used by phase-runner to break ties when both dual-impl test runs fail.
+ *
+ * Returns `undefined` when no signal is detectable — phase-runner uses
+ * undefined as "no signal" and falls back to fail-closed if BOTH impls
+ * lack a count. Returning 0 here was misleading: a compile-error or
+ * "no tests ran" output would beat a real "1 test failed" output in
+ * tie-breaking. (Codex Phase 3 review, MEDIUM.)
+ *
+ * Tries multiple signals in priority order:
+ *   1. Explicit summary line: `N failed`, `N fail` (bun, jest, vitest, pytest)
+ *   2. ✗ marker count (bun-style)
+ *   3. ^FAIL line count (jest/pytest-style)
  */
-export function parseFailureCount(output: string): number {
-  if (!output) return 0;
-  const cross = (output.match(/✗/g) || []).length;
-  // FAIL as a word-prefix line marker — avoid matching FAILURE/FAILED counts.
-  const fail = (output.match(/^FAIL\b/gm) || []).length;
-  return Math.max(cross, fail);
+export function parseFailureCount(output: string): number | undefined {
+  if (!output) return undefined;
+  const clean = stripAnsi(output);
+
+  // Priority 1: explicit summary at start of line, like "3 failed" / "3 fail".
+  // Anchored to ^\s* so it doesn't match "✗ test 1 failed" mid-line.
+  const summaryMatch = clean.match(/^\s*(\d+)\s+fail(?:ed|ing)?\b/im);
+  if (summaryMatch) return Number(summaryMatch[1]);
+
+  // Priority 2/3: marker counts as fallback.
+  const cross = (clean.match(/✗/g) || []).length;
+  const fail = (clean.match(/^FAIL\b/gm) || []).length;
+  const markerMax = Math.max(cross, fail);
+  return markerMax > 0 ? markerMax : undefined;
 }
 
 /**
  * Parse the Opus tournament judge's output for a verdict + reasoning.
  *
- * Expected format (case-insensitive on the value, case-sensitive on the keys):
+ * Expected format (anchored to start-of-line; case-insensitive on the value):
  *   WINNER: gemini|codex
  *   REASONING: <one paragraph>
  *
- * On malformed output (no WINNER line found), falls back to verdict='gemini'
- * with a reasoning string that explains the fallback. Caller is expected to
- * log a warning and proceed — better to apply one impl than to fail the phase
- * for a parser quirk.
+ * Returns `verdict: null` when no anchored WINNER line is found. Caller
+ * (Phase 4 CLI handler) MUST treat null as a hard failure — passing a fake
+ * verdict here would defeat the fail-closed semantics in phase-runner where
+ * dual_winner_pending without selectedImplementor → FAIL.
+ *
+ * (Codex Phase 3 review, HIGH — silent fallback to gemini was the original
+ * defect; null surfaces it instead.)
  */
-export function parseJudgeVerdict(output: string): { verdict: 'gemini' | 'codex'; reasoning: string } {
+export function parseJudgeVerdict(output: string): {
+  verdict: 'gemini' | 'codex' | null;
+  reasoning: string;
+} {
   const clean = stripAnsi(output || '');
-  const winnerMatch = clean.match(/WINNER:\s*(gemini|codex)\b/i);
+  // Anchored: WINNER must be at start of line. Avoids false matches like
+  // "I think the WINNER: gemini is better" embedded in narrative prose.
+  const winnerMatch = clean.match(/^\s*WINNER:\s*(gemini|codex)\b/im);
   if (!winnerMatch) {
     return {
-      verdict: 'gemini',
-      reasoning: 'fallback: no WINNER line found in judge output; defaulting to gemini',
+      verdict: null,
+      reasoning: 'no anchored WINNER line found in judge output — caller must fail-closed',
     };
   }
   const verdict = winnerMatch[1].toLowerCase() as 'gemini' | 'codex';
 
-  const reasoningMatch = clean.match(/REASONING:\s*([\s\S]*?)(?:\n\n|$)/i);
+  // REASONING runs from the anchored marker to end of input; trim whitespace.
+  // Single multi-paragraph reasoning is fine — Opus prompt template asks for
+  // one paragraph, but we accept anything until EOS.
+  const reasoningMatch = clean.match(/^\s*REASONING:\s*([\s\S]*)$/im);
   const reasoning = reasoningMatch ? reasoningMatch[1].trim() : '';
   return { verdict, reasoning };
 }
@@ -526,11 +553,18 @@ export function parseJudgeVerdict(output: string): { verdict: 'gemini' | 'codex'
 /**
  * Build the argv that runCodexImpl passes to the codex CLI. Extracted as a pure
  * helper so tests can verify the invocation shape without spawning the binary.
+ *
+ * Sandbox defaults to `workspace-write` — `danger-full-access` was unsafe
+ * because linked git worktrees share the .git dir, remotes, and credentials
+ * with the main cwd, so a destructive command in Codex (e.g. `git push --delete
+ * origin main`) would damage the parent repo. Override via GSTACK_BUILD_CODEX_IMPL_SANDBOX
+ * for environments where that risk is accepted. (Codex Phase 3 review, HIGH.)
  */
 export function buildCodexImplArgv(opts: {
   inputFilePath: string;
   outputFilePath: string;
   cwd: string;
+  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
 }): string[] {
   const codexPrompt = [
     `Read implementation instructions at ${opts.inputFilePath}.`,
@@ -540,11 +574,20 @@ export function buildCodexImplArgv(opts: {
     `Return ONLY the output file path. No narrative.`,
   ].join(' ');
 
+  const sandbox =
+    opts.sandbox ||
+    (process.env.GSTACK_BUILD_CODEX_IMPL_SANDBOX as
+      | 'read-only'
+      | 'workspace-write'
+      | 'danger-full-access'
+      | undefined) ||
+    'workspace-write';
+
   return [
     'exec',
     codexPrompt,
     '-s',
-    'danger-full-access',
+    sandbox,
     '-c',
     'model_reasoning_effort="high"',
     '-C',
@@ -604,6 +647,7 @@ export async function runCodexImpl(opts: {
 }
 
 const JUDGE_TIMEOUT_MS = Number(process.env.GSTACK_BUILD_JUDGE_TIMEOUT) || 10 * 60_000;
+const JUDGE_MODEL = process.env.GSTACK_BUILD_JUDGE_MODEL || 'claude-opus-4-7';
 
 /**
  * Run Claude Opus as the tournament judge. Caller writes the full judge prompt
@@ -632,7 +676,7 @@ export async function runJudgeOpus(opts: {
     `Return ONLY the output file path. No narrative.`,
   ].join(' ');
 
-  const argv = ['--model', 'claude-opus-4-7', '-p', shellPrompt];
+  const argv = ['--model', JUDGE_MODEL, '-p', shellPrompt];
 
   const logPath = path.join(
     logDir(opts.slug),
