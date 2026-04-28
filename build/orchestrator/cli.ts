@@ -429,7 +429,7 @@ async function runPhase(args: {
     }
 
     if (action.type === 'RUN_GEMINI_TEST_SPEC') {
-      console.log(`  → Gemini: writing test spec for Phase ${phase.number} (iter ${action.iteration})`);
+      console.log(`  → Test Specification: Phase ${phase.number} (iter ${action.iteration})`);
       let result: SubAgentResult;
       if (dryRun) {
         result = mockResult({ exitCode: 0, stdout: '[dry-run] Gemini would write test spec' });
