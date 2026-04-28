@@ -24,8 +24,12 @@ export interface WorktreePair {
   baseCommit: string;
 }
 
+// 50 MB is enough for diffs of ~500k lines. spawnSync default 1 MB silently
+// truncates output on large refactors — see git diff in applyWinner patch fallback.
+const SPAWN_MAX_BUFFER = 50 * 1024 * 1024;
+
 function run(args: string[], cwd: string): string {
-  const r = spawnSync("git", args, { cwd, encoding: "utf8" });
+  const r = spawnSync("git", args, { cwd, encoding: "utf8", maxBuffer: SPAWN_MAX_BUFFER });
   if (r.status !== 0) {
     throw new Error(`git ${args.join(" ")} failed (cwd=${cwd}): ${r.stderr || r.stdout}`);
   }
@@ -33,7 +37,7 @@ function run(args: string[], cwd: string): string {
 }
 
 function tryRun(args: string[], cwd: string): void {
-  spawnSync("git", args, { cwd, encoding: "utf8" });
+  spawnSync("git", args, { cwd, encoding: "utf8", maxBuffer: SPAWN_MAX_BUFFER });
 }
 
 /**
@@ -112,7 +116,7 @@ export function applyWinner(opts: {
   const logOutput = spawnSync(
     "git",
     ["log", "--reverse", "--format=%H", `${baseCommit}..HEAD`],
-    { cwd: worktreePath, encoding: "utf8" }
+    { cwd: worktreePath, encoding: "utf8", maxBuffer: SPAWN_MAX_BUFFER }
   ).stdout.trim();
 
   if (!logOutput) {
@@ -125,6 +129,7 @@ export function applyWinner(opts: {
   const cherryPick = spawnSync("git", ["cherry-pick", ...commits], {
     cwd,
     encoding: "utf8",
+    maxBuffer: SPAWN_MAX_BUFFER,
   });
 
   if (cherryPick.status === 0) {
@@ -137,7 +142,7 @@ export function applyWinner(opts: {
   const diff = spawnSync(
     "git",
     ["diff", `${baseCommit}..HEAD`],
-    { cwd: worktreePath, encoding: "utf8" }
+    { cwd: worktreePath, encoding: "utf8", maxBuffer: SPAWN_MAX_BUFFER }
   );
 
   if (!diff.stdout) {
@@ -148,6 +153,7 @@ export function applyWinner(opts: {
     cwd,
     input: diff.stdout,
     encoding: "utf8",
+    maxBuffer: SPAWN_MAX_BUFFER,
   });
 
   if (apply.status !== 0) {
@@ -158,21 +164,34 @@ export function applyWinner(opts: {
   }
 
   // Stage and commit the patch-applied changes
-  const addResult = spawnSync("git", ["add", "-A"], { cwd, encoding: "utf8" });
+  const addResult = spawnSync("git", ["add", "-A"], {
+    cwd,
+    encoding: "utf8",
+    maxBuffer: SPAWN_MAX_BUFFER,
+  });
   if (addResult.status !== 0) {
     return { ok: false, error: `git add failed after patch apply: ${addResult.stderr}` };
   }
 
-  const msg = spawnSync(
+  // Count commits to choose a clean message — avoids dumping N subject lines
+  // into one ugly multi-line -m string when N > 1.
+  const subjects = spawnSync(
     "git",
     ["log", "--format=%s", `${baseCommit}..HEAD`],
-    { cwd: worktreePath, encoding: "utf8" }
-  ).stdout.trim();
+    { cwd: worktreePath, encoding: "utf8", maxBuffer: SPAWN_MAX_BUFFER }
+  ).stdout.trim().split("\n").filter(Boolean);
+
+  const msg =
+    subjects.length === 0
+      ? `Apply ${winner} implementation`
+      : subjects.length === 1
+        ? subjects[0]
+        : `Apply ${winner} implementation (${subjects.length} commits squashed)`;
 
   const commitResult = spawnSync(
     "git",
-    ["commit", "-m", msg || `Apply ${winner} implementation`],
-    { cwd, encoding: "utf8" }
+    ["commit", "-m", msg],
+    { cwd, encoding: "utf8", maxBuffer: SPAWN_MAX_BUFFER }
   );
   if (commitResult.status !== 0) {
     return { ok: false, error: `git commit failed after patch apply: ${commitResult.stderr}` };
