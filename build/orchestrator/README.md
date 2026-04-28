@@ -79,8 +79,8 @@ The orchestrator auto-detects the test runner by searching the project root (`cw
 # Explicit override — use when auto-detection picks the wrong command:
 gstack-build plans/...md --test-cmd "bun test src/"
 
-# Monorepo: point at the subdirectory where the tests live:
-gstack-build plans/...md --test-cmd "cd packages/api && bun test"
+# Monorepo: runTests splits on whitespace, so use bash -c for shell operators:
+gstack-build plans/...md --test-cmd "bash -c 'cd packages/api && bun test'"
 ```
 
 ### Common workflows
@@ -106,7 +106,7 @@ gstack-build plans/...md --no-gbrain
 
 Hit Ctrl-C mid-run? Run the same command again — the orchestrator picks up at the phase that was in flight. State lives at `~/.gstack/build-state/<slug>.json` (and mirrored to gbrain page `<slug>` if gbrain is configured).
 
-To force a fresh start: `gstack-build ... --no-resume` or `rm ~/.gstack/build-state/<slug>.lock`.
+To force a fresh start: `gstack-build ... --no-resume` or `rm ~/.gstack/build-state/<slug>.json`.
 
 ## Environment variables
 
