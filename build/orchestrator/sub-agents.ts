@@ -583,6 +583,7 @@ export function buildCodexImplArgv(opts: {
   outputFilePath: string;
   cwd: string;
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
+  model?: string;
 }): string[] {
   const codexPrompt = [
     `Read implementation instructions at ${opts.inputFilePath}.`,
@@ -604,6 +605,7 @@ export function buildCodexImplArgv(opts: {
   return [
     'exec',
     codexPrompt,
+    ...(opts.model ? ['-m', opts.model] : []),
     '-s',
     sandbox,
     '-c',
@@ -627,6 +629,7 @@ export async function runCodexImpl(opts: {
   slug: string;
   phaseNumber: string;
   iteration: number;
+  model?: string;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
   const argv = buildCodexImplArgv(opts);

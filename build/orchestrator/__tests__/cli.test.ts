@@ -60,6 +60,54 @@ describe('--dual-impl flag wiring', () => {
   });
 });
 
+describe('--gemini-model / --codex-model flag wiring', () => {
+  it('--help text mentions --gemini-model', () => {
+    expect(HELP_TEXT).toContain('--gemini-model');
+  });
+
+  it('--help text mentions --codex-model', () => {
+    expect(HELP_TEXT).toContain('--codex-model');
+  });
+
+  it('parseArgs with --gemini-model sets geminiModel', () => {
+    const args = parseArgs(['plan.md', '--gemini-model', 'gemini-3.1-pro']);
+    expect(args.geminiModel).toBe('gemini-3.1-pro');
+  });
+
+  it('parseArgs with --codex-model sets codexModel', () => {
+    const args = parseArgs(['plan.md', '--codex-model', 'gpt-5.3-codex-spark']);
+    expect(args.codexModel).toBe('gpt-5.3-codex-spark');
+  });
+
+  it('parseArgs default → geminiModel and codexModel are undefined', () => {
+    const args = parseArgs(['plan.md']);
+    expect(args.geminiModel).toBeUndefined();
+    expect(args.codexModel).toBeUndefined();
+  });
+
+  it('parseArgs accepts both model flags together', () => {
+    const args = parseArgs([
+      'plan.md',
+      '--gemini-model', 'gemini-3.1-pro',
+      '--codex-model', 'gpt-5.3-codex-spark',
+    ]);
+    expect(args.geminiModel).toBe('gemini-3.1-pro');
+    expect(args.codexModel).toBe('gpt-5.3-codex-spark');
+  });
+
+  it('parseArgs model flags combine correctly with --dual-impl', () => {
+    const args = parseArgs([
+      'plan.md',
+      '--dual-impl',
+      '--gemini-model', 'gemini-3.1-pro',
+      '--codex-model', 'gpt-5.3-codex-spark',
+    ]);
+    expect(args.dualImpl).toBe(true);
+    expect(args.geminiModel).toBe('gemini-3.1-pro');
+    expect(args.codexModel).toBe('gpt-5.3-codex-spark');
+  });
+});
+
 describe('buildCodexImplPromptBody (dual-impl Codex implementation prompt)', () => {
   it('contains "implement"', () => {
     const body = buildCodexImplPromptBody(basePhase, 'plan.md');

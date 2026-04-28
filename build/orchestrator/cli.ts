@@ -84,6 +84,10 @@ export interface Args {
   testCmd?: string;
   /** When true, every phase implements via Gemini+Codex tournament with Opus judge. */
   dualImpl: boolean;
+  /** Model override for Gemini (Implementor A). E.g. "gemini-3.1-pro". */
+  geminiModel?: string;
+  /** Model override for Codex (Implementor B). E.g. "gpt-5.3-codex-spark". */
+  codexModel?: string;
 }
 
 export function parseArgs(argv: string[]): Args {
@@ -106,7 +110,15 @@ export function parseArgs(argv: string[]): Args {
     else if (a === '--no-gbrain') args.noGbrain = true;
     else if (a === '--skip-ship') args.skipShip = true;
     else if (a === '--dual-impl') args.dualImpl = true;
-    else if (a === '--test-cmd') {
+    else if (a === '--gemini-model') {
+      const next = argv[++i];
+      if (!next) { console.error('--gemini-model requires a value'); process.exit(2); }
+      args.geminiModel = next;
+    } else if (a === '--codex-model') {
+      const next = argv[++i];
+      if (!next) { console.error('--codex-model requires a value'); process.exit(2); }
+      args.codexModel = next;
+    } else if (a === '--test-cmd') {
       const next = argv[++i];
       if (!next) { console.error('--test-cmd requires a value'); process.exit(2); }
       args.testCmd = next;
@@ -150,6 +162,10 @@ Flags:
   --dual-impl          Tournament mode: Gemini and Codex implement in parallel
                        (isolated git worktrees), Opus judges and the winner
                        is cherry-picked back. Existing TDD pipeline runs after.
+  --gemini-model <m>   Model for Gemini (Implementor A). Default: Gemini CLI default.
+                       Example: gemini-3.1-pro
+  --codex-model <m>    Model for Codex (Implementor B). Default: Codex CLI default.
+                       Example: gpt-5.3-codex-spark
   --test-cmd <cmd>     Override test command (default: auto-detect from package.json/pytest.ini/go.mod/Cargo.toml).
   --max-codex-iter N   Cap recursive Codex iterations (default 5).
   -h, --help           Show this help.
@@ -537,6 +553,8 @@ async function runPhase(args: {
   dryRun: boolean;
   maxCodexIter: number;
   testCmd?: string;
+  geminiModel?: string;
+  codexModel?: string;
 }): Promise<'done' | 'failed'> {
   const { state, phase, cwd, noGbrain, dryRun, maxCodexIter } = args;
   let phaseState = state.phases[phase.index];
@@ -613,6 +631,7 @@ async function runPhase(args: {
           slug: state.slug,
           phaseNumber: phase.number,
           iteration: action.iteration,
+          model: args.geminiModel,
         });
       }
       phaseState = applyResult(phaseState, action, result);
@@ -679,7 +698,7 @@ async function runPhase(args: {
         const outputFilePath = path.join(logDir(state.slug), `phase-${phase.number}-gemini-testspec-${action.iteration}-output.md`);
         fs.writeFileSync(inputFilePath, buildGeminiTestSpecPrompt(phase, state.planFile));
         fs.writeFileSync(outputFilePath, '');
-        result = await runGeminiTestSpec({ inputFilePath, outputFilePath, cwd, slug: state.slug, phaseNumber: phase.number, iteration: action.iteration });
+        result = await runGeminiTestSpec({ inputFilePath, outputFilePath, cwd, slug: state.slug, phaseNumber: phase.number, iteration: action.iteration, model: args.geminiModel });
       }
       phaseState = applyResult(phaseState, action, result);
       state.phases[phase.index] = phaseState;
@@ -738,7 +757,7 @@ async function runPhase(args: {
         const outputFilePath = path.join(logDir(state.slug), `phase-${phase.number}-gemini-fix-${action.iteration}-output.md`);
         fs.writeFileSync(inputFilePath, buildGeminiFixPrompt(phase, state.planFile));
         fs.writeFileSync(outputFilePath, '');
-        result = await runGemini({ inputFilePath, outputFilePath, cwd, slug: state.slug, phaseNumber: phase.number, iteration: action.iteration, logPrefix: 'gemini-fix' });
+        result = await runGemini({ inputFilePath, outputFilePath, cwd, slug: state.slug, phaseNumber: phase.number, iteration: action.iteration, logPrefix: 'gemini-fix', model: args.geminiModel });
       }
       phaseState = applyResult(phaseState, action, result);
       state.phases[phase.index] = phaseState;
@@ -823,6 +842,7 @@ async function runPhase(args: {
             phaseNumber: phaseN,
             iteration: it,
             logPrefix: 'dual-gemini',
+            model: args.geminiModel,
           }),
           runCodexImpl({
             inputFilePath: codexInputPath,
@@ -831,6 +851,7 @@ async function runPhase(args: {
             slug,
             phaseNumber: phaseN,
             iteration: it,
+            model: args.codexModel,
           }),
         ]);
 
@@ -1243,6 +1264,8 @@ async function main() {
         dryRun: args.dryRun,
         maxCodexIter: args.maxCodexIter,
         testCmd: args.testCmd,
+        geminiModel: args.geminiModel,
+        codexModel: args.codexModel,
       });
 
       if (outcome === 'failed') {

@@ -223,4 +223,38 @@ describe('buildCodexImplArgv (codex exec invocation shape)', () => {
     expect(prompt).toContain('/tmp/MY_INPUT.md');
     expect(prompt).toContain('/tmp/MY_OUTPUT.md');
   });
+
+  it('includes -m <model> when model is specified', () => {
+    const argv = buildCodexImplArgv({
+      inputFilePath: '/tmp/in.md',
+      outputFilePath: '/tmp/out.md',
+      cwd: '/tmp/wt',
+      model: 'gpt-5.3-codex-spark',
+    });
+    const mIdx = argv.indexOf('-m');
+    expect(mIdx).toBeGreaterThan(-1);
+    expect(argv[mIdx + 1]).toBe('gpt-5.3-codex-spark');
+  });
+
+  it('omits -m when model is not specified', () => {
+    const argv = buildCodexImplArgv({
+      inputFilePath: '/tmp/in.md',
+      outputFilePath: '/tmp/out.md',
+      cwd: '/tmp/wt',
+    });
+    expect(argv).not.toContain('-m');
+  });
+
+  it('-m appears before -s so model is set before sandbox flags', () => {
+    const argv = buildCodexImplArgv({
+      inputFilePath: '/tmp/in.md',
+      outputFilePath: '/tmp/out.md',
+      cwd: '/tmp/wt',
+      model: 'gpt-5.3-codex-spark',
+    });
+    const mIdx = argv.indexOf('-m');
+    const sIdx = argv.indexOf('-s');
+    expect(mIdx).toBeGreaterThan(-1);
+    expect(sIdx).toBeGreaterThan(mIdx);
+  });
 });
