@@ -151,7 +151,46 @@ rm -rf .llm-tmp     # once after all phases complete (or on each phase cleanup)
    - **RECURSIVE LOOP REQUIREMENT**: If the output file's verdict is `GATE FAIL`, write a new input file (`.llm-tmp/build-<phase-N>-codex-input-<iter+1>.md`) describing the issues to fix, re-spawn Codex with a new output path, and re-check. Repeat the review→fix→review cycle until Codex writes `GATE PASS`. Do NOT advance to step 8 (Update Living Plan) with open review findings. A single review pass is NOT sufficient — past sessions have left issues unaddressed by stopping after one pass.
 7. **Wait for Codex Completion**: Run the Codex process synchronously in the foreground. Wait for the Bash tool to return. Apply the recursive loop in step 6 until the review is fully clean.
 8. **Update Living Plan (MANDATORY — never skip)**: After both Gemini implementation and the recursive Codex review have completed cleanly, you MUST immediately use the `Edit` tool to modify the living plan and check off the specific sub-checkboxes for this phase (change `[ ] **Test Specification...` to `[x]`, `[ ] **Implementation...` to `[x]`, and `[ ] **Review...` to `[x]`). This step runs unconditionally after every phase, regardless of how trivial the phase felt — past sessions have forgotten this step under context pressure and progress tracking has drifted. Treat this as a hard requirement, not a nice-to-have. Verify there are zero remaining issues from the review before checking the box.
-9. **Context save at phase boundary**: After each phase completes (all three sub-checkboxes — Test Specification, Implementation, and Review — checked), run `claude --model sonnet -p /context-save` via the `Bash` tool. This ensures progress survives a context window compaction mid-session.
+8.5. **Phase Guardrail Verification + Status Report**: Immediately after updating the plan, run the following verification sequence. If ANY item fails, STOP and complete the missing step before advancing — do NOT skip forward to context-save.
+
+   **Guardrail checklist** (run each check via Bash):
+   ```bash
+   # 1. All 3 checkboxes confirmed [x] in the plan file
+   grep -A3 "### Phase <N>" <plan-file> | grep -c "\[x\]"
+   # must equal 3
+
+   # 2. Red phase was verified (tests failed before impl)
+   # Confirm from your own execution trace above — if you cannot confirm, STOP.
+
+   # 3. Tests are green now
+   cd <project-dir> && <test-cmd>
+   # must exit 0
+
+   # 4. GATE PASS in last Codex output file
+   grep "GATE PASS" .llm-tmp/build-<phase-N>-codex-output-<last-iter>.md
+   # must match
+
+   # 5. Phase has at least one commit
+   git log --oneline -1
+   # must show work from this phase
+   ```
+
+   After all checks pass, print the following status block **immediately, without waiting for user input** — then continue to step 9 without pausing:
+
+   ```
+   ══════════════════════════════════════════════════════
+   PHASE <N> COMPLETE — <phase name>
+   Branch:      <current branch>
+   Test Spec:   ✅ written + Red confirmed
+   Tests:       ✅ <N pass, 0 fail> (fix iterations: <N>)
+   Review:      ✅ GATE PASS (codex iterations: <N>)
+   Commit:      <git log --oneline -1 output>
+   Plan:        all 3 checkboxes [x]
+   Next:        Phase <N+1> — <name>  |  or: FINAL SHIP
+   ══════════════════════════════════════════════════════
+   ```
+
+9. **Context save at phase boundary**: After each phase completes (all three sub-checkboxes — Test Specification, Implementation, and Review — checked and guardrail verified), run `claude --model sonnet -p /context-save` via the `Bash` tool. This ensures progress survives a context window compaction mid-session.
 
 Do NOT stop to ask the user for permission between phases unless a sub-agent fails catastrophically or hits a safety constraint. Keep the loop going.
 
@@ -163,7 +202,44 @@ Once ALL phases are complete (and have been individually reviewed):
    - **CRITICAL: Do NOT substitute these skills with raw `gh pr create` or `gh pr merge` commands! You MUST use the GStack skills because they contain mandatory CI/CD safety gates.** Do NOT invoke the native `ship` tool!
 2. **Wait for Sonnet Completion**: Run the Sonnet sub-agent synchronously in the foreground. Wait for the Bash tool to return.
 3. **Sync Status**: Use the `Edit` tool to update the execution status in the *original* plan file (the one you located in Step 1). Synchronize all the `[x]` completion marks from your synthesized living plan back to the original plan.
-4. Report the completion to the user: summarize what you built and confirm that all phases have been shipped and deployed successfully.
+4. **Week/Group Guardrail Verification**: After ship + land-and-deploy, run the following checks. If ANY fails, STOP and surface the error — do NOT report completion.
+
+   ```bash
+   # 1. PR is merged (not open)
+   gh pr list --state open --head <feature-branch>
+   # must return 0 rows
+
+   # 2. No unmerged feature branches remain for this week's work
+   git fetch origin
+   git branch -r --no-merged origin/main | grep "feat/"
+   # must return empty (or only branches for future weeks not yet started)
+
+   # 3. Main is up to date with the merge
+   git log origin/main --oneline -1
+   # commit sha must match the merge commit from /land-and-deploy
+
+   # 4. Clean local state — no staged/unstaged changes from this build
+   git status --porcelain
+   # must be empty
+   ```
+
+   After all checks pass, print the following status block **immediately, without waiting for user input**:
+
+   ```
+   ╔══════════════════════════════════════════════════════╗
+   ║  WEEK/GROUP COMPLETE — EXECUTION REPORT              ║
+   ╠══════════════════════════════════════════════════════╣
+   ║  Phases completed: <list, e.g. "1, 2, 3, 4">        ║
+   ║  PR:               #<N> merged ✅                    ║
+   ║  Branch:           <feat/name> — no unmerged ✅      ║
+   ║  Main:             <sha> — up to date ✅             ║
+   ║  Working tree:     clean ✅                          ║
+   ║  Ship:             ✅ /ship completed                ║
+   ║  Land:             ✅ /land-and-deploy completed     ║
+   ╚══════════════════════════════════════════════════════╝
+   ```
+
+5. Report the completion to the user: summarize what you built and confirm that all phases have been shipped and deployed successfully.
 
 **Rules:**
 - **Autonomous Continuity**: Do NOT ask for the user's confirmation to proceed between steps, phases, or loops unless you are critically blocked. Just narrate your current state and keep moving.
