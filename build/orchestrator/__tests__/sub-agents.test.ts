@@ -299,4 +299,51 @@ describe('buildCodexReviewArgv (codex review invocation shape)', () => {
     });
     expect(argv).not.toContain('-m');
   });
+
+  it('-m appears before -s so model is set before sandbox flags', () => {
+    const argv = buildCodexReviewArgv({
+      inputFilePath: '/tmp/review-in.md',
+      outputFilePath: '/tmp/review-out.md',
+      cwd: '/tmp/wt',
+      model: 'gpt-5.5',
+    });
+    const mIdx = argv.indexOf('-m');
+    const sIdx = argv.indexOf('-s');
+    expect(mIdx).toBeGreaterThan(-1);
+    expect(sIdx).toBeGreaterThan(mIdx);
+  });
+
+  it('embeds custom command in the prompt arg', () => {
+    const argv = buildCodexReviewArgv({
+      inputFilePath: '/tmp/review-in.md',
+      outputFilePath: '/tmp/review-out.md',
+      cwd: '/tmp/wt',
+      command: '/gstack-qa',
+    });
+    const prompt = argv[1];
+    expect(prompt).toContain('/gstack-qa');
+    expect(prompt).not.toContain('/gstack-review');
+  });
+
+  it('honors sandbox override (read-only)', () => {
+    const argv = buildCodexReviewArgv({
+      inputFilePath: '/tmp/review-in.md',
+      outputFilePath: '/tmp/review-out.md',
+      cwd: '/tmp/wt',
+      sandbox: 'read-only',
+    });
+    expect(argv).toContain('read-only');
+    expect(argv).not.toContain('workspace-write');
+  });
+
+  it('honors reasoning override (high overrides xhigh default)', () => {
+    const argv = buildCodexReviewArgv({
+      inputFilePath: '/tmp/review-in.md',
+      outputFilePath: '/tmp/review-out.md',
+      cwd: '/tmp/wt',
+      reasoning: 'high',
+    });
+    expect(argv).toContain('model_reasoning_effort="high"');
+    expect(argv).not.toContain('model_reasoning_effort="xhigh"');
+  });
 });

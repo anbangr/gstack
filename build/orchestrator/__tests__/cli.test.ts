@@ -75,8 +75,8 @@ describe('--gemini-model / --codex-model flag wiring', () => {
   });
 
   it('parseArgs with --codex-model sets codexModel', () => {
-    const args = parseArgs(['plan.md', '--codex-model', 'gpt-5.3-codex-spark']);
-    expect(args.codexModel).toBe('gpt-5.3-codex-spark');
+    const args = parseArgs(['plan.md', '--codex-model', 'gpt-5.4']);
+    expect(args.codexModel).toBe('gpt-5.4');
   });
 
   it('parseArgs default → model defaults are baked in (no flags needed)', () => {

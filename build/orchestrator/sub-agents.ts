@@ -296,17 +296,13 @@ export async function runCodexReview(opts: {
   model?: string;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
-  const command = opts.command || '/gstack-review';
-  const reasoning = opts.reasoning || 'xhigh';
-  const sandbox = opts.sandbox || 'workspace-write';
-
   const argv = buildCodexReviewArgv({
     inputFilePath: opts.inputFilePath,
     outputFilePath: opts.outputFilePath,
     cwd: opts.cwd,
-    command,
-    sandbox,
-    reasoning,
+    command: opts.command,
+    sandbox: opts.sandbox,
+    reasoning: opts.reasoning,
     model: opts.model,
   });
 
