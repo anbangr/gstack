@@ -1,0 +1,169 @@
+/**
+ * Git worktree helpers for dual-implementor mode (--dual-impl).
+ *
+ * Each phase gets two isolated worktrees:
+ *   /tmp/gstack-dual-<slug>-p<N>-<ts>/gemini  → branch gstack-dual-p<N>-gemini-<ts>
+ *   /tmp/gstack-dual-<slug>-p<N>-<ts>/codex   → branch gstack-dual-p<N>-codex-<ts>
+ *
+ * Both branches start at the current HEAD of the main cwd.
+ * The winning branch's commits are cherry-picked back onto main cwd after judging.
+ */
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { spawnSync } from "node:child_process";
+import type { DualImplState } from "./types";
+
+export interface WorktreePair {
+  geminiPath: string;
+  codexPath: string;
+  geminiBranch: string;
+  codexBranch: string;
+  baseCommit: string;
+}
+
+function run(args: string[], cwd: string): string {
+  const r = spawnSync("git", args, { cwd, encoding: "utf8" });
+  if (r.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed (cwd=${cwd}): ${r.stderr || r.stdout}`);
+  }
+  return r.stdout.trim();
+}
+
+function tryRun(args: string[], cwd: string): void {
+  spawnSync("git", args, { cwd, encoding: "utf8" });
+}
+
+/**
+ * Creates two worktrees rooted at /tmp/gstack-dual-<slug>-p<N>-<ts>/.
+ * On partial failure, rolls back any worktrees already created.
+ */
+export function createWorktrees(opts: {
+  cwd: string;
+  slug: string;
+  phaseNumber: string;
+}): WorktreePair {
+  const { cwd, slug, phaseNumber } = opts;
+  const ts = Date.now();
+  const baseDir = path.join("/tmp", `gstack-dual-${slug}-p${phaseNumber}-${ts}`);
+  const geminiPath = path.join(baseDir, "gemini");
+  const codexPath = path.join(baseDir, "codex");
+  const geminiBranch = `gstack-dual-p${phaseNumber}-gemini-${ts}`;
+  const codexBranch = `gstack-dual-p${phaseNumber}-codex-${ts}`;
+
+  const baseCommit = run(["rev-parse", "HEAD"], cwd);
+
+  fs.mkdirSync(geminiPath, { recursive: true });
+  fs.mkdirSync(codexPath, { recursive: true });
+
+  try {
+    run(["worktree", "add", "-b", geminiBranch, geminiPath, "HEAD"], cwd);
+  } catch (err) {
+    fs.rmSync(baseDir, { recursive: true, force: true });
+    throw err;
+  }
+
+  try {
+    run(["worktree", "add", "-b", codexBranch, codexPath, "HEAD"], cwd);
+  } catch (err) {
+    tryRun(["worktree", "remove", "--force", geminiPath], cwd);
+    tryRun(["branch", "-D", geminiBranch], cwd);
+    fs.rmSync(baseDir, { recursive: true, force: true });
+    throw err;
+  }
+
+  return { geminiPath, codexPath, geminiBranch, codexBranch, baseCommit };
+}
+
+/**
+ * Removes both worktrees and their tracking branches.
+ * Idempotent — safe to call even if already torn down.
+ */
+export function teardownWorktrees(opts: { cwd: string; dualImpl: DualImplState }): void {
+  const { cwd, dualImpl } = opts;
+  const { geminiWorktreePath, codexWorktreePath, geminiBranch, codexBranch } = dualImpl;
+
+  for (const wt of [geminiWorktreePath, codexWorktreePath]) {
+    tryRun(["worktree", "remove", "--force", wt], cwd);
+  }
+  for (const branch of [geminiBranch, codexBranch]) {
+    tryRun(["branch", "-D", branch], cwd);
+  }
+  tryRun(["worktree", "prune"], cwd);
+}
+
+/**
+ * Cherry-picks the winner's commits (baseCommit..HEAD in winner's worktree)
+ * onto the main cwd branch. Falls back to patch-apply if cherry-pick conflicts.
+ */
+export function applyWinner(opts: {
+  cwd: string;
+  winner: "gemini" | "codex";
+  dualImpl: DualImplState;
+}): { ok: boolean; error?: string } {
+  const { cwd, winner, dualImpl } = opts;
+  const worktreePath =
+    winner === "gemini" ? dualImpl.geminiWorktreePath : dualImpl.codexWorktreePath;
+  const { baseCommit } = dualImpl;
+
+  // Get list of commits from baseCommit..HEAD in winner's worktree
+  const logOutput = spawnSync(
+    "git",
+    ["log", "--reverse", "--format=%H", `${baseCommit}..HEAD`],
+    { cwd: worktreePath, encoding: "utf8" }
+  ).stdout.trim();
+
+  if (!logOutput) {
+    return { ok: false, error: "No commits found in winner worktree since base" };
+  }
+
+  const commits = logOutput.split("\n").filter(Boolean);
+
+  // Try cherry-pick
+  const cherryPick = spawnSync("git", ["cherry-pick", ...commits], {
+    cwd,
+    encoding: "utf8",
+  });
+
+  if (cherryPick.status === 0) {
+    return { ok: true };
+  }
+
+  // Cherry-pick failed — abort and try patch fallback
+  tryRun(["cherry-pick", "--abort"], cwd);
+
+  const diff = spawnSync(
+    "git",
+    ["diff", `${baseCommit}..HEAD`],
+    { cwd: worktreePath, encoding: "utf8" }
+  );
+
+  if (!diff.stdout) {
+    return { ok: false, error: `Cherry-pick failed and diff is empty: ${cherryPick.stderr}` };
+  }
+
+  const apply = spawnSync("git", ["apply", "-3", "-"], {
+    cwd,
+    input: diff.stdout,
+    encoding: "utf8",
+  });
+
+  if (apply.status !== 0) {
+    return {
+      ok: false,
+      error: `Both cherry-pick and patch-apply failed.\nCherry-pick: ${cherryPick.stderr}\nApply: ${apply.stderr}`,
+    };
+  }
+
+  // Stage and commit the patch-applied changes
+  spawnSync("git", ["add", "-A"], { cwd });
+  const msg = spawnSync(
+    "git",
+    ["log", "--format=%s", `${baseCommit}..HEAD`],
+    { cwd: worktreePath, encoding: "utf8" }
+  ).stdout.trim();
+
+  spawnSync("git", ["commit", "-m", msg || `Apply ${winner} implementation`], { cwd });
+
+  return { ok: true };
+}
