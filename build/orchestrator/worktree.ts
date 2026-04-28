@@ -10,13 +10,15 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import type { DualImplState } from "./types";
 
+// Field names match DualImplState so callers can spread directly.
 export interface WorktreePair {
-  geminiPath: string;
-  codexPath: string;
+  geminiWorktreePath: string;
+  codexWorktreePath: string;
   geminiBranch: string;
   codexBranch: string;
   baseCommit: string;
@@ -45,34 +47,34 @@ export function createWorktrees(opts: {
 }): WorktreePair {
   const { cwd, slug, phaseNumber } = opts;
   const ts = Date.now();
-  const baseDir = path.join("/tmp", `gstack-dual-${slug}-p${phaseNumber}-${ts}`);
-  const geminiPath = path.join(baseDir, "gemini");
-  const codexPath = path.join(baseDir, "codex");
+  const baseDir = path.join(os.tmpdir(), `gstack-dual-${slug}-p${phaseNumber}-${ts}`);
+  const geminiWorktreePath = path.join(baseDir, "gemini");
+  const codexWorktreePath = path.join(baseDir, "codex");
   const geminiBranch = `gstack-dual-p${phaseNumber}-gemini-${ts}`;
   const codexBranch = `gstack-dual-p${phaseNumber}-codex-${ts}`;
 
   const baseCommit = run(["rev-parse", "HEAD"], cwd);
 
-  fs.mkdirSync(geminiPath, { recursive: true });
-  fs.mkdirSync(codexPath, { recursive: true });
+  fs.mkdirSync(geminiWorktreePath, { recursive: true });
+  fs.mkdirSync(codexWorktreePath, { recursive: true });
 
   try {
-    run(["worktree", "add", "-b", geminiBranch, geminiPath, "HEAD"], cwd);
+    run(["worktree", "add", "-b", geminiBranch, geminiWorktreePath, "HEAD"], cwd);
   } catch (err) {
     fs.rmSync(baseDir, { recursive: true, force: true });
     throw err;
   }
 
   try {
-    run(["worktree", "add", "-b", codexBranch, codexPath, "HEAD"], cwd);
+    run(["worktree", "add", "-b", codexBranch, codexWorktreePath, "HEAD"], cwd);
   } catch (err) {
-    tryRun(["worktree", "remove", "--force", geminiPath], cwd);
+    tryRun(["worktree", "remove", "--force", geminiWorktreePath], cwd);
     tryRun(["branch", "-D", geminiBranch], cwd);
     fs.rmSync(baseDir, { recursive: true, force: true });
     throw err;
   }
 
-  return { geminiPath, codexPath, geminiBranch, codexBranch, baseCommit };
+  return { geminiWorktreePath, codexWorktreePath, geminiBranch, codexBranch, baseCommit };
 }
 
 /**
@@ -156,14 +158,25 @@ export function applyWinner(opts: {
   }
 
   // Stage and commit the patch-applied changes
-  spawnSync("git", ["add", "-A"], { cwd });
+  const addResult = spawnSync("git", ["add", "-A"], { cwd, encoding: "utf8" });
+  if (addResult.status !== 0) {
+    return { ok: false, error: `git add failed after patch apply: ${addResult.stderr}` };
+  }
+
   const msg = spawnSync(
     "git",
     ["log", "--format=%s", `${baseCommit}..HEAD`],
     { cwd: worktreePath, encoding: "utf8" }
   ).stdout.trim();
 
-  spawnSync("git", ["commit", "-m", msg || `Apply ${winner} implementation`], { cwd });
+  const commitResult = spawnSync(
+    "git",
+    ["commit", "-m", msg || `Apply ${winner} implementation`],
+    { cwd, encoding: "utf8" }
+  );
+  if (commitResult.status !== 0) {
+    return { ok: false, error: `git commit failed after patch apply: ${commitResult.stderr}` };
+  }
 
   return { ok: true };
 }

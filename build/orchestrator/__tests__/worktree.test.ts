@@ -42,38 +42,26 @@ afterAll(() => {
 test("createWorktrees creates two directories with distinct branches", () => {
   const pair = createWorktrees({ cwd: repoPath, slug: "test", phaseNumber: "1" });
 
-  expect(fs.existsSync(pair.geminiPath)).toBe(true);
-  expect(fs.existsSync(pair.codexPath)).toBe(true);
+  expect(fs.existsSync(pair.geminiWorktreePath)).toBe(true);
+  expect(fs.existsSync(pair.codexWorktreePath)).toBe(true);
   expect(pair.geminiBranch).not.toBe(pair.codexBranch);
   expect(pair.geminiBranch).toContain("gstack-dual");
   expect(pair.codexBranch).toContain("gstack-dual");
   expect(pair.baseCommit).toMatch(/^[0-9a-f]{7,40}$/);
 
-  const state: DualImplState = {
-    geminiWorktreePath: pair.geminiPath,
-    codexWorktreePath: pair.codexPath,
-    geminiBranch: pair.geminiBranch,
-    codexBranch: pair.codexBranch,
-    baseCommit: pair.baseCommit,
-  };
+  const state: DualImplState = { ...pair };
   teardownWorktrees({ cwd: repoPath, dualImpl: state });
 });
 
 test("teardownWorktrees removes both worktrees and is idempotent (safe to call twice)", () => {
   const pair = createWorktrees({ cwd: repoPath, slug: "test-td", phaseNumber: "2" });
 
-  const state: DualImplState = {
-    geminiWorktreePath: pair.geminiPath,
-    codexWorktreePath: pair.codexPath,
-    geminiBranch: pair.geminiBranch,
-    codexBranch: pair.codexBranch,
-    baseCommit: pair.baseCommit,
-  };
+  const state: DualImplState = { ...pair };
 
   teardownWorktrees({ cwd: repoPath, dualImpl: state });
 
-  expect(fs.existsSync(pair.geminiPath)).toBe(false);
-  expect(fs.existsSync(pair.codexPath)).toBe(false);
+  expect(fs.existsSync(pair.geminiWorktreePath)).toBe(false);
+  expect(fs.existsSync(pair.codexWorktreePath)).toBe(false);
 
   // Second call must not throw
   expect(() => teardownWorktrees({ cwd: repoPath, dualImpl: state })).not.toThrow();
@@ -83,17 +71,11 @@ test("applyWinner cherry-picks commits from winning worktree branch onto main cw
   const pair = createWorktrees({ cwd: repoPath, slug: "test-aw", phaseNumber: "3" });
 
   // Make a new commit in the gemini worktree
-  fs.writeFileSync(path.join(pair.geminiPath, "winner.ts"), "export const x = 1;\n");
-  git(["add", "."], pair.geminiPath);
-  git(["commit", "-m", "gemini impl"], pair.geminiPath);
+  fs.writeFileSync(path.join(pair.geminiWorktreePath, "winner.ts"), "export const x = 1;\n");
+  git(["add", "."], pair.geminiWorktreePath);
+  git(["commit", "-m", "gemini impl"], pair.geminiWorktreePath);
 
-  const state: DualImplState = {
-    geminiWorktreePath: pair.geminiPath,
-    codexWorktreePath: pair.codexPath,
-    geminiBranch: pair.geminiBranch,
-    codexBranch: pair.codexBranch,
-    baseCommit: pair.baseCommit,
-  };
+  const state: DualImplState = { ...pair };
 
   const result = applyWinner({ cwd: repoPath, winner: "gemini", dualImpl: state });
 
