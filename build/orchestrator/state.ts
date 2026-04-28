@@ -63,6 +63,9 @@ export function freshState(args: {
   planFile: string;
   branch: string;
   phases: Phase[];
+  geminiModel?: string;
+  codexModel?: string;
+  codexReviewModel?: string;
 }): BuildState {
   const slug = deriveSlug(args.planFile);
   const planBasename = path.basename(args.planFile).replace(/\.md$/i, '');
@@ -95,6 +98,9 @@ export function freshState(args: {
     currentPhaseIndex: Math.max(0, phaseStates.findIndex((s) => s.status !== 'committed')),
     phases: phaseStates,
     completed: phaseStates.every((s) => s.status === 'committed'),
+    ...(args.geminiModel && { geminiModel: args.geminiModel }),
+    ...(args.codexModel && { codexModel: args.codexModel }),
+    ...(args.codexReviewModel && { codexReviewModel: args.codexReviewModel }),
   };
 }
 

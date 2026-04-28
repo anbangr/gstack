@@ -147,4 +147,10 @@ export interface BuildState {
   failedAtPhase?: number;
   /** Human-readable failure description. */
   failureReason?: string;
+  /** Model used for Gemini (Implementor A). Stored for resume mismatch detection. */
+  geminiModel?: string;
+  /** Model used for Codex (Implementor B, dual-impl). Stored for resume mismatch detection. */
+  codexModel?: string;
+  /** Model used for Codex review pass. Stored for resume mismatch detection. */
+  codexReviewModel?: string;
 }

@@ -77,6 +77,9 @@ function spawnCaptured(args: {
         cwd: args.cwd,
       },
       (err, stdout, stderr) => {
+        // Detect timeout via Node's own kill flag (fires before our +1000ms setTimeout).
+        if (err?.killed) timedOut = true;
+
         // Persist captured output regardless of success.
         try {
           fs.writeFileSync(
@@ -605,6 +608,7 @@ export function buildCodexImplArgv(opts: {
   outputFilePath: string;
   cwd: string;
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
+  reasoning?: 'low' | 'medium' | 'high' | 'xhigh';
   model?: string;
 }): string[] {
   const codexPrompt = [
@@ -624,6 +628,8 @@ export function buildCodexImplArgv(opts: {
       | undefined) ||
     'workspace-write';
 
+  const reasoning = opts.reasoning || 'xhigh';
+
   return [
     'exec',
     codexPrompt,
@@ -631,7 +637,7 @@ export function buildCodexImplArgv(opts: {
     '-s',
     sandbox,
     '-c',
-    'model_reasoning_effort="xhigh"',
+    `model_reasoning_effort="${reasoning}"`,
     '-C',
     opts.cwd,
   ];
@@ -651,6 +657,7 @@ export async function runCodexImpl(opts: {
   slug: string;
   phaseNumber: string;
   iteration: number;
+  reasoning?: 'low' | 'medium' | 'high' | 'xhigh';
   model?: string;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);

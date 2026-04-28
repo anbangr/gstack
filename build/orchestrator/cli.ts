@@ -1167,6 +1167,10 @@ function mockResult(overrides: Partial<SubAgentResult>): SubAgentResult {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
+  if (args.codexModel !== 'gpt-5.3-codex-spark' && !args.dualImpl) {
+    console.warn('[warn] --codex-model has no effect without --dual-impl (Codex implementor only runs in tournament mode)');
+  }
+
   if (!fs.existsSync(args.planFile)) {
     console.error(`plan file not found: ${args.planFile}`);
     process.exit(2);
@@ -1216,6 +1220,9 @@ async function main() {
       planFile: args.planFile,
       branch: getCurrentBranch(),
       phases,
+      geminiModel: args.geminiModel,
+      codexModel: args.codexModel,
+      codexReviewModel: args.codexReviewModel,
     });
     saveState(state, { noGbrain: args.noGbrain, log: console.warn });
   } else {
@@ -1223,11 +1230,26 @@ async function main() {
     if (loaded) {
       console.log(`\nresuming state from ${loaded.lastUpdatedAt}`);
       state = loaded;
+      // Warn if CLI models differ from what the original run used.
+      if (loaded.geminiModel && loaded.geminiModel !== args.geminiModel) {
+        console.warn(`[warn] --gemini-model ${args.geminiModel} differs from resumed state (${loaded.geminiModel}); using CLI value`);
+      } else if (!loaded.geminiModel && args.geminiModel !== 'gemini-3.1-pro-preview') {
+        console.warn(`[warn] --gemini-model ${args.geminiModel} may differ from original run (state predates model tracking)`);
+      }
+      if (loaded.codexModel && loaded.codexModel !== args.codexModel) {
+        console.warn(`[warn] --codex-model ${args.codexModel} differs from resumed state (${loaded.codexModel}); using CLI value`);
+      }
+      if (loaded.codexReviewModel && loaded.codexReviewModel !== args.codexReviewModel) {
+        console.warn(`[warn] --codex-review-model ${args.codexReviewModel} differs from resumed state (${loaded.codexReviewModel}); using CLI value`);
+      }
     } else {
       state = freshState({
         planFile: args.planFile,
         branch: getCurrentBranch(),
         phases,
+        geminiModel: args.geminiModel,
+        codexModel: args.codexModel,
+        codexReviewModel: args.codexReviewModel,
       });
       saveState(state, { noGbrain: args.noGbrain, log: console.warn });
     }
