@@ -150,6 +150,7 @@ export async function runGemini(opts: {
   phaseNumber: string;
   iteration: number;
   model?: string;
+  logPrefix?: string;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
 
@@ -164,9 +165,10 @@ export async function runGemini(opts: {
   if (opts.model) argv.push('-m', opts.model);
   argv.push('--yolo');
 
+  const prefix = opts.logPrefix ?? 'gemini';
   const logPath = path.join(
     logDir(opts.slug),
-    `phase-${opts.phaseNumber}-gemini-${opts.iteration}.log`
+    `phase-${opts.phaseNumber}-${prefix}-${opts.iteration}.log`
   );
 
   let result = await spawnCaptured({

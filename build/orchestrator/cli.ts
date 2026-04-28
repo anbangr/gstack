@@ -497,7 +497,7 @@ async function runPhase(args: {
         const outputFilePath = path.join(logDir(state.slug), `phase-${phase.number}-gemini-fix-${action.iteration}-output.md`);
         fs.writeFileSync(inputFilePath, buildGeminiFixPrompt(phase, state.planFile));
         fs.writeFileSync(outputFilePath, '');
-        result = await runGemini({ inputFilePath, outputFilePath, cwd, slug: state.slug, phaseNumber: phase.number, iteration: action.iteration });
+        result = await runGemini({ inputFilePath, outputFilePath, cwd, slug: state.slug, phaseNumber: phase.number, iteration: action.iteration, logPrefix: 'gemini-fix' });
       }
       phaseState = applyResult(phaseState, action, result);
       state.phases[phase.index] = phaseState;
