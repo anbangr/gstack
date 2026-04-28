@@ -456,15 +456,18 @@ export async function runTests(opts: {
   slug: string;
   phaseNumber: string;
   iteration: number;
+  /** Optional suffix to disambiguate parallel runs (dual-impl: 'gemini' / 'codex'). */
+  logSuffix?: string;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
   const parts = opts.testCmd.trim().split(/\s+/);
   const bin = parts[0];
   const argv = parts.slice(1);
 
+  const suffix = opts.logSuffix ? `-${opts.logSuffix}` : '';
   const logPath = path.join(
     logDir(opts.slug),
-    `phase-${opts.phaseNumber}-tests-${opts.iteration}.log`
+    `phase-${opts.phaseNumber}-tests-${opts.iteration}${suffix}.log`
   );
 
   return spawnCaptured({
@@ -499,14 +502,20 @@ export function parseFailureCount(output: string): number | undefined {
   if (!output) return undefined;
   const clean = stripAnsi(output);
 
-  // Priority 1: explicit summary at start of line, like "3 failed" / "3 fail".
+  // Priority 1: pytest summary like "===== 2 failed in 0.10s =====" or "===== 2 failed, 3 passed".
+  // Pytest decorates with `=` and `_` chars before/around the summary line.
+  const pytestMatch = clean.match(/^=+\s*(\d+)\s+failed\b/im);
+  if (pytestMatch) return Number(pytestMatch[1]);
+
+  // Priority 2: bun/jest/vitest/cargo summary at start of line, like "3 failed" / "3 fail".
   // Anchored to ^\s* so it doesn't match "✗ test 1 failed" mid-line.
   const summaryMatch = clean.match(/^\s*(\d+)\s+fail(?:ed|ing)?\b/im);
   if (summaryMatch) return Number(summaryMatch[1]);
 
-  // Priority 2/3: marker counts as fallback.
+  // Priority 3: per-test marker counts as fallback.
+  // ✗ (bun-style), FAIL or FAILED at start of line (jest=FAIL, pytest=FAILED).
   const cross = (clean.match(/✗/g) || []).length;
-  const fail = (clean.match(/^FAIL\b/gm) || []).length;
+  const fail = (clean.match(/^FAIL(?:ED)?\b/gm) || []).length;
   const markerMax = Math.max(cross, fail);
   return markerMax > 0 ? markerMax : undefined;
 }

@@ -728,15 +728,16 @@ async function runPhase(args: {
 
         // Validate each implementor produced committed work — uncommitted edits
         // would pass tests but applyWinner would have nothing to cherry-pick.
-        // (Phase 4 review, HIGH.)
+        // (Phase 4 review, HIGH; refined Phase 5 /codex review P2.)
         const gCommits = countCommitsSinceBase(pair.geminiWorktreePath, pair.baseCommit);
         const cCommits = countCommitsSinceBase(pair.codexWorktreePath, pair.baseCommit);
+        const gCommitted = (gCommits ?? 0) > 0;
+        const cCommitted = (cCommits ?? 0) > 0;
 
-        // If either implementor failed catastrophically, fail the phase.
-        // "Catastrophic" = timeout, OR both have non-zero exit, OR neither committed anything.
+        // Catastrophic = timeout, OR both have non-zero exit, OR neither committed.
         const eitherTimedOut = gRes.timedOut || cRes.timedOut;
         const bothExitNonZero = gRes.exitCode !== 0 && cRes.exitCode !== 0;
-        const neitherCommitted = (gCommits ?? 0) === 0 && (cCommits ?? 0) === 0;
+        const neitherCommitted = !gCommitted && !cCommitted;
 
         if (eitherTimedOut || bothExitNonZero || neitherCommitted) {
           phaseState.status = 'failed';
@@ -757,6 +758,29 @@ async function runPhase(args: {
           logPath: gRes.logPath,
         });
         phaseState = applyResult(phaseState, action, synthetic, { dualImplInit: dualState });
+
+        // /codex review P2 — if exactly one side committed, the other is ineligible
+        // (tests would pass on uncommitted edits but applyWinner can't cherry-pick).
+        // Skip RUN_DUAL_TESTS + RUN_JUDGE_OPUS entirely; auto-select the committed side.
+        if (gCommitted && !cCommitted) {
+          console.log(`  ⚠ Codex did not commit (gemini=${gCommits} commits, codex=0) — auto-selecting gemini, skipping tests + judge`);
+          phaseState.dualImpl = {
+            ...(phaseState.dualImpl as any),
+            selectedImplementor: 'gemini',
+            selectedBy: 'auto',
+          };
+          phaseState.status = 'dual_winner_pending';
+        } else if (!gCommitted && cCommitted) {
+          console.log(`  ⚠ Gemini did not commit (gemini=0, codex=${cCommits} commits) — auto-selecting codex, skipping tests + judge`);
+          phaseState.dualImpl = {
+            ...(phaseState.dualImpl as any),
+            selectedImplementor: 'codex',
+            selectedBy: 'auto',
+          };
+          phaseState.status = 'dual_winner_pending';
+        }
+        // else: both committed — normal flow → dual_impl_done → RUN_DUAL_TESTS
+
         state.phases[phase.index] = phaseState;
         saveState(state, { noGbrain, log: console.warn });
         dualImplOk = true; // suppress finally teardown; downstream phases own cleanup
@@ -804,8 +828,8 @@ async function runPhase(args: {
           codexTR  = { worktreePath: dual.codexWorktreePath,  testExitCode: 0, testLogPath: 'no-test-cmd', timedOut: false, failureCount: 0 };
         } else {
           const [g, c] = await Promise.all([
-            runTests({ testCmd, cwd: dual.geminiWorktreePath, slug: state.slug, phaseNumber: phase.number, iteration: 1 }),
-            runTests({ testCmd, cwd: dual.codexWorktreePath,  slug: state.slug, phaseNumber: phase.number, iteration: 1 }),
+            runTests({ testCmd, cwd: dual.geminiWorktreePath, slug: state.slug, phaseNumber: phase.number, iteration: 1, logSuffix: 'gemini' }),
+            runTests({ testCmd, cwd: dual.codexWorktreePath,  slug: state.slug, phaseNumber: phase.number, iteration: 1, logSuffix: 'codex'  }),
           ]);
           geminiTR = {
             worktreePath: dual.geminiWorktreePath,

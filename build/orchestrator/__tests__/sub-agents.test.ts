@@ -127,6 +127,21 @@ describe('parseFailureCount (dual-impl test outcome scoring)', () => {
     const out = '✗ test 1\n✗ test 2\n--- summary ---\n3 failed, 1 passed\n';
     expect(parseFailureCount(out)).toBe(3);
   });
+
+  it('matches pytest summary "===== 2 failed in 0.10s ====="', () => {
+    const out = `FAILED test_foo.py::test_bar - AssertionError\nFAILED test_baz.py::test_qux - ValueError\n===== 2 failed in 0.10s =====\n`;
+    expect(parseFailureCount(out)).toBe(2);
+  });
+
+  it('matches pytest summary with mixed pass/fail "===== 3 failed, 5 passed in 1.2s ====="', () => {
+    const out = `===== 3 failed, 5 passed in 1.2s =====\n`;
+    expect(parseFailureCount(out)).toBe(3);
+  });
+
+  it('counts FAILED markers as fallback when no summary line', () => {
+    const out = 'FAILED test_a\nFAILED test_b\nFAILED test_c\n';
+    expect(parseFailureCount(out)).toBe(3);
+  });
 });
 
 describe('parseJudgeVerdict (Opus tournament judge output)', () => {
