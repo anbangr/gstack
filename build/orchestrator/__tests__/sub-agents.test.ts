@@ -6,6 +6,7 @@ import {
   parseFailureCount,
   parseJudgeVerdict,
   buildCodexImplArgv,
+  buildCodexReviewArgv,
 } from '../sub-agents';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -265,5 +266,37 @@ describe('buildCodexImplArgv (codex exec invocation shape)', () => {
     const sIdx = argv.indexOf('-s');
     expect(mIdx).toBeGreaterThan(-1);
     expect(sIdx).toBeGreaterThan(mIdx);
+  });
+});
+
+describe('buildCodexReviewArgv (codex review invocation shape)', () => {
+  it('uses xhigh reasoning effort (thinking mode) by default', () => {
+    const argv = buildCodexReviewArgv({
+      inputFilePath: '/tmp/review-in.md',
+      outputFilePath: '/tmp/review-out.md',
+      cwd: '/tmp/wt',
+    });
+    expect(argv).toContain('model_reasoning_effort="xhigh"');
+  });
+
+  it('includes -m <model> when model is specified', () => {
+    const argv = buildCodexReviewArgv({
+      inputFilePath: '/tmp/review-in.md',
+      outputFilePath: '/tmp/review-out.md',
+      cwd: '/tmp/wt',
+      model: 'gpt-5.5',
+    });
+    const mIdx = argv.indexOf('-m');
+    expect(mIdx).toBeGreaterThan(-1);
+    expect(argv[mIdx + 1]).toBe('gpt-5.5');
+  });
+
+  it('omits -m when model is not specified', () => {
+    const argv = buildCodexReviewArgv({
+      inputFilePath: '/tmp/review-in.md',
+      outputFilePath: '/tmp/review-out.md',
+      cwd: '/tmp/wt',
+    });
+    expect(argv).not.toContain('-m');
   });
 });

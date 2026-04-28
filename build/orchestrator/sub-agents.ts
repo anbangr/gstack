@@ -237,6 +237,40 @@ function mergeOutputFile(result: SubAgentResult, outputFilePath: string): SubAge
   }
 }
 
+export function buildCodexReviewArgv(opts: {
+  inputFilePath: string;
+  outputFilePath: string;
+  cwd: string;
+  command?: string;
+  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
+  reasoning?: 'low' | 'medium' | 'high' | 'xhigh';
+  model?: string;
+}): string[] {
+  const command = opts.command || '/gstack-review';
+  const reasoning = opts.reasoning || 'xhigh';
+  const sandbox = opts.sandbox || 'workspace-write';
+
+  const codexPrompt = [
+    `Read review context at ${opts.inputFilePath}.`,
+    `Run ${command}.`,
+    `Write your full review report to ${opts.outputFilePath}.`,
+    `The report MUST include a final 'GATE PASS' or 'GATE FAIL' line on its own.`,
+    `Return ONLY the output file path. No narrative.`,
+  ].join(' ');
+
+  return [
+    'exec',
+    codexPrompt,
+    ...(opts.model ? ['-m', opts.model] : []),
+    '-s',
+    sandbox,
+    '-c',
+    `model_reasoning_effort="${reasoning}"`,
+    '-C',
+    opts.cwd,
+  ];
+}
+
 /**
  * Run one iteration of Codex review (i.e. `codex exec /gstack-review`).
  * Caller checks the verdict via parseVerdict(stdout) and decides whether
@@ -266,25 +300,15 @@ export async function runCodexReview(opts: {
   const reasoning = opts.reasoning || 'xhigh';
   const sandbox = opts.sandbox || 'workspace-write';
 
-  const codexPrompt = [
-    `Read review context at ${opts.inputFilePath}.`,
-    `Run ${command}.`,
-    `Write your full review report to ${opts.outputFilePath}.`,
-    `The report MUST include a final 'GATE PASS' or 'GATE FAIL' line on its own.`,
-    `Return ONLY the output file path. No narrative.`,
-  ].join(' ');
-
-  const argv = [
-    'exec',
-    codexPrompt,
-    ...(opts.model ? ['-m', opts.model] : []),
-    '-s',
+  const argv = buildCodexReviewArgv({
+    inputFilePath: opts.inputFilePath,
+    outputFilePath: opts.outputFilePath,
+    cwd: opts.cwd,
+    command,
     sandbox,
-    '-c',
-    `model_reasoning_effort="${reasoning}"`,
-    '-C',
-    opts.cwd,
-  ];
+    reasoning,
+    model: opts.model,
+  });
 
   const logPath = path.join(
     logDir(opts.slug),
