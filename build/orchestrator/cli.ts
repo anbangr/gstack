@@ -189,7 +189,7 @@ function printPhaseTable(phases: Phase[]) {
   }
 }
 
-function printPhaseReport(phase: Phase, phaseState: import('./types').PhaseState, nextPhaseName: string | null) {
+export function printPhaseReport(phase: Phase, phaseState: import('./types').PhaseState, nextPhaseName: string | null, cwd: string) {
   const w = 58;
   const bar = '═'.repeat(w);
   const line = (label: string, value: string) =>
@@ -197,7 +197,8 @@ function printPhaseReport(phase: Phase, phaseState: import('./types').PhaseState
 
   const gitSha = (() => {
     try {
-      const r = spawnSync('git', ['log', '--oneline', '-1'], { encoding: 'utf8' });
+      const r = spawnSync('git', ['log', '--oneline', '-1'], { encoding: 'utf8', cwd, timeout: 10_000 });
+      if (r.status !== 0 || r.error) return '(unknown)';
       return r.stdout?.trim() || '(unknown)';
     } catch { return '(unknown)'; }
   })();
@@ -226,28 +227,38 @@ function printPhaseReport(phase: Phase, phaseState: import('./types').PhaseState
   console.log(`${'═'.repeat(w)}\n`);
 }
 
-async function verifyPostShip(cwd: string, branch: string): Promise<{ ok: boolean; report: string[] }> {
+export async function verifyPostShip(cwd: string, branch: string): Promise<{ ok: boolean; report: string[] }> {
   const issues: string[] = [];
   const lines: string[] = [];
 
-  const run = (cmd: string, args: string[]) =>
-    spawnSync(cmd, args, { encoding: 'utf8', cwd });
+  const run = (cmd: string, args: string[], timeoutMs = 15_000) =>
+    spawnSync(cmd, args, { encoding: 'utf8', cwd, timeout: timeoutMs });
 
   // 1. No open PRs for the feature branch
-  const openPR = run('gh', ['pr', 'list', '--state', 'open', '--head', branch, '--json', 'number', '--jq', 'length']);
-  const openCount = parseInt(openPR.stdout?.trim() || '0', 10);
-  if (openCount > 0) {
-    issues.push(`${openCount} open PR(s) still exist for branch ${branch}`);
-    lines.push(`  PR:          ⚠ ${openCount} open PR(s) for ${branch} — /land-and-deploy may not have completed`);
+  const openPR = run('gh', ['pr', 'list', '--state', 'open', '--head', branch, '--json', 'number', '--jq', 'length'], 30_000);
+  if (openPR.status !== 0 || openPR.error) {
+    issues.push('gh pr list failed — cannot verify PR state');
+    lines.push(`  PR:          ⚠ gh command failed (check auth/network)`);
   } else {
-    lines.push(`  PR:          ✅ merged (0 open)`);
+    const openCount = Number(openPR.stdout?.trim());
+    if (!Number.isFinite(openCount) || openCount > 0) {
+      const label = Number.isFinite(openCount) ? `${openCount} open PR(s) for ${branch}` : 'unexpected gh output';
+      issues.push(label);
+      lines.push(`  PR:          ⚠ ${label} — /land-and-deploy may not have completed`);
+    } else {
+      lines.push(`  PR:          ✅ merged (0 open)`);
+    }
   }
 
-  // 2. No unmerged feat/* branches on origin
-  run('git', ['fetch', 'origin']);
+  // 2. No unmerged feat/* branches on origin (excluding the current branch)
+  const fetchResult = run('git', ['fetch', 'origin'], 30_000);
+  if (fetchResult.status !== 0 || fetchResult.error) {
+    lines.push(`  Branches:    ⚠ git fetch failed — branch check uses stale data`);
+  }
   const unmerged = run('git', ['branch', '-r', '--no-merged', 'origin/main']);
   const unmergedFeat = (unmerged.stdout || '').split('\n')
-    .map((l: string) => l.trim()).filter((l: string) => l.startsWith('origin/feat/'));
+    .map((l: string) => l.trim())
+    .filter((l: string) => l.startsWith('origin/feat/') && l !== `origin/${branch}`);
   if (unmergedFeat.length > 0) {
     issues.push(`unmerged feat branches: ${unmergedFeat.join(', ')}`);
     lines.push(`  Branches:    ⚠ unmerged: ${unmergedFeat.join(', ')}`);
@@ -265,10 +276,14 @@ async function verifyPostShip(cwd: string, branch: string): Promise<{ ok: boolea
   }
 
   // 4. Current HEAD on main matches origin/main
-  const localHead = run('git', ['rev-parse', 'HEAD']).stdout?.trim();
-  const remoteHead = run('git', ['rev-parse', 'origin/main']).stdout?.trim();
-  if (localHead && remoteHead && localHead !== remoteHead) {
-    lines.push(`  Main sync:   ⚠ local HEAD ${localHead?.slice(0, 7)} ≠ origin/main ${remoteHead?.slice(0, 7)}`);
+  const localHeadR = run('git', ['rev-parse', 'HEAD']);
+  const remoteHeadR = run('git', ['rev-parse', 'origin/main']);
+  const localHead = localHeadR.status === 0 ? localHeadR.stdout?.trim() : null;
+  const remoteHead = remoteHeadR.status === 0 ? remoteHeadR.stdout?.trim() : null;
+  if (!localHead || !remoteHead) {
+    lines.push(`  Main sync:   ⚠ could not determine HEAD (rev-parse failed)`);
+  } else if (localHead !== remoteHead) {
+    lines.push(`  Main sync:   ⚠ local HEAD ${localHead.slice(0, 7)} ≠ origin/main ${remoteHead.slice(0, 7)}`);
   } else {
     lines.push(`  Main sync:   ✅ in sync`);
   }
@@ -564,7 +579,7 @@ async function runPhase(args: {
       state.phases[phase.index] = phaseState;
       state.currentPhaseIndex = phase.index + 1;
       saveState(state, { noGbrain, log: console.warn });
-      printPhaseReport(phase, phaseState, args.nextPhaseName);
+      printPhaseReport(phase, phaseState, args.nextPhaseName, args.cwd);
       return 'done';
     }
 
@@ -1239,8 +1254,6 @@ async function main() {
         exitCode = 1;
       } else {
         console.log(`  ✓ shipped (${(result.durationMs / 1000).toFixed(0)}s)`);
-        state.completed = true;
-        saveState(state, { noGbrain: args.noGbrain, log: console.warn });
         const { ok, report } = await verifyPostShip(cwd, state.branch);
         const w = 58;
         console.log(`\n${'╔' + '═'.repeat(w - 2) + '╗'}`);
@@ -1251,6 +1264,10 @@ async function main() {
         if (!ok) {
           console.error('✗ post-ship guardrail failed — see issues above');
           exitCode = 1;
+        } else {
+          // Only mark completed after guardrails pass — keeps state/exit-code in agreement
+          state.completed = true;
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
         }
       }
     } else if (exitCode === 0 && (args.skipShip || args.dryRun)) {
