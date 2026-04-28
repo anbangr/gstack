@@ -202,6 +202,15 @@ describe('buildCodexImplArgv (codex exec invocation shape)', () => {
     expect(argv).toContain('/tmp/gstack-dual-myslug-p1-1234567890/gemini');
   });
 
+  it('uses xhigh reasoning effort (thinking mode) by default', () => {
+    const argv = buildCodexImplArgv({
+      inputFilePath: '/tmp/in.md',
+      outputFilePath: '/tmp/out.md',
+      cwd: '/tmp/wt',
+    });
+    expect(argv).toContain('model_reasoning_effort="xhigh"');
+  });
+
   it('honors opts.sandbox override (e.g. danger-full-access when explicitly opted in)', () => {
     const argv = buildCodexImplArgv({
       inputFilePath: '/tmp/in.md',

@@ -253,16 +253,17 @@ export async function runCodexReview(opts: {
   iteration: number;
   /** Which slash-command to run, e.g. `/gstack-review` or `/gstack-qa`. */
   command?: string;
-  /** Reasoning effort: low | medium | high. Default high for reviews. */
-  reasoning?: 'low' | 'medium' | 'high';
+  /** Reasoning effort: low | medium | high | xhigh. Default xhigh for reviews (thinking mode). */
+  reasoning?: 'low' | 'medium' | 'high' | 'xhigh';
   /** Sandbox mode. `workspace-write` lets the review loop fix bugs;
    * `read-only` makes it report-only. Default workspace-write because the
    * recursive loop expects fix-and-rereview. */
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
+  model?: string;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
   const command = opts.command || '/gstack-review';
-  const reasoning = opts.reasoning || 'high';
+  const reasoning = opts.reasoning || 'xhigh';
   const sandbox = opts.sandbox || 'workspace-write';
 
   const codexPrompt = [
@@ -276,6 +277,7 @@ export async function runCodexReview(opts: {
   const argv = [
     'exec',
     codexPrompt,
+    ...(opts.model ? ['-m', opts.model] : []),
     '-s',
     sandbox,
     '-c',
@@ -609,7 +611,7 @@ export function buildCodexImplArgv(opts: {
     '-s',
     sandbox,
     '-c',
-    'model_reasoning_effort="high"',
+    'model_reasoning_effort="xhigh"',
     '-C',
     opts.cwd,
   ];

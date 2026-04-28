@@ -79,32 +79,40 @@ describe('--gemini-model / --codex-model flag wiring', () => {
     expect(args.codexModel).toBe('gpt-5.3-codex-spark');
   });
 
-  it('parseArgs default → geminiModel and codexModel are undefined', () => {
+  it('parseArgs default → model defaults are baked in (no flags needed)', () => {
     const args = parseArgs(['plan.md']);
-    expect(args.geminiModel).toBeUndefined();
-    expect(args.codexModel).toBeUndefined();
-  });
-
-  it('parseArgs accepts both model flags together', () => {
-    const args = parseArgs([
-      'plan.md',
-      '--gemini-model', 'gemini-3.1-pro',
-      '--codex-model', 'gpt-5.3-codex-spark',
-    ]);
     expect(args.geminiModel).toBe('gemini-3.1-pro');
     expect(args.codexModel).toBe('gpt-5.3-codex-spark');
+    expect(args.codexReviewModel).toBe('gpt-5.5');
+  });
+
+  it('--codex-review-model overrides the review model default', () => {
+    const args = parseArgs(['plan.md', '--codex-review-model', 'gpt-5.4']);
+    expect(args.codexReviewModel).toBe('gpt-5.4');
+  });
+
+  it('--help text mentions --codex-review-model', () => {
+    expect(HELP_TEXT).toContain('--codex-review-model');
+  });
+
+  it('parseArgs accepts all three model flags together', () => {
+    const args = parseArgs([
+      'plan.md',
+      '--gemini-model', 'gemini-3.2-pro',
+      '--codex-model', 'gpt-5.3-codex',
+      '--codex-review-model', 'gpt-5.4',
+    ]);
+    expect(args.geminiModel).toBe('gemini-3.2-pro');
+    expect(args.codexModel).toBe('gpt-5.3-codex');
+    expect(args.codexReviewModel).toBe('gpt-5.4');
   });
 
   it('parseArgs model flags combine correctly with --dual-impl', () => {
-    const args = parseArgs([
-      'plan.md',
-      '--dual-impl',
-      '--gemini-model', 'gemini-3.1-pro',
-      '--codex-model', 'gpt-5.3-codex-spark',
-    ]);
+    const args = parseArgs(['plan.md', '--dual-impl']);
     expect(args.dualImpl).toBe(true);
     expect(args.geminiModel).toBe('gemini-3.1-pro');
     expect(args.codexModel).toBe('gpt-5.3-codex-spark');
+    expect(args.codexReviewModel).toBe('gpt-5.5');
   });
 });
 

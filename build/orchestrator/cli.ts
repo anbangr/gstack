@@ -84,10 +84,12 @@ export interface Args {
   testCmd?: string;
   /** When true, every phase implements via Gemini+Codex tournament with Opus judge. */
   dualImpl: boolean;
-  /** Model override for Gemini (Implementor A). E.g. "gemini-3.1-pro". */
+  /** Model for Gemini (Implementor A). Default: gemini-3.1-pro (thinking built-in). */
   geminiModel?: string;
-  /** Model override for Codex (Implementor B). E.g. "gpt-5.3-codex-spark". */
+  /** Model for Codex (Implementor B, dual-impl). Default: gpt-5.3-codex-spark. */
   codexModel?: string;
+  /** Model for Codex review pass. Default: gpt-5.5. */
+  codexReviewModel?: string;
 }
 
 export function parseArgs(argv: string[]): Args {
@@ -100,6 +102,9 @@ export function parseArgs(argv: string[]): Args {
     skipShip: false,
     maxCodexIter: DEFAULT_MAX_CODEX_ITERATIONS,
     dualImpl: false,
+    geminiModel: 'gemini-3.1-pro',
+    codexModel: 'gpt-5.3-codex-spark',
+    codexReviewModel: 'gpt-5.5',
   };
   const positional: string[] = [];
   for (let i = 0; i < argv.length; i++) {
@@ -118,6 +123,10 @@ export function parseArgs(argv: string[]): Args {
       const next = argv[++i];
       if (!next) { console.error('--codex-model requires a value'); process.exit(2); }
       args.codexModel = next;
+    } else if (a === '--codex-review-model') {
+      const next = argv[++i];
+      if (!next) { console.error('--codex-review-model requires a value'); process.exit(2); }
+      args.codexReviewModel = next;
     } else if (a === '--test-cmd') {
       const next = argv[++i];
       if (!next) { console.error('--test-cmd requires a value'); process.exit(2); }
@@ -164,8 +173,9 @@ Flags:
                        is cherry-picked back. Existing TDD pipeline runs after.
   --gemini-model <m>   Model for Gemini (Implementor A). Default: Gemini CLI default.
                        Example: gemini-3.1-pro
-  --codex-model <m>    Model for Codex (Implementor B). Default: Codex CLI default.
-                       Example: gpt-5.3-codex-spark
+  --codex-model <m>    Model for Codex Implementor B (dual-impl). Default: gpt-5.3-codex-spark.
+  --codex-review-model <m>
+                       Model for Codex review pass. Default: gpt-5.5.
   --test-cmd <cmd>     Override test command (default: auto-detect from package.json/pytest.ini/go.mod/Cargo.toml).
   --max-codex-iter N   Cap recursive Codex iterations (default 5).
   -h, --help           Show this help.
@@ -555,6 +565,7 @@ async function runPhase(args: {
   testCmd?: string;
   geminiModel?: string;
   codexModel?: string;
+  codexReviewModel?: string;
 }): Promise<'done' | 'failed'> {
   const { state, phase, cwd, noGbrain, dryRun, maxCodexIter } = args;
   let phaseState = state.phases[phase.index];
@@ -680,6 +691,7 @@ async function runPhase(args: {
           slug: state.slug,
           phaseNumber: phase.number,
           iteration: action.iteration,
+          model: args.codexReviewModel,
         });
       }
       phaseState = applyResult(phaseState, action, result);
@@ -1266,6 +1278,7 @@ async function main() {
         testCmd: args.testCmd,
         geminiModel: args.geminiModel,
         codexModel: args.codexModel,
+        codexReviewModel: args.codexReviewModel,
       });
 
       if (outcome === 'failed') {
