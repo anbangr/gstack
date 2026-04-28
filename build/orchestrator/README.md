@@ -110,7 +110,11 @@ To force a fresh start: `gstack-build ... --no-resume` or `rm ~/.gstack/build-st
 
 ## Dual Implementor Mode (`--dual-impl`)
 
-Tournament selection: Gemini and GPT-Codex implement each phase **in parallel**, in **isolated git worktrees**, and Claude Opus picks the winner. The winning commits are cherry-picked back onto the main branch and the existing TDD pipeline (test+fix loop → Codex review) takes over from there.
+Tournament selection: Gemini and GPT-Codex implement each TDD phase **in parallel**, in **isolated git worktrees**, and Claude Opus picks the winner. The winning commits are cherry-picked back onto the main branch and the existing TDD pipeline (test+fix loop → Codex review) takes over from there.
+
+**Legacy 2-checkbox plans don't trigger dual-impl** — dual-impl only fires after `tests_red`, which requires a `**Test Specification` checkbox. Setting `--dual-impl` on a legacy plan is silently a no-op for that phase; you'll see normal single-Gemini behavior.
+
+**Required CLIs**: `gemini`, `codex`, and `claude` must all be on `PATH` (or set `GEMINI_BIN` / `CODEX_BIN` / `CLAUDE_BIN`). The orchestrator does not preflight check these — if Codex is missing, `runCodexImpl` will exit non-zero and you'll see one half of the tournament fail. Effectively the phase falls back to "gemini auto-wins via test results" or fails outright if both halves break. Install all three before running.
 
 This eliminates single-model blind spots — if Gemini takes a structurally wrong approach, Codex's independent attempt usually doesn't, and the judge sees both diffs side-by-side.
 
@@ -238,4 +242,4 @@ cd ~/.claude/skills/gstack
 bun test build/orchestrator/__tests__/
 ```
 
-105 tests across 9 files cover: parser edge cases, state persistence atomicity, lock contention, every phase-runner TDD state transition, plan mutator atomicity, ANSI-stripping verdict parser, gbrain frontmatter strip, detectTestCmd detection, buildGeminiTestSpecPrompt prompt structure, and dry-run TDD integration.
+147 tests across 10 files cover: parser edge cases (incl. dual-impl opt stamping), state persistence atomicity, lock contention, every phase-runner state transition (TDD + dual-impl tournament), plan mutator atomicity, ANSI-stripping verdict parser, gbrain frontmatter strip, detectTestCmd detection, prompt-builder shapes (test-spec, dual-impl, judge), worktree primitives (createWorktrees / applyWinner / teardownWorktrees against a real temp git repo), parseFailureCount + parseJudgeVerdict + buildCodexImplArgv, fail-closed paths, and dry-run integration for both single-impl TDD and `--dual-impl` modes.
