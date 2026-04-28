@@ -457,7 +457,7 @@ async function runPhase(args: {
           console.warn('  ⚠ no test command detected; assuming Red for VERIFY_RED');
           result = mockResult({ exitCode: 1, stdout: 'no test command detected; assuming Red' });
         } else {
-          result = await runTests({ testCmd, cwd, slug: state.slug, phaseNumber: phase.number, iteration: action.iteration });
+          result = await runTests({ testCmd, cwd, slug: state.slug, phaseNumber: phase.number, iteration: 1 });
         }
       }
       phaseState = applyResult(phaseState, action, result);
