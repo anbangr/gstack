@@ -214,6 +214,15 @@ export async function runGemini(opts: {
 function mergeOutputFile(result: SubAgentResult, outputFilePath: string): SubAgentResult {
   try {
     const fileContent = fs.readFileSync(outputFilePath, 'utf8');
+    if (fileContent.trim() === '') {
+      // Sub-agent left the output file empty (e.g. Codex applied edits inline but
+      // skipped writing the report). Preserve captured streams so parseVerdict can
+      // still find GATE PASS / GATE FAIL — Codex writes its verdict to stderr.
+      return {
+        ...result,
+        stdout: [result.stdout, result.stderr].filter(Boolean).join('\n'),
+      };
+    }
     return {
       ...result,
       stderr: result.stderr + (result.stdout ? `\n# original stdout:\n${result.stdout}` : ''),
