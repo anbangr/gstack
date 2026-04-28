@@ -207,14 +207,15 @@ describe('verifyPostShip', () => {
     expect(report.join('\n')).toContain('Main sync:   ✅ in sync');
   });
 
-  it('reports HEAD mismatch when local is ahead of origin', async () => {
+  it('reports HEAD mismatch and sets ok=false when local is ahead of origin', async () => {
     // Make a local commit without pushing
     fs.writeFileSync(path.join(repoPath, 'ahead.txt'), 'ahead');
     git(['add', '.'], repoPath);
     git(['commit', '-m', 'local only'], repoPath);
-    const { report } = await verifyPostShip(repoPath, 'main');
+    const { ok, report } = await verifyPostShip(repoPath, 'main');
     // Restore: push so later tests are clean
     git(['push', 'origin', 'main'], repoPath);
+    expect(ok).toBe(false);
     expect(report.join('\n')).toContain('⚠ local HEAD');
   });
 

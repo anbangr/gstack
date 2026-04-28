@@ -253,17 +253,20 @@ export async function verifyPostShip(cwd: string, branch: string): Promise<{ ok:
   // 2. No unmerged feat/* branches on origin (excluding the current branch)
   const fetchResult = run('git', ['fetch', 'origin'], 30_000);
   if (fetchResult.status !== 0 || fetchResult.error) {
-    lines.push(`  Branches:    ⚠ git fetch failed — branch check uses stale data`);
-  }
-  const unmerged = run('git', ['branch', '-r', '--no-merged', 'origin/main']);
-  const unmergedFeat = (unmerged.stdout || '').split('\n')
-    .map((l: string) => l.trim())
-    .filter((l: string) => l.startsWith('origin/feat/') && l !== `origin/${branch}`);
-  if (unmergedFeat.length > 0) {
-    issues.push(`unmerged feat branches: ${unmergedFeat.join(', ')}`);
-    lines.push(`  Branches:    ⚠ unmerged: ${unmergedFeat.join(', ')}`);
+    // Fail-closed: if fetch failed, we can't trust the branch list
+    issues.push('git fetch failed — cannot verify unmerged branch state');
+    lines.push(`  Branches:    ⚠ git fetch failed — cannot verify (check network/auth)`);
   } else {
-    lines.push(`  Branches:    ✅ no unmerged feat/* on origin/main`);
+    const unmerged = run('git', ['branch', '-r', '--no-merged', 'origin/main']);
+    const unmergedFeat = (unmerged.stdout || '').split('\n')
+      .map((l: string) => l.trim())
+      .filter((l: string) => l.startsWith('origin/feat/') && l !== `origin/${branch}`);
+    if (unmergedFeat.length > 0) {
+      issues.push(`unmerged feat branches: ${unmergedFeat.join(', ')}`);
+      lines.push(`  Branches:    ⚠ unmerged: ${unmergedFeat.join(', ')}`);
+    } else {
+      lines.push(`  Branches:    ✅ no unmerged feat/* on origin/main`);
+    }
   }
 
   // 3. Working tree clean
@@ -275,14 +278,16 @@ export async function verifyPostShip(cwd: string, branch: string): Promise<{ ok:
     lines.push(`  Working tree: ✅ clean`);
   }
 
-  // 4. Current HEAD on main matches origin/main
+  // 4. Current HEAD on main matches origin/main (fail-closed: mismatch or unknown → issue)
   const localHeadR = run('git', ['rev-parse', 'HEAD']);
   const remoteHeadR = run('git', ['rev-parse', 'origin/main']);
   const localHead = localHeadR.status === 0 ? localHeadR.stdout?.trim() : null;
   const remoteHead = remoteHeadR.status === 0 ? remoteHeadR.stdout?.trim() : null;
   if (!localHead || !remoteHead) {
+    issues.push('could not determine HEAD — rev-parse failed');
     lines.push(`  Main sync:   ⚠ could not determine HEAD (rev-parse failed)`);
   } else if (localHead !== remoteHead) {
+    issues.push(`local HEAD ${localHead.slice(0, 7)} ≠ origin/main ${remoteHead.slice(0, 7)}`);
     lines.push(`  Main sync:   ⚠ local HEAD ${localHead.slice(0, 7)} ≠ origin/main ${remoteHead.slice(0, 7)}`);
   } else {
     lines.push(`  Main sync:   ✅ in sync`);
