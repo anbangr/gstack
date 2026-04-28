@@ -187,7 +187,14 @@ export function decideNextAction(
       return { type: 'RUN_JUDGE_OPUS', phaseIndex: phaseState.index };
 
     case 'dual_winner_pending': {
-      const winner = phaseState.dualImpl?.selectedImplementor ?? 'gemini';
+      const winner = phaseState.dualImpl?.selectedImplementor;
+      if (!winner) {
+        return {
+          type: 'FAIL',
+          phaseIndex: phaseState.index,
+          reason: 'dual_winner_pending without selectedImplementor — state corrupted',
+        };
+      }
       return { type: 'APPLY_WINNER', phaseIndex: phaseState.index, winner };
     }
 
@@ -375,9 +382,12 @@ export function applyResult(
       next.error = `Dual implementation failed: exit ${result.exitCode}`;
       return next;
     }
-    if (extra?.dualImplInit) {
-      next.dualImpl = { ...(phaseState.dualImpl ?? {}), ...extra.dualImplInit };
+    if (!extra?.dualImplInit) {
+      next.status = 'failed';
+      next.error = 'RUN_DUAL_IMPL requires dualImplInit (worktree paths/branches/baseCommit) in extra';
+      return next;
     }
+    next.dualImpl = { ...(phaseState.dualImpl ?? {}), ...extra.dualImplInit };
     next.status = 'dual_impl_done';
     return next;
   }
@@ -390,6 +400,18 @@ export function applyResult(
       next.error = 'RUN_DUAL_TESTS requires geminiTestResult and codexTestResult in extra';
       return next;
     }
+    // Both timing out is treated as a hard failure — no test evidence to pick a winner.
+    if (g.timedOut && c.timedOut) {
+      next.dualImpl = {
+        ...(phaseState.dualImpl as any),
+        geminiTestResult: g,
+        codexTestResult: c,
+      };
+      next.status = 'failed';
+      next.error = 'Both dual-impl test runs timed out — cannot select a winner';
+      return next;
+    }
+
     const gPass = g.testExitCode === 0 && !g.timedOut;
     const cPass = c.testExitCode === 0 && !c.timedOut;
 
@@ -404,6 +426,18 @@ export function applyResult(
       selectedImplementor = 'codex';
       nextStatus = 'dual_winner_pending';
     } else {
+      // Both failed (no timeouts). If failureCount is missing on both, fail closed —
+      // we have no signal to choose a winner.
+      if (g.failureCount == null && c.failureCount == null) {
+        next.dualImpl = {
+          ...(phaseState.dualImpl as any),
+          geminiTestResult: g,
+          codexTestResult: c,
+        };
+        next.status = 'failed';
+        next.error = 'Both dual-impl test runs failed and failureCount is missing on both — cannot select winner';
+        return next;
+      }
       const gFails = g.failureCount ?? Number.MAX_SAFE_INTEGER;
       const cFails = c.failureCount ?? Number.MAX_SAFE_INTEGER;
       selectedImplementor = cFails < gFails ? 'codex' : 'gemini';

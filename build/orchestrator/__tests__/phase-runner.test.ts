@@ -474,4 +474,56 @@ describe('Dual-implementor state machine transitions', () => {
     const action = decideNextAction(state, 5, singlePhase);
     expect(action.type).toBe('RUN_GEMINI');
   });
+
+  // Fail-closed: dual_winner_pending without selectedImplementor → FAIL
+  it('dual_winner_pending without selectedImplementor → FAIL (fail-closed)', () => {
+    const state = basePhase({ status: 'dual_winner_pending' as any, dualImpl: minDualImpl() });
+    const action = decideNextAction(state);
+    expect(action.type).toBe('FAIL');
+  });
+
+  // Fail-closed: RUN_DUAL_IMPL without dualImplInit → status failed
+  it('RUN_DUAL_IMPL without dualImplInit in extra → status failed', () => {
+    const initial = basePhase({ status: 'dual_impl_running' as any });
+    const next = applyResult(
+      initial,
+      { type: 'RUN_DUAL_IMPL', phaseIndex: 0, iteration: 1 } as any,
+      geminiSuccess()
+      // no extra
+    );
+    expect(next.status).toBe('failed');
+    expect(next.error).toMatch(/dualImplInit/);
+  });
+
+  // Fail-closed: both timed out → status failed (no auto-select)
+  it('RUN_DUAL_TESTS with both timed out → status failed', () => {
+    const initial = basePhase({ status: 'dual_impl_done' as any, dualImpl: minDualImpl() });
+    const next = applyResult(
+      initial,
+      { type: 'RUN_DUAL_TESTS', phaseIndex: 0 } as any,
+      geminiSuccess(),
+      {
+        geminiTestResult: { worktreePath: '/g', testExitCode: null, testLogPath: 'g.log', timedOut: true },
+        codexTestResult: { worktreePath: '/c', testExitCode: null, testLogPath: 'c.log', timedOut: true },
+      }
+    );
+    expect(next.status).toBe('failed');
+    expect(next.error).toMatch(/timed out/);
+  });
+
+  // Fail-closed: both fail with no failureCount → status failed
+  it('RUN_DUAL_TESTS both fail with missing failureCount on both → status failed', () => {
+    const initial = basePhase({ status: 'dual_impl_done' as any, dualImpl: minDualImpl() });
+    const next = applyResult(
+      initial,
+      { type: 'RUN_DUAL_TESTS', phaseIndex: 0 } as any,
+      geminiSuccess(),
+      {
+        geminiTestResult: { worktreePath: '/g', testExitCode: 1, testLogPath: 'g.log', timedOut: false },
+        codexTestResult: { worktreePath: '/c', testExitCode: 1, testLogPath: 'c.log', timedOut: false },
+      }
+    );
+    expect(next.status).toBe('failed');
+    expect(next.error).toMatch(/failureCount/);
+  });
 });
