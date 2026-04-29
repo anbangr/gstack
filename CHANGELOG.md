@@ -5,6 +5,23 @@
 > Fork-only changes ahead of `garrytan/gstack:main` (currently at v1.17.0.0).
 > When syncing from upstream after their next release, give the entries below real versions + dates.
 
+## **`gstack-build` startup gates: clean check + feat/* sweep (build skill v1.18.0)**
+
+Two preflight gates run before any phase begins:
+
+1. **Pre-build clean check** — `git status --porcelain` filtered to tracked changes only (untracked `??` lines excluded). If dirty, exits 1 with a summary of modified/staged files. Bypass: `--skip-clean-check`.
+2. **Unshipped feat/* sweep** — fetches `origin`, finds all `feat/*` branches not merged into `origin/main` (excluding the current build branch), checks each out, runs `shipAndDeploy`, and returns. Warn-and-continue on per-branch failure. Bypass: `--skip-sweep`.
+
+Both gates skip automatically when `--dry-run` or `--skip-ship` is active.
+
+### Added
+- `checkWorkingTreeClean(cwd)` exported from `cli.ts` — pure function, uses `git status --porcelain`.
+- `findUnshippedFeatBranches(cwd, currentBranch)` exported from `cli.ts` — fetches origin, returns unmerged `feat/*` branch names excluding current branch.
+- `sweepUnshippedFeatBranches(cwd, currentBranch, slug)` in `cli.ts` — iterates unshipped branches, ships each, always restores original branch.
+- `--skip-clean-check` / `--skip-sweep` CLI flags in `Args`, `parseArgs()`, and `HELP_TEXT`.
+- `__tests__/startup.test.ts` — 8 unit tests using real temp git repos + local bare remotes.
+- 5 flag tests added to `__tests__/cli.test.ts`.
+
 ## **`gstack-build` dual-implementor tournament mode (build skill v1.17.0)**
 
 `gstack-build --dual-impl` runs Gemini and GPT-Codex in parallel on every implementation phase, then has Claude Opus judge which version to adopt. Both implementors work in isolated git worktrees so they never see each other's code. Opus evaluates both diffs and test results and emits a `WINNER:` verdict with reasoning. The winning version is cherry-picked (or patch-applied as fallback) onto the main branch; existing TDD test+fix loop and Codex review then run on the winner. Auto-selection (no judge) fires when one implementation passes and the other fails, or when both fail (fewer-failures winner). This eliminates single-model blind spots and surfaces structurally different solutions for Opus to arbitrate.

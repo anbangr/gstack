@@ -90,6 +90,10 @@ export interface Args {
   codexModel: string;
   /** Model for Codex review pass. Default: gpt-5.5. */
   codexReviewModel: string;
+  /** Skip the pre-build working tree dirty check. */
+  skipCleanCheck: boolean;
+  /** Skip the unshipped feat/* branch sweep at startup. */
+  skipSweep: boolean;
 }
 
 export function parseArgs(argv: string[]): Args {
@@ -105,6 +109,8 @@ export function parseArgs(argv: string[]): Args {
     geminiModel: 'gemini-3.1-pro-preview',
     codexModel: 'gpt-5.3-codex-spark',
     codexReviewModel: 'gpt-5.5',
+    skipCleanCheck: false,
+    skipSweep: false,
   };
   const positional: string[] = [];
   for (let i = 0; i < argv.length; i++) {
@@ -114,6 +120,8 @@ export function parseArgs(argv: string[]): Args {
     else if (a === '--no-resume' || a === '--restart') args.noResume = true;
     else if (a === '--no-gbrain') args.noGbrain = true;
     else if (a === '--skip-ship') args.skipShip = true;
+    else if (a === '--skip-clean-check') args.skipCleanCheck = true;
+    else if (a === '--skip-sweep') args.skipSweep = true;
     else if (a === '--dual-impl') args.dualImpl = true;
     else if (a === '--gemini-model') {
       const next = argv[++i];
@@ -168,6 +176,8 @@ Flags:
   --no-resume          Ignore existing state, start fresh.
   --no-gbrain          Skip gbrain mirror; local JSON only.
   --skip-ship          Skip the final /ship + /land-and-deploy step.
+  --skip-clean-check   Skip the pre-build working tree dirty check.
+  --skip-sweep         Skip the unshipped feat/* branch sweep at startup.
   --dual-impl          Tournament mode: Gemini and Codex implement in parallel
                        (isolated git worktrees), Opus judges and the winner
                        is cherry-picked back. Existing TDD pipeline runs after.
@@ -1242,7 +1252,26 @@ async function main() {
     process.exit(2);
   }
 
+  const cwdForPreflight = path.dirname(args.planFile).includes('plans')
+    ? path.resolve(path.dirname(args.planFile), '..')
+    : path.dirname(args.planFile);
+
+  if (!args.skipCleanCheck && !args.dryRun && !args.skipShip) {
+    const { clean, dirty } = checkWorkingTreeClean(cwdForPreflight);
+    if (!clean) {
+      console.error('\n✗ working tree has uncommitted changes — commit or stash before building:\n');
+      for (const f of dirty) console.error(`  ${f}`);
+      console.error('\n  (use --skip-clean-check to bypass)\n');
+      process.exit(1);
+    }
+  }
+
   const slug = deriveSlug(args.planFile);
+
+  const currentBranchForSweep = getCurrentBranch();
+  if (!args.skipSweep && !args.dryRun && !args.skipShip) {
+    await sweepUnshippedFeatBranches(cwdForPreflight, currentBranchForSweep, slug);
+  }
 
   // Lock contention check.
   if (!acquireLock(slug)) {
@@ -1410,6 +1439,51 @@ async function main() {
   }
 
   process.exit(exitCode);
+}
+
+export function checkWorkingTreeClean(cwd: string): { clean: boolean; dirty: string[] } {
+  const r = spawnSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8' });
+  const lines = (r.stdout || '').split('\n').filter(Boolean);
+  const dirty = lines.filter((l: string) => !l.startsWith('??'));
+  return { clean: dirty.length === 0, dirty };
+}
+
+export function findUnshippedFeatBranches(cwd: string, currentBranch: string): string[] {
+  spawnSync('git', ['fetch', 'origin'], { cwd, encoding: 'utf8' });
+  const r = spawnSync('git', ['branch', '-r', '--no-merged', 'origin/main'], { cwd, encoding: 'utf8' });
+  return (r.stdout || '')
+    .split('\n')
+    .map((l: string) => l.trim())
+    .filter((l: string) => l.startsWith('origin/feat/'))
+    .map((l: string) => l.replace(/^origin\//, ''))
+    .filter((b: string) => b !== currentBranch);
+}
+
+async function sweepUnshippedFeatBranches(
+  cwd: string,
+  currentBranch: string,
+  slug: string
+): Promise<void> {
+  const branches = findUnshippedFeatBranches(cwd, currentBranch);
+  if (branches.length === 0) return;
+
+  console.log(`\n▶ Unshipped feat/* branches: ${branches.join(', ')}`);
+  for (const branch of branches) {
+    console.log(`\n  ↳ checking out ${branch} and running /ship + /land-and-deploy...`);
+    spawnSync('git', ['checkout', branch], { cwd, encoding: 'utf8' });
+    const result = await shipAndDeploy({
+      cwd,
+      slug: `${slug}-sweep-${branch.replace(/[^a-z0-9-]/g, '-')}`,
+    });
+    if (result.exitCode !== 0 || result.timedOut) {
+      console.warn(`  ⚠ ship failed for ${branch} (exit ${result.exitCode}) — continuing`);
+    } else {
+      console.log(`  ✓ shipped ${branch}`);
+    }
+  }
+  if (getCurrentBranch() !== currentBranch) {
+    spawnSync('git', ['checkout', currentBranch], { cwd, encoding: 'utf8' });
+  }
 }
 
 function getCurrentBranch(): string {
