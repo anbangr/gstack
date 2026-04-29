@@ -201,6 +201,71 @@ describe('parseJudgeVerdict (Opus tournament judge output)', () => {
     const result = parseJudgeVerdict(diagnosticMsg);
     expect(result.verdict).toBeNull();
   });
+
+  it('extracts HARDENING notes when all three sections are present', () => {
+    const out =
+      'WINNER: gemini\nREASONING: cleaner implementation\nHARDENING:\n- Handle null input in processPayment\n- Guard against empty worktree path\n';
+    const result = parseJudgeVerdict(out);
+    expect(result.verdict).toBe('gemini');
+    expect(result.reasoning).toContain('cleaner implementation');
+    expect(result.hardeningNotes).toContain('Handle null input');
+    expect(result.hardeningNotes).toContain('Guard against empty worktree path');
+  });
+
+  it('returns empty hardeningNotes when HARDENING section is absent', () => {
+    const out = 'WINNER: codex\nREASONING: fewer abstractions\n';
+    const result = parseJudgeVerdict(out);
+    expect(result.verdict).toBe('codex');
+    expect(result.hardeningNotes).toBe('');
+  });
+
+  it('REASONING does not bleed into HARDENING section', () => {
+    const out = 'WINNER: gemini\nREASONING: good structure\nHARDENING:\n- edge case A\n';
+    const result = parseJudgeVerdict(out);
+    expect(result.reasoning).not.toContain('edge case A');
+    expect(result.hardeningNotes).toContain('edge case A');
+  });
+
+  it('extracts HARDENING when it appears before REASONING (order variation)', () => {
+    const out = 'WINNER: codex\nHARDENING:\n- null check missing\nREASONING: overall better approach\n';
+    const result = parseJudgeVerdict(out);
+    expect(result.verdict).toBe('codex');
+    expect(result.hardeningNotes).toContain('null check missing');
+    expect(result.reasoning).toContain('overall better approach');
+  });
+
+  it('parses correctly when input has Windows CRLF line endings', () => {
+    const out = 'WINNER: gemini\r\nREASONING: clean impl\r\nHARDENING:\r\n- guard null path\r\n';
+    const result = parseJudgeVerdict(out);
+    expect(result.verdict).toBe('gemini');
+    expect(result.reasoning).toContain('clean impl');
+    expect(result.hardeningNotes).toContain('guard null path');
+  });
+
+  it('HARDENING: -> none identified inline sentinel is captured and does not bleed into REASONING', () => {
+    const out =
+      'WINNER: codex\n' +
+      'REASONING: both implementations are clean with no major differences.\n' +
+      'HARDENING: -> none identified\n';
+    const result = parseJudgeVerdict(out);
+    expect(result.verdict).toBe('codex');
+    expect(result.reasoning).not.toContain('none identified');
+    expect(result.hardeningNotes).toContain('none identified');
+  });
+
+  it('REASONING does not truncate when "HARDENING:" appears mid-sentence in prose', () => {
+    // Fix #3: tightened regex requires HARDENING: to be standalone or bullet-prefixed.
+    // A sentence containing "HARDENING:" as prose should not end the REASONING block.
+    const out =
+      'WINNER: gemini\n' +
+      'REASONING: The key concern is HARDENING: this is prose, not a section. More text here.\n' +
+      'HARDENING:\n' +
+      '- actual hardening note\n';
+    const result = parseJudgeVerdict(out);
+    expect(result.verdict).toBe('gemini');
+    expect(result.reasoning).toContain('HARDENING: this is prose');
+    expect(result.hardeningNotes).toContain('actual hardening note');
+  });
 });
 
 describe('buildCodexImplArgv (codex exec invocation shape)', () => {
