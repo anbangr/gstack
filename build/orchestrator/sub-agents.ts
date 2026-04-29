@@ -636,8 +636,9 @@ export function buildCodexImplArgv(opts: {
 /**
  * Run the Codex implementation pass for one half of a dual-impl tournament.
  * Mirrors runGemini's structure: file-path I/O, captured output, single retry
- * on timeout. Each call expects to be running in an isolated git worktree so
- * danger-full-access is safe (changes can't leak to main cwd).
+ * on timeout. Default sandbox is workspace-write because git worktrees share
+ * .git/remotes with the parent repo — danger-full-access would allow Codex to
+ * push or delete remote branches. Override via GSTACK_BUILD_CODEX_IMPL_SANDBOX.
  */
 export async function runCodexImpl(opts: {
   inputFilePath: string;

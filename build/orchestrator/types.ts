@@ -69,7 +69,6 @@ export interface DualImplState {
   geminiBranch: string;
   codexBranch: string;
   baseCommit: string;
-  codexImpl?: SubAgentInvocation;
   geminiTestResult?: DualImplTestResult;
   codexTestResult?: DualImplTestResult;
   judgeLogPath?: string;

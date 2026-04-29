@@ -460,7 +460,8 @@ export function buildJudgePrompt(opts: {
   codexTestResult: DualImplTestResult;
 }): string {
   const { phase, geminiDiff, codexDiff, geminiTestResult, codexTestResult } = opts;
-  const trim = (s: string, max = 5000) =>
+  // 40 000 chars ≈ 500 lines × 80 chars — matches the design spec cap.
+  const trim = (s: string, max = 40000) =>
     s.length <= max ? s : s.slice(0, max) + `\n\n[...truncated ${s.length - max} bytes]`;
 
   const fmtTest = (r: DualImplTestResult) =>
@@ -885,12 +886,14 @@ async function runPhase(args: {
         const gCommitted = gCommits > 0;
         const cCommitted = cCommits > 0;
 
-        // Catastrophic = timeout, OR both have non-zero exit, OR neither committed.
-        const eitherTimedOut = gRes.timedOut || cRes.timedOut;
+        // Catastrophic = BOTH timed out, OR both exited non-zero, OR neither committed.
+        // One-sided timeout is NOT catastrophic — if only one side timed out but the
+        // other committed work, the auto-select logic below handles it (committed side wins).
+        const bothTimedOut = gRes.timedOut && cRes.timedOut;
         const bothExitNonZero = gRes.exitCode !== 0 && cRes.exitCode !== 0;
         const neitherCommitted = !gCommitted && !cCommitted;
 
-        if (eitherTimedOut || bothExitNonZero || neitherCommitted) {
+        if (bothTimedOut || bothExitNonZero || neitherCommitted) {
           phaseState.status = 'failed';
           phaseState.error =
             `Dual implementation failed: ` +
@@ -1036,7 +1039,7 @@ async function runPhase(args: {
       }
 
       let verdict: 'gemini' | 'codex' | null;
-      let reasoning: string;
+      let reasoning = '';
       let logPath = 'dryrun';
 
       if (dryRun) {
