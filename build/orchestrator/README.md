@@ -112,7 +112,7 @@ To force a fresh start: `gstack-build ... --no-resume` or `rm ~/.gstack/build-st
 
 Tournament selection: Gemini and GPT-Codex implement each TDD phase **in parallel**, in **isolated git worktrees**, and Claude Opus picks the winner. The winning commits are cherry-picked back onto the main branch and the existing TDD pipeline (test+fix loop → Codex review) takes over from there.
 
-**Legacy 2-checkbox plans don't trigger dual-impl** — dual-impl only fires after `tests_red`, which requires a `**Test Specification` checkbox. Setting `--dual-impl` on a legacy plan is silently a no-op for that phase; you'll see normal single-Gemini behavior.
+**Prewritten test specs are supported** — if a phase has `[x] **Test Specification` already checked (user wrote the tests before running gstack), dual-impl runs `VERIFY_RED` first to confirm the tests fail, then spawns both implementors. If the prewritten tests pass trivially (before any implementation), the phase fails with a clear message: fix the tests so they fail, then re-run. **Legacy 2-checkbox plans** (no test spec checkbox at all) still skip dual-impl silently and use normal single-Gemini behavior.
 
 **Required CLIs**: `gemini`, `codex`, and `claude` must all be on `PATH` (or set `GEMINI_BIN` / `CODEX_BIN` / `CLAUDE_BIN`). The orchestrator does not preflight check these — if Codex fails to produce committed work, `countCommitsSinceBase` returns 0 for the Codex side, making it ineligible. If only Gemini committed, it is auto-selected and dual-tests + judge are skipped (`selectedBy='auto'`). If neither committed, the phase fails. Install all three before running.
 
@@ -167,7 +167,7 @@ Manual recovery: `git worktree list` to find leftover worktrees, then `git workt
 
 ### Backward compat
 
-`--dual-impl` is a runtime-only flag. Plans don't need any per-phase frontmatter — when the flag is set, every parsed phase gets `dualImpl=true`. Legacy 2-checkbox plans still work; dual-impl only fires after `tests_red`, so test-spec-less phases skip it silently.
+`--dual-impl` is a runtime-only flag. Plans don't need any per-phase frontmatter — when the flag is set, every parsed phase gets `dualImpl=true`. Prewritten test-spec phases (where `[x] **Test Specification` is already checked) now run `VERIFY_RED` first before spawning both implementors. Legacy 2-checkbox plans (no test-spec checkbox at all) still skip dual-impl and use the normal single-Gemini path.
 
 ## Environment variables
 
@@ -250,4 +250,4 @@ cd ~/.claude/skills/gstack
 bun test build/orchestrator/__tests__/
 ```
 
-194 tests across 11 files cover: parser edge cases (incl. dual-impl opt stamping), state persistence atomicity, lock contention, every phase-runner state transition (TDD + dual-impl tournament), plan mutator atomicity, ANSI-stripping verdict parser, gbrain frontmatter strip, detectTestCmd detection, prompt-builder shapes (test-spec, dual-impl, judge), worktree primitives (createWorktrees / applyWinner / teardownWorktrees against a real temp git repo), parseFailureCount + parseJudgeVerdict + buildCodexImplArgv, fail-closed paths, and dry-run integration for both single-impl TDD and `--dual-impl` modes.
+198 tests across 11 files cover: parser edge cases (incl. dual-impl opt stamping), state persistence atomicity, lock contention, every phase-runner state transition (TDD + dual-impl tournament), plan mutator atomicity, ANSI-stripping verdict parser, gbrain frontmatter strip, detectTestCmd detection, prompt-builder shapes (test-spec, dual-impl, judge), worktree primitives (createWorktrees / applyWinner / teardownWorktrees against a real temp git repo), parseFailureCount + parseJudgeVerdict + buildCodexImplArgv, fail-closed paths, and dry-run integration for both single-impl TDD and `--dual-impl` modes.

@@ -70,6 +70,11 @@ export function decideNextAction(
       if (phase && !phase.testSpecDone) {
         return { type: 'RUN_GEMINI_TEST_SPEC', phaseIndex: phaseState.index, iteration: 1 };
       }
+      // Prewritten test spec + dual-impl: confirm tests are red before spawning
+      // both implementors — same guarantee as the standard TDD path.
+      if (phase?.dualImpl) {
+        return { type: 'VERIFY_RED', phaseIndex: phaseState.index };
+      }
       return {
         type: 'RUN_GEMINI',
         phaseIndex: phaseState.index,
@@ -87,6 +92,17 @@ export function decideNextAction(
       };
 
     case 'test_spec_running':
+      // Prewritten test spec landed here because VERIFY_RED found the tests pass
+      // trivially. Re-running the test spec generator makes no sense — the spec
+      // is user-authored and we can't rewrite it. Fail with a clear message.
+      if (phase?.testSpecDone) {
+        return {
+          type: 'FAIL',
+          phaseIndex: phaseState.index,
+          reason:
+            'Prewritten tests pass before implementation — fix the tests so they fail first, then re-run with --dual-impl',
+        };
+      }
       return {
         type: 'RUN_GEMINI_TEST_SPEC',
         phaseIndex: phaseState.index,
@@ -107,9 +123,10 @@ export function decideNextAction(
       };
 
     case 'gemini_done':
-      // For TDD phases (testSpecDone was false), run tests after implementation.
-      // For legacy phases (testSpecDone=true), go straight to Codex review.
-      if (phase && !phase.testSpecDone) {
+      // For TDD phases (testSpecDone=false) or prewritten-testspec+dual-impl phases,
+      // run tests to verify the adopted code on main cwd.
+      // For legacy phases (testSpecDone=true, !dualImpl), go straight to Codex review.
+      if (phase && (!phase.testSpecDone || phase.dualImpl)) {
         return {
           type: 'RUN_TESTS',
           phaseIndex: phaseState.index,
