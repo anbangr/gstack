@@ -3,9 +3,35 @@
 ## [Unreleased]
 
 > Fork-only changes ahead of `garrytan/gstack:main` (currently at v1.17.0.0).
-> Version on this fork is held at v1.15.0.0 to avoid collision when upstream
-> next bumps. When syncing from upstream after their next release, give this
-> entry a real version + date.
+> When syncing from upstream after their next release, give the entries below real versions + dates.
+
+## **`gstack-build` dual-implementor tournament mode (build skill v1.17.0)**
+
+`gstack-build --dual-impl` runs Gemini and GPT-Codex in parallel on every implementation phase, then has Claude Opus judge which version to adopt. Both implementors work in isolated git worktrees so they never see each other's code. Opus evaluates both diffs and test results and emits a `WINNER:` verdict with reasoning. The winning version is cherry-picked (or patch-applied as fallback) onto the main branch; existing TDD test+fix loop and Codex review then run on the winner. Auto-selection (no judge) fires when one implementation passes and the other fails, or when both fail (fewer-failures winner). This eliminates single-model blind spots and surfaces structurally different solutions for Opus to arbitrate.
+
+### Added
+- `--dual-impl` CLI flag. When set, stamps `phase.dualImpl=true` on all phases and activates tournament mode for each implementation step.
+- `worktree.ts` — `createWorktrees`, `applyWinner` (cherry-pick + patch fallback), `teardownWorktrees` (idempotent). Worktrees live under `$TMPDIR/gstack-dual-<slug>-p<N>-<ts>/gemini|codex`.
+- `runCodexImpl()` in `sub-agents.ts` — spawns `codex exec` with `workspace-write` sandbox (safer than `danger-full-access` in linked worktrees) and `xhigh` reasoning effort.
+- `runJudgeOpus()` in `sub-agents.ts` — invokes Claude Opus, parses anchored `WINNER: gemini|codex` + `REASONING:` lines. Returns `null` verdict on empty/malformed output (fail-closed: falls back to gemini + warning).
+- `parseFailureCount()` in `sub-agents.ts` — extracts failure count from bun/jest/pytest output for auto-selection scoring.
+- `parseJudgeVerdict()` in `sub-agents.ts` — strict anchored `WINNER:` line parser (case-insensitive value, strips ANSI). Returns `null` on any parse failure.
+- `buildCodexImplArgv()` / `buildCodexReviewArgv()` in `sub-agents.ts` — pure argv builders for Codex invocations (unit-testable, injectable model + sandbox + reasoning).
+- `buildCodexImplPromptBody()` and `buildJudgePrompt()` in `cli.ts` — prompt constructors for Codex implementor and Opus judge (diff truncation at 40 000 chars with `[...truncated]` marker).
+- 6 new `PhaseStatus` values: `dual_impl_running`, `dual_impl_done`, `dual_tests_running`, `dual_judge_pending`, `dual_judge_running`, `dual_winner_pending`.
+- `DualImplState` and `DualImplTestResult` types in `types.ts`.
+- 4 new `Action` types: `RUN_DUAL_IMPL`, `RUN_DUAL_TESTS`, `RUN_JUDGE_OPUS`, `APPLY_WINNER`.
+- `--gemini-model` / `--codex-model` / `--codex-review-model` defaults wired through dual-impl dispatch.
+- Startup sweep for stale `gstack-dual-*` worktrees older than 24 h.
+
+### Fixed
+- `state.ts`: `freshState()` now correctly emits `impl_done` (was `gemini_done`). `loadState()` migrates persisted `gemini_done` phases in both the local JSON path and the gbrain fallback path via a shared `migrateState()` helper.
+- `phase-runner.ts`: `test_spec_running` + `testSpecDone=true` now only FAILs when `redSpecAttempts > 0` (VERIFY_RED actually ran). With `redSpecAttempts=0` (crash before first VERIFY_RED), it retries VERIFY_RED instead of spuriously failing the phase.
+- `phase-runner.ts`: `pending` + `dualImpl=true` correctly skips VERIFY_RED for legacy 2-checkbox plans (`testSpecCheckboxLine === -1`), keeping the unchanged single-Gemini flow for those plans.
+
+### Changed
+- `build/SKILL.md.tmpl` (and regenerated `build/SKILL.md`) bumped to v1.17.0.
+- `build/orchestrator/README.md` extended with Dual Implementor section (workflow, `--dual-impl` flag, worktree isolation, judge format, auto-select conditions, recovery guide).
 
 ## **`gstack-build` model selection + hardening (build skill v1.16.0)**
 

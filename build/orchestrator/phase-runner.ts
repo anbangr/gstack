@@ -95,16 +95,22 @@ export function decideNextAction(
       };
 
     case 'test_spec_running':
-      // Prewritten test spec landed here because VERIFY_RED found the tests pass
-      // trivially. Re-running the test spec generator makes no sense — the spec
-      // is user-authored and we can't rewrite it. Fail with a clear message.
       if (phase?.testSpecDone) {
-        return {
-          type: 'FAIL',
-          phaseIndex: phaseState.index,
-          reason:
-            'Prewritten tests pass before implementation — fix the tests so they fail first, then re-run with --dual-impl',
-        };
+        // Prewritten test spec: VERIFY_RED ran and found tests pass trivially.
+        // Re-running the test spec generator makes no sense — the spec is
+        // user-authored. Fail with a clear message.
+        if ((phaseState.redSpecAttempts ?? 0) > 0) {
+          return {
+            type: 'FAIL',
+            phaseIndex: phaseState.index,
+            reason:
+              'Prewritten tests pass before implementation — fix the tests so they fail first, then re-run with --dual-impl',
+          };
+        }
+        // redSpecAttempts=0: process crashed between writing test_spec_running
+        // and launching VERIFY_RED. Retry VERIFY_RED rather than spuriously
+        // failing or running the test spec generator on a prewritten spec.
+        return { type: 'VERIFY_RED', phaseIndex: phaseState.index };
       }
       return {
         type: 'RUN_GEMINI_TEST_SPEC',

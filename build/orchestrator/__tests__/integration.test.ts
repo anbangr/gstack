@@ -96,7 +96,7 @@ test("dry-run with --dual-impl announces Dual Impl, Judge Opus, and Apply Winner
   expect(out).toContain("Dual Tests");
   expect(out).toContain("Judge Opus");
   expect(out).toContain("Apply Winner");
-  // TDD steps still run after dual-impl hands off to gemini_done.
+  // TDD steps still run after dual-impl hands off to impl_done.
   expect(out).toContain("Test Specification");
   expect(out).toContain("Verify Red");
   // Dry-run must complete successfully.

@@ -1,7 +1,7 @@
 ---
 name: build
 preamble-tier: 4
-version: 1.16.0
+version: 1.17.0
 description: |
   Autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews

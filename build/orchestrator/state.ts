@@ -51,6 +51,13 @@ function ensureStateDir(): void {
   fs.mkdirSync(STATE_DIR, { recursive: true });
 }
 
+function migrateState(state: BuildState): BuildState {
+  state.phases = state.phases.map((ph) =>
+    (ph.status as string) === 'gemini_done' ? { ...ph, status: 'impl_done' } : ph
+  );
+  return state;
+}
+
 export function ensureLogDir(slug: string): void {
   fs.mkdirSync(logDir(slug), { recursive: true });
 }
@@ -126,11 +133,7 @@ export function loadState(slug: string, opts: PersistOptions = {}): BuildState |
         `state file at ${p} is corrupt (${(err as Error).message}). Inspect or delete to start fresh.`
       );
     }
-    // Migration: pre-rename persisted states use 'gemini_done'; map to 'impl_done'.
-    parsed.phases = parsed.phases.map((ph) =>
-      (ph.status as string) === 'gemini_done' ? { ...ph, status: 'impl_done' } : ph
-    );
-    return parsed;
+    return migrateState(parsed);
   }
 
   if (opts.noGbrain) return null;
@@ -139,7 +142,7 @@ export function loadState(slug: string, opts: PersistOptions = {}): BuildState |
   const fromBrain = gbrainGet(slug);
   if (!fromBrain) return null;
   try {
-    const parsed = JSON.parse(fromBrain) as BuildState;
+    const parsed = migrateState(JSON.parse(fromBrain) as BuildState);
     // Mirror back to local JSON so subsequent reads are fast and the
     // local file is the canonical source.
     saveState(parsed, { noGbrain: true });

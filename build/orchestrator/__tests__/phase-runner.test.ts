@@ -307,6 +307,7 @@ describe('TDD state machine transitions', () => {
     reviewDone: false, reviewCheckboxLine: 12,
     dualImpl: false,
   };
+  const prewrittenDual: Phase = { ...prewrittenPhase, dualImpl: true };
 
   it('pending with testSpecDone=false → RUN_GEMINI_TEST_SPEC', () => {
     const state: PhaseState = { index: 0, number: '1', name: 'TDD', status: 'pending' as any };
@@ -328,14 +329,12 @@ describe('TDD state machine transitions', () => {
   });
 
   it('pending with prewritten testspec + dual-impl → VERIFY_RED (not RUN_GEMINI)', () => {
-    const prewrittenDual: Phase = { ...prewrittenPhase, dualImpl: true };
     const state: PhaseState = { index: 0, number: '1', name: 'PrewrittenDual', status: 'pending' as any };
     const action = decideNextAction(state, 5, prewrittenDual);
     expect(action.type).toBe('VERIFY_RED');
   });
 
   it('test_spec_running with prewritten testspec (VERIFY_RED found trivially passing) → FAIL', () => {
-    const prewrittenDual: Phase = { ...prewrittenPhase, dualImpl: true };
     const state: PhaseState = {
       index: 0, number: '1', name: 'PrewrittenDual',
       status: 'test_spec_running' as any,
@@ -344,6 +343,18 @@ describe('TDD state machine transitions', () => {
     const action = decideNextAction(state, 5, prewrittenDual);
     expect(action.type).toBe('FAIL');
     expect((action as any).reason).toMatch(/Prewritten tests pass/);
+  });
+
+  it('test_spec_running crash-resume (redSpecAttempts=0) → VERIFY_RED (not FAIL)', () => {
+    // If process crashes between writing test_spec_running and spawning VERIFY_RED,
+    // redSpecAttempts stays 0. Must re-run VERIFY_RED, not spuriously FAIL.
+    const state: PhaseState = {
+      index: 0, number: '1', name: 'PrewrittenDual',
+      status: 'test_spec_running' as any,
+      redSpecAttempts: 0,
+    };
+    const action = decideNextAction(state, 5, prewrittenDual);
+    expect(action.type).toBe('VERIFY_RED');
   });
 
   it('test_spec_running without prewritten testspec → RUN_GEMINI_TEST_SPEC (unchanged)', () => {
@@ -357,7 +368,6 @@ describe('TDD state machine transitions', () => {
   });
 
   it('impl_done with prewritten testspec + dual-impl → RUN_TESTS (verify winner on main cwd)', () => {
-    const prewrittenDual: Phase = { ...prewrittenPhase, dualImpl: true };
     const state: PhaseState = { index: 0, number: '1', name: 'PrewrittenDual', status: 'impl_done' as any };
     const action = decideNextAction(state, 5, prewrittenDual);
     expect(action.type).toBe('RUN_TESTS');

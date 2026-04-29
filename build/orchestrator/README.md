@@ -140,7 +140,7 @@ gstack-build plans/...md --dual-impl
                          emits "WINNER: gemini|codex" + REASONING
 6. Apply Winner        — cherry-pick winning branch's commits onto main cwd
                          (patch fallback if cherry-pick conflicts)
-7. — handoff —         — phase rejoins gemini_done; existing TDD loop runs
+7. — handoff —         — phase rejoins impl_done; existing TDD loop runs
 8. Test+Fix Loop       — adopted code is verified again on main cwd
 9. Codex Review        — final review on main cwd
 ```
