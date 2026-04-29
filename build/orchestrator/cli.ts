@@ -1268,7 +1268,7 @@ async function main() {
 
   const slug = deriveSlug(args.planFile);
 
-  const currentBranchForSweep = getCurrentBranch();
+  const currentBranchForSweep = getCurrentBranch(cwdForPreflight);
   if (!args.skipSweep && !args.dryRun && !args.skipShip) {
     await sweepUnshippedFeatBranches(cwdForPreflight, currentBranchForSweep, slug);
   }
@@ -1468,28 +1468,36 @@ async function sweepUnshippedFeatBranches(
   if (branches.length === 0) return;
 
   console.log(`\n▶ Unshipped feat/* branches: ${branches.join(', ')}`);
-  for (const branch of branches) {
-    console.log(`\n  ↳ checking out ${branch} and running /ship + /land-and-deploy...`);
-    spawnSync('git', ['checkout', branch], { cwd, encoding: 'utf8' });
-    const result = await shipAndDeploy({
-      cwd,
-      slug: `${slug}-sweep-${branch.replace(/[^a-z0-9-]/g, '-')}`,
-    });
-    if (result.exitCode !== 0 || result.timedOut) {
-      console.warn(`  ⚠ ship failed for ${branch} (exit ${result.exitCode}) — continuing`);
-    } else {
-      console.log(`  ✓ shipped ${branch}`);
+  try {
+    for (const branch of branches) {
+      console.log(`\n  ↳ checking out ${branch} and running /ship + /land-and-deploy...`);
+      const co = spawnSync('git', ['checkout', branch], { cwd, encoding: 'utf8' });
+      if (co.status !== 0) {
+        console.warn(`  ⚠ checkout failed for ${branch} (exit ${co.status}) — skipping`);
+        continue;
+      }
+      const result = await shipAndDeploy({
+        cwd,
+        slug: `${slug}-sweep-${branch.replace(/[^a-z0-9-]/g, '-')}`,
+      });
+      if (result.exitCode !== 0 || result.timedOut) {
+        console.warn(`  ⚠ ship failed for ${branch} (exit ${result.exitCode}) — continuing`);
+      } else {
+        console.log(`  ✓ shipped ${branch}`);
+      }
     }
-  }
-  if (getCurrentBranch() !== currentBranch) {
-    spawnSync('git', ['checkout', currentBranch], { cwd, encoding: 'utf8' });
+  } finally {
+    if (getCurrentBranch(cwd) !== currentBranch) {
+      spawnSync('git', ['checkout', currentBranch], { cwd, encoding: 'utf8' });
+    }
   }
 }
 
-function getCurrentBranch(): string {
+function getCurrentBranch(cwd?: string): string {
   try {
     const result = spawnSync('git', ['branch', '--show-current'], {
       encoding: 'utf8',
+      ...(cwd ? { cwd } : {}),
     });
     return result.stdout?.trim() || 'unknown';
   } catch {

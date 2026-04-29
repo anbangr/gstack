@@ -23,7 +23,7 @@ describe('checkWorkingTreeClean', () => {
     fs.writeFileSync(path.join(tempDir, 'README.md'), 'init');
     spawnSync('git', ['add', '.'], { cwd: tempDir });
     spawnSync('git', ['commit', '-m', 'init'], { cwd: tempDir });
-    
+
     expect(checkWorkingTreeClean(tempDir)).toEqual({ clean: true, dirty: [] });
   });
 
@@ -31,9 +31,9 @@ describe('checkWorkingTreeClean', () => {
     fs.writeFileSync(path.join(tempDir, 'README.md'), 'init');
     spawnSync('git', ['add', '.'], { cwd: tempDir });
     spawnSync('git', ['commit', '-m', 'init'], { cwd: tempDir });
-    
+
     fs.writeFileSync(path.join(tempDir, 'README.md'), 'mod');
-    
+
     const result = checkWorkingTreeClean(tempDir);
     expect(result.clean).toBe(false);
     expect(result.dirty.length).toBeGreaterThan(0);
@@ -44,9 +44,9 @@ describe('checkWorkingTreeClean', () => {
     fs.writeFileSync(path.join(tempDir, 'README.md'), 'init');
     spawnSync('git', ['add', '.'], { cwd: tempDir });
     spawnSync('git', ['commit', '-m', 'init'], { cwd: tempDir });
-    
+
     fs.writeFileSync(path.join(tempDir, 'untracked.ts'), 'untracked');
-    
+
     expect(checkWorkingTreeClean(tempDir)).toEqual({ clean: true, dirty: [] });
   });
 
@@ -54,10 +54,10 @@ describe('checkWorkingTreeClean', () => {
     fs.writeFileSync(path.join(tempDir, 'README.md'), 'init');
     spawnSync('git', ['add', '.'], { cwd: tempDir });
     spawnSync('git', ['commit', '-m', 'init'], { cwd: tempDir });
-    
+
     fs.writeFileSync(path.join(tempDir, 'staged.ts'), 'staged');
     spawnSync('git', ['add', '.'], { cwd: tempDir });
-    
+
     const result = checkWorkingTreeClean(tempDir);
     expect(result.clean).toBe(false);
     expect(result.dirty.length).toBeGreaterThan(0);
@@ -96,7 +96,7 @@ describe('findUnshippedFeatBranches', () => {
     spawnSync('git', ['commit', '-m', 'feat a'], { cwd: mainDir });
     spawnSync('git', ['push', 'origin', 'feat/a'], { cwd: mainDir });
     spawnSync('git', ['checkout', 'main'], { cwd: mainDir });
-    
+
     const result = findUnshippedFeatBranches(mainDir, 'main');
     expect(result).toEqual(['feat/a']);
   });
@@ -121,7 +121,7 @@ describe('findUnshippedFeatBranches', () => {
     spawnSync('git', ['add', '.'], { cwd: mainDir });
     spawnSync('git', ['commit', '-m', 'feat a'], { cwd: mainDir });
     spawnSync('git', ['push', 'origin', 'feat/a'], { cwd: mainDir });
-    
+
     // We stay on feat/a
     const result = findUnshippedFeatBranches(mainDir, 'feat/a');
     expect(result).toEqual([]);
