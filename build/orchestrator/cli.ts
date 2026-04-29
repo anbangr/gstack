@@ -6,8 +6,8 @@
  *
  * Drives the build loop in code rather than via LLM, so it never stalls
  * with "Standing by, let me know what's next" between phases. Per-phase
- * work still spawns Gemini (impl) and Codex (review) as fresh subprocesses
- * with isolated context.
+ * work still spawns configured Claude, Gemini, and Codex subprocesses with
+ * isolated context.
  *
  * Flags:
  *   --print-only    Parse and show phase table; exit.
@@ -54,12 +54,13 @@ import {
 } from "./phase-runner";
 import {
   runGemini,
-  runCodexReview,
+  runClaudeTask,
+  runSlashCommand,
   detectTestCmd,
-  runGeminiTestSpec,
   runTests,
   runCodexImpl,
   runJudgeOpus,
+  parseVerdict,
   parseFailureCount,
   parseJudgeVerdict,
   type SubAgentResult,
@@ -68,6 +69,18 @@ import { flipPhaseCheckboxes, flipTestSpecCheckbox } from "./plan-mutator";
 import { shipAndDeploy } from "./ship";
 import { createWorktrees, applyWinner, teardownWorktrees } from "./worktree";
 import type { BuildState, Phase, DualImplTestResult } from "./types";
+import {
+  DEFAULT_ROLE_CONFIGS,
+  ROLE_DEFINITIONS,
+  applyEnvRoleConfig,
+  applyRoleOverride,
+  cloneRoleConfigs,
+  roleLabel,
+  type RoleConfig,
+  type RoleConfigs,
+  type RoleField,
+  type RoleKey,
+} from "./role-config";
 
 export interface Args {
   planFile: string;
@@ -78,13 +91,16 @@ export interface Args {
   skipShip: boolean;
   maxCodexIter: number;
   testCmd?: string;
-  /** When true, every phase implements via Gemini+Codex tournament with Opus judge. */
+  projectRoot?: string;
+  /** When true, every phase implements via Gemini+Codex tournament with Claude judge. */
   dualImpl: boolean;
-  /** Model for Gemini (Implementor A). Default: gemini-3.1-pro-preview (thinking built-in). */
+  /** Central provider/model/reasoning/command routing. */
+  roles: RoleConfigs;
+  /** Deprecated alias for roles.primaryImpl.model. */
   geminiModel: string;
-  /** Model for Codex (Implementor B, dual-impl). Default: gpt-5.3-codex-spark. */
+  /** Deprecated alias for roles.secondaryImpl.model. */
   codexModel: string;
-  /** Model for Codex review pass. Default: gpt-5.5. */
+  /** Deprecated alias for roles.reviewSecondary.model. */
   codexReviewModel: string;
   /** Skip the pre-build working tree dirty check. */
   skipCleanCheck: boolean;
@@ -93,6 +109,13 @@ export interface Args {
 }
 
 export function parseArgs(argv: string[]): Args {
+  let roles: RoleConfigs;
+  try {
+    roles = applyEnvRoleConfig(cloneRoleConfigs(DEFAULT_ROLE_CONFIGS));
+  } catch (err) {
+    console.error((err as Error).message);
+    process.exit(2);
+  }
   const args: Args = {
     planFile: "",
     printOnly: false,
@@ -101,14 +124,17 @@ export function parseArgs(argv: string[]): Args {
     noGbrain: false,
     skipShip: false,
     maxCodexIter: DEFAULT_MAX_CODEX_ITERATIONS,
+    projectRoot: undefined,
     dualImpl: false,
-    geminiModel: "gemini-3.1-pro-preview",
-    codexModel: "gpt-5.3-codex-spark",
-    codexReviewModel: "gpt-5.5",
+    roles,
+    geminiModel: DEFAULT_ROLE_CONFIGS.primaryImpl.model,
+    codexModel: DEFAULT_ROLE_CONFIGS.secondaryImpl.model,
+    codexReviewModel: DEFAULT_ROLE_CONFIGS.reviewSecondary.model,
     skipCleanCheck: false,
     skipSweep: false,
   };
   const positional: string[] = [];
+  const roleFlags = buildRoleFlagMap();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--print-only") args.printOnly = true;
@@ -119,27 +145,40 @@ export function parseArgs(argv: string[]): Args {
     else if (a === "--skip-clean-check") args.skipCleanCheck = true;
     else if (a === "--skip-sweep") args.skipSweep = true;
     else if (a === "--dual-impl") args.dualImpl = true;
-    else if (a === "--gemini-model") {
+    else if (roleFlags.has(a)) {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error(`${a} requires a value`);
+        process.exit(2);
+      }
+      const [role, field] = roleFlags.get(a)!;
+      try {
+        applyRoleOverride(args.roles, role, field, next);
+      } catch (err) {
+        console.error((err as Error).message);
+        process.exit(2);
+      }
+    } else if (a === "--gemini-model") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
         console.error("--gemini-model requires a value");
         process.exit(2);
       }
-      args.geminiModel = next;
+      args.roles.primaryImpl.model = next;
     } else if (a === "--codex-model") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
         console.error("--codex-model requires a value");
         process.exit(2);
       }
-      args.codexModel = next;
+      args.roles.secondaryImpl.model = next;
     } else if (a === "--codex-review-model") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
         console.error("--codex-review-model requires a value");
         process.exit(2);
       }
-      args.codexReviewModel = next;
+      args.roles.reviewSecondary.model = next;
     } else if (a === "--test-cmd") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
@@ -147,6 +186,13 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.testCmd = next;
+    } else if (a === "--project-root") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--project-root requires a value");
+        process.exit(2);
+      }
+      args.projectRoot = path.resolve(next);
     } else if (a === "--max-codex-iter") {
       const next = argv[++i];
       const n = Number(next);
@@ -167,12 +213,136 @@ export function parseArgs(argv: string[]): Args {
       positional.push(a);
     }
   }
+  args.geminiModel = args.roles.primaryImpl.model;
+  args.codexModel = args.roles.secondaryImpl.model;
+  args.codexReviewModel = args.roles.reviewSecondary.model;
   if (positional.length !== 1) {
     console.error("usage: gstack-build <plan-file> [flags]   (-h for help)");
     process.exit(2);
   }
   args.planFile = path.resolve(positional[0]);
+  const providerErrors = validateRoleProviders(args);
+  if (providerErrors.length > 0) {
+    console.error(providerErrors.join("\n"));
+    process.exit(2);
+  }
   return args;
+}
+
+export function validateRoleProviders(args: Pick<Args, "dualImpl" | "roles">): string[] {
+  const errors: string[] = [];
+  for (const name of ["review", "reviewSecondary", "qa"] as const) {
+    if (args.roles[name].provider === "gemini") {
+      errors.push(`--${roleFlagName(name)}-provider gemini is not supported for slash-command gates`);
+    }
+  }
+  for (const name of ["ship", "land"] as const) {
+    if (args.roles[name].provider === "gemini") {
+      errors.push(`--${roleFlagName(name)}-provider gemini is not supported for ship/land`);
+    }
+  }
+  if (args.dualImpl) {
+    if (args.roles.primaryImpl.provider !== "gemini") {
+      errors.push("--primary-impl-provider must be gemini when --dual-impl is enabled");
+    }
+    if (args.roles.secondaryImpl.provider !== "codex") {
+      errors.push("--secondary-impl-provider must be codex when --dual-impl is enabled");
+    }
+    if (args.roles.judge.provider !== "claude") {
+      errors.push("--judge-provider must be claude when --dual-impl is enabled");
+    }
+  }
+  return errors;
+}
+
+function gitRootFor(cwd: string): string | null {
+  const r = spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
+    encoding: "utf8",
+  });
+  if (r.status !== 0) return null;
+  return r.stdout.trim() || null;
+}
+
+function isGstackMirrorRoot(dir: string): boolean {
+  return path.basename(dir).endsWith("-gstack");
+}
+
+export function resolveProjectRoot(opts: {
+  planFile: string;
+  projectRoot?: string;
+  cwd?: string;
+}): string {
+  if (opts.projectRoot) {
+    const explicit = path.resolve(opts.projectRoot);
+    if (!fs.existsSync(explicit)) {
+      throw new Error(`--project-root does not exist: ${explicit}`);
+    }
+    return explicit;
+  }
+
+  const planDir = path.dirname(path.resolve(opts.planFile));
+  const planParent = path.basename(planDir);
+  const planGitRoot = gitRootFor(planDir);
+  const planContainer = path.resolve(planDir, "..");
+  const planMirrorRoot =
+    planGitRoot && isGstackMirrorRoot(planGitRoot)
+      ? planGitRoot
+      : isGstackMirrorRoot(planContainer)
+        ? planContainer
+        : null;
+
+  if (planParent === "living-plans" && planMirrorRoot) {
+    throw new Error(
+      `plan is stored in ${planMirrorRoot}/living-plans but the product repo is ambiguous; rerun with --project-root <repo>`,
+    );
+  }
+
+  if (planParent === "plans") {
+    const root = path.resolve(planDir, "..");
+    if (fs.existsSync(path.join(root, ".git"))) return root;
+  }
+
+  if (planGitRoot && !isGstackMirrorRoot(planGitRoot)) return planGitRoot;
+
+  const currentRoot = gitRootFor(opts.cwd ?? process.cwd());
+  if (currentRoot && !isGstackMirrorRoot(currentRoot)) return currentRoot;
+
+  throw new Error(
+    `could not infer project root for ${opts.planFile}; rerun with --project-root <repo>`,
+  );
+}
+
+export function archiveLivingPlan(planFile: string): string | null {
+  const resolved = path.resolve(planFile);
+  const livingDir = path.dirname(resolved);
+  if (path.basename(livingDir) !== "living-plans") return null;
+
+  const archiveDir = path.join(path.dirname(livingDir), "archived");
+  fs.mkdirSync(archiveDir, { recursive: true });
+
+  const parsed = path.parse(resolved);
+  let target = path.join(archiveDir, parsed.base);
+  if (fs.existsSync(target)) {
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "Z");
+    target = path.join(archiveDir, `${parsed.name}-${stamp}${parsed.ext}`);
+  }
+  fs.renameSync(resolved, target);
+  return target;
+}
+
+function buildRoleFlagMap(): Map<string, [RoleKey, RoleField]> {
+  const map = new Map<string, [RoleKey, RoleField]>();
+  for (const [key, flag] of ROLE_DEFINITIONS) {
+    map.set(`--${flag}-provider`, [key, "provider"]);
+    map.set(`--${flag}-model`, [key, "model"]);
+    map.set(`--${flag}-reasoning`, [key, "reasoning"]);
+    map.set(`--${flag}-command`, [key, "command"]);
+  }
+  return map;
+}
+
+function roleFlagName(role: RoleKey): string {
+  return ROLE_DEFINITIONS.find(([key]) => key === role)?.[1] ?? role;
 }
 
 export const HELP_TEXT = `gstack-build — code-driven phase orchestrator
@@ -191,11 +361,23 @@ Flags:
   --dual-impl          Tournament mode: Gemini and Codex implement in parallel
                        (isolated git worktrees), Opus judges and the winner
                        is cherry-picked back. Existing TDD pipeline runs after.
-  --gemini-model <m>   Model for Gemini (Implementor A). Default: gemini-3.1-pro-preview.
-  --codex-model <m>    Model for Codex Implementor B (dual-impl). Default: gpt-5.3-codex-spark.
-  --codex-review-model <m>
-                       Model for Codex review pass. Default: gpt-5.5.
+  --test-writer-model <m>          Default: claude-opus-4-7.
+  --primary-impl-model <m>         Default: gemini-3.1-pro.
+  --test-fixer-model <m>           Default: gpt-5.5.
+  --secondary-impl-model <m>       Default: gpt-5.3-codex.
+  --review-model <m>               Default: claude-opus-4-7.
+  --review-secondary-model <m>     Default: claude-opus-4-7.
+  --qa-model <m>                   Default: gpt-5.5.
+  --ship-model <m>                 Default: gpt-5.5.
+  --land-model <m>                 Default: gpt-5.5.
+  --<role>-provider <p>            claude|codex|gemini. Some workflows require fixed providers.
+  --<role>-reasoning <r>           low|medium|high|xhigh.
+  --<role>-command <cmd>           For review, review-secondary, qa, ship, land.
+  --gemini-model <m>               Deprecated alias for --primary-impl-model.
+  --codex-model <m>                Deprecated alias for --secondary-impl-model.
+  --codex-review-model <m>         Deprecated alias for --review-secondary-model.
   --test-cmd <cmd>     Override test command (default: auto-detect from package.json/pytest.ini/go.mod/Cargo.toml).
+  --project-root <dir> Run sub-agents/tests from this repo root. Required when a living plan is stored in an ambiguous *-gstack repo.
   --max-codex-iter N   Cap recursive Codex iterations (default 5).
   -h, --help           Show this help.
 
@@ -448,11 +630,11 @@ function buildGeminiPromptBody(
 }
 
 /**
- * Build the Codex review context body that gets written to a file. Captures
- * which phase, what changed, what to verify so Codex can run /gstack-review
- * with full context without us inlining a huge diff.
+ * Build the review-gate context body that gets written to a file. Captures
+ * which phase, what changed, and what to verify so each configured gate command
+ * can run with full context without us inlining a huge diff.
  */
-function buildCodexReviewBody(
+export function buildCodexReviewBody(
   phase: Phase,
   planFile: string,
   branch: string,
@@ -461,7 +643,7 @@ function buildCodexReviewBody(
   hardeningNotes?: string,
 ): string {
   return [
-    `# Codex Review — Phase ${phase.number}: ${phase.name} (iter ${iteration})`,
+    `# Review Gate — Phase ${phase.number}: ${phase.name} (iter ${iteration})`,
     "",
     `Branch: ${branch}`,
     `Plan file: ${planFile}`,
@@ -482,8 +664,8 @@ function buildCodexReviewBody(
       : "",
     "## Your task",
     "",
-    `1. Run /gstack-review on the current branch's working tree against its base.`,
-    `2. If iteration > 1, this is a re-review after Codex tried to fix earlier findings — be especially thorough.`,
+    `1. Run the slash command specified by the runner prompt on the current branch's working tree against its base.`,
+    `2. If iteration > 1, this is a re-run after an earlier gate tried to fix findings — be especially thorough.`,
     `3. Use --yolo / workspace-write file tools to inspect the actual code; don't ask the orchestrator to inline anything.`,
     `4. Fix bugs as you find them (workspace-write sandbox is enabled).`,
     `5. Write your full review report to the output file path (provided in the shell prompt).`,
@@ -672,6 +854,132 @@ function summarizePhase(
   console.log(`\n[${marker}] Phase ${phaseNumber}: ${phaseName}`);
 }
 
+async function runRoleTask(opts: {
+  role: RoleConfig;
+  inputFilePath: string;
+  outputFilePath: string;
+  cwd: string;
+  slug: string;
+  phaseNumber: string;
+  iteration: number;
+  logPrefix: string;
+}): Promise<SubAgentResult> {
+  if (opts.role.provider === "gemini") {
+    return runGemini({
+      inputFilePath: opts.inputFilePath,
+      outputFilePath: opts.outputFilePath,
+      cwd: opts.cwd,
+      slug: opts.slug,
+      phaseNumber: opts.phaseNumber,
+      iteration: opts.iteration,
+      logPrefix: opts.logPrefix,
+      model: opts.role.model,
+    });
+  }
+  if (opts.role.provider === "codex") {
+    return runCodexImpl({
+      inputFilePath: opts.inputFilePath,
+      outputFilePath: opts.outputFilePath,
+      cwd: opts.cwd,
+      slug: opts.slug,
+      phaseNumber: opts.phaseNumber,
+      iteration: opts.iteration,
+      logPrefix: opts.logPrefix,
+      model: opts.role.model,
+      reasoning: opts.role.reasoning,
+    });
+  }
+  return runClaudeTask({
+    inputFilePath: opts.inputFilePath,
+    outputFilePath: opts.outputFilePath,
+    cwd: opts.cwd,
+    slug: opts.slug,
+    phaseNumber: opts.phaseNumber,
+    iteration: opts.iteration,
+    logPrefix: opts.logPrefix,
+    model: opts.role.model,
+    reasoning: opts.role.reasoning,
+  });
+}
+
+async function runReviewGates(opts: {
+  roles: RoleConfigs;
+  inputFilePath: string;
+  cwd: string;
+  slug: string;
+  phaseNumber: string;
+  iteration: number;
+}): Promise<SubAgentResult> {
+  const outputs: SubAgentResult[] = [];
+  const combined: string[] = [];
+  const runGate = async (name: "review" | "reviewSecondary" | "qa", role: RoleConfig) => {
+    if (!role.command) {
+      return mockResult({
+        exitCode: 1,
+        stdout: `${name} role has no command. GATE FAIL`,
+      });
+    }
+    if (role.provider === "gemini") {
+      return mockResult({
+        exitCode: 1,
+        stdout: `${name} role provider gemini is not supported for slash-command gates. GATE FAIL`,
+      });
+    }
+    const outputFilePath = path.join(
+      logDir(opts.slug),
+      `phase-${opts.phaseNumber}-${name}-${opts.iteration}-output.md`,
+    );
+    fs.writeFileSync(outputFilePath, "");
+    return runSlashCommand({
+      inputFilePath: opts.inputFilePath,
+      outputFilePath,
+      cwd: opts.cwd,
+      slug: opts.slug,
+      phaseNumber: opts.phaseNumber,
+      iteration: opts.iteration,
+      logPrefix: name,
+      role: {
+        provider: role.provider,
+        model: role.model,
+        reasoning: role.reasoning,
+        command: role.command,
+      },
+      gate: true,
+    });
+  };
+
+  for (const [name, role] of [
+    ["review", opts.roles.review],
+    ["reviewSecondary", opts.roles.reviewSecondary],
+    ["qa", opts.roles.qa],
+  ] as const) {
+    const result = await runGate(name, role);
+    outputs.push(result);
+    combined.push(`## ${name} (${roleLabel(role)})\n${result.stdout}\n${result.stderr}`);
+    const verdict = parseVerdict(result.stdout + "\n" + result.stderr);
+    if (result.timedOut || result.exitCode !== 0 || verdict !== "pass") {
+      return mergeGateResults(outputs, combined, "GATE FAIL");
+    }
+  }
+  return mergeGateResults(outputs, combined, "GATE PASS");
+}
+
+function mergeGateResults(
+  outputs: SubAgentResult[],
+  combined: string[],
+  verdict: "GATE PASS" | "GATE FAIL",
+): SubAgentResult {
+  const last = outputs[outputs.length - 1] ?? mockResult({});
+  return {
+    ...last,
+    exitCode: verdict === "GATE PASS" ? 0 : (last.exitCode ?? 1),
+    stdout: `${combined.join("\n\n")}\n\n${verdict}`,
+    logPath: last.logPath,
+    durationMs: outputs.reduce((sum, r) => sum + r.durationMs, 0),
+    retries: outputs.reduce((sum, r) => sum + r.retries, 0),
+  };
+}
+
 /**
  * After an implementor's initial pass, run tests and fix recursively in that
  * worktree until green or maxFixIter exhausted. Both Gemini and Codex loops
@@ -692,6 +1000,7 @@ async function runDualImplFixLoop(opts: {
   maxFixIter: number;
   geminiModel?: string;
   codexModel?: string;
+  codexReasoning?: RoleConfig["reasoning"];
 }): Promise<{
   testResult: DualImplTestResult;
   fixIterations: number | null;
@@ -709,6 +1018,7 @@ async function runDualImplFixLoop(opts: {
     maxFixIter,
     geminiModel,
     codexModel,
+    codexReasoning,
   } = opts;
 
   if (!testCmd) {
@@ -810,6 +1120,7 @@ async function runDualImplFixLoop(opts: {
         iteration: i,
         logPrefix: `dual-codex-fix${i}`,
         model: codexModel,
+        reasoning: codexReasoning,
       });
     }
     // If the model itself failed, there are no new commits — running tests again
@@ -907,9 +1218,7 @@ async function runPhase(args: {
   dryRun: boolean;
   maxCodexIter: number;
   testCmd?: string;
-  geminiModel: string;
-  codexModel: string;
-  codexReviewModel: string;
+  roles: RoleConfigs;
 }): Promise<"done" | "failed"> {
   const { state, phase, cwd, noGbrain, dryRun, maxCodexIter } = args;
   let phaseState = state.phases[phase.index];
@@ -970,13 +1279,13 @@ async function runPhase(args: {
 
     if (action.type === "RUN_GEMINI") {
       console.log(
-        `  → Gemini: implementing Phase ${phase.number} (iter ${action.iteration})`,
+        `  → Primary implementor ${roleLabel(args.roles.primaryImpl)}: Phase ${phase.number} (iter ${action.iteration})`,
       );
       let result: SubAgentResult;
       if (dryRun) {
         result = mockResult({
           exitCode: 0,
-          stdout: "[dry-run] Gemini would have implemented",
+          stdout: `[dry-run] ${roleLabel(args.roles.primaryImpl)} would have implemented`,
         });
       } else {
         // File-path I/O: write input prompt to disk, pass paths to runGemini.
@@ -994,14 +1303,15 @@ async function runPhase(args: {
         );
         // Pre-create empty output file so a missing-file error is unambiguous.
         fs.writeFileSync(outputFilePath, "");
-        result = await runGemini({
+        result = await runRoleTask({
+          role: args.roles.primaryImpl,
           inputFilePath,
           outputFilePath,
           cwd,
           slug: state.slug,
           phaseNumber: phase.number,
           iteration: action.iteration,
-          model: args.geminiModel,
+          logPrefix: "primary-impl",
         });
       }
       phaseState = applyResult(phaseState, action, result);
@@ -1011,23 +1321,21 @@ async function runPhase(args: {
     }
 
     if (action.type === "RUN_CODEX_REVIEW") {
-      console.log(`  → Codex review iter ${action.iteration}`);
+      console.log(
+        `  → Review gates: ${roleLabel(args.roles.review)} + ${roleLabel(args.roles.reviewSecondary)} + QA ${roleLabel(args.roles.qa)} (iter ${action.iteration})`,
+      );
       let result: SubAgentResult;
       if (dryRun) {
         // For dry-run, simulate a single GATE PASS so we walk through
         // the happy path without infinite loops.
         result = mockResult({
           exitCode: 0,
-          stdout: "[dry-run] Codex would review. GATE PASS",
+          stdout: `[dry-run] ${roleLabel(args.roles.review)} and ${roleLabel(args.roles.reviewSecondary)} plus ${roleLabel(args.roles.qa)} would pass. GATE PASS`,
         });
       } else {
         const inputFilePath = path.join(
           logDir(state.slug),
           `phase-${phase.number}-codex-${action.iteration}-input.md`,
-        );
-        const outputFilePath = path.join(
-          logDir(state.slug),
-          `phase-${phase.number}-codex-${action.iteration}-output.md`,
         );
         // Locate Gemini's output from this iteration so Codex can read it.
         const geminiOutputPath = path.join(
@@ -1046,15 +1354,13 @@ async function runPhase(args: {
             phaseState.dualImpl?.judgeHardeningNotes,
           ),
         );
-        fs.writeFileSync(outputFilePath, "");
-        result = await runCodexReview({
+        result = await runReviewGates({
+          roles: args.roles,
           inputFilePath,
-          outputFilePath,
           cwd,
           slug: state.slug,
           phaseNumber: phase.number,
           iteration: action.iteration,
-          model: args.codexReviewModel,
         });
       }
       phaseState = applyResult(phaseState, action, result);
@@ -1065,13 +1371,13 @@ async function runPhase(args: {
 
     if (action.type === "RUN_GEMINI_TEST_SPEC") {
       console.log(
-        `  → Test Specification: Phase ${phase.number} (iter ${action.iteration})`,
+        `  → Test Specification writer ${roleLabel(args.roles.testWriter)}: Phase ${phase.number} (iter ${action.iteration})`,
       );
       let result: SubAgentResult;
       if (dryRun) {
         result = mockResult({
           exitCode: 0,
-          stdout: "[dry-run] Gemini would write test spec",
+          stdout: `[dry-run] ${roleLabel(args.roles.testWriter)} would write failing tests`,
         });
       } else {
         const inputFilePath = path.join(
@@ -1087,14 +1393,15 @@ async function runPhase(args: {
           buildGeminiTestSpecPrompt(phase, state.planFile),
         );
         fs.writeFileSync(outputFilePath, "");
-        result = await runGeminiTestSpec({
+        result = await runRoleTask({
+          role: args.roles.testWriter,
           inputFilePath,
           outputFilePath,
           cwd,
           slug: state.slug,
           phaseNumber: phase.number,
           iteration: action.iteration,
-          model: args.geminiModel,
+          logPrefix: "test-writer",
         });
       }
       phaseState = applyResult(phaseState, action, result);
@@ -1173,12 +1480,12 @@ async function runPhase(args: {
     }
 
     if (action.type === "RUN_GEMINI_FIX") {
-      console.log(`  → Gemini: fixing failing tests, iter ${action.iteration}`);
+      console.log(`  → Test fixer ${roleLabel(args.roles.testFixer)}: iter ${action.iteration}`);
       let result: SubAgentResult;
       if (dryRun) {
         result = mockResult({
           exitCode: 0,
-          stdout: "[dry-run] Gemini would fix tests",
+          stdout: `[dry-run] ${roleLabel(args.roles.testFixer)} would fix tests`,
         });
       } else {
         const inputFilePath = path.join(
@@ -1194,7 +1501,8 @@ async function runPhase(args: {
           buildGeminiFixPrompt(phase, state.planFile),
         );
         fs.writeFileSync(outputFilePath, "");
-        result = await runGemini({
+        result = await runRoleTask({
+          role: args.roles.testFixer,
           inputFilePath,
           outputFilePath,
           cwd,
@@ -1202,7 +1510,6 @@ async function runPhase(args: {
           phaseNumber: phase.number,
           iteration: action.iteration,
           logPrefix: "gemini-fix",
-          model: args.geminiModel,
         });
       }
       phaseState = applyResult(phaseState, action, result);
@@ -1352,7 +1659,7 @@ async function runPhase(args: {
               phaseNumber: phaseN,
               iteration: it,
               logPrefix: "dual-gemini",
-              model: args.geminiModel,
+              model: args.roles.primaryImpl.model,
             });
             if (implResult.timedOut || implResult.exitCode !== 0) {
               const failTest: DualImplTestResult = {
@@ -1380,7 +1687,7 @@ async function runPhase(args: {
                 phaseNumber: phaseN,
                 testCmd: dualTestCmd,
                 maxFixIter: DEFAULT_MAX_TEST_ITERATIONS,
-                geminiModel: args.geminiModel,
+                geminiModel: args.roles.primaryImpl.model,
               });
             const gHeadR = spawnSync("git", ["-C", pair.geminiWorktreePath, "rev-parse", "HEAD"], { encoding: "utf8" });
             return { implResult, testResult, fixIterations, fixHistory, testedCommit: gHeadR.stdout.trim() || undefined };
@@ -1393,7 +1700,8 @@ async function runPhase(args: {
               slug,
               phaseNumber: phaseN,
               iteration: it,
-              model: args.codexModel,
+              model: args.roles.secondaryImpl.model,
+              reasoning: args.roles.secondaryImpl.reasoning,
             });
             if (implResult.timedOut || implResult.exitCode !== 0) {
               const failTest: DualImplTestResult = {
@@ -1421,7 +1729,8 @@ async function runPhase(args: {
                 phaseNumber: phaseN,
                 testCmd: dualTestCmd,
                 maxFixIter: DEFAULT_MAX_TEST_ITERATIONS,
-                codexModel: args.codexModel,
+                codexModel: args.roles.secondaryImpl.model,
+                codexReasoning: args.roles.secondaryImpl.reasoning,
               });
             const cHeadR = spawnSync("git", ["-C", pair.codexWorktreePath, "rev-parse", "HEAD"], { encoding: "utf8" });
             return { implResult, testResult, fixIterations, fixHistory, testedCommit: cHeadR.stdout.trim() || undefined };
@@ -1837,6 +2146,8 @@ async function runPhase(args: {
           cwd,
           slug: state.slug,
           phaseNumber: phase.number,
+          model: args.roles.judge.model,
+          reasoning: args.roles.judge.reasoning,
         });
         logPath = judgeRes.logPath;
         const parsed = parseJudgeVerdict(judgeRes.stdout);
@@ -1981,9 +2292,12 @@ function mockResult(overrides: Partial<SubAgentResult>): SubAgentResult {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
-  if (args.codexModel !== "gpt-5.3-codex-spark" && !args.dualImpl) {
+  if (
+    args.roles.secondaryImpl.model !== DEFAULT_ROLE_CONFIGS.secondaryImpl.model &&
+    !args.dualImpl
+  ) {
     console.warn(
-      "[warn] --codex-model has no effect without --dual-impl (Codex implementor only runs in tournament mode)",
+      "[warn] secondary implementor model has no effect without --dual-impl",
     );
   }
 
@@ -2014,18 +2328,23 @@ async function main() {
     process.exit(2);
   }
 
-  // Plan files in a plans/ subdirectory sit one level below the project root.
-  const resolvedPlan = path.resolve(args.planFile);
-  const cwdForPreflight =
-    path.basename(path.dirname(resolvedPlan)) === "plans"
-      ? path.resolve(path.dirname(resolvedPlan), "..")
-      : path.dirname(resolvedPlan);
+  let projectRoot: string;
+  try {
+    projectRoot = resolveProjectRoot({
+      planFile: args.planFile,
+      projectRoot: args.projectRoot,
+    });
+  } catch (err) {
+    console.error((err as Error).message);
+    process.exit(2);
+  }
+  console.log(`Project root: ${projectRoot}`);
 
   // Skip both startup gates when running in simulation mode or skipping ship.
   const runStartupGates = !args.dryRun && !args.skipShip;
 
   if (!args.skipCleanCheck && runStartupGates) {
-    const { clean, dirty } = checkWorkingTreeClean(cwdForPreflight);
+    const { clean, dirty } = checkWorkingTreeClean(projectRoot);
     if (!clean) {
       console.error(
         "\n✗ working tree has uncommitted changes — commit or stash before building:\n",
@@ -2041,12 +2360,13 @@ async function main() {
   // Sweep runs before the lock so that sibling unshipped branches are processed
   // regardless of whether this slug is already locked. Concurrent gstack-build
   // invocations are rare in practice; warn-and-continue handles sweep failures.
-  const currentBranchForSweep = getCurrentBranch(cwdForPreflight);
+  const currentBranchForSweep = getCurrentBranch(projectRoot);
   if (!args.skipSweep && runStartupGates) {
     await sweepUnshippedFeatBranches(
-      cwdForPreflight,
+      projectRoot,
       currentBranchForSweep,
       slug,
+      args.roles,
     );
   }
 
@@ -2068,11 +2388,12 @@ async function main() {
   if (args.noResume) {
     state = freshState({
       planFile: args.planFile,
-      branch: getCurrentBranch(cwdForPreflight),
+      branch: getCurrentBranch(projectRoot),
       phases,
-      geminiModel: args.geminiModel,
-      codexModel: args.codexModel,
-      codexReviewModel: args.codexReviewModel,
+      geminiModel: args.roles.primaryImpl.model,
+      codexModel: args.roles.secondaryImpl.model,
+      codexReviewModel: args.roles.reviewSecondary.model,
+      roleConfigs: args.roles,
     });
     saveState(state, { noGbrain: args.noGbrain, log: console.warn });
   } else {
@@ -2083,68 +2404,22 @@ async function main() {
     if (loaded) {
       console.log(`\nresuming state from ${loaded.lastUpdatedAt}`);
       state = loaded;
-      // Warn if CLI models differ from what the original run used.
-      // After warning, update state to reflect CLI values so future saveState is accurate.
-      let modelMismatch = false;
-      if (loaded.geminiModel && loaded.geminiModel !== args.geminiModel) {
-        console.warn(
-          `[warn] --gemini-model ${args.geminiModel} differs from resumed state (${loaded.geminiModel}); using CLI value`,
-        );
-        modelMismatch = true;
-      } else if (
-        !loaded.geminiModel &&
-        args.geminiModel !== "gemini-3.1-pro-preview"
-      ) {
-        console.warn(
-          `[warn] --gemini-model ${args.geminiModel} may differ from original run (state predates model tracking)`,
-        );
-        modelMismatch = true;
-      }
-      if (loaded.codexModel && loaded.codexModel !== args.codexModel) {
-        console.warn(
-          `[warn] --codex-model ${args.codexModel} differs from resumed state (${loaded.codexModel}); using CLI value`,
-        );
-        modelMismatch = true;
-      } else if (
-        !loaded.codexModel &&
-        args.codexModel !== "gpt-5.3-codex-spark"
-      ) {
-        console.warn(
-          `[warn] --codex-model ${args.codexModel} may differ from original run (state predates model tracking)`,
-        );
-        modelMismatch = true;
-      }
-      if (
-        loaded.codexReviewModel &&
-        loaded.codexReviewModel !== args.codexReviewModel
-      ) {
-        console.warn(
-          `[warn] --codex-review-model ${args.codexReviewModel} differs from resumed state (${loaded.codexReviewModel}); using CLI value`,
-        );
-        modelMismatch = true;
-      } else if (
-        !loaded.codexReviewModel &&
-        args.codexReviewModel !== "gpt-5.5"
-      ) {
-        console.warn(
-          `[warn] --codex-review-model ${args.codexReviewModel} may differ from original run (state predates model tracking)`,
-        );
-        modelMismatch = true;
-      }
-      if (modelMismatch) {
-        // Update state fields so subsequent saveState persists the CLI values, not stale ones.
-        state.geminiModel = args.geminiModel;
-        state.codexModel = args.codexModel;
-        state.codexReviewModel = args.codexReviewModel;
+      if (JSON.stringify(loaded.roleConfigs) !== JSON.stringify(args.roles)) {
+        console.warn("[warn] CLI/env role config differs from resumed state; using current config");
+        state.roleConfigs = args.roles;
+        state.geminiModel = args.roles.primaryImpl.model;
+        state.codexModel = args.roles.secondaryImpl.model;
+        state.codexReviewModel = args.roles.reviewSecondary.model;
       }
     } else {
       state = freshState({
         planFile: args.planFile,
-        branch: getCurrentBranch(cwdForPreflight),
+        branch: getCurrentBranch(projectRoot),
         phases,
-        geminiModel: args.geminiModel,
-        codexModel: args.codexModel,
-        codexReviewModel: args.codexReviewModel,
+        geminiModel: args.roles.primaryImpl.model,
+        codexModel: args.roles.secondaryImpl.model,
+        codexReviewModel: args.roles.reviewSecondary.model,
+        roleConfigs: args.roles,
       });
       saveState(state, { noGbrain: args.noGbrain, log: console.warn });
     }
@@ -2176,9 +2451,7 @@ async function main() {
   });
 
   // Drive the loop.
-  const cwd = path.dirname(args.planFile).includes("plans")
-    ? path.resolve(path.dirname(args.planFile), "..")
-    : path.dirname(args.planFile);
+  const cwd = projectRoot;
 
   let exitCode = 0;
   try {
@@ -2197,9 +2470,7 @@ async function main() {
         dryRun: args.dryRun,
         maxCodexIter: args.maxCodexIter,
         testCmd: args.testCmd,
-        geminiModel: args.geminiModel,
-        codexModel: args.codexModel,
-        codexReviewModel: args.codexReviewModel,
+        roles: args.roles,
       });
 
       if (outcome === "failed") {
@@ -2212,7 +2483,12 @@ async function main() {
       console.log(
         "\n▶ All phases committed. Running /ship + /land-and-deploy.",
       );
-      const result = await shipAndDeploy({ cwd, slug });
+      const result = await shipAndDeploy({
+        cwd,
+        slug,
+        shipRole: args.roles.ship,
+        landRole: args.roles.land,
+      });
       if (result.exitCode !== 0 || result.timedOut) {
         console.error(
           `✗ ship failed (exit ${result.exitCode}, timed_out=${result.timedOut}); see ${result.logPath}`,
@@ -2244,6 +2520,14 @@ async function main() {
       console.log(
         `\n${args.dryRun ? "(dry-run) " : ""}all phases done${args.skipShip ? " (ship skipped)" : ""}`,
       );
+    }
+    if (exitCode === 0 && state.completed && !args.dryRun) {
+      const archivedPath = archiveLivingPlan(state.planFile);
+      if (archivedPath) {
+        state.planFile = archivedPath;
+        saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+        console.log(`Archived living plan: ${archivedPath}`);
+      }
     }
   } finally {
     releaseLock(slug);
@@ -2307,6 +2591,7 @@ async function sweepUnshippedFeatBranches(
   cwd: string,
   currentBranch: string,
   slug: string,
+  roles: RoleConfigs,
 ): Promise<void> {
   const MAX_SWEEP_BRANCHES = 3;
   const allBranches = findUnshippedFeatBranches(cwd, currentBranch);
@@ -2339,6 +2624,8 @@ async function sweepUnshippedFeatBranches(
       const result = await shipAndDeploy({
         cwd,
         slug: `${slug}-sweep-${branch.replace(/[^a-z0-9-]/g, "-")}`,
+        shipRole: roles.ship,
+        landRole: roles.land,
       });
       if (result.exitCode !== 0 || result.timedOut) {
         console.warn(

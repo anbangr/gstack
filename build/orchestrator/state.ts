@@ -17,6 +17,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { BuildState, Phase, PhaseState } from './types';
+import type { RoleConfigs } from './role-config';
+import { migrateLegacyModels } from './role-config';
 import { isGbrainAvailable, gbrainPut, gbrainGet } from './gbrain';
 import { isPhaseComplete } from './parser';
 
@@ -55,6 +57,7 @@ function migrateState(state: BuildState): BuildState {
   state.phases = state.phases.map((ph) =>
     (ph.status as string) === 'gemini_done' ? { ...ph, status: 'impl_done' } : ph
   );
+  state.roleConfigs = migrateLegacyModels(state);
   return state;
 }
 
@@ -73,6 +76,7 @@ export function freshState(args: {
   geminiModel?: string;
   codexModel?: string;
   codexReviewModel?: string;
+  roleConfigs?: RoleConfigs;
 }): BuildState {
   const slug = deriveSlug(args.planFile);
   const planBasename = path.basename(args.planFile).replace(/\.md$/i, '');
@@ -108,6 +112,7 @@ export function freshState(args: {
     ...(args.geminiModel && { geminiModel: args.geminiModel }),
     ...(args.codexModel && { codexModel: args.codexModel }),
     ...(args.codexReviewModel && { codexReviewModel: args.codexReviewModel }),
+    ...(args.roleConfigs && { roleConfigs: args.roleConfigs }),
   };
 }
 

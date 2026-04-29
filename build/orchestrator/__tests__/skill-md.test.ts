@@ -9,12 +9,15 @@ test("SKILL.md.tmpl contains TDD changes", () => {
   expect(content.includes('**Test Specification')).toBe(true);
   expect(content.includes('version: 1.19.0')).toBe(true);
   expect(content.includes('Verify Red')).toBe(true);
-  expect(content.includes('Test Specification (Gemini Sub-agent)')).toBe(true);
+  expect(content.includes('Test Specification (test-writer role)')).toBe(true);
   expect(content.includes('gemini-testspec-input')).toBe(true);
   expect(content.includes('gemini-testspec-output')).toBe(true);
-  expect(content.includes('gemini-fix-input')).toBe(true);
-  expect(content.includes('gemini-fix-output')).toBe(true);
+  expect(content.includes('test-fix-input')).toBe(true);
+  expect(content.includes('test-fix-output')).toBe(true);
   expect(content.includes('all three sub-checkboxes')).toBe(true);
+  expect(content.includes('*-gstack/living-plans')).toBe(true);
+  expect(content.includes('--project-root "$_PROJECT_ROOT"')).toBe(true);
+  expect(content.includes('Archive Living Plan')).toBe(true);
 });
 
 test("generated SKILL.md reflects TDD changes", () => {
@@ -24,4 +27,6 @@ test("generated SKILL.md reflects TDD changes", () => {
   expect(content.includes('**Test Specification')).toBe(true);
   expect(content.includes('1.18.0')).toBe(true);
   expect(content.includes('Verify Red')).toBe(true);
+  expect(content.includes('*-gstack/living-plans')).toBe(true);
+  expect(content.includes('--project-root "$_PROJECT_ROOT"')).toBe(true);
 });

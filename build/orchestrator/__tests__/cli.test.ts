@@ -1,12 +1,29 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, afterEach } from 'bun:test';
 import {
   buildGeminiTestSpecPrompt,
   buildCodexImplPromptBody,
+  buildCodexReviewBody,
   buildJudgePrompt,
   parseArgs,
+  validateRoleProviders,
+  resolveProjectRoot,
+  archiveLivingPlan,
   HELP_TEXT,
 } from '../cli';
 import type { Phase, DualImplTestResult } from '../types';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+
+let tmpDir: string | null = null;
+
+afterEach(() => {
+  if (tmpDir && fs.existsSync(tmpDir)) {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+  tmpDir = null;
+});
 
 const basePhase: Phase = {
   index: 0,
@@ -107,9 +124,25 @@ describe('--gemini-model / --codex-model flag wiring', () => {
 
   it('parseArgs default -> model defaults are baked in (no flags needed)', () => {
     const args = parseArgs(['plan.md']);
-    expect(args.geminiModel).toBe('gemini-3.1-pro-preview');
-    expect(args.codexModel).toBe('gpt-5.3-codex-spark');
-    expect(args.codexReviewModel).toBe('gpt-5.5');
+    expect(args.geminiModel).toBe('gemini-3.1-pro');
+    expect(args.codexModel).toBe('gpt-5.3-codex');
+    expect(args.codexReviewModel).toBe('claude-opus-4-7');
+    expect(args.roles.testWriter).toEqual({
+      provider: 'claude',
+      model: 'claude-opus-4-7',
+      reasoning: 'xhigh',
+    });
+    expect(args.roles.testFixer).toEqual({
+      provider: 'codex',
+      model: 'gpt-5.5',
+      reasoning: 'high',
+    });
+    expect(args.roles.ship).toEqual({
+      provider: 'codex',
+      model: 'gpt-5.5',
+      reasoning: 'high',
+      command: '/gstack-ship',
+    });
   });
 
   it('--codex-review-model overrides the review model default', () => {
@@ -136,9 +169,125 @@ describe('--gemini-model / --codex-model flag wiring', () => {
   it('parseArgs model flags combine correctly with --dual-impl', () => {
     const args = parseArgs(['plan.md', '--dual-impl']);
     expect(args.dualImpl).toBe(true);
-    expect(args.geminiModel).toBe('gemini-3.1-pro-preview');
-    expect(args.codexModel).toBe('gpt-5.3-codex-spark');
-    expect(args.codexReviewModel).toBe('gpt-5.5');
+    expect(args.geminiModel).toBe('gemini-3.1-pro');
+    expect(args.codexModel).toBe('gpt-5.3-codex');
+    expect(args.codexReviewModel).toBe('claude-opus-4-7');
+  });
+
+  it('new role flags override defaults', () => {
+    const args = parseArgs([
+      'plan.md',
+      '--review-secondary-model', 'claude-custom',
+      '--review-secondary-command', '/custom second opinion',
+      '--ship-model', 'gpt-5.4',
+      '--ship-reasoning', 'medium',
+    ]);
+    expect(args.roles.reviewSecondary.model).toBe('claude-custom');
+    expect(args.roles.reviewSecondary.command).toBe('/custom second opinion');
+    expect(args.roles.ship.model).toBe('gpt-5.4');
+    expect(args.roles.ship.reasoning).toBe('medium');
+  });
+
+  it('--project-root resolves to an absolute path', () => {
+    const args = parseArgs(['plan.md', '--project-root', '.']);
+    expect(path.isAbsolute(args.projectRoot!)).toBe(true);
+  });
+
+  it('provider validation rejects unsupported slash-command and dual-impl providers', () => {
+    const args = parseArgs(['plan.md', '--dual-impl']);
+    args.roles.qa.provider = 'gemini';
+    args.roles.primaryImpl.provider = 'codex';
+    args.roles.secondaryImpl.provider = 'claude';
+    args.roles.judge.provider = 'codex';
+
+    expect(validateRoleProviders(args)).toEqual([
+      '--qa-provider gemini is not supported for slash-command gates',
+      '--primary-impl-provider must be gemini when --dual-impl is enabled',
+      '--secondary-impl-provider must be codex when --dual-impl is enabled',
+      '--judge-provider must be claude when --dual-impl is enabled',
+    ]);
+  });
+});
+
+describe('plan storage helpers', () => {
+  it('uses explicit --project-root when plan lives outside the product repo', () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-root-'));
+    const project = path.join(tmpDir, 'app');
+    const mirror = path.join(tmpDir, 'app-gstack', 'living-plans');
+    fs.mkdirSync(project, { recursive: true });
+    fs.mkdirSync(mirror, { recursive: true });
+    const plan = path.join(mirror, 'app-impl-plan-20260430.md');
+    fs.writeFileSync(plan, '# plan\n');
+
+    expect(resolveProjectRoot({ planFile: plan, projectRoot: project })).toBe(project);
+  });
+
+  it('requires --project-root when invoked from an ambiguous *-gstack repo', () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-root-'));
+    const mirror = path.join(tmpDir, 'app-gstack');
+    const living = path.join(mirror, 'living-plans');
+    fs.mkdirSync(living, { recursive: true });
+    spawnSync('git', ['init'], { cwd: mirror, stdio: 'ignore' });
+    const plan = path.join(living, 'app-impl-plan-20260430.md');
+    fs.writeFileSync(plan, '# plan\n');
+
+    expect(() => resolveProjectRoot({ planFile: plan, cwd: mirror })).toThrow(/--project-root/);
+  });
+
+  it('does not bind a sibling living plan to the current product repo implicitly', () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-root-'));
+    const currentProject = path.join(tmpDir, 'app-b');
+    const mirror = path.join(tmpDir, 'app-a-gstack');
+    const living = path.join(mirror, 'living-plans');
+    fs.mkdirSync(currentProject, { recursive: true });
+    fs.mkdirSync(living, { recursive: true });
+    spawnSync('git', ['init'], { cwd: currentProject, stdio: 'ignore' });
+    spawnSync('git', ['init'], { cwd: mirror, stdio: 'ignore' });
+    const plan = path.join(living, 'app-a-impl-plan-20260430.md');
+    fs.writeFileSync(plan, '# plan\n');
+
+    expect(() => resolveProjectRoot({ planFile: plan, cwd: currentProject })).toThrow(/--project-root/);
+  });
+
+  it('requires --project-root for living plans in an uninitialized *-gstack directory too', () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-root-'));
+    const currentProject = path.join(tmpDir, 'app-b');
+    const living = path.join(tmpDir, 'app-a-gstack', 'living-plans');
+    fs.mkdirSync(currentProject, { recursive: true });
+    fs.mkdirSync(living, { recursive: true });
+    spawnSync('git', ['init'], { cwd: currentProject, stdio: 'ignore' });
+    const plan = path.join(living, 'app-a-impl-plan-20260430.md');
+    fs.writeFileSync(plan, '# plan\n');
+
+    expect(() => resolveProjectRoot({ planFile: plan, cwd: currentProject })).toThrow(/--project-root/);
+  });
+
+  it('prefers the plan repo over the current cwd repo for in-repo plans', () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-root-'));
+    const planProject = path.join(tmpDir, 'app-a');
+    const currentProject = path.join(tmpDir, 'app-b');
+    const plans = path.join(planProject, 'plans');
+    fs.mkdirSync(plans, { recursive: true });
+    fs.mkdirSync(currentProject, { recursive: true });
+    spawnSync('git', ['init'], { cwd: planProject, stdio: 'ignore' });
+    spawnSync('git', ['init'], { cwd: currentProject, stdio: 'ignore' });
+    const plan = path.join(plans, 'app-a-impl-plan-20260430.md');
+    fs.writeFileSync(plan, '# plan\n');
+
+    expect(resolveProjectRoot({ planFile: plan, cwd: currentProject })).toBe(planProject);
+  });
+
+  it('archives completed living plans into the sibling archived dir', () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-archive-'));
+    const living = path.join(tmpDir, 'app-gstack', 'living-plans');
+    fs.mkdirSync(living, { recursive: true });
+    const plan = path.join(living, 'app-impl-plan-20260430.md');
+    fs.writeFileSync(plan, '# plan\n');
+
+    const archived = archiveLivingPlan(plan);
+    expect(archived).toBe(path.join(tmpDir, 'app-gstack', 'archived', 'app-impl-plan-20260430.md'));
+    expect(fs.existsSync(plan)).toBe(false);
+    expect(fs.existsSync(archived!)).toBe(true);
   });
 });
 
@@ -157,6 +306,14 @@ describe('buildCodexImplPromptBody (dual-impl Codex implementation prompt)', () 
     const body = buildCodexImplPromptBody(basePhase, 'plan.md');
     expect(body).toContain(basePhase.name);
     expect(body).toContain('plan.md');
+  });
+});
+
+describe('buildCodexReviewBody (configured review gate context)', () => {
+  it('does not hardcode /gstack-review so configured commands stay authoritative', () => {
+    const body = buildCodexReviewBody(basePhase, 'plan.md', 'feat/test', 1, null);
+    expect(body).toContain('slash command specified by the runner prompt');
+    expect(body).not.toContain('/gstack-review');
   });
 });
 

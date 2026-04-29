@@ -23,6 +23,7 @@ import { execFile } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { logDir, ensureLogDir } from './state';
+import type { RoleReasoning } from './role-config';
 
 const MAX_BUFFER = 20 * 1024 * 1024;
 
@@ -255,18 +256,21 @@ export function buildCodexReviewArgv(opts: {
   cwd: string;
   command?: string;
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
-  reasoning?: 'low' | 'medium' | 'high' | 'xhigh';
+  reasoning?: RoleReasoning;
   model?: string;
+  gate?: boolean;
 }): string[] {
   const command = opts.command || '/gstack-review';
-  const reasoning = opts.reasoning || 'xhigh';
+  const reasoning = opts.reasoning || 'high';
   const sandbox = opts.sandbox || 'workspace-write';
 
   const codexPrompt = [
     `Read review context at ${opts.inputFilePath}.`,
     `Run ${command}.`,
     `Write your full review report to ${opts.outputFilePath}.`,
-    `The report MUST include a final 'GATE PASS' or 'GATE FAIL' line on its own.`,
+    opts.gate === false
+      ? `Report whether the command completed successfully.`
+      : `The report MUST include a final 'GATE PASS' or 'GATE FAIL' line on its own.`,
     `Return ONLY the output file path. No narrative.`,
   ].join(' ');
 
@@ -300,12 +304,15 @@ export async function runCodexReview(opts: {
   /** Which slash-command to run, e.g. `/gstack-review` or `/gstack-qa`. */
   command?: string;
   /** Reasoning effort: low | medium | high | xhigh. Default xhigh for reviews (thinking mode). */
-  reasoning?: 'low' | 'medium' | 'high' | 'xhigh';
+  reasoning?: RoleReasoning;
   /** Sandbox mode. `workspace-write` lets the review loop fix bugs;
    * `read-only` makes it report-only. Default workspace-write because the
    * recursive loop expects fix-and-rereview. */
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
   model?: string;
+  gate?: boolean;
+  logPrefix?: string;
+  timeoutMs?: number;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
   const argv = buildCodexReviewArgv({
@@ -316,18 +323,21 @@ export async function runCodexReview(opts: {
     sandbox: opts.sandbox,
     reasoning: opts.reasoning,
     model: opts.model,
+    gate: opts.gate,
   });
 
   const logPath = path.join(
     logDir(opts.slug),
-    `phase-${opts.phaseNumber}-codex-${opts.iteration}.log`
+    `phase-${opts.phaseNumber}-${opts.logPrefix ?? 'codex'}-${opts.iteration}.log`
   );
+
+  const timeoutMs = opts.timeoutMs ?? CODEX_TIMEOUT_MS;
 
   let result = await spawnCaptured({
     bin: CODEX_BIN,
     argv,
     cwd: opts.cwd,
-    timeoutMs: CODEX_TIMEOUT_MS,
+    timeoutMs,
     logPath,
     closeStdin: true, // codex exec hangs without this
   });
@@ -335,13 +345,13 @@ export async function runCodexReview(opts: {
   if (result.timedOut) {
     const retryLog = path.join(
       logDir(opts.slug),
-      `phase-${opts.phaseNumber}-codex-${opts.iteration}-retry.log`
+      `phase-${opts.phaseNumber}-${opts.logPrefix ?? 'codex'}-${opts.iteration}-retry.log`
     );
     const retryResult = await spawnCaptured({
       bin: CODEX_BIN,
       argv,
       cwd: opts.cwd,
-      timeoutMs: CODEX_TIMEOUT_MS,
+      timeoutMs,
       logPath: retryLog,
       closeStdin: true,
     });
@@ -352,29 +362,114 @@ export async function runCodexReview(opts: {
 }
 
 /**
- * Final ship step: spawn Claude Code with /ship, then /land-and-deploy.
- * These are TWO sequential claude invocations, not one chained call —
- * `&&` inside a -p argument is treated as part of the prompt, not as
- * a shell operator. Long timeout (30 min default per phase) because
- * deploys can wait on CI.
- *
- * Returns the FIRST failure, or the final /land-and-deploy result on
- * full success. The combined log captures both invocations.
+ * Build the argv for a Claude file-path task. Claude does not expose the same
+ * reasoning flag shape as Codex here, so reasoning is carried as an explicit
+ * instruction in the prompt.
+ */
+export function buildClaudeTaskArgv(opts: {
+  inputFilePath: string;
+  outputFilePath: string;
+  command?: string;
+  model?: string;
+  reasoning?: RoleReasoning;
+  gate?: boolean;
+}): string[] {
+  const commandLine = opts.command ? `Run ${opts.command}.` : 'Do the requested work.';
+  const gateLine = opts.gate
+    ? `The report MUST include a final 'GATE PASS' or 'GATE FAIL' line on its own.`
+    : '';
+  const prompt = [
+    `Use ${opts.reasoning || 'high'} thinking.`,
+    `Read instructions at ${opts.inputFilePath}.`,
+    commandLine,
+    `Write your complete output to ${opts.outputFilePath}.`,
+    gateLine,
+    `Return ONLY the output file path. No narrative.`,
+  ].filter(Boolean).join(' ');
+  return [...(opts.model ? ['--model', opts.model] : []), '-p', prompt];
+}
+
+export async function runClaudeTask(opts: {
+  inputFilePath: string;
+  outputFilePath: string;
+  cwd: string;
+  slug: string;
+  phaseNumber?: string;
+  iteration?: number;
+  logPrefix: string;
+  command?: string;
+  model?: string;
+  reasoning?: RoleReasoning;
+  gate?: boolean;
+  timeoutMs?: number;
+}): Promise<SubAgentResult> {
+  ensureLogDir(opts.slug);
+  const argv = buildClaudeTaskArgv(opts);
+  const logPath = path.join(
+    logDir(opts.slug),
+    opts.phaseNumber
+      ? `phase-${opts.phaseNumber}-${opts.logPrefix}-${opts.iteration ?? 1}.log`
+      : `${opts.logPrefix}.log`
+  );
+  let result = await spawnCaptured({
+    bin: CLAUDE_BIN,
+    argv,
+    cwd: opts.cwd,
+    timeoutMs: opts.timeoutMs ?? CODEX_TIMEOUT_MS,
+    logPath,
+    closeStdin: false,
+  });
+  if (result.timedOut) {
+    const retryLog = logPath.replace(/\.log$/, '-retry.log');
+    const retryResult = await spawnCaptured({
+      bin: CLAUDE_BIN,
+      argv,
+      cwd: opts.cwd,
+      timeoutMs: opts.timeoutMs ?? CODEX_TIMEOUT_MS,
+      logPath: retryLog,
+      closeStdin: false,
+    });
+    retryResult.retries = 1;
+    return mergeOutputFile(retryResult, opts.outputFilePath);
+  }
+  return mergeOutputFile(result, opts.outputFilePath);
+}
+
+/**
+ * Final ship step: run the configurable ship command, then land command.
+ * Returns the FIRST failure, or the final land result on full success.
  */
 export async function runShip(opts: {
   cwd: string;
   slug: string;
+  ship: {
+    provider: 'claude' | 'codex';
+    model: string;
+    reasoning: RoleReasoning;
+    command: string;
+  };
+  land: {
+    provider: 'claude' | 'codex';
+    model: string;
+    reasoning: RoleReasoning;
+    command: string;
+  };
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
 
-  const shipLog = path.join(logDir(opts.slug), 'ship.log');
-  const shipResult = await spawnCaptured({
-    bin: CLAUDE_BIN,
-    argv: ['--model', 'sonnet', '-p', '/ship'],
+  const shipInput = path.join(logDir(opts.slug), 'ship-input.md');
+  const shipOutput = path.join(logDir(opts.slug), 'ship-output.md');
+  fs.writeFileSync(shipInput, `Run ${opts.ship.command} for this repository. Report exactly what happened.`);
+  fs.writeFileSync(shipOutput, '');
+  const shipResult = await runSlashCommand({
+    inputFilePath: shipInput,
+    outputFilePath: shipOutput,
     cwd: opts.cwd,
+    slug: opts.slug,
+    logPrefix: 'ship',
+    role: opts.ship,
     timeoutMs: SHIP_TIMEOUT_MS,
-    logPath: shipLog,
-    closeStdin: false,
+    gate: false,
   });
 
   // Bail out before /land-and-deploy if /ship failed.
@@ -382,14 +477,68 @@ export async function runShip(opts: {
     return shipResult;
   }
 
-  const deployLog = path.join(logDir(opts.slug), 'land-and-deploy.log');
-  return spawnCaptured({
-    bin: CLAUDE_BIN,
-    argv: ['--model', 'sonnet', '-p', '/land-and-deploy'],
+  const landInput = path.join(logDir(opts.slug), 'land-and-deploy-input.md');
+  const landOutput = path.join(logDir(opts.slug), 'land-and-deploy-output.md');
+  fs.writeFileSync(landInput, `Run ${opts.land.command} for this repository. Report exactly what happened.`);
+  fs.writeFileSync(landOutput, '');
+  return runSlashCommand({
+    inputFilePath: landInput,
+    outputFilePath: landOutput,
     cwd: opts.cwd,
+    slug: opts.slug,
+    logPrefix: 'land-and-deploy',
+    role: opts.land,
     timeoutMs: SHIP_TIMEOUT_MS,
-    logPath: deployLog,
-    closeStdin: false,
+    gate: false,
+  });
+}
+
+export async function runSlashCommand(opts: {
+  inputFilePath: string;
+  outputFilePath: string;
+  cwd: string;
+  slug: string;
+  phaseNumber?: string;
+  iteration?: number;
+  logPrefix: string;
+  role: {
+    provider: 'claude' | 'codex';
+    model: string;
+    reasoning: RoleReasoning;
+    command: string;
+  };
+  timeoutMs?: number;
+  gate?: boolean;
+}): Promise<SubAgentResult> {
+  if (opts.role.provider === 'claude') {
+    return runClaudeTask({
+      inputFilePath: opts.inputFilePath,
+      outputFilePath: opts.outputFilePath,
+      cwd: opts.cwd,
+      slug: opts.slug,
+      phaseNumber: opts.phaseNumber,
+      iteration: opts.iteration,
+      logPrefix: opts.logPrefix,
+      command: opts.role.command,
+      model: opts.role.model,
+      reasoning: opts.role.reasoning,
+      gate: opts.gate,
+      timeoutMs: opts.timeoutMs,
+    });
+  }
+  return runCodexReview({
+    inputFilePath: opts.inputFilePath,
+    outputFilePath: opts.outputFilePath,
+    cwd: opts.cwd,
+    slug: opts.slug,
+    phaseNumber: opts.phaseNumber ?? 'ship',
+    iteration: opts.iteration ?? 1,
+    command: opts.role.command,
+    model: opts.role.model,
+    reasoning: opts.role.reasoning,
+    gate: opts.gate,
+    logPrefix: opts.logPrefix,
+    timeoutMs: opts.timeoutMs,
   });
 }
 
@@ -626,7 +775,7 @@ export function buildCodexImplArgv(opts: {
   outputFilePath: string;
   cwd: string;
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
-  reasoning?: 'low' | 'medium' | 'high' | 'xhigh';
+  reasoning?: RoleReasoning;
   model?: string;
 }): string[] {
   const codexPrompt = [
@@ -646,7 +795,7 @@ export function buildCodexImplArgv(opts: {
       | undefined) ||
     'workspace-write';
 
-  const reasoning = opts.reasoning || 'xhigh';
+  const reasoning = opts.reasoning || 'high';
 
   return [
     'exec',
@@ -676,7 +825,7 @@ export async function runCodexImpl(opts: {
   slug: string;
   phaseNumber: string;
   iteration: number;
-  reasoning?: 'low' | 'medium' | 'high' | 'xhigh';
+  reasoning?: RoleReasoning;
   model?: string;
   /** Optional prefix for log filenames — used by fix-loop passes to avoid overwriting the initial impl log. */
   logPrefix?: string;
@@ -719,7 +868,6 @@ export async function runCodexImpl(opts: {
 }
 
 const JUDGE_TIMEOUT_MS = Number(process.env.GSTACK_BUILD_JUDGE_TIMEOUT) || 10 * 60_000;
-const JUDGE_MODEL = process.env.GSTACK_BUILD_JUDGE_MODEL || 'claude-opus-4-7';
 
 /**
  * Run Claude Opus as the tournament judge. Caller writes the full judge prompt
@@ -736,10 +884,13 @@ export async function runJudgeOpus(opts: {
   cwd: string;
   slug: string;
   phaseNumber: string;
+  model?: string;
+  reasoning?: RoleReasoning;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
 
   const shellPrompt = [
+    `Use ${opts.reasoning || 'xhigh'} thinking.`,
     `Read judge prompt at ${opts.inputFilePath}.`,
     `Pick the better of the two implementations described inside.`,
     `Write your verdict to ${opts.outputFilePath} in this exact format:`,
@@ -748,7 +899,7 @@ export async function runJudgeOpus(opts: {
     `Return ONLY the output file path. No narrative.`,
   ].join(' ');
 
-  const argv = ['--model', JUDGE_MODEL, '-p', shellPrompt];
+  const argv = ['--model', opts.model || process.env.GSTACK_BUILD_JUDGE_MODEL || 'claude-opus-4-7', '-p', shellPrompt];
 
   const logPath = path.join(
     logDir(opts.slug),

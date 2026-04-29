@@ -8,6 +8,8 @@
  * Plus the top-level BuildState that the persistence layer reads/writes.
  */
 
+import type { RoleConfigs } from './role-config';
+
 export type PhaseStatus =
   | 'pending'
   | 'test_spec_running'
@@ -180,4 +182,6 @@ export interface BuildState {
   codexModel?: string;
   /** Model used for Codex review pass. Stored for resume mismatch detection. */
   codexReviewModel?: string;
+  /** Role-based provider/model/reasoning/command routing. */
+  roleConfigs?: RoleConfigs;
 }

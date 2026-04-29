@@ -7,6 +7,7 @@ import {
   parseJudgeVerdict,
   buildCodexImplArgv,
   buildCodexReviewArgv,
+  buildClaudeTaskArgv,
 } from '../sub-agents';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -284,13 +285,13 @@ describe('buildCodexImplArgv (codex exec invocation shape)', () => {
     expect(argv).toContain('/tmp/gstack-dual-myslug-p1-1234567890/gemini');
   });
 
-  it('uses xhigh reasoning effort (thinking mode) by default', () => {
+  it('uses high reasoning effort (thinking mode) by default', () => {
     const argv = buildCodexImplArgv({
       inputFilePath: '/tmp/in.md',
       outputFilePath: '/tmp/out.md',
       cwd: '/tmp/wt',
     });
-    expect(argv).toContain('model_reasoning_effort="xhigh"');
+    expect(argv).toContain('model_reasoning_effort="high"');
   });
 
   it('honors opts.sandbox override (e.g. danger-full-access when explicitly opted in)', () => {
@@ -351,13 +352,13 @@ describe('buildCodexImplArgv (codex exec invocation shape)', () => {
 });
 
 describe('buildCodexReviewArgv (codex review invocation shape)', () => {
-  it('uses xhigh reasoning effort (thinking mode) by default', () => {
+  it('uses high reasoning effort (thinking mode) by default', () => {
     const argv = buildCodexReviewArgv({
       inputFilePath: '/tmp/review-in.md',
       outputFilePath: '/tmp/review-out.md',
       cwd: '/tmp/wt',
     });
-    expect(argv).toContain('model_reasoning_effort="xhigh"');
+    expect(argv).toContain('model_reasoning_effort="high"');
   });
 
   it('includes -m <model> when model is specified', () => {
@@ -426,5 +427,37 @@ describe('buildCodexReviewArgv (codex review invocation shape)', () => {
     });
     expect(argv).toContain('model_reasoning_effort="high"');
     expect(argv).not.toContain('model_reasoning_effort="xhigh"');
+  });
+});
+
+describe('buildClaudeTaskArgv (claude role invocation shape)', () => {
+  it('builds an Opus /review gate prompt with xhigh thinking', () => {
+    const argv = buildClaudeTaskArgv({
+      inputFilePath: '/tmp/review-in.md',
+      outputFilePath: '/tmp/review-out.md',
+      command: '/review',
+      model: 'claude-opus-4-7',
+      reasoning: 'xhigh',
+      gate: true,
+    });
+    expect(argv).toContain('--model');
+    expect(argv[argv.indexOf('--model') + 1]).toBe('claude-opus-4-7');
+    const prompt = argv[argv.indexOf('-p') + 1];
+    expect(prompt).toContain('Use xhigh thinking');
+    expect(prompt).toContain('/review');
+    expect(prompt).toContain('GATE PASS');
+  });
+
+  it('builds an Opus /codex review second-opinion prompt', () => {
+    const argv = buildClaudeTaskArgv({
+      inputFilePath: '/tmp/review-in.md',
+      outputFilePath: '/tmp/review-out.md',
+      command: '/codex review',
+      model: 'claude-opus-4-7',
+      reasoning: 'xhigh',
+      gate: true,
+    });
+    const prompt = argv[argv.indexOf('-p') + 1];
+    expect(prompt).toContain('/codex review');
   });
 });

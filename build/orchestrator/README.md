@@ -11,7 +11,7 @@ Standalone CLI that drives a multi-phase implementation plan to completion. Repl
 | The phases need ad-hoc judgment | Each phase has a clear, scriptable description |
 | Quick iteration, exploratory work | Production builds, multi-day work |
 
-The CLI delegates each per-phase task to fresh Gemini and Codex subprocesses, so the LLM brain still does the work — it just doesn't drive the loop.
+The CLI delegates each per-phase task to fresh Claude, Gemini, or Codex subprocesses, so the LLM brain still does the work — it just doesn't drive the loop.
 
 ## Install
 
@@ -30,6 +30,11 @@ If it's not on PATH, add `~/.claude/skills/gstack/bin` to your `PATH` or symlink
 gstack-build <plan-file> [flags]
 ```
 
+When the plan lives in a sibling `*-gstack/living-plans/` repo, run the command
+from the product repo and pass `--project-root "$(git rev-parse --show-toplevel)"`
+if there is any ambiguity. Completed living plans are moved to the sibling
+`archived/` directory after a successful non-dry-run build.
+
 The plan file supports two formats:
 
 **TDD format (recommended)** — 3 checkboxes per phase:
@@ -37,14 +42,14 @@ The plan file supports two formats:
 ### Phase 1: Skeleton + parser
 - [ ] **Test Specification (Gemini Sub-agent)**: Write failing tests that cover...
 - [ ] **Implementation (Gemini Sub-agent)**: Make all failing tests pass...
-- [ ] **Review & QA (Codex Sub-agent)**: Run codex /gstack-review...
+- [ ] **Review & QA (review roles)**: Run /review, /codex review, and /gstack-qa...
 ```
 
 **Legacy format (still supported)** — 2 checkboxes per phase:
 ```markdown
 ### Phase 1: Skeleton + parser
 - [ ] **Implementation (Gemini Sub-agent)**: Write parser.ts with...
-- [ ] **Review & QA (Codex Sub-agent)**: Run codex /gstack-review...
+- [ ] **Review & QA (review roles)**: Run /review, /codex review, and /gstack-qa...
 ```
 
 Phase number can be `N` or `N.M`. The orchestrator processes phases in document order. Phases missing the `**Implementation` or `**Review` checkbox are skipped with a warning. TDD format phases without a `**Test Specification` checkbox are treated as legacy and skip the Red/Green steps.
@@ -54,11 +59,11 @@ Phase number can be `N` or `N.M`. The orchestrator processes phases in document 
 When a phase has a `**Test Specification` checkbox, the orchestrator runs a 7-step loop:
 
 ```
-1. Test Specification  — Gemini writes failing tests (Red)
-2. Verify Red          — run tests; if they pass, Gemini rewrites stricter tests (cap: GSTACK_BUILD_RED_MAX_ITER)
-3. Implementation      — Gemini implements until tests pass
-4. Test+Fix Loop       — run tests; if failing, Gemini fixes; repeat (cap: GSTACK_BUILD_TEST_MAX_ITER)
-5. Codex Review        — recursive GATE PASS loop (unchanged)
+1. Test Specification  — Claude Opus 4.7 xhigh writes failing tests (Red)
+2. Verify Red          — run tests; if they pass, test-writer rewrites stricter tests (cap: GSTACK_BUILD_RED_MAX_ITER)
+3. Implementation      — Gemini 3.1 Pro implements until tests pass
+4. Test+Fix Loop       — run tests; if failing, Codex GPT-5.5 high fixes; repeat (cap: GSTACK_BUILD_TEST_MAX_ITER)
+5. Review + QA         — Claude `/review`, Claude `/codex review`, then Codex `/gstack-qa`; all require GATE PASS
 6. Update Plan         — flip all 3 checkboxes [x]
 7. Context save        — claude --model sonnet -p /context-save
 ```
@@ -73,7 +78,7 @@ The orchestrator auto-detects the test runner by searching the project root (`cw
 4. `pyproject.toml` with `[tool.pytest.ini_options]` → `pytest`
 5. `go.mod` → `go test ./...`
 6. `Cargo.toml` → `cargo test`
-7. None found → warn and skip Red/Green verification (test spec still written; Codex review still runs)
+7. None found → warn and skip Red/Green verification (test spec still written; review gates still run)
 
 ```bash
 # Explicit override — use when auto-detection picks the wrong command:
@@ -110,7 +115,7 @@ To force a fresh start: `gstack-build ... --no-resume` or `rm ~/.gstack/build-st
 
 ## Dual Implementor Mode (`--dual-impl`)
 
-Tournament selection: Gemini and GPT-Codex implement each TDD phase **in parallel**, in **isolated git worktrees**, and Claude Opus picks the winner. The winning commits are cherry-picked back onto the main branch and the existing TDD pipeline (test+fix loop → Codex review) takes over from there.
+Tournament selection: Gemini and GPT-Codex implement each TDD phase **in parallel**, in **isolated git worktrees**, and Claude Opus picks the winner. The winning commits are cherry-picked back onto the main branch and the existing TDD pipeline (test+fix loop → review gates) takes over from there.
 
 **Prewritten test specs are supported** — if a phase has `[x] **Test Specification` already checked (user wrote the tests before running gstack), dual-impl runs `VERIFY_RED` first to confirm the tests fail, then spawns both implementors. If the prewritten tests pass trivially (before any implementation), the phase fails with a clear message: fix the tests so they fail, then re-run. **Legacy 2-checkbox plans** (no test spec checkbox at all) still skip dual-impl silently and use normal single-Gemini behavior.
 
@@ -125,7 +130,7 @@ gstack-build plans/...md --dual-impl
 ### Per-phase loop (when `--dual-impl` is active)
 
 ```
-1. Test Specification  — Gemini writes failing tests (Red)            [unchanged]
+1. Test Specification  — Claude Opus writes failing tests (Red)
 2. Verify Red          — confirm tests fail                            [unchanged]
 3. Dual Impl           — createWorktrees, then Promise.all of:
                            - runGemini  in /tmp/gstack-dual-<slug>-pN-<ts>/gemini
@@ -151,13 +156,13 @@ gstack-build plans/...md --dual-impl
 5. Judge Opus          — Claude Opus reads both diffs + test results + fixHistory,
                          emits "WINNER: gemini|codex" + REASONING + HARDENING block
                          (HARDENING: lists concrete bug surfaces from either side's
-                         fix history; injected into the Codex review prompt)
+                         fix history; injected into the review prompt)
 6. Apply Winner        — cherry-pick winning branch's commits onto main cwd
                          (patch fallback if cherry-pick conflicts)
 7. — handoff —         — phase rejoins impl_done; existing TDD loop runs
 8. Test+Fix Loop       — adopted code is verified again on main cwd
-9. Codex Review        — final review on main cwd; receives HARDENING notes so
-                         the reviewer checks for known edge cases from both
+9. Review + QA         — final review on main cwd; receives HARDENING notes so
+                         the reviewers check for known edge cases from both
                          implementors' failure histories
 ```
 
@@ -192,18 +197,39 @@ Manual recovery: `git worktree list` to find leftover worktrees, then `git workt
 |---|---|---|
 | `GEMINI_BIN` | `gemini` | Path to Gemini CLI. |
 | `CODEX_BIN` | `codex` | Path to Codex CLI. |
-| `CLAUDE_BIN` | `claude` | Path to Claude Code (for the ship step + Opus judge). |
+| `CLAUDE_BIN` | `claude` | Path to Claude Code. |
 | `GBRAIN_BIN` | `gbrain` | Path to gbrain CLI (optional). |
+| `GSTACK_BUILD_TEST_WRITER_MODEL` | `claude-opus-4-7` | Failing-test writer model. |
+| `GSTACK_BUILD_PRIMARY_IMPL_MODEL` | `gemini-3.1-pro` | Primary implementation model. |
+| `GSTACK_BUILD_TEST_FIXER_MODEL` | `gpt-5.5` | Test-fixer model. |
+| `GSTACK_BUILD_SECONDARY_IMPL_MODEL` | `gpt-5.3-codex` | Dual-impl secondary model. |
+| `GSTACK_BUILD_REVIEW_MODEL` | `claude-opus-4-7` | Primary review model. |
+| `GSTACK_BUILD_REVIEW_SECONDARY_MODEL` | `claude-opus-4-7` | Secondary review model. |
+| `GSTACK_BUILD_QA_MODEL` | `gpt-5.5` | QA model. |
+| `GSTACK_BUILD_SHIP_MODEL` | `gpt-5.5` | Ship model. |
+| `GSTACK_BUILD_LAND_MODEL` | `gpt-5.5` | Land model. |
+| `GSTACK_BUILD_<ROLE>_PROVIDER` | role default | Provider override where supported; dual-impl requires Gemini primary, Codex secondary, Claude judge. |
+| `GSTACK_BUILD_<ROLE>_REASONING` | role default | Role reasoning override. |
+| `GSTACK_BUILD_<ROLE>_COMMAND` | role default | Command override for review, QA, ship, and land roles. |
 | `GSTACK_BUILD_GEMINI_TIMEOUT` | `600000` | Per-Gemini-call timeout in ms (10 min). |
 | `GSTACK_BUILD_CODEX_TIMEOUT` | `900000` | Per-Codex-iteration timeout in ms (15 min). |
 | `GSTACK_BUILD_SHIP_TIMEOUT` | `1800000` | Final ship-step timeout in ms (30 min). |
-| `GSTACK_BUILD_CODEX_MAX_ITER` | `5` | Hard cap on recursive Codex review iterations. |
+| `GSTACK_BUILD_CODEX_MAX_ITER` | `5` | Hard cap on recursive review gate iterations. |
 | `GSTACK_BUILD_TEST_TIMEOUT` | `300000` | Per-test-run timeout in ms (5 min). |
-| `GSTACK_BUILD_TEST_MAX_ITER` | `5` | Hard cap on Gemini fix iterations when tests fail post-impl. |
-| `GSTACK_BUILD_RED_MAX_ITER` | `3` | Hard cap on Gemini re-spec iterations when tests pass trivially (VERIFY_RED). |
+| `GSTACK_BUILD_TEST_MAX_ITER` | `5` | Hard cap on test-fixer iterations when tests fail post-impl. |
+| `GSTACK_BUILD_RED_MAX_ITER` | `3` | Hard cap on test-writer re-spec iterations when tests pass trivially (VERIFY_RED). |
 | `GSTACK_BUILD_JUDGE_TIMEOUT` | `600000` | Per-Opus-judge-call timeout in ms (10 min). Dual-impl only. |
 | `GSTACK_BUILD_JUDGE_MODEL` | `claude-opus-4-7` | Model passed to `claude --model` for the judge. Dual-impl only. |
 | `GSTACK_BUILD_CODEX_IMPL_SANDBOX` | `workspace-write` | Sandbox mode for `runCodexImpl`. Set to `danger-full-access` to opt in to looser sandboxing (worktrees share .git/remotes — be aware). |
+
+## Living plan storage
+
+`/build` writes synthesized living plans to the workspace's sibling
+`*-gstack/living-plans/` directory. The product repo remains the execution root:
+tests, sub-agents, review, ship, and land all run from `--project-root` or the
+current git worktree. If `gstack-build` is invoked from inside the `*-gstack`
+repo and cannot infer the product repo, it exits with instructions to rerun with
+`--project-root <repo>`.
 
 ## File layout
 
@@ -212,13 +238,13 @@ Manual recovery: `git worktree list` to find leftover worktrees, then `git workt
 ├── <slug>.json                           Live state (atomic temp+rename)
 ├── <slug>.lock                           O_EXCL lock file (cleared on graceful exit)
 └── <slug>/
-    ├── phase-1-gemini-testspec-1.log     Test-spec Gemini stdout+stderr
+    ├── phase-1-test-writer-1.log         Test-writer stdout+stderr
     ├── phase-1-gemini-testspec-1-input.md
     ├── phase-1-gemini-testspec-1-output.md
     ├── phase-1-tests-1.log               Test runner stdout+stderr (VERIFY_RED)
     ├── phase-1-gemini-1.log              Implementation Gemini stdout+stderr
     ├── phase-1-tests-1.log               Test runner stdout+stderr (post-impl)
-    ├── phase-1-gemini-fix-1.log          Fix-iteration Gemini stdout+stderr
+    ├── phase-1-gemini-fix-1.log          Fix-iteration stdout+stderr
     ├── phase-1-codex-1.log
     ├── phase-1-codex-2.log
     └── ship.log
@@ -235,7 +261,7 @@ The orchestrator stops at any of these and writes the failure reason into the st
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `Gemini timed out (after 1 retry)` | Phase too large, network blip, or Gemini hung | Raise `GSTACK_BUILD_GEMINI_TIMEOUT`, or split the phase |
-| `Codex review failed to converge after N iterations` | The recursive review can't reach `GATE PASS` | Read `phase-N-codex-*.log`, fix the underlying issue manually, resume |
+| `Review gates failed to converge after N iterations` | The recursive review can't reach `GATE PASS` | Read the phase review logs, fix the underlying issue manually, resume |
 | `Codex output did not contain GATE PASS or GATE FAIL` | Codex changed output format, or hit an internal error | Read the log; usually means the codex CLI itself errored |
 | `Tests still failing after N fix iterations` | Gemini can't converge; tests and impl are in conflict | Read `phase-N-gemini-fix-*.log`, fix manually, resume |
 | `Gemini could not produce failing tests after N attempts` | Tests pass before implementation (trivially-asserting tests) | Read `phase-N-gemini-testspec-*.log`, tighten the phase description, resume |
@@ -254,7 +280,7 @@ sub-agents.ts   gemini/codex/claude CLI wrappers with retries; detectTestCmd; ru
 plan-mutator.ts atomic [ ] → [x] checkbox flip (impl, review, test-spec)
 state.ts        ~/.gstack/build-state/<slug>.json + gbrain mirror
 gbrain.ts       gbrain CLI wrapper (best-effort, never throws)
-ship.ts         final /ship + /land-and-deploy via claude -p
+ship.ts         configurable /gstack-ship + /gstack-land-and-deploy delegation
 types.ts        Phase, PhaseState, BuildState
 ```
 
