@@ -185,6 +185,22 @@ describe('parseJudgeVerdict (Opus tournament judge output)', () => {
     const result = parseJudgeVerdict(out);
     expect(result.verdict).toBe('gemini');
   });
+
+  it('returns verdict=null for empty string (P2-3: emptyFileIsError stdout=\'\' path)', () => {
+    // mergeOutputFile sets stdout='' when the judge output file is empty.
+    // parseJudgeVerdict must return null so the caller fails-closed (falls back
+    // to gemini) rather than extracting a false WINNER from an error message.
+    const result = parseJudgeVerdict('');
+    expect(result.verdict).toBeNull();
+  });
+
+  it('returns verdict=null for diagnostic text that does not contain WINNER: (safety check)', () => {
+    // Verify that the error message format used in the old code (before P2-3)
+    // would not accidentally produce a verdict even if it appeared in stdout.
+    const diagnosticMsg = 'Judge did not write expected output to /tmp/judge-out.md. Original shell stdout:\nLoading model...';
+    const result = parseJudgeVerdict(diagnosticMsg);
+    expect(result.verdict).toBeNull();
+  });
 });
 
 describe('buildCodexImplArgv (codex exec invocation shape)', () => {

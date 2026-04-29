@@ -183,4 +183,19 @@ describe('buildJudgePrompt (Opus tournament judge prompt)', () => {
     expect(prompt.toLowerCase()).toMatch(/0/);
     expect(prompt.toLowerCase()).toMatch(/1/);
   });
+
+  it('truncates diffs longer than 40000 chars with a [truncated] marker', () => {
+    const hugeDiff = 'x'.repeat(40001);
+    const prompt = buildJudgePrompt({
+      phase: basePhase,
+      geminiDiff: hugeDiff,
+      codexDiff: 'short',
+      geminiTestResult: pass(),
+      codexTestResult: pass(),
+    });
+    expect(prompt).toContain('[...truncated');
+    // The first 40000 chars must be present; the 40001st must not
+    expect(prompt).toContain('x'.repeat(40000));
+    expect(prompt).not.toContain('x'.repeat(40001));
+  });
 });

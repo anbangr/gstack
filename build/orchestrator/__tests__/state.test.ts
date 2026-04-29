@@ -100,6 +100,17 @@ describe('freshState', () => {
     expect(s.phases[0].status).toBe('pending');
     expect(s.completed).toBe(false);
   });
+
+  it('freshState sets impl_done (not gemini_done) when implementation checked but review is not', () => {
+    const implDonePhase: Phase[] = [{
+      index: 0, number: '1', name: 'ImplDone', body: '',
+      testSpecDone: true, testSpecCheckboxLine: -1,
+      implementationDone: true, reviewDone: false,
+      implementationCheckboxLine: 5, reviewCheckboxLine: 6,
+    }];
+    const s = freshState({ planFile: '/x/foo.md', branch: 'main', phases: implDonePhase });
+    expect(s.phases[0].status).toBe('impl_done');
+  });
 });
 
 describe('loadState / saveState round-trip', () => {
@@ -139,6 +150,23 @@ describe('loadState / saveState round-trip', () => {
     const dir = path.dirname(statePath(s.slug));
     const stragglers = fs.readdirSync(dir).filter((f) => f.includes('.tmp.'));
     expect(stragglers).toHaveLength(0);
+  });
+
+  it('loadState migrates persisted gemini_done → impl_done (rename backward compat)', () => {
+    // Simulate a state file written before the gemini_done→impl_done rename.
+    const slug = 'build-migration-test';
+    const oldState = {
+      planFile: '/x/foo.md', planBasename: 'foo', slug,
+      branch: 'main', startedAt: new Date().toISOString(),
+      lastUpdatedAt: new Date().toISOString(), currentPhaseIndex: 0,
+      phases: [{ index: 0, number: '1', name: 'Foo', status: 'gemini_done' }],
+      completed: false,
+    };
+    fs.mkdirSync(path.dirname(statePath(slug)), { recursive: true });
+    fs.writeFileSync(statePath(slug), JSON.stringify(oldState));
+    const loaded = loadState(slug, { noGbrain: true });
+    expect(loaded).not.toBeNull();
+    expect(loaded!.phases[0].status).toBe('impl_done');
   });
 });
 
