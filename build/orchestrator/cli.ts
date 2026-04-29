@@ -1253,9 +1253,10 @@ async function main() {
   }
 
   // Plan files in a plans/ subdirectory sit one level below the project root.
-  const cwdForPreflight = path.basename(path.dirname(args.planFile)) === 'plans'
-    ? path.resolve(path.dirname(args.planFile), '..')
-    : path.dirname(args.planFile);
+  const resolvedPlan = path.resolve(args.planFile);
+  const cwdForPreflight = path.basename(path.dirname(resolvedPlan)) === 'plans'
+    ? path.resolve(path.dirname(resolvedPlan), '..')
+    : path.dirname(resolvedPlan);
 
   // Skip both startup gates when running in simulation mode or skipping ship.
   const runStartupGates = !args.dryRun && !args.skipShip;
@@ -1272,6 +1273,9 @@ async function main() {
 
   const slug = deriveSlug(args.planFile);
 
+  // Sweep runs before the lock so that sibling unshipped branches are processed
+  // regardless of whether this slug is already locked. Concurrent gstack-build
+  // invocations are rare in practice; warn-and-continue handles sweep failures.
   const currentBranchForSweep = getCurrentBranch(cwdForPreflight);
   if (!args.skipSweep && runStartupGates) {
     await sweepUnshippedFeatBranches(cwdForPreflight, currentBranchForSweep, slug);
@@ -1340,7 +1344,7 @@ async function main() {
     } else {
       state = freshState({
         planFile: args.planFile,
-        branch: getCurrentBranch(),
+        branch: getCurrentBranch(cwdForPreflight),
         phases,
         geminiModel: args.geminiModel,
         codexModel: args.codexModel,
@@ -1457,10 +1461,13 @@ export function checkWorkingTreeClean(cwd: string): { clean: boolean; dirty: str
 }
 
 export function findUnshippedFeatBranches(cwd: string, currentBranch: string): string[] {
-  spawnSync('git', ['fetch', 'origin'], { cwd, encoding: 'utf8' });
+  const fetchR = spawnSync('git', ['fetch', '--prune', 'origin'], { cwd, encoding: 'utf8' });
+  if (fetchR.status !== 0) {
+    console.warn(`  ⚠ git fetch failed (exit ${fetchR.status}) — branch list may be stale`);
+  }
   // Assumes origin/main is the default branch. If your repo uses master or another
   // default, pass --skip-sweep and handle the sweep manually.
-  const r = spawnSync('git', ['branch', '-r', '--no-merged', 'origin/main'], { cwd, encoding: 'utf8' });
+  const r = spawnSync('git', ['branch', '-r', '--no-merged', 'origin/main', '--list', 'origin/feat/*'], { cwd, encoding: 'utf8' });
   return (r.stdout || '')
     .split('\n')
     .map((l: string) => l.trim())
@@ -1474,14 +1481,20 @@ async function sweepUnshippedFeatBranches(
   currentBranch: string,
   slug: string
 ): Promise<void> {
-  const branches = findUnshippedFeatBranches(cwd, currentBranch);
-  if (branches.length === 0) return;
+  const MAX_SWEEP_BRANCHES = 3;
+  const allBranches = findUnshippedFeatBranches(cwd, currentBranch);
+  if (allBranches.length === 0) return;
+
+  const branches = allBranches.slice(0, MAX_SWEEP_BRANCHES);
+  if (allBranches.length > MAX_SWEEP_BRANCHES) {
+    console.warn(`\n  ⚠ ${allBranches.length} unshipped feat/* branches found — capping sweep at ${MAX_SWEEP_BRANCHES}. Use --skip-sweep to skip entirely.`);
+  }
 
   console.log(`\n▶ Unshipped feat/* branches: ${branches.join(', ')}`);
   try {
     for (const branch of branches) {
       console.log(`\n  ↳ checking out ${branch} and running /ship + /land-and-deploy...`);
-      const co = spawnSync('git', ['checkout', branch], { cwd, encoding: 'utf8' });
+      const co = spawnSync('git', ['checkout', '-B', branch, `origin/${branch}`], { cwd, encoding: 'utf8' });
       if (co.status !== 0) {
         console.warn(`  ⚠ checkout failed for ${branch} (exit ${co.status}) — skipping`);
         continue;
@@ -1497,11 +1510,11 @@ async function sweepUnshippedFeatBranches(
       }
     }
   } finally {
-    if (getCurrentBranch(cwd) !== currentBranch) {
-      const restore = spawnSync('git', ['checkout', currentBranch], { cwd, encoding: 'utf8' });
-      if (restore.status !== 0) {
-        console.warn(`  ⚠ could not restore branch: ${currentBranch} — you may be on a different branch`);
-      }
+    // Always restore unconditionally — shipAndDeploy may leave the tree on a
+    // different branch if it crashes mid-checkout, making getCurrentBranch unreliable.
+    const restore = spawnSync('git', ['checkout', currentBranch], { cwd, encoding: 'utf8' });
+    if (restore.status !== 0) {
+      console.warn(`  ⚠ could not restore branch: ${currentBranch} — you may be on a different branch`);
     }
   }
 }

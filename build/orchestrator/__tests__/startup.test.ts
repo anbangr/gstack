@@ -58,7 +58,7 @@ describe('checkWorkingTreeClean', () => {
     spawnSync('git', ['commit', '-m', 'init'], { cwd: tempDir });
 
     fs.writeFileSync(path.join(tempDir, 'staged.ts'), 'staged');
-    spawnSync('git', ['add', '.'], { cwd: tempDir });
+    spawnSync('git', ['add', 'staged.ts'], { cwd: tempDir });
 
     const result = checkWorkingTreeClean(tempDir);
     expect(result.clean).toBe(false);
@@ -80,6 +80,8 @@ describe('findUnshippedFeatBranches', () => {
     spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: mainDir });
     spawnSync('git', ['config', 'user.name', 'Test'], { cwd: mainDir });
     spawnSync('git', ['init', '--bare', '--initial-branch=main'], { cwd: bareDir });
+    // Fallback for git < 2.28 that ignores --initial-branch in bare repos.
+    spawnSync('git', ['symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: bareDir });
     spawnSync('git', ['remote', 'add', 'origin', bareDir], { cwd: mainDir });
     // make a commit so main exists
     fs.writeFileSync(path.join(mainDir, 'README.md'), 'init');
