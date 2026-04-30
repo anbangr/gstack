@@ -16,7 +16,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { BuildState, Phase, PhaseState } from './types';
+import type { BuildState, Feature, FeatureState, Phase, PhaseState } from './types';
 import type { RoleConfigs } from './role-config';
 import { migrateLegacyModels } from './role-config';
 import { isGbrainAvailable, gbrainPut, gbrainGet } from './gbrain';
@@ -58,6 +58,17 @@ function migrateState(state: BuildState): BuildState {
     (ph.status as string) === 'gemini_done' ? { ...ph, status: 'impl_done' } : ph
   );
   state.roleConfigs = migrateLegacyModels(state);
+  if (!state.features) {
+    state.features = [{
+      index: 0,
+      number: '1',
+      name: 'Full plan',
+      phaseIndexes: state.phases.map((ph) => ph.index),
+      status: state.completed ? 'committed' : 'pending',
+      ...(state.completed ? { completedAt: state.lastUpdatedAt } : {}),
+    }];
+    state.currentFeatureIndex = state.features[0].status === 'committed' ? -1 : 0;
+  }
   return state;
 }
 
@@ -72,6 +83,7 @@ export function ensureLogDir(slug: string): void {
 export function freshState(args: {
   planFile: string;
   branch: string;
+  features?: Feature[];
   phases: Phase[];
   geminiModel?: string;
   codexModel?: string;
@@ -99,6 +111,30 @@ export function freshState(args: {
         ? 'committed'
         : 'pending',
   }));
+  const providedFeatures = args.features?.filter((f) => f.phaseIndexes.length > 0);
+  const sourceFeatures =
+    providedFeatures && providedFeatures.length > 0
+      ? providedFeatures
+      : phaseStates.length > 0
+      ? [{
+          index: 0,
+          number: '1',
+          name: 'Full plan',
+          body: '',
+          phaseIndexes: phaseStates.map((p) => p.index),
+        }]
+      : [];
+  const featureStates: FeatureState[] = sourceFeatures.map((f) => {
+    const done = f.phaseIndexes.every((idx) => phaseStates[idx]?.status === 'committed');
+    return {
+      index: f.index,
+      number: f.number,
+      name: f.name,
+      phaseIndexes: [...f.phaseIndexes],
+      status: done ? 'phases_done' : 'pending',
+    };
+  });
+  const currentFeatureIndex = featureStates.findIndex((s) => s.status !== 'committed');
   return {
     planFile: args.planFile,
     planBasename,
@@ -107,8 +143,10 @@ export function freshState(args: {
     startedAt: now,
     lastUpdatedAt: now,
     currentPhaseIndex: Math.max(0, phaseStates.findIndex((s) => s.status !== 'committed')),
+    currentFeatureIndex,
+    features: featureStates,
     phases: phaseStates,
-    completed: phaseStates.every((s) => s.status === 'committed'),
+    completed: false,
     ...(args.geminiModel && { geminiModel: args.geminiModel }),
     ...(args.codexModel && { codexModel: args.codexModel }),
     ...(args.codexReviewModel && { codexReviewModel: args.codexReviewModel }),

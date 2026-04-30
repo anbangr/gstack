@@ -1,6 +1,6 @@
 # gstack-build — code-driven phase orchestrator
 
-Standalone CLI that drives a multi-phase implementation plan to completion. Replaces the LLM-orchestrated loop in the `/build` skill for long, multi-week plans where context compaction or "Standing by, let me know what's next" stalls become a problem.
+Standalone CLI that drives a feature-block implementation plan to completion. Replaces the LLM-orchestrated loop in the `/build` skill for long, multi-week plans where context compaction or "Standing by, let me know what's next" stalls become a problem.
 
 ## When to use this vs `/build`
 
@@ -33,9 +33,29 @@ gstack-build <plan-file> [flags]
 When the plan lives in a sibling `*-gstack/inbox/living-plan/` or `*-gstack/inbox/` repo, run the command
 from the product repo and pass `--project-root "$(git rev-parse --show-toplevel)"`
 if there is any ambiguity. Completed living plans are moved to the sibling
-`archived/` directory after a successful non-dry-run build.
+`archived/` directory after a successful non-dry-run build. Pass
+`--origin-plan <file>` when the living plan was synthesized from a separate
+source plan in `*-gstack/inbox/`; after the final completion exam passes, that
+origin plan is archived too.
 
-The plan file supports two formats:
+The plan file is organized into semantic feature blocks. The `/build` skill
+should reorganize all origin-plan weeks, milestones, blocks, and phases into
+feature groups before handing the living plan to this CLI:
+
+```markdown
+## Feature 1: Authentication
+Origin trace: Week 1 / Phase 2, Week 2 / Phase 1
+Acceptance: Login, logout, and session expiry satisfy the source plan.
+
+### Phase 1.1: Auth tests
+- [ ] **Test Specification (Gemini Sub-agent)**: Write failing tests that cover...
+- [ ] **Implementation (Gemini Sub-agent)**: Make all failing tests pass...
+- [ ] **Review & QA (review roles)**: Run /review, /codex review, and /gstack-qa...
+```
+
+Legacy phase-only plans still run as a single feature named `Full plan`.
+
+Each phase supports two formats:
 
 **TDD format (recommended)** — 3 checkboxes per phase:
 ```markdown
@@ -52,7 +72,21 @@ The plan file supports two formats:
 - [ ] **Review & QA (review roles)**: Run /review, /codex review, and /gstack-qa...
 ```
 
-Phase number can be `N` or `N.M`. The orchestrator processes phases in document order. Phases missing the `**Implementation` or `**Review` checkbox are skipped with a warning. TDD format phases without a `**Test Specification` checkbox are treated as legacy and skip the Red/Green steps.
+Feature and phase numbers can be `N` or `N.M`. The orchestrator processes features in document order, and phases in document order within each feature. Phases missing the `**Implementation` or `**Review` checkbox are skipped with a warning. TDD format phases without a `**Test Specification` checkbox are treated as legacy and skip the Red/Green steps.
+
+## Feature Workflow
+
+For each feature block, the orchestrator:
+
+1. Ensures it is on a feature branch.
+2. Runs every incomplete phase through the TDD/review loop.
+3. Runs `/ship` and `/land-and-deploy` for that feature unless `--skip-ship` or `--dry-run` is set.
+4. Verifies the landed feature against the origin plan when `--origin-plan` is provided.
+5. Marks the feature complete and advances to the next feature.
+
+Every atomic feature/phase/gate transition writes a `status` event to `~/.gstack/analytics/build-runs.jsonl` and prints a `[build-status]` line so monitors can observe progress and pause on unresolved issues.
+
+After all features complete, the final exam verifies there are no incomplete phases/features and, for shipped runs, no unmerged remote `feat/*` branches remain. Only then are the living plan and optional origin plan archived.
 
 ## TDD Workflow
 

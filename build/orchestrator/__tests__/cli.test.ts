@@ -8,9 +8,14 @@ import {
   validateRoleProviders,
   resolveProjectRoot,
   archiveLivingPlan,
+  archiveOriginPlan,
+  buildOriginVerificationBody,
+  ensureFeatureBranch,
+  restartFeatureFromOriginIssues,
   HELP_TEXT,
 } from '../cli';
-import type { Phase, DualImplTestResult } from '../types';
+import type { BuildState, FeatureState, Phase, DualImplTestResult } from '../types';
+import { statePath } from '../state';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -29,6 +34,9 @@ const basePhase: Phase = {
   index: 0,
   number: '1',
   name: 'Auth middleware',
+  featureIndex: 0,
+  featureNumber: '1',
+  featureName: 'Auth',
   body: 'Write tests for the auth middleware.',
   testSpecDone: false,
   testSpecCheckboxLine: 5,
@@ -328,6 +336,49 @@ describe('plan storage helpers', () => {
     expect(fs.existsSync(plan)).toBe(false);
     expect(fs.existsSync(archived!)).toBe(true);
   });
+
+  it('archives completed origin plans from the sibling inbox into archived', () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-origin-archive-'));
+    const inbox = path.join(tmpDir, 'app-gstack', 'inbox');
+    fs.mkdirSync(inbox, { recursive: true });
+    const plan = path.join(inbox, 'app-plan-20260430.md');
+    fs.writeFileSync(plan, '# source plan\n');
+
+    const archived = archiveOriginPlan(plan);
+    expect(archived).toBe(path.join(tmpDir, 'app-gstack', 'archived', 'app-plan-20260430.md'));
+    expect(fs.existsSync(plan)).toBe(false);
+    expect(fs.existsSync(archived!)).toBe(true);
+  });
+
+  it('does not archive origin plans outside a gstack inbox/plans dir', () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-origin-archive-'));
+    const dir = path.join(tmpDir, 'app', 'plans');
+    fs.mkdirSync(dir, { recursive: true });
+    const plan = path.join(dir, 'app-plan-20260430.md');
+    fs.writeFileSync(plan, '# source plan\n');
+
+    expect(archiveOriginPlan(plan)).toBeNull();
+    expect(fs.existsSync(plan)).toBe(true);
+  });
+});
+
+describe('buildOriginVerificationBody', () => {
+  it('asks for a GATE PASS / GATE FAIL origin-plan check', () => {
+    const body = buildOriginVerificationBody({
+      feature: {
+        index: 0,
+        number: '1',
+        name: 'Auth',
+        phaseIndexes: [0, 1],
+        status: 'origin_verifying',
+      },
+      livingPlanFile: 'living.md',
+      originPlanFile: 'origin.md',
+    });
+    expect(body).toContain('Origin plan: origin.md');
+    expect(body).toContain('GATE PASS');
+    expect(body).toContain('GATE FAIL');
+  });
 });
 
 describe('buildCodexImplPromptBody (dual-impl Codex implementation prompt)', () => {
@@ -353,6 +404,196 @@ describe('buildCodexReviewBody (configured review gate context)', () => {
     const body = buildCodexReviewBody(basePhase, 'plan.md', 'feat/test', 1, null);
     expect(body).toContain('slash command specified by the runner prompt');
     expect(body).not.toContain('/gstack-review');
+  });
+
+  it('includes origin-plan issue reports when restarting a feature loop', () => {
+    const body = buildCodexReviewBody(basePhase, 'plan.md', 'feat/test', 1, null, undefined, '/tmp/origin-issues.md');
+    expect(body).toContain('Origin-plan verification issues');
+    expect(body).toContain('/tmp/origin-issues.md');
+    expect(body).toContain('Fix every concrete gap');
+  });
+});
+
+describe('restartFeatureFromOriginIssues', () => {
+  function stateAndFeature(): { state: BuildState; feature: FeatureState } {
+    const feature: FeatureState = {
+      index: 0,
+      number: '1',
+      name: 'Auth',
+      phaseIndexes: [0, 1],
+      status: 'origin_verifying',
+    };
+    return {
+      feature,
+      state: {
+        planFile: 'plan.md',
+        planBasename: 'plan',
+        slug: 'plan',
+        branch: 'feat/auth',
+        startedAt: '2026-04-30T00:00:00.000Z',
+        lastUpdatedAt: '2026-04-30T00:00:00.000Z',
+        currentPhaseIndex: 0,
+        currentFeatureIndex: 0,
+        features: [feature],
+        phases: [
+          { index: 0, number: '1.1', name: 'Tests', status: 'committed' },
+          {
+            index: 1,
+            number: '1.2',
+            name: 'Implementation',
+            status: 'committed',
+            codexReview: {
+              iterations: 2,
+              finalVerdict: 'GATE PASS',
+              outputLogPaths: ['/tmp/review.md'],
+            },
+          },
+        ],
+        completed: false,
+        geminiModel: 'gemini',
+        codexModel: 'codex',
+        codexReviewModel: 'codex-review',
+      },
+    };
+  }
+
+  it('records origin issues and resets the feature to its review loop', () => {
+    const { state, feature } = stateAndFeature();
+    const restart = restartFeatureFromOriginIssues({
+      state,
+      feature,
+      issueLogPath: '/tmp/origin-issues.md',
+      reason: 'missing acceptance behavior',
+    });
+    expect(restart).toEqual({ restarted: true, phaseIndex: 1 });
+    expect(feature.status).toBe('running');
+    expect(feature.originVerificationAttempts).toBe(1);
+    expect(feature.originIssueLogPaths).toEqual(['/tmp/origin-issues.md']);
+    expect(state.phases[1].status).toBe('tests_green');
+    expect(state.phases[1].codexReview).toBeUndefined();
+    expect(state.phases[1].originIssueLogPath).toBe('/tmp/origin-issues.md');
+  });
+
+  it('pauses after the origin verification retry cap is exhausted', () => {
+    const { state, feature } = stateAndFeature();
+    feature.originVerificationAttempts = 1;
+    const restart = restartFeatureFromOriginIssues({
+      state,
+      feature,
+      issueLogPath: '/tmp/origin-issues.md',
+      reason: 'still missing behavior',
+      maxAttempts: 1,
+    });
+    expect(restart.restarted).toBe(false);
+    expect(feature.status).toBe('paused');
+    expect(feature.error).toContain('still failing after 1 auto-fix attempts');
+  });
+});
+
+describe('ensureFeatureBranch', () => {
+  function stateForBranchTest(slug: string, feature: FeatureState, branch = 'feat/other'): BuildState {
+    return {
+      planFile: 'plan.md',
+      planBasename: 'plan',
+      slug,
+      branch,
+      startedAt: '2026-04-30T00:00:00.000Z',
+      lastUpdatedAt: '2026-04-30T00:00:00.000Z',
+      currentPhaseIndex: 0,
+      currentFeatureIndex: 0,
+      features: [feature],
+      phases: [],
+      completed: false,
+      geminiModel: 'gemini',
+      codexModel: 'codex',
+      codexReviewModel: 'codex-review',
+    };
+  }
+
+  it('checks out a saved feature branch when resuming from another branch', () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-feature-branch-'));
+    const repo = tmpDir;
+    expect(spawnSync('git', ['init', '-b', 'main'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', ['config', 'user.name', 'Test User'], { cwd: repo }).status).toBe(0);
+    fs.writeFileSync(path.join(repo, 'README.md'), '# test\n');
+    expect(spawnSync('git', ['add', 'README.md'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', ['commit', '-m', 'init'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', ['checkout', '-b', 'feat/auth'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', ['checkout', 'main'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', ['checkout', '-b', 'feat/other'], { cwd: repo }).status).toBe(0);
+
+    const slug = `test-branch-${Date.now()}`;
+    const feature: FeatureState = {
+      index: 0,
+      number: '1',
+      name: 'Auth',
+      phaseIndexes: [],
+      status: 'running',
+      branch: 'feat/auth',
+    };
+    const state = stateForBranchTest(slug, feature);
+
+    expect(ensureFeatureBranch({
+      cwd: repo,
+      state,
+      feature,
+      dryRun: false,
+      noGbrain: true,
+    })).toBe(true);
+    const current = spawnSync('git', ['branch', '--show-current'], {
+      cwd: repo,
+      encoding: 'utf8',
+    }).stdout.trim();
+    expect(current).toBe('feat/auth');
+    fs.rmSync(statePath(slug), { force: true });
+  });
+
+  it('creates a follow-up branch from base for landed origin-verification retries', () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-origin-retry-'));
+    const bare = path.join(tmpDir, 'origin.git');
+    const repo = path.join(tmpDir, 'repo');
+    expect(spawnSync('git', ['init', '--bare', bare]).status).toBe(0);
+    expect(spawnSync('git', ['clone', bare, repo]).status).toBe(0);
+    expect(spawnSync('git', ['checkout', '-b', 'main'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', ['config', 'user.name', 'Test User'], { cwd: repo }).status).toBe(0);
+    fs.writeFileSync(path.join(repo, 'README.md'), '# test\n');
+    expect(spawnSync('git', ['add', 'README.md'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', ['commit', '-m', 'init'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', ['push', '-u', 'origin', 'main'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', ['checkout', '-b', 'feat/auth'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', ['checkout', 'main'], { cwd: repo }).status).toBe(0);
+    expect(spawnSync('git', ['branch', '-D', 'feat/auth'], { cwd: repo }).status).toBe(0);
+
+    const slug = `test-origin-retry-${Date.now()}`;
+    const feature: FeatureState = {
+      index: 0,
+      number: '1',
+      name: 'Auth',
+      phaseIndexes: [],
+      status: 'running',
+      branch: 'feat/auth',
+      landedAt: '2026-04-30T00:00:00.000Z',
+      originVerificationAttempts: 1,
+    };
+    const state = stateForBranchTest(slug, feature, 'main');
+
+    expect(ensureFeatureBranch({
+      cwd: repo,
+      state,
+      feature,
+      dryRun: false,
+      noGbrain: true,
+    })).toBe(true);
+    const current = spawnSync('git', ['branch', '--show-current'], {
+      cwd: repo,
+      encoding: 'utf8',
+    }).stdout.trim();
+    expect(current).toBe('feat/auth-followup-1');
+    expect(feature.branch).toBe('feat/auth-followup-1');
+    expect(state.branch).toBe('feat/auth-followup-1');
+    fs.rmSync(statePath(slug), { force: true });
   });
 });
 

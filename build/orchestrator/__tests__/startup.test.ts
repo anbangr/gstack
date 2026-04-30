@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { checkWorkingTreeClean, findUnshippedFeatBranches } from '../cli';
+import { checkWorkingTreeClean, findUnmergedLocalFeatBranches, findUnshippedFeatBranches, verifyNoUnmergedFeatBranches } from '../cli';
 
 describe('checkWorkingTreeClean', () => {
   let tempDir: string;
@@ -136,5 +136,65 @@ describe('findUnshippedFeatBranches', () => {
   it('no feat/* branches on origin → returns []', () => {
     const result = findUnshippedFeatBranches(mainDir, 'main');
     expect(result).toEqual([]);
+  });
+
+  it('local has unmerged feat branch not pushed to origin → returns local branch', () => {
+    spawnSync('git', ['checkout', '-b', 'feat/local-only'], { cwd: mainDir });
+    fs.writeFileSync(path.join(mainDir, 'local-only.ts'), 'local');
+    spawnSync('git', ['add', '.'], { cwd: mainDir });
+    spawnSync('git', ['commit', '-m', 'feat local only'], { cwd: mainDir });
+    spawnSync('git', ['checkout', 'main'], { cwd: mainDir });
+
+    const result = findUnmergedLocalFeatBranches(mainDir, 'main');
+    expect(result).toEqual(['feat/local-only']);
+  });
+
+  it('strict final exam check fails closed when fetch cannot verify remote branches', () => {
+    spawnSync('git', ['remote', 'set-url', 'origin', path.join(bareDir, 'missing.git')], { cwd: mainDir });
+
+    const result = verifyNoUnmergedFeatBranches(mainDir, 'main');
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('git fetch failed');
+  });
+
+  it('strict final exam includes the current unmerged feat branch', () => {
+    spawnSync('git', ['checkout', '-b', 'feat/current'], { cwd: mainDir });
+    fs.writeFileSync(path.join(mainDir, 'current.ts'), 'current');
+    spawnSync('git', ['add', '.'], { cwd: mainDir });
+    spawnSync('git', ['commit', '-m', 'feat current'], { cwd: mainDir });
+    spawnSync('git', ['push', 'origin', 'feat/current'], { cwd: mainDir });
+
+    const result = verifyNoUnmergedFeatBranches(mainDir, 'feat/current');
+    expect(result.ok).toBe(false);
+    expect(result.branches).toContain('origin/feat/current');
+    expect(result.branches).toContain('feat/current');
+  });
+
+  it('strict final exam uses origin/master when origin/main is absent', () => {
+    spawnSync('git', ['branch', '-m', 'main', 'master'], { cwd: mainDir });
+    spawnSync('git', ['push', '-u', 'origin', 'master'], { cwd: mainDir });
+    spawnSync('git', ['symbolic-ref', 'HEAD', 'refs/heads/master'], { cwd: bareDir });
+    spawnSync('git', ['push', 'origin', ':main'], { cwd: mainDir });
+    spawnSync('git', ['fetch', '--prune', 'origin'], { cwd: mainDir });
+
+    const result = verifyNoUnmergedFeatBranches(mainDir, 'master');
+    expect(result).toEqual({ ok: true, branches: [] });
+  });
+
+  it('strict final exam can ignore known shipped local squash branches', () => {
+    spawnSync('git', ['checkout', '-b', 'feat/squashed'], { cwd: mainDir });
+    fs.writeFileSync(path.join(mainDir, 'squashed.ts'), 'squashed');
+    spawnSync('git', ['add', '.'], { cwd: mainDir });
+    spawnSync('git', ['commit', '-m', 'feat squashed'], { cwd: mainDir });
+    spawnSync('git', ['checkout', 'main'], { cwd: mainDir });
+
+    const blocked = verifyNoUnmergedFeatBranches(mainDir, 'main');
+    expect(blocked.ok).toBe(false);
+    expect(blocked.branches).toContain('feat/squashed');
+
+    const ignored = verifyNoUnmergedFeatBranches(mainDir, 'main', {
+      ignoreLocalBranches: ['feat/squashed'],
+    });
+    expect(ignored).toEqual({ ok: true, branches: [] });
   });
 });

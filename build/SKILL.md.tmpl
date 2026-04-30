@@ -38,12 +38,12 @@ You are the Execution Agent. The planning phase is over. Your job is to read the
 - **Resume Mode**: Triggered automatically if you detect a partially completed living plan in the sibling `*-gstack/inbox/living-plan/` directory, or if the user explicitly asks you to resume. In this mode:
   - Do NOT synthesize a new plan.
   - Identify the active feature branch and check it out.
-  - Proceed directly to Step 2 and pick up execution from the first uncompleted `[ ]` phase.
+  - Proceed directly to Step 2 and pick up execution from the first uncompleted `[ ]` feature/phase.
 - **Reexamine Mode**: Triggered if the user asks to "reexamine", "audit", or "rerun the full process" for an implemented plan. In this mode:
   - Do NOT synthesize a new plan and do NOT create a new branch.
   - Locate the existing living plan (`<workspace>/<project>-gstack/inbox/living-plan/<project-slug>-impl-plan-<date>.md`).
-  - Loop through *every* phase in the existing plan (ignoring `[x]` marks).
-  - For each phase, spawn a sub-agent to audit the codebase and verify the phase was fully implemented. If missing steps are found, the sub-agent MUST fix them. If fully implemented, mark it clean.
+  - Loop through *every* feature and phase in the existing plan (ignoring `[x]` marks).
+  - For each feature, spawn a sub-agent to audit the codebase and verify the feature satisfies its mapped origin-plan requirements. If missing steps are found, the sub-agent MUST fix them. If fully implemented, mark it clean.
 
 ## Step 1: Synthesize Living Plan & Create Branch (Skip if Reexamine or Resume Mode)
 
@@ -57,7 +57,7 @@ If you are in **Reexamine Mode** or **Resume Mode**, skip this entire step and p
    ```
    If exactly one match exists, set `GSTACK_REPO` to it. If multiple matches exist or none exists, STOP and ask the user to specify the correct `*-gstack` repo path. Create `$GSTACK_REPO/inbox/living-plan/` and `$GSTACK_REPO/archived/` if missing.
 2. **Check for Resume**: Look first for an existing `<gstack-repo>/inbox/living-plan/*-impl-plan-*.md` file, then legacy `<gstack-repo>/living-plans/*-impl-plan-*.md`. If one exists and contains uncompleted phases, explicitly ask the user if they want to **resume** it. If they say yes, you are in Resume Mode.
-3. **Create Feature Branch**: Before doing anything else, use the `Bash` tool to create and check out a single feature branch for this entire implementation (e.g., `git checkout main && git pull && git checkout -b feat/your-feature-name`). Do NOT work directly on the `main` or `master` branch.
+3. **Create First Feature Branch**: Before doing anything else, use the `Bash` tool to create and check out a feature branch for the first living-plan feature block (e.g., `git checkout main && git pull && git checkout -b feat/your-feature-name`). Do NOT work directly on the `main` or `master` branch. After each feature is shipped and landed, sync main and create the next feature branch before continuing.
 4. Look for the latest deliverables from `/office-hours`, `/autoplan`, or a workspace TODOS.md. Check in this priority order:
 
 ```bash
@@ -100,9 +100,15 @@ When more than one candidate is found across priorities, prefer the most recent 
 
 5. Read the most recent plan file you find. **CRITICAL:** If you cannot find any plan file or TODOS.md from Step 4, you MUST immediately STOP, output an error, and wait for the user. Do NOT attempt to guess the plan or invent your own checklist. You must process the ENTIRE plan, covering all weeks, phases, and milestones, not just the next immediate week.
 6. Synthesize a comprehensive "Living Implementation & Test Plan" that spans the entire project timeline. Write this plan to `<gstack-repo>/inbox/living-plan/<project-slug>-impl-plan-<date>.md` (e.g., `../agnt2-gstack/inbox/living-plan/agnt2-impl-plan-20260426.md`). It MUST include:
-   - A comprehensive phase-by-phase checklist of implementation steps spanning all weeks (using `[ ]` markdown checkboxes).
+   - A feature-block checklist that reorganizes **all** origin-plan phases/tasks into semantic deliverable features. Do this even when the origin plan already has weeks, milestones, phases, or blocks; those groups are source material, not the execution grouping. Only preserve an origin group as a feature when it naturally matches a deliverable feature.
+   - Traceability from every feature block back to the origin-plan sections it satisfies.
+   - A comprehensive phase-by-phase checklist inside each feature block (using `[ ]` markdown checkboxes).
    - **CRITICAL**: For *every* phase in the checklist, you MUST explicitly include sub-checkboxes for the execution loop. This acts as your strict state machine. Format every phase exactly like this:
      ```markdown
+     ## Feature X: [Feature Name]
+     Origin trace: [source plan sections/weeks/blocks/phases covered by this feature]
+     Acceptance: [what must be true for this feature to satisfy the origin plan]
+
      ### Phase X: [Phase Name]
      - [ ] **Test Specification (test-writer role)**: Write failing tests covering the behavior described below. Tests MUST fail before implementation begins. Cover happy path + key edge cases using the project's existing test framework. Do NOT write any implementation code yet. Default: Claude Opus 4.7 xhigh.
      - [ ] **Implementation (primary-impl role)**: Make all failing tests pass with minimal correct code. Do NOT change test assertions. Default: Gemini 3.1 Pro with high thinking.
@@ -115,8 +121,8 @@ When more than one candidate is found across priorities, prefer the most recent 
 
 Because this is a long-running skill, your context window will eventually become compacted, causing you to forget rules. To prevent this, you MUST delegate the execution of each phase to a fresh sub-agent.
 
-For each phase in your living plan checklist that is marked as `[ ]` (if in Reexamine Mode, audit ALL phases regardless of `[x]` status):
-**Narrate Your State:** Before executing ANY step or sub-agent spawn in this loop, you MUST explicitly print: "Currently executing Phase [X], Step [Y]: [Name of Step]". This forced chain-of-thought is a critical guardrail to ensure you do not skip instructions.
+For each feature block in your living plan checklist, execute every incomplete phase in that feature before moving to ship/land for that feature (if in Reexamine Mode, audit ALL features and phases regardless of `[x]` status):
+**Narrate Your State:** Before executing ANY step or sub-agent spawn in this loop, you MUST explicitly print: "Currently executing Feature [X], Phase [Y], Step [Z]: [Name of Step]". This status narration is a critical guardrail and gives the inspector/monitor an observable checkpoint where it can report or pause execution.
 **File-path I/O is mandatory for ALL sub-agent calls.** Never paste large content inline. Write inputs to disk, ask the model to write outputs to disk, then read the output files. This rule applies universally — small or large tasks. The `--yolo` (Gemini) and `-s workspace-write` (Codex) modes make file I/O reliable; the older "model hangs when told to read files" failure was a non-yolo / read-only-sandbox problem and no longer applies.
 
 **Per-phase file layout (consistent paths):**
@@ -195,8 +201,11 @@ If A: proceed to Step M2.
 
 ```bash
 _PLAN_FILE=<plan-file>
+_ORIGIN_PLAN_FILE=<source-plan-file-if-separate-or-empty>
 _PROJECT_ROOT="$(git rev-parse --show-toplevel)"
 _FLAGS="<any extra flags, e.g. --dual-impl --skip-ship>"
+_ORIGIN_FLAG=()
+[ -n "$_ORIGIN_PLAN_FILE" ] && [ "$_ORIGIN_PLAN_FILE" != "$_PLAN_FILE" ] && _ORIGIN_FLAG=(--origin-plan "$_ORIGIN_PLAN_FILE")
 _SLUG="build-$(basename "$_PLAN_FILE" .md)"
 _STATE_FILE="$HOME/.gstack/build-state/$_SLUG.json"
 _LOG_DIR="$HOME/.gstack/build-state/$_SLUG"
@@ -207,7 +216,7 @@ echo "STATE: $_STATE_FILE"
 
 Then launch in the background using `run_in_background: true` on the Bash tool:
 ```bash
-gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" $_FLAGS 2>&1 | tee "$_LOG_DIR/agent-stdout.log"
+gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS 2>&1 | tee "$_LOG_DIR/agent-stdout.log"
 ```
 
 Store the slug and plan file path in a local variable for use across poll ticks.
@@ -286,7 +295,7 @@ Completed:   <lastUpdatedAt>
 
    **Contains `"timed out"`** → auto-remediate:
    ```bash
-   GSTACK_BUILD_GEMINI_TIMEOUT=1200000 gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" $_FLAGS   # run_in_background: true
+   GSTACK_BUILD_GEMINI_TIMEOUT=1200000 gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS   # run_in_background: true
    ```
    Report to user: "Gemini timed out on Phase <N>. Raised timeout to 20 min and resumed automatically." Continue monitoring.
 
@@ -316,7 +325,7 @@ Completed:   <lastUpdatedAt>
      ❌ No forward progress; you'll need to re-run manually later
    Net: Fix root cause first; resuming blind re-hits the same wall.
    ```
-   If A: `gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" $_FLAGS` (background) + continue monitoring.
+   If A: `gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS` (background) + continue monitoring.
    If B: exit the loop and print the manual resume command.
 
 #### On stale `lastUpdatedAt` (unchanged across 3 consecutive ticks ≈ 3 min)
@@ -344,7 +353,7 @@ When `_STALE_TICKS >= 3`:
 1. Check if the process is alive: `pgrep -f "gstack-build"`
 2. **Dead** (no process, no lock file): auto-resume.
    ```bash
-   gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" $_FLAGS --skip-clean-check   # run_in_background: true
+   gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS --skip-clean-check   # run_in_background: true
    ```
    Report: "Build process appears to have crashed (state frozen, no process found). Auto-resumed." Reset `_STALE_TICKS` to 0. Continue monitoring.
 3. **Alive** (process running but state frozen): surface via `AskUserQuestion`:
@@ -368,7 +377,7 @@ When `_STALE_TICKS >= 3`:
    ```bash
    kill $(pgrep -f "gstack-build") 2>/dev/null || true
    sleep 2
-   gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" $_FLAGS --skip-clean-check   # run_in_background: true
+   gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS --skip-clean-check   # run_in_background: true
    ```
    Reset `_STALE_TICKS` to 0. Continue monitoring.
 
@@ -441,25 +450,24 @@ If none of the above conditions fired, schedule the next wakeup at 60 seconds an
 
 9. **Context save at phase boundary**: After each phase completes (all three sub-checkboxes — Test Specification, Implementation, and Review — checked and guardrail verified), run `claude --model sonnet -p /context-save` via the `Bash` tool. This ensures progress survives a context window compaction mid-session.
 
-Do NOT stop to ask the user for permission between phases unless a sub-agent fails catastrophically or hits a safety constraint. Keep the loop going.
+After each feature's phases are clean, ship and land that feature before starting the next feature. Then revisit the origin plan and verify that the shipped feature satisfies the origin-plan requirements mapped to that feature. If not, record concrete issues and restart the feature loop. Do NOT stop to ask the user for permission between phases or features unless a sub-agent fails catastrophically, a gate cannot be cleared automatically, or a safety constraint requires user judgment. Keep the loop going.
 
 ## Step 3: Final Ship & Completion
 
-Once ALL phases are complete (and have been individually reviewed):
+For EACH feature, once all phases in that feature are complete (and have been individually reviewed):
 1. **Spawn Ship/Land Roles**: You MUST spawn the configured ship and land roles to merge and deploy the fully reviewed feature branch. Defaults are Codex GPT-5.5 high running `/gstack-ship`, then Codex GPT-5.5 high running `/gstack-land-and-deploy`.
    - Use the configured commands exactly; by default run `/gstack-ship` followed by `/gstack-land-and-deploy` via Codex.
    - **CRITICAL: Do NOT substitute these skills with raw `gh pr create` or `gh pr merge` commands! You MUST use the GStack skills because they contain mandatory CI/CD safety gates.** Do NOT invoke the native `ship` tool!
 2. **Wait for Ship/Land Completion**: Run each ship/land sub-agent synchronously in the foreground. Wait for the Bash tool to return.
-3. **Archive Living Plan**: After ship and land complete, move the completed living plan from `<gstack-repo>/inbox/living-plan/` to `<gstack-repo>/archived/`. Legacy plans may still move from `<gstack-repo>/living-plans/`. If a file with the same name already exists in `archived/`, append a timestamp before moving. If you cannot determine the correct `*-gstack` repo, STOP and ask the user to specify it.
-4. **Sync Status**: Use the `Edit` tool to update the execution status in the *original* source plan file if it was separate from the living plan. Synchronize all the `[x]` completion marks from your synthesized living plan back to the original plan.
-5. **Week/Group Guardrail Verification**: After ship + land-and-deploy, run the following checks. If ANY fails, STOP and surface the error — do NOT report completion.
+3. **Origin Plan Feature Verification**: Re-open the original source plan and verify this landed feature satisfies the mapped origin-plan requirements. If gaps remain, record the issues in the living plan and restart that feature's implementation loop.
+4. **Feature Guardrail Verification**: After ship + land-and-deploy, run the following checks. If ANY fails, STOP and surface the error — do NOT report completion.
 
    ```bash
    # 1. PR is merged (not open)
    gh pr list --state open --head <feature-branch>
    # must return 0 rows
 
-   # 2. No unmerged feature branches remain for this week's work
+   # 2. No unmerged feature branches remain for this completed feature
    git fetch origin
    git branch -r --no-merged origin/main | grep "feat/"
    # must return empty (or only branches for future weeks not yet started)
@@ -477,7 +485,7 @@ Once ALL phases are complete (and have been individually reviewed):
 
    ```
    ╔══════════════════════════════════════════════════════╗
-   ║  WEEK/GROUP COMPLETE — EXECUTION REPORT              ║
+   ║  FEATURE COMPLETE — EXECUTION REPORT                 ║
    ╠══════════════════════════════════════════════════════╣
    ║  Phases completed: <list, e.g. "1, 2, 3, 4">        ║
    ║  PR:               #<N> merged ✅                    ║
@@ -489,7 +497,10 @@ Once ALL phases are complete (and have been individually reviewed):
    ╚══════════════════════════════════════════════════════╝
    ```
 
-5. Report the completion to the user: summarize what you built and confirm that all phases have been shipped and deployed successfully.
+After ALL features are complete:
+1. **Final Completion Exam**: Confirm no feature branches remain unmerged locally or remotely; re-check the origin plan against the full implementation. If gaps remain, convert them into issues and restart the autonomous loop.
+2. **Archive Plans**: After the final completion exam passes, move the completed living plan from `<gstack-repo>/inbox/living-plan/` to `<gstack-repo>/archived/`. Move the completed origin plan from `<gstack-repo>/inbox/` to `<gstack-repo>/archived/`. Legacy living plans may still move from `<gstack-repo>/living-plans/`. If a file with the same name already exists in `archived/`, append a timestamp before moving. If you cannot determine the correct `*-gstack` repo, STOP and ask the user to specify it.
+3. Report the completion to the user: summarize what you built and confirm that all features have been shipped and deployed successfully.
 
 **Rules:**
 - **Autonomous Continuity**: Do NOT ask for the user's confirmation to proceed between steps, phases, or loops unless you are critically blocked. Just narrate your current state and keep moving.

@@ -17,8 +17,9 @@
  *   - BOM, trailing whitespace
  */
 
-import type { Phase } from './types';
+import type { Feature, Phase } from './types';
 
+const FEATURE_HEADING = /^##\s+Feature\s+(\d+(?:\.\d+)?)\s*:\s*(.+?)\s*$/i;
 const PHASE_HEADING = /^###\s+Phase\s+(\d+(?:\.\d+)?)\s*:\s*(.+?)\s*$/;
 const IMPL_CHECKBOX = /^\s*-\s+\[([ xX])\]\s+\*\*Implementation\b/;
 const REVIEW_CHECKBOX = /^\s*-\s+\[([ xX])\]\s+\*\*Review\b/;
@@ -26,6 +27,7 @@ const TESTSPEC_CHECKBOX = /^\s*-\s*\[([xX ])\]\s*\*\*Test Specification/i;
 const FENCE = /^```/;
 
 export interface ParseResult {
+  features: Feature[];
   phases: Phase[];
   /** Diagnostics for phases that look broken — missing checkboxes etc. */
   warnings: string[];
@@ -42,11 +44,27 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
   const lines = content.split(/\r?\n/);
 
   const phases: Phase[] = [];
+  const features: Feature[] = [];
   const warnings: string[] = [];
 
   let inFence = false;
+  let currentFeature: (Feature & { bodyLines: string[] }) | null = null;
   let currentPhase: Partial<Phase> & { bodyLines: string[] } | null = null;
   let currentPhaseStartLine = 0;
+
+  const ensureFeature = () => {
+    if (currentFeature) return currentFeature;
+    currentFeature = {
+      index: features.length,
+      number: '1',
+      name: 'Full plan',
+      body: '',
+      bodyLines: [],
+      phaseIndexes: [],
+    };
+    features.push(currentFeature);
+    return currentFeature;
+  };
 
   const finalize = (endLineExclusive: number) => {
     if (!currentPhase) return;
@@ -70,10 +88,16 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
 
     // Only emit phases with both core checkboxes — the orchestrator can't run a half-shaped phase.
     if (p.implementationCheckboxLine != null && p.reviewCheckboxLine != null) {
+      const feature = ensureFeature();
+      const phaseIndex = phases.length;
+      feature.phaseIndexes.push(phaseIndex);
       phases.push({
-        index: phases.length,
+        index: phaseIndex,
         number: p.number!,
         name: p.name!,
+        featureIndex: feature.index,
+        featureNumber: feature.number,
+        featureName: feature.name,
         testSpecDone: !!p.testSpecDone,
         implementationDone: !!p.implementationDone,
         reviewDone: !!p.reviewDone,
@@ -84,6 +108,7 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
         dualImpl: !!opts.dualImpl,
       });
     }
+    currentPhase = null;
   };
 
   for (let i = 0; i < lines.length; i++) {
@@ -107,6 +132,7 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
       // Close out previous phase.
       finalize(i);
       currentPhaseStartLine = i;
+      ensureFeature();
       currentPhase = {
         number: headingMatch[1],
         name: headingMatch[2],
@@ -115,7 +141,25 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
       continue;
     }
 
-    if (!currentPhase) continue;
+    const featureMatch = line.match(FEATURE_HEADING);
+    if (featureMatch) {
+      finalize(i);
+      currentFeature = {
+        index: features.length,
+        number: featureMatch[1],
+        name: featureMatch[2],
+        body: '',
+        bodyLines: [],
+        phaseIndexes: [],
+      };
+      features.push(currentFeature);
+      continue;
+    }
+
+    if (!currentPhase) {
+      if (currentFeature) currentFeature.bodyLines.push(line);
+      continue;
+    }
 
     // We're inside a phase body. Look for checkboxes.
     const testSpecMatch = line.match(TESTSPEC_CHECKBOX);
@@ -145,8 +189,34 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
 
   // Close out the last phase.
   finalize(lines.length);
+  for (const f of features) {
+    f.body = f.bodyLines.join('\n');
+    delete (f as any).bodyLines;
+  }
 
-  return { phases, warnings };
+  const executableFeatures = features.filter((f) => f.phaseIndexes.length > 0);
+  if (executableFeatures.length !== features.length) {
+    for (const f of features) {
+      if (f.phaseIndexes.length === 0) {
+        warnings.push(`Feature ${f.number} ("${f.name}") has no executable phases and was ignored`);
+      }
+    }
+    const featureIndexByOldIndex = new Map<number, number>();
+    executableFeatures.forEach((f, index) => {
+      featureIndexByOldIndex.set(f.index, index);
+      f.index = index;
+    });
+    for (const phase of phases) {
+      const newIndex = featureIndexByOldIndex.get(phase.featureIndex);
+      if (newIndex == null) continue;
+      const feature = executableFeatures[newIndex];
+      phase.featureIndex = newIndex;
+      phase.featureNumber = feature.number;
+      phase.featureName = feature.name;
+    }
+  }
+
+  return { features: executableFeatures, phases, warnings };
 }
 
 /**

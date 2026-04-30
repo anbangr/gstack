@@ -13,8 +13,10 @@ describe('parsePlan', () => {
 - [x] **Implementation (Gemini Sub-agent)**: do bar
 - [ ] **Review & QA (Codex Sub-agent)**: review bar
 `;
-    const { phases, warnings } = parsePlan(md);
+    const { features, phases, warnings } = parsePlan(md);
     expect(warnings).toEqual([]);
+    expect(features).toHaveLength(1);
+    expect(features[0].name).toBe('Full plan');
     expect(phases).toHaveLength(2);
     expect(phases[0].number).toBe('1');
     expect(phases[0].name).toBe('Foo');
@@ -23,6 +25,59 @@ describe('parsePlan', () => {
     expect(phases[1].number).toBe('2');
     expect(phases[1].implementationDone).toBe(true);
     expect(phases[1].reviewDone).toBe(false);
+  });
+
+  it('parses feature sections and assigns phases to their feature', () => {
+    const md = `# Plan
+
+## Feature 1: Auth
+Source: Week 2, Phase 3
+
+### Phase 1.1: Login tests
+- [ ] **Test Specification**: tests
+- [ ] **Implementation**: impl
+- [ ] **Review**: review
+
+### Phase 1.2: Login implementation
+- [ ] **Test Specification**: tests
+- [ ] **Implementation**: impl
+- [ ] **Review**: review
+
+## Feature 2: Billing
+
+### Phase 2.1: Stripe
+- [ ] **Test Specification**: tests
+- [ ] **Implementation**: impl
+- [ ] **Review**: review
+`;
+    const { features, phases } = parsePlan(md);
+    expect(features.map((f) => f.name)).toEqual(['Auth', 'Billing']);
+    expect(features[0].phaseIndexes).toEqual([0, 1]);
+    expect(features[1].phaseIndexes).toEqual([2]);
+    expect(features[0].body).toContain('Source: Week 2');
+    expect(phases[0].featureName).toBe('Auth');
+    expect(phases[2].featureNumber).toBe('2');
+  });
+
+  it('ignores feature sections that contain no executable phases', () => {
+    const md = `# Plan
+
+## Feature 1: Placeholder
+No phases yet.
+
+## Feature 2: Auth
+
+### Phase 2.1: Login
+- [ ] **Implementation**: impl
+- [ ] **Review**: review
+`;
+    const { features, phases, warnings } = parsePlan(md);
+    expect(features.map((f) => f.name)).toEqual(['Auth']);
+    expect(features[0].index).toBe(0);
+    expect(features[0].phaseIndexes).toEqual([0]);
+    expect(phases[0].featureIndex).toBe(0);
+    expect(phases[0].featureName).toBe('Auth');
+    expect(warnings.some((w) => w.includes('Feature 1 ("Placeholder") has no executable phases'))).toBe(true);
   });
 
   it('handles decimal phase numbers like 2.1', () => {

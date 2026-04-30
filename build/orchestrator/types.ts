@@ -1,7 +1,8 @@
 /**
  * Shared types for the gstack-build orchestrator.
  *
- * Two domain objects:
+ * Three domain objects:
+ *   Feature     — parsed from the plan markdown (groups executable phases)
  *   Phase       — parsed from the plan markdown (immutable after parse)
  *   PhaseState  — runtime state of executing a phase (mutates as we go)
  *
@@ -31,6 +32,31 @@ export type PhaseStatus =
   | 'dual_judge_running'
   | 'dual_winner_pending';
 
+export type FeatureStatus =
+  | 'pending'
+  | 'running'
+  | 'phases_done'
+  | 'shipping'
+  | 'landed'
+  | 'origin_verifying'
+  | 'origin_verified'
+  | 'committed'
+  | 'failed'
+  | 'paused';
+
+export interface Feature {
+  /** Zero-based index in the order features appear in the plan file. */
+  index: number;
+  /** Feature number as written in the heading, e.g. "1", "2". */
+  number: string;
+  /** Feature name (everything after `## Feature N: `). */
+  name: string;
+  /** Free-form body between the feature heading and its first phase. */
+  body: string;
+  /** Phase indexes that belong to this feature. */
+  phaseIndexes: number[];
+}
+
 export interface Phase {
   /** Zero-based index in the order phases appear in the plan file. */
   index: number;
@@ -38,6 +64,12 @@ export interface Phase {
   number: string;
   /** Phase name (everything after `### Phase N: `). */
   name: string;
+  /** Zero-based feature index that owns this phase. */
+  featureIndex: number;
+  /** Feature number as written in the heading, e.g. "1". */
+  featureNumber: string;
+  /** Feature name. */
+  featureName: string;
   /** True if `[x] **Implementation` appears in the parsed plan. */
   implementationDone: boolean;
   /** True if `[x] **Review` appears in the parsed plan. */
@@ -147,9 +179,28 @@ export interface PhaseState {
     outputLogPaths: string[];
   };
   codexReview?: CodexReviewState;
+  /** Origin-plan verification issue report that must be fixed during the next review loop. */
+  originIssueLogPath?: string;
   /** Dual-implementor tournament state (populated when --dual-impl is active). */
   dualImpl?: DualImplState;
   committedAt?: string;
+  error?: string;
+}
+
+export interface FeatureState {
+  index: number;
+  number: string;
+  name: string;
+  phaseIndexes: number[];
+  status: FeatureStatus;
+  branch?: string;
+  shippedAt?: string;
+  landedAt?: string;
+  originVerifiedAt?: string;
+  completedAt?: string;
+  issueLogPath?: string;
+  originIssueLogPaths?: string[];
+  originVerificationAttempts?: number;
   error?: string;
 }
 
@@ -168,6 +219,10 @@ export interface BuildState {
   lastUpdatedAt: string;
   /** Zero-based index of the next phase to run. */
   currentPhaseIndex: number;
+  /** Zero-based index of the next feature to run. */
+  currentFeatureIndex?: number;
+  /** Per-feature runtime state, parallel array to parsed features. */
+  features?: FeatureState[];
   /** Per-phase runtime state, parallel array to the parsed phases. */
   phases: PhaseState[];
   /** True after the ship step completes. */

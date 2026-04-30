@@ -17,7 +17,9 @@ test("SKILL.md.tmpl contains TDD changes", () => {
   expect(content.includes('all three sub-checkboxes')).toBe(true);
   expect(content.includes('*-gstack/inbox/living-plan')).toBe(true);
   expect(content.includes('--project-root "$_PROJECT_ROOT"')).toBe(true);
-  expect(content.includes('Archive Living Plan')).toBe(true);
+  expect(content.includes('Archive Plans')).toBe(true);
+  expect(content.includes('## Feature X: [Feature Name]')).toBe(true);
+  expect(content.includes('Origin Plan Feature Verification')).toBe(true);
 });
 
 test("generated SKILL.md reflects TDD changes", () => {
@@ -29,4 +31,6 @@ test("generated SKILL.md reflects TDD changes", () => {
   expect(content.includes('Verify Red')).toBe(true);
   expect(content.includes('*-gstack/inbox/living-plan')).toBe(true);
   expect(content.includes('--project-root "$_PROJECT_ROOT"')).toBe(true);
+  expect(content.includes('## Feature X: [Feature Name]')).toBe(true);
+  expect(content.includes('Origin Plan Feature Verification')).toBe(true);
 });

@@ -36,6 +36,9 @@ const phases: Phase[] = [
     index: 0,
     number: '1',
     name: 'Foo',
+    featureIndex: 0,
+    featureNumber: '1',
+    featureName: 'Full plan',
     testSpecDone: true,
     implementationDone: false,
     reviewDone: false,
@@ -48,6 +51,9 @@ const phases: Phase[] = [
     index: 1,
     number: '2',
     name: 'Bar',
+    featureIndex: 0,
+    featureNumber: '1',
+    featureName: 'Full plan',
     testSpecDone: true,
     implementationDone: true,
     reviewDone: true,
@@ -74,19 +80,53 @@ describe('freshState', () => {
     const s = freshState({ planFile: '/x/foo.md', branch: 'main', phases });
     expect(s.phases[0].status).toBe('pending');
     expect(s.phases[1].status).toBe('committed');
+    expect(s.features![0].status).toBe('pending');
   });
   it('points currentPhaseIndex at first non-committed', () => {
     const s = freshState({ planFile: '/x/foo.md', branch: 'main', phases });
     expect(s.currentPhaseIndex).toBe(0);
   });
-  it('marks build completed when all phases are pre-checked', () => {
+  it('marks all pre-checked phases as ready to ship, not completed', () => {
     const allDone: Phase[] = phases.map((p) => ({
       ...p,
       implementationDone: true,
       reviewDone: true,
     }));
     const s = freshState({ planFile: '/x/foo.md', branch: 'main', phases: allDone });
-    expect(s.completed).toBe(true);
+    expect(s.completed).toBe(false);
+    expect(s.features![0].status).toBe('phases_done');
+    expect(s.currentFeatureIndex).toBe(0);
+  });
+
+  it('creates feature states from parsed feature groups', () => {
+    const s = freshState({
+      planFile: '/x/foo.md',
+      branch: 'main',
+      phases,
+      features: [
+        { index: 0, number: '1', name: 'Foo feature', body: '', phaseIndexes: [0] },
+        { index: 1, number: '2', name: 'Bar feature', body: '', phaseIndexes: [1] },
+      ],
+    });
+    expect(s.features!.map((f) => f.name)).toEqual(['Foo feature', 'Bar feature']);
+    expect(s.features![0].status).toBe('pending');
+    expect(s.features![1].status).toBe('phases_done');
+    expect(s.currentFeatureIndex).toBe(0);
+  });
+
+  it('does not create executable state for empty feature groups', () => {
+    const s = freshState({
+      planFile: '/x/foo.md',
+      branch: 'main',
+      phases,
+      features: [
+        { index: 0, number: '1', name: 'Empty feature', body: '', phaseIndexes: [] },
+        { index: 1, number: '2', name: 'Real feature', body: '', phaseIndexes: [0, 1] },
+      ],
+    });
+    expect(s.features!.map((f) => f.name)).toEqual(['Real feature']);
+    expect(s.features![0].phaseIndexes).toEqual([0, 1]);
+    expect(s.features![0].status).toBe('pending');
   });
 
   it('does NOT mark a phase committed when testSpecDone=false even if impl+review are checked', () => {
@@ -167,6 +207,27 @@ describe('loadState / saveState round-trip', () => {
     const loaded = loadState(slug, { noGbrain: true });
     expect(loaded).not.toBeNull();
     expect(loaded!.phases[0].status).toBe('impl_done');
+  });
+
+  it('loadState keeps legacy all-phase-done state unshipped when completed=false', () => {
+    const slug = 'build-legacy-unshipped-test';
+    const oldState = {
+      planFile: '/x/foo.md', planBasename: 'foo', slug,
+      branch: 'feat/foo', startedAt: new Date().toISOString(),
+      lastUpdatedAt: new Date().toISOString(), currentPhaseIndex: 0,
+      phases: [
+        { index: 0, number: '1', name: 'Foo', status: 'committed' },
+        { index: 1, number: '2', name: 'Bar', status: 'committed' },
+      ],
+      completed: false,
+    };
+    fs.mkdirSync(path.dirname(statePath(slug)), { recursive: true });
+    fs.writeFileSync(statePath(slug), JSON.stringify(oldState));
+    const loaded = loadState(slug, { noGbrain: true });
+    expect(loaded).not.toBeNull();
+    expect(loaded!.features![0].status).toBe('pending');
+    expect(loaded!.currentFeatureIndex).toBe(0);
+    fs.rmSync(statePath(slug), { force: true });
   });
 
   it('loadState migrates legacy model fields into roleConfigs', () => {

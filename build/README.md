@@ -36,25 +36,34 @@ gstack-build plans/example-impl-plan.md --no-resume
 
 ## High-Level Flow
 
-1. Find or synthesize a living implementation plan.
-2. Execute each phase as an isolated unit of work.
+1. Find or synthesize a living implementation plan organized into semantic feature blocks.
+2. Execute each feature block as a shipped unit of work, with phases inside it.
 3. Write failing tests first when the phase uses the TDD format.
 4. Implement until tests pass.
 5. Run recursive review gates until primary review, secondary review, and QA emit `GATE PASS`.
 6. Flip the phase checkboxes in the plan.
-7. Persist state and continue to the next phase.
-8. After all phases are complete, run `/ship` and `/land-and-deploy`.
-9. Verify the PR, branch, main sync, and working tree guardrails.
+7. Persist state and continue to the next phase in the current feature.
+8. After a feature's phases are complete, run `/ship` and `/land-and-deploy`.
+9. Verify the landed feature against the origin plan, then continue to the next feature.
+10. After all features complete, verify no feature branches remain unmerged and archive the living/origin plans.
 
 The CLI owns the durable version of this loop. The skill prompt mirrors the same
 workflow for smaller plans and tells the agent when to hand off to the CLI.
 
 ## Plan Format
 
-The preferred phase shape is TDD-first:
+Living plans should regroup all source-plan weeks, milestones, blocks, and phases
+into deliverable feature sections. Legacy phase-only plans still run as one
+default feature.
+
+The preferred phase shape inside each feature is TDD-first:
 
 ```markdown
-### Phase 1: Parser
+## Feature 1: Parser workflow
+Origin trace: Week 1 / Phase 2
+Acceptance: Parser behavior satisfies the source plan.
+
+### Phase 1.1: Parser tests
 - [ ] **Test Specification (Gemini Sub-agent)**: Write failing tests covering the parser behavior.
 - [ ] **Implementation (Gemini Sub-agent)**: Make the tests pass with minimal code.
 - [ ] **Review & QA (Codex Sub-agent)**: Run review and fix all findings.
@@ -68,10 +77,10 @@ Legacy two-checkbox phases are still supported:
 - [ ] **Review & QA (Codex Sub-agent)**: Run review and fix all findings.
 ```
 
-The parser accepts `### Phase N: Name` and decimal phase numbers like
-`### Phase 2.1: Name`. It records the exact checkbox line numbers so the plan
-mutator can flip only the intended lines. Checkbox-like text inside fenced code
-blocks is ignored.
+The parser accepts `## Feature N: Name`, `### Phase N: Name`, and decimal
+numbers like `### Phase 2.1: Name`. It records the exact checkbox line numbers
+so the plan mutator can flip only the intended lines. Checkbox-like text inside
+fenced code blocks is ignored.
 
 ## Skill-Prompt Path
 
@@ -238,7 +247,7 @@ The CLI talks to these tools through subprocess wrappers in
 
 ## Final Ship
 
-After every phase is committed, the CLI runs the existing release skills instead
+After every feature is committed, the CLI runs the existing release skills instead
 of using raw GitHub commands:
 
 ```text
@@ -249,7 +258,7 @@ codex exec "/gstack-land-and-deploy" -m gpt-5.5 -c model_reasoning_effort=\"high
 Post-ship verification checks:
 
 - no open PR remains for the feature branch
-- no unmerged remote `feat/*` branches remain, excluding the current branch
+- no unmerged remote `feat/*` branches remain at the final completion exam
 - the working tree is clean
 - local `HEAD` matches `origin/main`
 
@@ -298,6 +307,7 @@ the root cause, re-run the same `gstack-build` command to resume.
 | `--<role>-reasoning <r>` | Override role reasoning (`low`, `medium`, `high`, `xhigh`). |
 | `--<role>-command <cmd>` | Override review, QA, ship, or land command. |
 | `--test-cmd <cmd>` | Override automatic test command detection. |
+| `--origin-plan <file>` | Source plan to verify after each feature and archive after final completion. |
 | `--max-codex-iter N` | Override the review gate loop cap. |
 | `--skip-clean-check` | Bypass tracked dirty-file preflight. |
 | `--skip-sweep` | Bypass unshipped remote `feat/*` branch sweep. |
