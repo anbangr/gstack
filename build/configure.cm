@@ -60,6 +60,21 @@
       "model": "sonnet",
       "reasoning": "high",
       "command": "/context-save"
+    },
+    "planLocator": {
+      "provider": "claude",
+      "model": "claude-haiku-4-5-20251001",
+      "reasoning": "low"
+    },
+    "planSynthesizer": {
+      "provider": "claude",
+      "model": "claude-sonnet-4-6",
+      "reasoning": "high"
+    },
+    "featureVerifier": {
+      "provider": "claude",
+      "model": "claude-sonnet-4-6",
+      "reasoning": "high"
     }
   },
   "limits": {

@@ -537,9 +537,13 @@ for (const currentHost of hostsToRun) {
           const srcDir = path.dirname(tmplPath);
           const destDir = path.dirname(outputPath);
           const isRootSkill = srcDir === ROOT;
+          if (!currentHostConfig.generation.generateMetadata) {
+            fs.rmSync(path.join(destDir, 'agents'), { recursive: true, force: true });
+          }
           const entries = fs.readdirSync(srcDir, { withFileTypes: true });
           for (const entry of entries) {
             if (entry.name === 'SKILL.md' || entry.name === 'SKILL.md.tmpl') continue;
+            if (entry.name === 'agents') continue; // External hosts generate their own metadata.
             const srcPath = path.join(srcDir, entry.name);
             const destPath = path.join(destDir, entry.name);
             if (entry.isDirectory()) {

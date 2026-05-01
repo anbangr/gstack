@@ -39,7 +39,7 @@ _AUTO=""
 echo "AUTO_UPGRADE=$_AUTO"
 ```
 
-**If `AUTO_UPGRADE=true` or `AUTO_UPGRADE=1`:** Skip AskUserQuestion. Log "Auto-upgrading gstack v{old} → v{new}..." and proceed directly to Step 2. If `./setup` fails during auto-upgrade, restore from backup (`.bak` directory) and warn the user: "Auto-upgrade failed — restored previous version. Run `/gstack-upgrade` manually to retry."
+**If `AUTO_UPGRADE=true` or `AUTO_UPGRADE=1`:** Skip AskUserQuestion. Log "Auto-upgrading gstack v{old} → v{new}..." and proceed directly to Step 2. If `./setup` fails during auto-upgrade, restore from backup when a `.bak` directory exists; for git installs, leave the merge state intact and warn the user: "Auto-upgrade failed — resolve the install at `$INSTALL_DIR` and run `/gstack-upgrade` manually to retry."
 
 **Otherwise**, use AskUserQuestion:
 - Question: "gstack **v{new}** is available (you're on v{old}). Upgrade now?"
@@ -122,26 +122,90 @@ OLD_VERSION=$(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo "unknown")
 
 Use the install type and directory detected in Step 2:
 
+**Core rule:** preserve the user's own gstack version. Do not replace a customized
+install with a hard reset. Fetch upstream, merge it into the current local
+version, then run setup. If a merge conflict appears, stop and tell the user the
+upgrade needs manual conflict resolution in `$INSTALL_DIR`; do not continue to
+migrations or cache clearing.
+
 **For git installs** (global-git, local-git):
 ```bash
 cd "$INSTALL_DIR"
-STASH_OUTPUT=$(git stash 2>&1)
-git fetch origin
-git reset --hard origin/main
-./setup
+CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || true)
+if [ -z "$CURRENT_BRANCH" ]; then
+  CURRENT_BRANCH="gstack-local"
+  git switch "$CURRENT_BRANCH" 2>/dev/null || git switch -c "$CURRENT_BRANCH"
+fi
+
+STASH_OUTPUT=""
+if [ -n "$(git status --porcelain)" ]; then
+  STASH_OUTPUT=$(git stash push -u -m "gstack-upgrade local changes $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>&1)
+fi
+
+git fetch origin main
+if ! git merge --no-edit origin/main; then
+  echo "ERROR: gstack upgrade merge has conflicts in $INSTALL_DIR"
+  echo "Resolve conflicts, run ./setup, then rerun /gstack-upgrade if needed."
+  exit 1
+fi
+
+if echo "$STASH_OUTPUT" | grep -q "Saved working directory"; then
+  if ! git stash pop; then
+    echo "ERROR: stashed local changes conflicted after the upgrade merge."
+    echo "Resolve conflicts in $INSTALL_DIR, run ./setup, then rerun /gstack-upgrade if needed."
+    exit 1
+  fi
+fi
+
+if ! ./setup; then
+  echo "ERROR: ./setup failed after merging upstream."
+  exit 1
+fi
 ```
-If `$STASH_OUTPUT` contains "Saved working directory", warn the user: "Note: local changes were stashed. Run `git stash pop` in the skill directory to restore them."
+If `$STASH_OUTPUT` contains "Saved working directory", tell the user: "Local uncommitted changes were stashed before the upstream merge and reapplied after it."
 
 **For vendored installs** (vendored, vendored-global):
 ```bash
 PARENT=$(dirname "$INSTALL_DIR")
 TMP_DIR=$(mktemp -d)
-git clone --depth 1 https://github.com/garrytan/gstack.git "$TMP_DIR/gstack"
+git clone https://github.com/garrytan/gstack.git "$TMP_DIR/gstack"
 mv "$INSTALL_DIR" "$INSTALL_DIR.bak"
+cd "$TMP_DIR/gstack"
+
+if [ "$OLD_VERSION" != "unknown" ] && git rev-parse "v$OLD_VERSION" >/dev/null 2>&1; then
+  git switch -c gstack-local "v$OLD_VERSION"
+else
+  echo "ERROR: cannot preserve customized vendored install safely; missing upstream tag v$OLD_VERSION."
+  echo "Restored previous vendored copy. Convert it to a git install or upgrade manually."
+  rm -rf "$INSTALL_DIR"
+  mv "$INSTALL_DIR.bak" "$INSTALL_DIR"
+  rm -rf "$TMP_DIR"
+  exit 1
+fi
+
+rsync -a --delete --exclude .git "$INSTALL_DIR.bak"/ "$TMP_DIR/gstack"/
+git add -A
+git -c user.email=gstack-upgrade@example.invalid -c user.name=gstack-upgrade \
+  commit -m "Preserve local gstack customization before upgrade" 2>/dev/null || true
+git fetch origin main
+if ! git merge --no-edit origin/main; then
+  echo "ERROR: gstack vendored upgrade merge has conflicts in $TMP_DIR/gstack"
+  echo "Restored previous vendored copy at $INSTALL_DIR."
+  rm -rf "$INSTALL_DIR"
+  mv "$INSTALL_DIR.bak" "$INSTALL_DIR"
+  exit 1
+fi
+
 mv "$TMP_DIR/gstack" "$INSTALL_DIR"
-cd "$INSTALL_DIR" && ./setup
+if ! (cd "$INSTALL_DIR" && ./setup); then
+  rm -rf "$INSTALL_DIR"
+  mv "$INSTALL_DIR.bak" "$INSTALL_DIR"
+  echo "ERROR: ./setup failed — restored previous vendored copy."
+  exit 1
+fi
 rm -rf "$INSTALL_DIR.bak" "$TMP_DIR"
 ```
+Tell user: "Converted vendored gstack to a git-backed local customization branch, merged upstream, and preserved the previous copy in git history."
 
 ### Step 4.5: Handle local vendored copy
 
@@ -190,6 +254,38 @@ rm -rf "$LOCAL_GSTACK"
 mv "$LOCAL_GSTACK.bak" "$LOCAL_GSTACK"
 ```
 Tell user: "Sync failed — restored previous version at `$LOCAL_GSTACK`. Run `/gstack-upgrade` manually to retry."
+
+### Step 4.6: Regenerate and audit skill consistency
+
+After the upstream merge and any local vendored sync, verify that the shared
+generated portions of every skill still match the current repo. This matters for
+customized gstack forks: upstream often changes preambles, host path rewrites,
+tool names, or shared sections while the user's branch keeps custom workflow
+content.
+
+Run from the primary install directory:
+
+```bash
+cd "$INSTALL_DIR"
+bun run gen:skill-docs --host all
+bun run skill:check
+```
+
+If `skill:check` reports stale or invalid generated files, inspect and update the
+source templates, not generated `SKILL.md` files. Pay special attention to:
+
+- `build/SKILL.md.tmpl`, `build/configure.cm`, and `build/orchestrator/README.md`
+  because `/build` shells out to other skills and is sensitive to command names,
+  model/provider defaults, and host-specific path rewrites.
+- Any custom skill template containing the PREAMBLE placeholder; it should use
+  the current generated preamble rather than a copied older preamble block.
+- Any custom non-templated `SKILL.md` that copied old preamble text, old
+  `UPGRADE_AVAILABLE` instructions, hardcoded Claude/Codex paths, or stale shared
+  boilerplate. Update only the shared boilerplate/preexisting sections needed for
+  consistency; preserve the custom workflow content.
+
+Rerun `bun run gen:skill-docs --host all` and `bun run skill:check` until they
+pass or until a real merge conflict requires user input.
 
 ### Step 4.75: Run version migrations
 
