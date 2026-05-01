@@ -1904,7 +1904,7 @@ Current version: 0.5.0. A new version 0.6.0 is available on origin/main.
 
 Follow the standalone upgrade flow:
 1. Detect install type (local-git)
-2. Run git fetch origin && git reset --hard origin/main in the install directory
+2. Run git fetch origin main && git merge --no-edit origin/main in the install directory
 3. Run the setup script
 4. Show what's new from CHANGELOG
 

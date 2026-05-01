@@ -119,6 +119,9 @@ gstack/
 ├── codex/           # /codex skill (multi-AI second opinion via OpenAI Codex CLI)
 ├── land-and-deploy/ # /land-and-deploy skill (merge → deploy → canary verify)
 ├── office-hours/    # /office-hours skill (YC Office Hours — startup diagnostic + builder brainstorm)
+├── build/           # /build skill (autonomous plan executor: TDD loop, dual-impl, Codex review)
+│   ├── SKILL.md, SKILL.md.tmpl
+│   └── orchestrator/  # gstack-build CLI: cli.ts, phase-runner.ts, sub-agents.ts, worktree.ts, etc.
 ├── investigate/     # /investigate skill (systematic root-cause debugging)
 ├── retro/           # Retrospective skill (includes /retro global cross-project mode)
 ├── bin/             # CLI utilities (gstack-repo-mode, gstack-slug, gstack-config, etc.)
@@ -633,6 +636,17 @@ above, plus:
 - **Always credit community contributions.** When an entry includes work from a
   community PR, name the contributor with `Contributed by @username`. Contributors
   did real work. Thank them publicly every time, no exceptions.
+
+## Fork versioning rule
+
+**Never bump the top-level `VERSION` file in this repo when working on fork-specific skills.**
+
+This repo (`anbangr/gstack`) is a personal fork of `garrytan/gstack`. The top-level `VERSION` file tracks the fork's release state relative to upstream. Bumping it creates divergence that makes `gstack-update-check` output confusing (`UPGRADE_AVAILABLE` with the local version higher than upstream).
+
+**The rule:**
+- Editing or building a custom skill (e.g. `build/SKILL.md.tmpl`)? Bump only the `version:` frontmatter field inside that skill file (e.g. `version: 1.19.0`). Do NOT touch `VERSION` or `package.json` version.
+- Merging upstream? Sync `VERSION` and `package.json` to upstream's version after the merge.
+- Only bump `VERSION` when merging or syncing with upstream, never for fork-local skill work.
 
 ## AI effort compression
 

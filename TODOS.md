@@ -1548,6 +1548,16 @@ Shipped in v0.6.5. TemplateContext in gen-skill-docs.ts bakes skill name into pr
 
 ## Completed
 
+### Dual Implementor foundation + fix loops + hardening notes (v1.15.0.0 – v1.23.0.0)
+
+- **Phase 1/2 (v1.15.0.0):** `worktree.ts` with `createWorktrees`/`applyWinner`/`teardownWorktrees`, 6 new `PhaseStatus` values, `DualImplState`/`DualImplTestResult` interfaces, `phase-runner.ts` with `RUN_DUAL_IMPL`/`RUN_DUAL_TESTS`/`RUN_JUDGE_OPUS`/`APPLY_WINNER` action types, full transition test coverage.
+- **Phase 5 (v1.15.0.0):** `README.md` dual-impl section, `integration.test.ts` dry-run test with `--dual-impl --dry-run`.
+- **Fix loops + hardening (v1.23.0.0):** `runDualImplFixLoop` recursive fix passes (up to `DEFAULT_MAX_TEST_ITERATIONS`), per-iteration `fixHistory` threaded to the Opus judge, `HARDENING:` block flowing into Codex review prompt, SHA validation on resume, test hygiene gate before auto-select.
+
+**Completed:** v1.23.0.0 (2026-04-29)
+
+---
+
 ### Slim preamble + real-PTY plan-mode E2E harness (v1.13.1.0)
 
 - Compressed 18 preamble resolvers; total `SKILL.md` corpus dropped from 3.08 MB to 2.30 MB across 47 outputs (-25.5%, ~196K tokens saved).
