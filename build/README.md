@@ -1,16 +1,14 @@
 # Build Skill Workflow
 
-The build skill turns an approved plan into shipped code. It has two execution
-paths:
+The build skill turns an approved plan into shipped code. It has two components:
 
-- `/build`, the skill prompt in `build/SKILL.md.tmpl`, for short plans where the
-  current agent can stay in the loop.
-- `gstack-build`, the TypeScript orchestrator in `build/orchestrator/`, for long
-  or high-risk plans where the loop must survive context compaction, restarts,
-  and multi-hour sub-agent work.
-
-Use the skill when you want guided execution. Use the CLI when the plan is large
-enough that "keep going" cannot be trusted to remain in model context.
+- `/build`, the skill prompt in `build/SKILL.md.tmpl`, is the entry point. It
+  discovers the source plan, synthesizes a living plan via subagents, confirms
+  with the user, and hands off to the CLI for all execution.
+- `gstack-build`, the TypeScript orchestrator in `build/orchestrator/`, drives
+  the full TDD + review + ship loop. The skill always delegates to it — even for
+  single-phase plans — because the CLI survives context compaction, restarts, and
+  multi-hour sub-agent work where an LLM-driven loop cannot.
 
 ## Entry Points
 
@@ -47,8 +45,8 @@ gstack-build plans/example-impl-plan.md --no-resume
 9. Verify the landed feature against the origin plan, then continue to the next feature.
 10. After all features complete, verify no feature branches remain unmerged and archive the living/origin plans.
 
-The CLI owns the durable version of this loop. The skill prompt mirrors the same
-workflow for smaller plans and tells the agent when to hand off to the CLI.
+The CLI owns the full durable loop. The skill prompt's role is plan discovery,
+synthesis, user confirmation, CLI launch, and post-feature monitoring.
 
 ## Plan Format
 
@@ -60,10 +58,12 @@ The preferred phase shape inside each feature is TDD-first:
 
 ```markdown
 ## Feature 1: Parser workflow
+
 Origin trace: Week 1 / Phase 2
 Acceptance: Parser behavior satisfies the source plan.
 
 ### Phase 1.1: Parser tests
+
 - [ ] **Test Specification (Gemini Sub-agent)**: Write failing tests covering the parser behavior.
 - [ ] **Implementation (Gemini Sub-agent)**: Make the tests pass with minimal code.
 - [ ] **Review & QA (Codex Sub-agent)**: Run review and fix all findings.
@@ -73,6 +73,7 @@ Legacy two-checkbox phases are still supported:
 
 ```markdown
 ### Phase 1: Parser
+
 - [ ] **Implementation (Gemini Sub-agent)**: Implement the parser.
 - [ ] **Review & QA (Codex Sub-agent)**: Run review and fix all findings.
 ```
@@ -84,26 +85,44 @@ fenced code blocks is ignored.
 
 ## Skill-Prompt Path
 
-For short plans, `/build` acts as the orchestrator itself:
+Since v1.20.0, `/build` always routes every plan — including single-phase — to
+`gstack-build`. The LLM-driven execution loop is gone; the skill's role is now
+**plan discovery → living-plan synthesis → user confirmation → CLI handoff →
+monitoring**. The CLI handles all phase execution, TDD loops, review gates,
+ship, and land.
 
-1. Locate the sibling `*-gstack` repo and use its `inbox/living-plan/` directory.
-2. Ask for confirmation after synthesizing a living plan.
-3. Create `.llm-tmp/` for file-path I/O with sub-agents.
-4. Ask the configured test-writer role to write failing tests.
-5. Verify the tests are red.
-6. Ask the configured primary-impl role to implement.
-7. Re-run tests and use the configured test-fixer role until green.
-8. Run the configured review gates.
-9. Run the configured QA role and repeat until all gates emit `GATE PASS`.
-10. Update checkboxes, print a phase report, and save context.
-11. Repeat without asking between phases unless blocked.
-12. Delegate final ship and deploy to the configured ship and land roles.
-13. Move the completed living plan from `<gstack-repo>/inbox/living-plan/` to
-    `<gstack-repo>/archived/`.
+The skill's startup sequence:
 
-All model handoffs use file-path I/O. Large prompts are written to disk and the
-sub-agent is told only which input file to read and which output file to write.
-That keeps subprocess prompts small and makes logs inspectable after failure.
+1. Delegate plan discovery to a Haiku subagent (role: `planLocator`) that
+   searches `*-gstack/inbox/living-plan/`, `inbox/`, `TODOS.md`, and fallback
+   locations in priority order. Output is a single JSON line written to
+   `.llm-tmp/build-plan-locate-output.md`.
+2. If a partially completed living plan exists, offer to resume (Resume Mode).
+   If the user asks to re-audit an implemented plan, enter Reexamine Mode.
+3. Synthesize the living plan by delegating to a fresh Claude subagent (role:
+   `planSynthesizer`) that reads the source plan and writes the grouped
+   feature-block living plan to `*-gstack/inbox/living-plan/`. It returns only
+   a compact summary via `.llm-tmp/build-synthesis-output.md`.
+4. Create `.llm-tmp/` for file-path I/O with sub-agents. All model handoffs
+   write inputs to disk and read outputs from disk — prompts stay small and logs
+   are inspectable after failure.
+5. Confirm the feature list with the user via `AskUserQuestion`, then launch
+   `gstack-build` in the background and monitor `~/.gstack/build-state/<slug>.json`.
+
+After `gstack-build` reports each feature complete:
+
+1. Spawn ship and land roles **only when `--skip-ship` was passed** to
+   `gstack-build`. Without `--skip-ship`, the CLI already ran `/ship` and
+   `/land-and-deploy` internally — re-spawning would double-ship and create
+   duplicate PRs.
+2. Delegate origin-plan coverage verification to a fresh Claude subagent (role:
+   `featureVerifier`) that reads only the relevant source-plan sections and
+   emits a `VERIFICATION: PASS | GAPS` result.
+3. Run `gstack-build-phase-guardrail` to confirm the feature PR merged, the
+   working tree is clean, and `origin/main` is up to date.
+4. After all features are complete, spawn a final-exam subagent (role:
+   `featureVerifier`) to compare the full source plan against the git log and
+   living plan. Archive plans on `EXAM: PASS`.
 
 ## CLI Path
 
@@ -239,9 +258,21 @@ is still running.
 - `secondaryImpl` acts as the second implementor in `--dual-impl`.
 - `judge` judges dual-implementor tournaments.
 - `qa`, `ship`, and `land` run QA and release commands.
+- `contextSave` saves build context between phases.
+
+Three additional roles are **template-only** — they are consumed by the skill
+prompt via `jq` and are intentionally absent from the CLI's `ROLE_DEFINITIONS`.
+They have no CLI flags or env var overrides:
+
+- `planLocator` — Haiku subagent that discovers the source plan file.
+- `planSynthesizer` — synthesizes the living plan from the source plan.
+- `featureVerifier` — checks origin-plan coverage after each feature ships and
+  runs the final completion exam.
 
 All role providers, models, reasoning levels, and commands are configured in
-`build/configure.cm`.
+`build/configure.cm`. If a role lookup returns empty (via `jq -r '... // empty'`),
+the skill halts with a STOP rather than silently using a wrong model — a
+misconfigured or missing `configure.cm` fails closed.
 
 The CLI talks to these tools through subprocess wrappers in
 `build/orchestrator/sub-agents.ts`. Codex stdin is explicitly closed because
@@ -257,10 +288,31 @@ of using raw GitHub commands:
 <configured land role command>
 ```
 
-Post-ship verification checks:
+**Double-ship prevention:** The skill's Step 3 spawns the ship and land roles
+only when `--skip-ship` was passed to `gstack-build`. Without `--skip-ship`, the
+CLI already ran them internally — the skill skips that step to avoid creating
+duplicate PRs.
 
-- no open PR remains for the feature branch
-- no unmerged remote `feat/*` branches remain at the final completion exam
+**Feature verification:** After shipping, the skill delegates origin-plan
+coverage checking to a fresh `featureVerifier` subagent. It reads only the
+source-plan sections named in the feature's "Origin trace:" line and emits
+`VERIFICATION: PASS` or `VERIFICATION: GAPS`. Gaps restart the implementation
+loop for that feature.
+
+**Phase guardrail:** After ship + land, the skill runs `gstack-build-phase-guardrail`
+to confirm three things:
+
+1. The feature PR state is `MERGED` (checked via `gh pr view --json state` —
+   fails closed on `gh` errors, auth failures, or missing PRs).
+2. `origin/main` is fetchable and up to date (hard-fails on network error).
+3. The working tree has no staged or unstaged changes.
+
+The guardrail uses `gh pr view --json state` rather than `git branch --merged`
+so squash and rebase merges are detected correctly.
+
+CLI-level post-ship checks run after all features are complete:
+
+- no unmerged remote `feat/*` branches remain
 - the working tree is clean
 - local `HEAD` matches `origin/main`
 
@@ -288,31 +340,31 @@ the root cause, re-run the same `gstack-build` command to resume.
 
 ## Important Flags
 
-| Flag | Effect |
-| --- | --- |
-| `--print-only` | Parse the plan and print the phase table. |
-| `--dry-run` | Walk the state machine without spawning sub-agents or shipping. |
-| `--skip-ship` | Complete phases but skip final ship and deploy. |
-| `--no-resume` | Ignore existing state and start fresh. |
-| `--no-gbrain` | Use only local JSON state. |
-| `--dual-impl` | Run Gemini and Codex implementations in parallel worktrees. |
-| `--test-writer-model <m>` | Override failing-test writer model. |
-| `--primary-impl-model <m>` | Override primary implementor model. |
-| `--test-fixer-model <m>` | Override test-fixer model. |
-| `--secondary-impl-model <m>` | Override dual-impl secondary model. |
-| `--review-model <m>` | Override primary review model. |
-| `--review-secondary-model <m>` | Override secondary review model. |
-| `--qa-model <m>` | Override QA model. |
-| `--ship-model <m>` | Override ship model. |
-| `--land-model <m>` | Override land model. |
-| `--<role>-provider <p>` | Override role provider (`claude`, `codex`, `gemini`) where supported. Dual-impl requires Gemini primary, Codex secondary, and Claude judge. |
-| `--<role>-reasoning <r>` | Override role reasoning (`low`, `medium`, `high`, `xhigh`). |
-| `--<role>-command <cmd>` | Override review, QA, ship, or land command. |
-| `--test-cmd <cmd>` | Override automatic test command detection. |
-| `--origin-plan <file>` | Source plan to verify after each feature and archive after final completion. |
-| `--max-codex-iter N` | Override the review gate loop cap. |
-| `--skip-clean-check` | Bypass tracked dirty-file preflight. |
-| `--skip-sweep` | Bypass unshipped remote `feat/*` branch sweep. |
+| Flag                           | Effect                                                                                                                                      |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--print-only`                 | Parse the plan and print the phase table.                                                                                                   |
+| `--dry-run`                    | Walk the state machine without spawning sub-agents or shipping.                                                                             |
+| `--skip-ship`                  | Complete phases but skip final ship and deploy.                                                                                             |
+| `--no-resume`                  | Ignore existing state and start fresh.                                                                                                      |
+| `--no-gbrain`                  | Use only local JSON state.                                                                                                                  |
+| `--dual-impl`                  | Run Gemini and Codex implementations in parallel worktrees.                                                                                 |
+| `--test-writer-model <m>`      | Override failing-test writer model.                                                                                                         |
+| `--primary-impl-model <m>`     | Override primary implementor model.                                                                                                         |
+| `--test-fixer-model <m>`       | Override test-fixer model.                                                                                                                  |
+| `--secondary-impl-model <m>`   | Override dual-impl secondary model.                                                                                                         |
+| `--review-model <m>`           | Override primary review model.                                                                                                              |
+| `--review-secondary-model <m>` | Override secondary review model.                                                                                                            |
+| `--qa-model <m>`               | Override QA model.                                                                                                                          |
+| `--ship-model <m>`             | Override ship model.                                                                                                                        |
+| `--land-model <m>`             | Override land model.                                                                                                                        |
+| `--<role>-provider <p>`        | Override role provider (`claude`, `codex`, `gemini`) where supported. Dual-impl requires Gemini primary, Codex secondary, and Claude judge. |
+| `--<role>-reasoning <r>`       | Override role reasoning (`low`, `medium`, `high`, `xhigh`).                                                                                 |
+| `--<role>-command <cmd>`       | Override review, QA, ship, or land command.                                                                                                 |
+| `--test-cmd <cmd>`             | Override automatic test command detection.                                                                                                  |
+| `--origin-plan <file>`         | Source plan to verify after each feature and archive after final completion.                                                                |
+| `--max-codex-iter N`           | Override the review gate loop cap.                                                                                                          |
+| `--skip-clean-check`           | Bypass tracked dirty-file preflight.                                                                                                        |
+| `--skip-sweep`                 | Bypass unshipped remote `feat/*` branch sweep.                                                                                              |
 
 ## Environment Variables
 
@@ -321,28 +373,28 @@ Edit that file when the built-in defaults change; use the env vars below for
 per-run overrides. Set `GSTACK_BUILD_CONFIG_FILE` to point at a different
 config file.
 
-| Variable | Purpose |
-| --- | --- |
-| `GEMINI_BIN` | Gemini CLI path. |
-| `CODEX_BIN` | Codex CLI path. |
-| `CLAUDE_BIN` | Claude CLI path. |
-| `GBRAIN_BIN` | Optional gbrain CLI path. |
-| `GSTACK_BUILD_CONFIG_FILE` | Alternate build config file. |
-| `GSTACK_BUILD_DEFAULTS_FILE` | Legacy alias for `GSTACK_BUILD_CONFIG_FILE`. |
-| `GSTACK_BUILD_<ROLE>_PROVIDER` | Role provider override where supported. |
-| `GSTACK_BUILD_<ROLE>_MODEL` | Role model override. |
-| `GSTACK_BUILD_<ROLE>_REASONING` | Role reasoning override. |
-| `GSTACK_BUILD_<ROLE>_COMMAND` | Command override for review, QA, ship, land, and context-save roles. |
-| `GSTACK_BUILD_GEMINI_TIMEOUT` | Gemini call timeout in milliseconds. |
-| `GSTACK_BUILD_CODEX_TIMEOUT` | Codex call timeout in milliseconds. |
-| `GSTACK_BUILD_SHIP_TIMEOUT` | Final ship/deploy timeout in milliseconds. |
-| `GSTACK_BUILD_CODEX_MAX_ITER` | Review gate loop cap. |
-| `GSTACK_BUILD_TEST_TIMEOUT` | Test command timeout in milliseconds. |
-| `GSTACK_BUILD_TEST_MAX_ITER` | Gemini test-fix loop cap. |
-| `GSTACK_BUILD_RED_MAX_ITER` | Test-spec rewrite cap when tests pass too early. |
-| `GSTACK_BUILD_JUDGE_TIMEOUT` | Dual-impl judge timeout in milliseconds. |
-| `GSTACK_BUILD_JUDGE_MODEL` | Claude model used for tournament judging. |
-| `GSTACK_BUILD_CODEX_IMPL_SANDBOX` | Codex implementor sandbox override. |
+| Variable                          | Purpose                                                              |
+| --------------------------------- | -------------------------------------------------------------------- |
+| `GEMINI_BIN`                      | Gemini CLI path.                                                     |
+| `CODEX_BIN`                       | Codex CLI path.                                                      |
+| `CLAUDE_BIN`                      | Claude CLI path.                                                     |
+| `GBRAIN_BIN`                      | Optional gbrain CLI path.                                            |
+| `GSTACK_BUILD_CONFIG_FILE`        | Alternate build config file.                                         |
+| `GSTACK_BUILD_DEFAULTS_FILE`      | Legacy alias for `GSTACK_BUILD_CONFIG_FILE`.                         |
+| `GSTACK_BUILD_<ROLE>_PROVIDER`    | Role provider override where supported.                              |
+| `GSTACK_BUILD_<ROLE>_MODEL`       | Role model override.                                                 |
+| `GSTACK_BUILD_<ROLE>_REASONING`   | Role reasoning override.                                             |
+| `GSTACK_BUILD_<ROLE>_COMMAND`     | Command override for review, QA, ship, land, and context-save roles. |
+| `GSTACK_BUILD_GEMINI_TIMEOUT`     | Gemini call timeout in milliseconds.                                 |
+| `GSTACK_BUILD_CODEX_TIMEOUT`      | Codex call timeout in milliseconds.                                  |
+| `GSTACK_BUILD_SHIP_TIMEOUT`       | Final ship/deploy timeout in milliseconds.                           |
+| `GSTACK_BUILD_CODEX_MAX_ITER`     | Review gate loop cap.                                                |
+| `GSTACK_BUILD_TEST_TIMEOUT`       | Test command timeout in milliseconds.                                |
+| `GSTACK_BUILD_TEST_MAX_ITER`      | Gemini test-fix loop cap.                                            |
+| `GSTACK_BUILD_RED_MAX_ITER`       | Test-spec rewrite cap when tests pass too early.                     |
+| `GSTACK_BUILD_JUDGE_TIMEOUT`      | Dual-impl judge timeout in milliseconds.                             |
+| `GSTACK_BUILD_JUDGE_MODEL`        | Claude model used for tournament judging.                            |
+| `GSTACK_BUILD_CODEX_IMPL_SANDBOX` | Codex implementor sandbox override.                                  |
 
 Role env vars use `GSTACK_BUILD_<ROLE>_<FIELD>`, where role is
 `TEST_WRITER`, `PRIMARY_IMPL`, `TEST_FIXER`, `SECONDARY_IMPL`, `REVIEW`,
@@ -350,20 +402,26 @@ Role env vars use `GSTACK_BUILD_<ROLE>_<FIELD>`, where role is
 `PROVIDER`, `MODEL`, `REASONING`, or `COMMAND`. CLI flags override env vars;
 env vars override defaults.
 
+The template-only roles (`planLocator`, `planSynthesizer`, `featureVerifier`)
+are read directly from `configure.cm` by the skill via `jq` and have no
+corresponding env var overrides. To change their models, edit `configure.cm`.
+
 ## Module Map
 
-| File | Responsibility |
-| --- | --- |
-| `SKILL.md.tmpl` | Human-facing `/build` workflow and CLI-monitoring instructions. |
-| `orchestrator/cli.ts` | CLI args, startup gates, lock, main loop, ship guardrails. |
-| `orchestrator/parser.ts` | Markdown plan parser. |
-| `orchestrator/phase-runner.ts` | Pure phase state machine. |
-| `orchestrator/sub-agents.ts` | Gemini, Codex, Claude, test, verdict, and judge wrappers. |
-| `orchestrator/plan-mutator.ts` | Atomic checkbox updates in the plan file. |
-| `orchestrator/state.ts` | Local JSON state, gbrain mirror, lock files, log paths. |
-| `orchestrator/worktree.ts` | Dual-impl worktree creation, teardown, and winner apply. |
-| `orchestrator/ship.ts` | Final `/ship` plus `/land-and-deploy` delegation. |
-| `orchestrator/types.ts` | Shared phase and build state types. |
+| File                               | Responsibility                                                         |
+| ---------------------------------- | ---------------------------------------------------------------------- |
+| `SKILL.md.tmpl`                    | Human-facing `/build` workflow and CLI-monitoring instructions.        |
+| `configure.cm`                     | Role routing, retry caps, and timeouts (source of truth for defaults). |
+| `bin/gstack-build-phase-guardrail` | Post-feature guardrail: PR merged, origin/main up to date, tree clean. |
+| `orchestrator/cli.ts`              | CLI args, startup gates, lock, main loop, ship guardrails.             |
+| `orchestrator/parser.ts`           | Markdown plan parser.                                                  |
+| `orchestrator/phase-runner.ts`     | Pure phase state machine.                                              |
+| `orchestrator/sub-agents.ts`       | Gemini, Codex, Claude, test, verdict, and judge wrappers.              |
+| `orchestrator/plan-mutator.ts`     | Atomic checkbox updates in the plan file.                              |
+| `orchestrator/state.ts`            | Local JSON state, gbrain mirror, lock files, log paths.                |
+| `orchestrator/worktree.ts`         | Dual-impl worktree creation, teardown, and winner apply.               |
+| `orchestrator/ship.ts`             | Final `/ship` plus `/land-and-deploy` delegation.                      |
+| `orchestrator/types.ts`            | Shared phase and build state types.                                    |
 
 ## Testing
 
