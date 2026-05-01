@@ -984,13 +984,17 @@ describe('gstack-slug', () => {
   });
 
   test('no templates or bin scripts use source process substitution for gstack-slug', () => {
-    const result = Bun.spawnSync(
-      ['grep', '-r', 'source <(.*gstack-slug', '--include=*.tmpl', '--include=gstack-review-*', '.'],
-      { cwd: ROOT, stdout: 'pipe', stderr: 'pipe' }
-    );
-    // grep returns exit code 1 when no matches found — that's what we want
-    expect(result.stdout.toString().trim()).toBe('');
-  }, 15_000);
+    const filesResult = Bun.spawnSync(['git', 'ls-files'], { cwd: ROOT, stdout: 'pipe', stderr: 'pipe' });
+    expect(filesResult.exitCode).toBe(0);
+
+    const offenders = filesResult.stdout.toString()
+      .split('\n')
+      .filter(Boolean)
+      .filter(file => file.endsWith('.tmpl') || path.basename(file).startsWith('gstack-review-'))
+      .filter(file => /source <\(.*gstack-slug/.test(fs.readFileSync(path.join(ROOT, file), 'utf-8')));
+
+    expect(offenders).toEqual([]);
+  });
 });
 
 // --- Test Bootstrap validation ---

@@ -8,11 +8,13 @@ Detailed guides for every gstack skill — philosophy, workflow, and examples.
 | [`/plan-ceo-review`](#plan-ceo-review) | **CEO / Founder** | Rethink the problem. Find the 10-star product hiding inside the request. Four modes: Expansion, Selective Expansion, Hold Scope, Reduction. |
 | [`/plan-domain-review`](#plan-domain-review) | **Domain Architect** | Interactive domain-model review. Clarifies glossary, bounded contexts, ownership seams, state transitions, and domain events for workflow-heavy plans. |
 | [`/plan-api-review`](#plan-api-review) | **API Designer** | Interactive API contract review. Locks in interface style, compatibility, versioning, error models, idempotency, pagination, and rate limits. |
+| [`/plan-arch-review`](#plan-arch-review) | **Architecture Reviewer** | Second-pass architecture review after eng review. Checks boundaries, sequencing, operability, and migration risk. |
 | [`/plan-modernization-review`](#plan-modernization-review) | **Modernization Lead** | Interactive migration review. Clarifies current state, target state, rollout phases, rollback points, and migration hazards. |
 | [`/plan-eng-review`](#plan-eng-review) | **Eng Manager** | Lock in architecture, data flow, diagrams, edge cases, and tests. Forces hidden assumptions into the open. |
 | [`/plan-design-review`](#plan-design-review) | **Senior Designer** | Interactive plan-mode design review. Rates each dimension 0-10, explains what a 10 looks like, fixes the plan. Works in plan mode. |
 | [`/design-consultation`](#design-consultation) | **Design Partner** | Build a complete design system from scratch. Knows the landscape, proposes creative risks, generates realistic product mockups. Design at the heart of all other phases. |
 | [`/review`](#review) | **Staff Engineer** | Find the bugs that pass CI but blow up in production. Auto-fixes the obvious ones. Flags completeness gaps. |
+| [`/build`](#build) | **Build Orchestrator** | Executes living implementation plans with recursive review, reviewsecondary, and QA fix loops until clean. |
 | [`/investigate`](#investigate) | **Debugger** | Systematic root-cause debugging. Iron Law: no fixes without investigation. Traces data flow, tests hypotheses, stops after 3 failed fixes. |
 | [`/design-review`](#design-review) | **Designer Who Codes** | Live-site visual audit + fix loop. 80-item audit, then fixes what it finds. Atomic commits, before/after screenshots. |
 | [`/design-shotgun`](#design-shotgun) | **Design Explorer** | Generate multiple AI design variants, open a comparison board in your browser, and iterate until you approve a direction. Taste memory biases toward your preferences. |

@@ -18,6 +18,10 @@ Invoke them by name (e.g., `/office-hours`).
 | `/plan-eng-review` | Lock architecture, data flow, edge cases, and tests. |
 | `/plan-design-review` | Rate each design dimension 0-10, explain what a 10 looks like. |
 | `/plan-devex-review` | DX-mode review: TTHW, magical moments, friction points, persona traces. |
+| `/plan-domain-review` | Domain-model review for bounded contexts, state, ownership, and events. |
+| `/plan-api-review` | API contract review for REST/gRPC/async interfaces and compatibility. |
+| `/plan-arch-review` | Second-pass software architecture review after eng review. |
+| `/plan-modernization-review` | Modernization review for modularization, migrations, and rollout hazards. |
 | `/plan-tune` | Self-tune AskUserQuestion sensitivity per question. |
 | `/autoplan` | One command runs CEO → design → eng → DX review. |
 | `/design-consultation` | Build a complete design system from scratch. |
@@ -28,6 +32,7 @@ Invoke them by name (e.g., `/office-hours`).
 |-------|-------------|
 | `/review` | Pre-landing PR review. Finds bugs that pass CI but break in prod. |
 | `/codex` | Second opinion via OpenAI Codex. Review, challenge, or consult modes. |
+| `/build` | Autonomous gstack execution loop for living implementation plans. |
 | `/investigate` | Systematic root-cause debugging. No fixes without investigation. |
 | `/design-review` | Live-site visual audit + fix loop with atomic commits. |
 | `/design-shotgun` | Generate multiple AI design variants, comparison board, iterate. |

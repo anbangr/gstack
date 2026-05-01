@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.25.0.0-fork] - 2026-05-02
+
+## **Fork customizations preserved while upgrading to upstream v1.25.0.0.**
+
+This fork keeps its custom `gstack-build` orchestration behavior while merging upstream releases. The upgrade path now treats the user's own gstack repository as the source of truth: fetch upstream, merge it into the local branch, resolve conflicts, regenerate skills, and push only to the user's fork.
+
+### Preserved local behavior
+
+- `gstack-build` recursive fix loops remain in place: review, reviewsecondary, and QA are expected to run fix-and-rerun loops until no issues remain.
+- Dual-implementor build hardening remains in place, including per-implementor test-fix iterations, judge hardening notes, resume SHA validation, and test-modification hygiene checks.
+- Build startup guardrails remain in place: dirty-tree checks, stale branch sweep, bounded branch processing, and restore-on-exit behavior.
+- `/gstack-upgrade` remains merge-based for customized installs. It must not hard-reset or replace the user's fork when upstream has a new release.
+
 ## [1.25.0.0] - 2026-05-01
 
 ## **Plan-mode skills surface every decision again, even when the host disallows AskUserQuestion.**
