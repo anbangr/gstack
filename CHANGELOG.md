@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.25.0.0-fork] - 2026-05-02
+## [1.25.0.0] - 2026-05-02
 
 ## **Fork customizations preserved while upgrading to upstream v1.25.0.0.**
 
