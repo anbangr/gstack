@@ -1,7 +1,7 @@
 ---
 name: build
 preamble-tier: 4
-version: 1.19.0
+version: 1.20.0
 description: |
   Autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -685,27 +685,20 @@ PLAN MODE EXCEPTION — always allowed (it's the plan file).
 
 # /build — Autonomous Execution Loop
 
-You are the Execution Agent. The planning phase is over. Your job is to read the approved implementation plan and execute it autonomously in phases.
-**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/build` orchestrator v1.16.0").**
+You are the Execution Agent. The planning phase is over. Your job is to locate the source plan, synthesize a living plan via subagents, and hand off execution to the `gstack-build` CLI.
+**Before you do anything else, explicitly announce your version to the user (e.g., "Starting `/build` orchestrator v1.20.0").**
 
-**LLM-driven loop vs. code-driven CLI** — for short plans (1-3 phases), proceed with this skill: you are the orchestrator. For long multi-week plans (5+ phases), the LLM-driven loop is unreliable: it stalls between phases ("Standing by, let me know what's next") even with explicit "don't stop" rules, and context compaction loses awareness of "I'm in the middle of a 12-week build." For those, use the standalone CLI: `gstack-build <plan-file>`. The CLI drives the loop in code while still spawning fresh Claude, Gemini, and Codex subprocesses per phase. **Do NOT block waiting for it** — use the **CLI Monitoring Loop** (see below): confirm with the user, launch in the background, and poll the state file every 60 seconds to report progress and handle faults. See `~/.claude/skills/gstack/build/orchestrator/README.md` for full usage.
+**Always use the code-driven CLI.** Route all plans — even single-phase — to `gstack-build`. The LLM-driven loop stalls between phases even on 2-phase builds, and context compaction mid-build causes the agent to silently forget rules. Your role: locate plan → synthesize living plan → confirm with user → launch CLI → monitor.
 
 **Execution Modes**:
-- **Normal Mode**: Synthesize a new living plan and build the feature from scratch. (Default)
-- **Resume Mode**: Triggered automatically if you detect a partially completed living plan in the sibling `*-gstack/inbox/living-plan/` directory, or if the user explicitly asks you to resume. In this mode:
-  - Do NOT synthesize a new plan.
-  - Identify the active feature branch and check it out.
-  - Proceed directly to Step 2 and pick up execution from the first uncompleted `[ ]` feature/phase.
-- **Reexamine Mode**: Triggered if the user asks to "reexamine", "audit", or "rerun the full process" for an implemented plan. In this mode:
-  - Do NOT synthesize a new plan and do NOT create a new branch.
-  - Locate the existing living plan (`<workspace>/<project>-gstack/inbox/living-plan/<project-slug>-impl-plan-<date>.md`).
-  - Loop through *every* feature and phase in the existing plan (ignoring `[x]` marks).
-  - For each feature, spawn a sub-agent to audit the codebase and verify the feature satisfies its mapped origin-plan requirements. If missing steps are found, the sub-agent MUST fix them. If fully implemented, mark it clean.
+- **Normal Mode**: Locate the source plan, synthesize a new living plan, create the first feature branch, then launch the CLI. (Default)
+- **Resume Mode**: Triggered if a partially completed living plan exists in `*-gstack/inbox/living-plan/`, or if the user explicitly asks to resume. Skip Steps 1.4–1.6. Identify the active feature branch, check it out, then proceed to the CLI Monitoring Loop.
+- **Reexamine Mode**: Triggered if the user asks to "reexamine", "audit", or "rerun the full process" for an implemented plan. Skip Steps 1.4–1.6. Locate the existing living plan and proceed to **Reexamine Mode: Parallel Audit Subagents** below.
 
-## Step 1: Synthesize Living Plan & Create Branch (Skip if Reexamine or Resume Mode)
+## Step 1: Set Up & Synthesize Living Plan (Normal Mode)
 
-Your first task is to set up your environment and synthesize a formal living plan.
-If you are in **Reexamine Mode** or **Resume Mode**, skip this entire step and proceed directly to Step 2 using the existing living plan.
+Skip this entire step if in Reexamine or Resume Mode.
+
 1. **Locate the sibling gstack repo**: Living plans MUST be stored in the workspace's sibling `*-gstack` repo, not in the product repo. Find it with:
    ```bash
    _GSTACK_REPOS=$(find .. -maxdepth 1 -type d -name '*-gstack' 2>/dev/null | sort)
@@ -713,121 +706,145 @@ If you are in **Reexamine Mode** or **Resume Mode**, skip this entire step and p
    [ "$_GSTACK_COUNT" = "1" ] && GSTACK_REPO=$(printf '%s\n' "$_GSTACK_REPOS" | sed '/^$/d' | head -n 1)
    ```
    If exactly one match exists, set `GSTACK_REPO` to it. If multiple matches exist or none exists, STOP and ask the user to specify the correct `*-gstack` repo path. Create `$GSTACK_REPO/inbox/living-plan/` and `$GSTACK_REPO/archived/` if missing.
-2. **Check for Resume**: Look first for an existing `<gstack-repo>/inbox/living-plan/*-impl-plan-*.md` file, then legacy `<gstack-repo>/living-plans/*-impl-plan-*.md`. If one exists and contains uncompleted phases, explicitly ask the user if they want to **resume** it. If they say yes, you are in Resume Mode.
-3. **Create First Feature Branch**: Before doing anything else, use the `Bash` tool to create and check out a feature branch for the first living-plan feature block (e.g., `git checkout main && git pull && git checkout -b feat/your-feature-name`). Do NOT work directly on the `main` or `master` branch. After each feature is shipped and landed, sync main and create the next feature branch before continuing.
-4. Look for the latest deliverables from `/office-hours`, `/autoplan`, or a workspace TODOS.md. Check in this priority order:
 
-```bash
-# Priority 1: Sibling -gstack inbox (canonical plan handoff for workspaces)
-ls -t "$GSTACK_REPO"/inbox/living-plan/*-impl-plan-*.md 2>/dev/null | head -n 1
-ls -t "$GSTACK_REPO"/inbox/*-plan-*.md 2>/dev/null | head -n 1
-# Priority 2: TODOS.md at workspace root (canonical backlog for multi-repo workspaces)
-ls TODOS.md 2>/dev/null
-# Priority 3: Standard plan files (legacy sibling -gstack dirs, in-repo plans/, and in-repo .gstack/projects/)
-ls -t "$GSTACK_REPO"/living-plans/*-plan-*.md 2>/dev/null | head -n 1
-ls -t "$GSTACK_REPO"/plans/*-plan-*.md 2>/dev/null | head -n 1
-ls -t plans/*-plan-*.md 2>/dev/null | head -n 1
-ls -t .gstack/projects/*/*-plan-*.md 2>/dev/null | head -n 1
-ls -t ../*-gstack/inbox/living-plan/*-impl-plan-*.md 2>/dev/null | head -n 1
-ls -t ../*-gstack/inbox/*-plan-*.md 2>/dev/null | head -n 1
-ls -t ../*-gstack/plans/*-plan-*.md 2>/dev/null | head -n 1
-# Priority 4: User-level gstack project home (~/.gstack/projects/<slug>/)
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" 2>/dev/null || true
-ls -t ~/.gstack/projects/${SLUG:-unknown}/*-plan-*.md 2>/dev/null | head -n 1
-ls -t ~/.gstack/projects/${SLUG:-unknown}/ceo-plans/*.md 2>/dev/null | head -n 1
-# Priority 5: Plan-mode workflow output (host-agent plans)
-ls -t ~/.claude/plans/*.md 2>/dev/null | head -n 3
-ls -t ~/.codex/plans/*.md 2>/dev/null | head -n 3
-# Priority 6: Sub-directory TODOS
-ls -t */TODOS.md 2>/dev/null | head -n 3
-```
+2. **Check for Resume**: Look for an existing `<gstack-repo>/inbox/living-plan/*-impl-plan-*.md` (also legacy `<gstack-repo>/living-plans/*-impl-plan-*.md`). If one exists and contains uncompleted phases, ask the user if they want to **resume** it. If yes, switch to Resume Mode.
 
-If the highest-priority selected source is `TODOS.md` at the workspace root, treat unchecked `[ ]` items as the implementation backlog — group them by priority label (P0, P1, P2, etc.) and ask the user which priority bands to execute. Do NOT let `TODOS.md` override a higher-priority `*-gstack/inbox/` plan.
+3. **Create First Feature Branch**: Create and check out a feature branch for the first living-plan feature block (e.g., `git checkout main && git pull && git checkout -b feat/your-feature-name`). Do NOT work directly on `main` or `master`. After each feature ships and lands, sync main and create the next feature branch before continuing.
 
-**Plan locations covered (in priority order):**
-1. **Sibling `-gstack/` inbox** (`<workspace>/<project>-gstack/inbox/living-plan/` for active living plans, then `<workspace>/<project>-gstack/inbox/` for source plans)
-2. `TODOS.md` at workspace root
-3. In-repo `plans/*-plan-*.md` and `.gstack/projects/<slug>/*-plan-*.md`
-4. **Legacy sibling `-gstack/` mirror dirs** (e.g., `../mitosis-gstack/living-plans/`, `../netx-gstack/plans/`) — per the gstack outputs mirror pattern, design docs and implementation plans for product projects often live in the sibling `-gstack/` repo, not the prototype source tree
-5. `~/.gstack/projects/<slug>/*-plan-*.md` and `~/.gstack/projects/<slug>/ceo-plans/*.md` — user-level gstack project home where /office-hours and /plan-ceo-review save artifacts
-6. **`~/.claude/plans/*.md` and `~/.codex/plans/*.md`** — host-agent plan-mode workflow output
-7. Sub-directory `*/TODOS.md` (multi-repo workspace fallback)
-
-When more than one candidate is found across priorities, prefer the most recent (`-mtime` order) within the highest-priority category that has a match. When the file's branch/repo basename matches the current branch/repo, that's the strongest signal — favor it.
-
-5. Read the most recent plan file you find. **CRITICAL:** If you cannot find any plan file or TODOS.md from Step 4, you MUST immediately STOP, output an error, and wait for the user. Do NOT attempt to guess the plan or invent your own checklist. You must process the ENTIRE plan, covering all weeks, phases, and milestones, not just the next immediate week.
-6. Synthesize a comprehensive "Living Implementation & Test Plan" that spans the entire project timeline. Write this plan to `<gstack-repo>/inbox/living-plan/<project-slug>-impl-plan-<date>.md` (e.g., `../agnt2-gstack/inbox/living-plan/agnt2-impl-plan-20260426.md`). It MUST include:
-   - A feature-block checklist that reorganizes **all** origin-plan phases/tasks into semantic deliverable features. Do this even when the origin plan already has weeks, milestones, phases, or blocks; those groups are source material, not the execution grouping. Only preserve an origin group as a feature when it naturally matches a deliverable feature.
-   - Traceability from every feature block back to the origin-plan sections it satisfies.
-   - A comprehensive phase-by-phase checklist inside each feature block (using `[ ]` markdown checkboxes).
-   - **CRITICAL**: For *every* phase in the checklist, you MUST explicitly include sub-checkboxes for the execution loop. This acts as your strict state machine. Format every phase exactly like this:
-     ```markdown
-     ## Feature X: [Feature Name]
-     Origin trace: [source plan sections/weeks/blocks/phases covered by this feature]
-     Acceptance: [what must be true for this feature to satisfy the origin plan]
-
-     ### Phase X: [Phase Name]
-     - [ ] **Test Specification (test-writer role)**: Write failing tests covering the behavior described below. Tests MUST fail before implementation begins. Cover happy path + key edge cases using the project's existing test framework. Do NOT write any implementation code yet. Default comes from `build/configure.cm`.
-     - [ ] **Implementation (primary-impl role)**: Make all failing tests pass with minimal correct code. Do NOT change test assertions. Default comes from `build/configure.cm`.
-     - [ ] **Review & QA (review roles)**: Run primary `/review`, secondary `/codex review`, and `/gstack-qa`; all gates must pass. Defaults come from `build/configure.cm`.
-     ```
-   - A dedicated test plan strategy for verifying the behavior.
-7. Present this newly synthesized living plan to the user and **PAUSE**. Use `AskUserQuestion` to explicitly ask the user to confirm the plan before moving on to the coding loop.
-
-## Step 2: The Autonomous Loop (Context-Preserved Delegation)
-
-Because this is a long-running skill, your context window will eventually become compacted, causing you to forget rules. To prevent this, you MUST delegate the execution of each phase to a fresh sub-agent.
-
-For each feature block in your living plan checklist, execute every incomplete phase in that feature before moving to ship/land for that feature (if in Reexamine Mode, audit ALL features and phases regardless of `[x]` status):
-**Narrate Your State:** Before executing ANY step or sub-agent spawn in this loop, you MUST explicitly print: "Currently executing Feature [X], Phase [Y], Step [Z]: [Name of Step]". This status narration is a critical guardrail and gives the inspector/monitor an observable checkpoint where it can report or pause execution.
-**File-path I/O is mandatory for ALL sub-agent calls.** Never paste large content inline. Write inputs to disk, ask the model to write outputs to disk, then read the output files. This rule applies universally — small or large tasks. The `--yolo` (Gemini) and `-s workspace-write` (Codex) modes make file I/O reliable; the older "model hangs when told to read files" failure was a non-yolo / read-only-sandbox problem and no longer applies.
-
-**Per-phase file layout (consistent paths):**
-
-All I/O files live in `.llm-tmp/` under the project working directory — never `/tmp`. Gemini and Codex CLI sandboxes scope filesystem access to `cwd`; `/tmp` is outside that scope and cannot be read. Create the dir before first use and delete it on successful completion:
-```bash
-mkdir -p .llm-tmp   # once at loop start
-rm -rf .llm-tmp     # once after all phases complete (or on each phase cleanup)
-```
-
-- Test-spec input: `.llm-tmp/build-<phase-N>-gemini-testspec-input-<iter>.md`
-- Test-spec output: `.llm-tmp/build-<phase-N>-gemini-testspec-output-<iter>.md`
-- Input prompt: `.llm-tmp/build-<phase-N>-gemini-input-<iter>.md`
-- Output summary: `.llm-tmp/build-<phase-N>-gemini-output-<iter>.md`
-- Test-fix input: `.llm-tmp/build-<phase-N>-gemini-fix-input-<iter>.md`
-- Test-fix output: `.llm-tmp/build-<phase-N>-gemini-fix-output-<iter>.md`
-- Codex review input: `.llm-tmp/build-<phase-N>-codex-input-<iter>.md`
-- Codex review output: `.llm-tmp/build-<phase-N>-codex-output-<iter>.md`
-
-1. **Spawn Gemini Test Specification Sub-Agent (file-path I/O)**: Before any implementation, spawn Gemini to write failing tests.
-   - Write the test-spec input prompt to `.llm-tmp/build-<phase-N>-gemini-testspec-input-<iter>.md`. Include: the phase goal, what behavior the tests must cover (happy path + edge cases), the project's existing test framework (detect from package.json/pytest.ini/etc.), the constraint "tests MUST fail before implementation — do NOT write any implementation code."
-   - The MCP call's `prompt` field stays short: `"Read instructions at <input-path>. Write failing tests only. Write output summary to <output-path>. Return ONLY the path."`
-   - After the MCP call, read `<output-path>` to confirm tests were written.
-2. **Run Tests — Verify Red (MANDATORY)**: After Gemini writes tests, run them to confirm they fail.
-   - Use the Bash tool to run the project's test command (auto-detect: check `package.json scripts.test`, `pytest.ini`, `go.mod`, `Cargo.toml` in order; or use the test command the user provided). Example: `cd <project-dir> && bun test <test-file-path>` or `pytest <test-path>`.
-   - **If tests PASS before implementation**: The tests are too weak. Write a new test-spec input file describing the problem ("tests passed before implementation — rewrite with stricter assertions") and re-spawn Gemini. Re-run until tests fail. Cap this at `GSTACK_BUILD_RED_MAX_ITER` (default 3) re-prompts. If Gemini cannot produce failing tests after 3 attempts, STOP and surface the error to the user.
-   - **If tests FAIL as expected**: Proceed to implementation (step 3).
-
-2.5. **Startup Gates (v1.18.0)**: `gstack-build` runs two preflight checks before starting any phase:
-
-   1. **Pre-build clean check** — if any tracked file is modified or staged (untracked files ignored), the CLI exits 1 immediately with a diff summary. Commit or stash before building. Bypass with `--skip-clean-check`.
-   2. **Unshipped feat/* sweep** — scans `origin` for any `feat/*` branch not merged into `origin/main`. For each one (excluding the current build's branch), checks it out, runs `/ship + /land-and-deploy`, and returns. Warn-and-continue on individual sweep failures. Bypass with `--skip-sweep`.
-
-   Both gates are skipped automatically when `--dry-run` or `--skip-ship` is active.
-
-2.6. **Dual-Implementor Mode (`--dual-impl`) — full CLI delegation**: When the user wants tournament selection (primary implementor vs secondary implementor, configured judge), hand off the entire build to the `gstack-build` CLI with `--dual-impl`. **Do NOT attempt to manually orchestrate dual-impl within this skill** — the CLI owns the full loop: worktree creation, parallel impl, tests, judge, apply winner, test+fix, review gates, QA, and plan checkbox updates.
+4. **Locate the source plan (Haiku subagent)**: Delegate plan discovery to a Haiku subagent — keeps the priority logic and any directory-listing output off the main context.
 
    ```bash
-   gstack-build <plan.md> --dual-impl [--primary-impl-model M] [--secondary-impl-model M]
+   mkdir -p .llm-tmp
+   eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" 2>/dev/null || true
+   _BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
+   _CWD=$(pwd)
    ```
 
-   Default providers, models, reasoning levels, and commands come from `build/configure.cm`; CLI/env overrides still apply. Deprecated aliases still work: `--gemini-model`, `--codex-model`, and `--codex-review-model`.
+   Write `.llm-tmp/build-plan-locate-input.md` (substitute actual shell variable values for all placeholders):
 
-   Your role after invocation: use the **CLI Monitoring Loop** (see below) — confirm with the user, launch in the background, and poll for progress and faults. Do NOT run `gstack-build --dual-impl` as a blocking Bash call; that prevents fault recovery during a potentially multi-hour run. The full dual-impl workflow and recovery guide are in `build/orchestrator/README.md`.
+   ```
+   You are a plan locator. Run bash commands to find the best source plan. Output one JSON line.
+
+   Context:
+   GSTACK_REPO: <value of $GSTACK_REPO>
+   SLUG: <value of $SLUG or "unknown">
+   BRANCH: <value of $_BRANCH>
+   CWD: <value of $_CWD>
+
+   Search in priority order (P1 = highest). Within a tier, pick the newest file by mtime.
+   If a filename contains the branch name or repo slug, strongly prefer it within the same tier.
+
+   P1: $GSTACK_REPO/inbox/living-plan/*-impl-plan-*.md
+   P2: $GSTACK_REPO/inbox/*-plan-*.md  (skip if already matched P1)
+   P3: TODOS.md at CWD
+   P4: $GSTACK_REPO/living-plans/*-plan-*.md, $GSTACK_REPO/plans/*-plan-*.md,
+       CWD/plans/*-plan-*.md, CWD/.gstack/projects/*/*-plan-*.md
+   P5: ~/.gstack/projects/<SLUG>/*-plan-*.md, ~/.gstack/projects/<SLUG>/ceo-plans/*.md
+   P6: ~/.claude/plans/*.md, ~/.codex/plans/*.md
+   P7: CWD/*/TODOS.md  (subdirectory fallback, lowest priority)
+
+   Run ls/find commands for each tier in order. Stop at the first tier that has a match.
+
+   Write output to .llm-tmp/build-plan-locate-output.md as a single JSON line:
+   {"planPath":"<absolute-path>","type":"living-plan|source-plan|todos","isTodos":false}
+   If nothing found: {"planPath":null,"type":null,"isTodos":false}
+   Return ONLY the output file path. No narrative.
+   ```
+
+   Spawn the Haiku subagent (model read from configure.cm `planLocator` role):
+   ```bash
+   _LOCATOR_MODEL=$(jq -r '.roles.planLocator.model // empty' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
+   ```
+   If `_LOCATOR_MODEL` is empty, STOP — configure.cm is missing or malformed. Run `ls ~/.claude/skills/gstack/build/configure.cm` to diagnose.
+   ```bash
+   claude --model "$_LOCATOR_MODEL" -p "Read instructions at .llm-tmp/build-plan-locate-input.md. Run the discovery commands. Write result JSON to .llm-tmp/build-plan-locate-output.md. Return ONLY the output file path. No narrative."
+   ```
+
+   Read `.llm-tmp/build-plan-locate-output.md`. Parse the JSON.
+   - If `planPath` is null: STOP, output "No plan file found — please specify one", and wait for the user.
+   - If `isTodos` is true: treat unchecked `[ ]` items as the backlog. Ask the user which priority bands (P0, P1, P2, etc.) to execute before synthesizing the living plan.
+
+5. **Synthesize the living plan (Claude subagent)**: Delegate full plan synthesis to a fresh Claude subagent so the entire origin plan document is read off the main context. The subagent reads the source plan, synthesizes the living plan, writes it to disk, and returns only a compact summary.
+
+   Write `.llm-tmp/build-synthesis-input.md` (substitute actual values):
+
+   ```
+   You are a living-plan synthesizer for gstack-build.
+
+   Source plan path: <planPath from step 4>
+   GSTACK_REPO: <value of $GSTACK_REPO>
+   Project slug: <value of $SLUG>
+   Today's date: <YYYYMMDD>
+   Living plan output path: <$GSTACK_REPO>/inbox/living-plan/<SLUG>-impl-plan-<YYYYMMDD>.md
+
+   Read the source plan fully. Then write a comprehensive Living Implementation & Test Plan.
+
+   The living plan MUST include:
+   - A feature-block checklist reorganizing ALL source-plan phases/tasks into semantic deliverable
+     features. Even when the source plan has weeks/milestones, those are source material — group
+     by deliverable feature. Only preserve an origin group as a feature when it naturally matches.
+   - Traceability from every feature block back to the source plan sections it satisfies.
+   - A phase-by-phase checklist inside each feature block using [ ] markdown checkboxes.
+   - For EVERY phase, exactly this sub-checkbox structure:
+
+     ## Feature X: [Feature Name]
+     Origin trace: [source plan sections/weeks/blocks covered]
+     Acceptance: [what must be true for this feature to satisfy the source plan]
+
+     ### Phase X: [Phase Name]
+     - [ ] **Test Specification (test-writer role)**: Write failing tests covering the behavior
+       described below. Tests MUST fail before implementation begins. Cover happy path + key edge
+       cases using the project's existing test framework. Do NOT write any implementation code yet.
+     - [ ] **Implementation (primary-impl role)**: Make all failing tests pass with minimal correct
+       code. Do NOT change test assertions.
+     - [ ] **Review & QA (review roles)**: Run primary /review, secondary /codex review, and
+       /gstack-qa; all gates must pass.
+
+   - A dedicated test plan strategy section.
+
+   After writing the living plan file, write a compact summary to
+   .llm-tmp/build-synthesis-output.md in this exact format:
+   PLAN_PATH: <absolute path to the written living plan file>
+   FEATURE_COUNT: <N>
+   FEATURES:
+   - Feature 1: <name> (<M> phases)
+   - Feature 2: <name> (<M> phases)
+   ...
+   Return ONLY the path .llm-tmp/build-synthesis-output.md. No narrative.
+   ```
+
+   Spawn (model read from configure.cm `planSynthesizer` role):
+   ```bash
+   _SYNTH_MODEL=$(jq -r '.roles.planSynthesizer.model // empty' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
+   ```
+   If `_SYNTH_MODEL` is empty, STOP — configure.cm is missing or malformed.
+   ```bash
+   claude --model "$_SYNTH_MODEL" -p "Read synthesis instructions at .llm-tmp/build-synthesis-input.md. Read the source plan. Write the living plan. Write the summary to .llm-tmp/build-synthesis-output.md. Return ONLY the output path. No narrative."
+   ```
+
+   Extract the plan path from the summary (deterministic shell extraction, not natural-language parsing):
+   ```bash
+   LIVING_PLAN_FILE=$(grep "^PLAN_PATH:" .llm-tmp/build-synthesis-output.md | cut -d' ' -f2-)
+   ```
+   If `LIVING_PLAN_FILE` is empty, STOP — the synthesis subagent failed to write the output or used wrong format.
+
+6. **Confirm with user**: Present the feature list from the synthesis summary, then use `AskUserQuestion` to ask the user to confirm before launching the CLI. Show: living plan file path, feature count, and each feature name with phase count.
 
 ## CLI Monitoring Loop
 
-Use this execution path whenever handing off to `gstack-build` — for 5+ phase plans (LLM-driven loop vs. code-driven CLI section above) **and** for `--dual-impl` mode. After launching, skip steps 3–9 entirely; the CLI owns the per-phase loop.
+Use this execution path for all plans — Normal Mode (after Step 1.6 confirmation), Resume Mode (after detecting the existing plan), and after Reexamine Mode completes if new work is needed.
+
+### Startup Gates (v1.18.0)
+
+Before launching, `gstack-build` runs two preflight checks:
+1. **Pre-build clean check** — exits 1 if any tracked file is modified or staged. Commit or stash before building. Bypass with `--skip-clean-check`.
+2. **Unshipped feat/* sweep** — scans `origin` for any `feat/*` branch not merged into `origin/main`, runs `/ship + /land-and-deploy` on each, and returns. Bypass with `--skip-sweep`.
+
+Both gates are skipped when `--dry-run` or `--skip-ship` is active.
+
+### Dual-Implementor Mode (`--dual-impl`)
+
+For tournament-selection builds, pass `--dual-impl` to `gstack-build`. The CLI owns the full dual-impl loop: worktree creation, parallel impl, tests, judge, apply winner, test+fix, review gates, QA. Deprecated aliases (`--gemini-model`, `--codex-model`, `--codex-review-model`) still work. Full guide in `build/orchestrator/README.md`.
 
 ### Step M1: Confirm and Launch
 
@@ -876,7 +893,7 @@ Then launch in the background using `run_in_background: true` on the Bash tool:
 gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS 2>&1 | tee "$_LOG_DIR/agent-stdout.log"
 ```
 
-Store the slug and plan file path in a local variable for use across poll ticks.
+Store the slug and plan file path for use across poll ticks.
 
 ### Step M3: Poll Loop (60-second cadence via ScheduleWakeup)
 
@@ -1032,7 +1049,8 @@ When `_STALE_TICKS >= 3`:
    If A: schedule wakeup at 180s (instead of 60s), reset `_STALE_TICKS` to 0.
    If B:
    ```bash
-   kill $(pgrep -f "gstack-build") 2>/dev/null || true
+   # Scope the kill to this build's project root to avoid killing unrelated builds.
+   kill $(pgrep -f "gstack-build.*$_PROJECT_ROOT") 2>/dev/null || true
    sleep 2
    gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS --skip-clean-check   # run_in_background: true
    ```
@@ -1044,102 +1062,135 @@ If none of the above conditions fired, schedule the next wakeup at 60 seconds an
 
 ---
 
-3. **Spawn Primary Implementation Sub-Agent (file-path I/O)**: Use the configured primary-impl role from `build/configure.cm` plus any CLI/env overrides. You MUST spawn the execution sub-agent using the configured primary-impl role. **CRITICAL:** Do NOT use the `Bash` tool to run `claude -m gemini` or `claude --model gemini`, as that will fail!
-   - **Write the input prompt to a file first.** Use the `Write` tool to put the full instruction body — goal, phase checklist, code references, constraints, success criteria — into `.llm-tmp/build-<phase-N>-gemini-input-<iter>.md`. The MCP prompt body itself stays short: it just says "Read `<input-path>`. Do the work. Write your output summary to `<output-path>`." Do NOT inline the phase context in the MCP call.
-   - **Reference existing code by file path, not by inlined content.** Tell Gemini: "Read the existing code at `path/to/file.ts` if you need it." With `--yolo` mode, Gemini's file-read tools work reliably. Inlining hundreds of lines of code wastes tokens and the model often returns truncated.
-   - **The input file** must include: the exact goal, phase checklist from the living plan, instructions to build and verify, instructions to make GitHub Actions checks green, instruction to commit to the current branch, instruction to fail forward and only return when the code is written, and "Do NOT use raw `git` commands or `gh` CLI to ship. Do NOT skip steps or hallucinate your own review process. Do NOT instruct Gemini to run /review or /ship."
-   - **The MCP call's `prompt` field** must be short and only say: "Read the instructions at `<input-path>`. Do the work autonomously with --yolo file tools. When done, write your output summary (what files changed, what tests pass, what's committed) to `<output-path>`. Return ONLY the path to your output file. No narrative."
-   - **After the MCP call returns**, use the `Read` tool to read `<output-path>` for Gemini's actual work summary. Treat the MCP return value as a status indicator, not the work product.
-   - **File batching**: Gemini handles ≤2 file references per call reliably. If a phase touches 3+ files, split into parallel sub-calls. Each sub-call still uses the file-path I/O pattern.
-4. **Wait for Gemini Completion**: The MCP tool call will execute synchronously. Let it block until it finishes. **NEVER skip the sub-agent to do the work yourself.** Read the output file before proceeding.
-5. **Recursive Test+Fix Loop (MANDATORY — loop until green)**: After implementation finishes, run tests recursively until they all pass.
-   - Run the project's test command: `cd <project-dir> && <test-cmd>`.
-   - If tests **PASS** (exit 0): proceed to review gates (step 6).
-   - If tests **FAIL**: write a new test-fixer input file at `.llm-tmp/build-<phase-N>-test-fix-input-<iter>.md` describing which tests failed and what the error output was. Re-spawn the configured test-fixer role, require it to write its output summary to `.llm-tmp/build-<phase-N>-test-fix-output-<iter>.md`, then read that output file before re-running tests. Repeat up to the configured `GSTACK_BUILD_TEST_MAX_ITER` cap.
-   - If still failing after 5 iterations: STOP, surface the failure to the user, and exit. Do NOT advance to review gates with failing tests.
-6. **Spawn Review Gates (RECURSIVE — loop until clean, file-path I/O)**: After implementation is green, run the configured primary review, secondary review, and QA roles from `build/configure.cm`.
-   - **Write the review request to a file.** Put the goal of this review iteration (which phase, what changed, what to verify) into `.llm-tmp/build-<phase-N>-codex-input-<iter>.md`. The codex CLI invocation prompt stays short.
-   - **Invocation pattern**: each gate reads `.llm-tmp/build-<phase-N>-review-input-<iter>.md`, runs its configured slash command, and writes a report file containing a final `GATE PASS` or `GATE FAIL` line. Do NOT inline the diff or instructions.
-   - QA is now part of the default gate sequence, not only a UI-change add-on.
-   - **CRITICAL**: Do NOT use an unconfigured fallback model for review, QA, ship, or land; the role config is authoritative.
-   - **After each Codex iteration**, use the `Read` tool to read the output file. Look for the `GATE PASS` / `GATE FAIL` keyword on its own line. Do NOT parse stdout for the verdict — stdout is for status only; the file is the source of truth for the work product.
-   - **RECURSIVE LOOP REQUIREMENT**: If the output file's verdict is `GATE FAIL`, write a new input file (`.llm-tmp/build-<phase-N>-codex-input-<iter+1>.md`) describing the issues to fix, re-spawn Codex with a new output path, and re-check. Repeat the review→fix→review cycle until Codex writes `GATE PASS`. Do NOT advance to step 8 (Update Living Plan) with open review findings. A single review pass is NOT sufficient — past sessions have left issues unaddressed by stopping after one pass.
-7. **Wait for Review Completion**: Run each gate synchronously in the foreground. Apply the recursive loop in step 6 until all gates are fully clean.
-8. **Update Living Plan (MANDATORY — never skip)**: After implementation, tests, review, secondary review, and QA have completed cleanly, you MUST immediately use the `Edit` tool to modify the living plan and check off the specific sub-checkboxes for this phase (change `[ ] **Test Specification...` to `[x]`, `[ ] **Implementation...` to `[x]`, and `[ ] **Review...` to `[x]`). This step runs unconditionally after every phase, regardless of how trivial the phase felt — past sessions have forgotten this step under context pressure and progress tracking has drifted. Treat this as a hard requirement, not a nice-to-have. Verify there are zero remaining issues from the review before checking the box.
-8.5. **Phase Guardrail Verification + Status Report**: Immediately after updating the plan, run the following verification sequence. If ANY item fails, STOP and complete the missing step before advancing — do NOT skip forward to context-save.
+## Reexamine Mode: Parallel Audit Subagents
 
-   **Guardrail checklist** (run each check via Bash):
+When in Reexamine Mode, spawn one Claude subagent per feature block to audit and fix. The main agent only writes inputs, launches subagents, and collects reports — it never reads the full codebase or living plan content itself.
+
+1. **Locate the living plan**:
    ```bash
-   # 1. All 3 checkboxes confirmed [x] in the plan file
-   grep -A3 "### Phase <N>" <plan-file> | grep -c "\[x\]"
-   # must equal 3
-
-   # 2. Red phase was verified (tests failed before impl)
-   # Confirm from your own execution trace above — if you cannot confirm, STOP.
-
-   # 3. Tests are green now
-   cd <project-dir> && <test-cmd>
-   # must exit 0
-
-   # 4. GATE PASS in last Codex output file
-   grep "GATE PASS" .llm-tmp/build-<phase-N>-codex-output-<last-iter>.md
-   # must match
-
-   # 5. Phase has at least one commit
-   git log --oneline -1
-   # must show work from this phase
+   GSTACK_REPO=$(find .. -maxdepth 1 -type d -name '*-gstack' 2>/dev/null | sort | head -1)
+   LIVING_PLAN_FILE=$(ls -t "$GSTACK_REPO/inbox/living-plan/"*-impl-plan-*.md 2>/dev/null | head -1)
+   # Fall back to legacy location
+   [ -z "$LIVING_PLAN_FILE" ] && LIVING_PLAN_FILE=$(ls -t "$GSTACK_REPO/living-plans/"*-impl-plan-*.md 2>/dev/null | head -1)
    ```
+   If `LIVING_PLAN_FILE` is empty, STOP and ask the user to specify the plan path.
 
-   After all checks pass, print the following status block **immediately, without waiting for user input** — then continue to step 9 without pausing:
+2. **Extract feature list**: Run `grep "^## Feature" "$LIVING_PLAN_FILE"` to get feature headings only. Do NOT read the full plan. Build a list of `{ featureIndex, featureName }` tuples.
+
+3. **Write audit inputs and spawn subagents in parallel**: Subagents are **read-only auditors** — they report gaps but NEVER write code, run tests, or commit. The main agent applies fixes serially after collecting all reports (no git race conditions). For each feature N, write `.llm-tmp/build-reexamine-feature-<N>-input.md`:
 
    ```
-   ══════════════════════════════════════════════════════
-   PHASE <N> COMPLETE — <phase name>
-   Branch:      <current branch>
-   Test Spec:   ✅ written + Red confirmed
-   Tests:       ✅ <N pass, 0 fail> (fix iterations: <N>)
-   Review:      ✅ GATE PASS (codex iterations: <N>)
-   Commit:      <git log --oneline -1 output>
-   Plan:        all 3 checkboxes [x]
-   Next:        Phase <N+1> — <name>  |  or: FINAL SHIP
-   ══════════════════════════════════════════════════════
+   You are a READ-ONLY feature auditor for gstack-build reexamine mode.
+   DO NOT write code, modify files, run tests, or commit anything.
+   Your only output is a gap report.
+
+   Feature: <feature name>
+   Feature index: <N>
+   Living plan path: <LIVING_PLAN_FILE>
+   Project root: <project root>
+
+   Steps:
+   1. Read Feature <N> from the living plan (only that feature block — from "## Feature <N>"
+      through the next "## Feature" heading or EOF).
+   2. Read the source files implied by the feature's phase descriptions.
+   3. Check every phase — even phases marked [x]. Verify each sub-task is actually implemented.
+   4. Write a compact gap report to .llm-tmp/build-reexamine-feature-<N>-output.md:
+
+   FEATURE: <name>
+   STATUS: CLEAN | GAPS_FOUND
+   GAPS:
+   - <gap description with file:line references, or "none">
+   PHASES_CHECKED: <N>
+
+   Return ONLY the output file path. No narrative.
    ```
 
-9. **Context save at phase boundary**: After each phase completes (all three sub-checkboxes — Test Specification, Implementation, and Review — checked and guardrail verified), run the configured context-save role from `build/configure.cm`. This ensures progress survives a context window compaction mid-session.
+   Spawn all subagents concurrently. Track PIDs to detect individual failures:
+   ```bash
+   # Launch one subagent per feature in parallel; track PIDs
+   claude -p "Read .llm-tmp/build-reexamine-feature-1-input.md. Audit (read-only). Write report to .llm-tmp/build-reexamine-feature-1-output.md. Return ONLY the output path." > .llm-tmp/spawn-1.log 2>&1 &
+   PID_1=$!
+   claude -p "Read .llm-tmp/build-reexamine-feature-2-input.md. Audit (read-only). Write report to .llm-tmp/build-reexamine-feature-2-output.md. Return ONLY the output path." > .llm-tmp/spawn-2.log 2>&1 &
+   PID_2=$!
+   # ... one per feature
+   wait $PID_1 || echo "WARN: subagent for feature 1 exited non-zero — check .llm-tmp/spawn-1.log"
+   wait $PID_2 || echo "WARN: subagent for feature 2 exited non-zero — check .llm-tmp/spawn-2.log"
+   ```
+   After all PIDs complete, verify each output file exists and starts with `FEATURE:`. If any is missing or malformed, re-run that feature's subagent serially before proceeding.
 
-After each feature's phases are clean, ship and land that feature before starting the next feature. Then revisit the origin plan and verify that the shipped feature satisfies the origin-plan requirements mapped to that feature. If not, record concrete issues and restart the feature loop. Do NOT stop to ask the user for permission between phases or features unless a sub-agent fails catastrophically, a gate cannot be cleared automatically, or a safety constraint requires user judgment. Keep the loop going.
+4. **Collect reports and apply fixes serially**: Read each `.llm-tmp/build-reexamine-feature-<N>-output.md`. For each feature with `STATUS: GAPS_FOUND`, apply the gaps one at a time (write code → run tests → commit). Do NOT parallelize the fix phase — serial application avoids git conflicts.
+
+   Print a consolidated summary after all fixes:
+   ```
+   ═══ REEXAMINE COMPLETE ══════════════════════════════════
+   Feature 1: <name> — CLEAN
+   Feature 2: <name> — GAPS_FOUND → fixed (commits: abc123)
+   Feature 3: <name> — CLEAN
+   Total: <N> features audited, <M> gaps fixed
+   ═════════════════════════════════════════════════════════
+   ```
+
+5. **Update living plan**: For any features where gaps were fixed, flip the relevant `[ ]` checkboxes to `[x]` in `LIVING_PLAN_FILE`.
+
+6. **Proceed to CLI Monitoring Loop** if any feature was FIXED and new phases remain. Otherwise report completion.
 
 ## Step 3: Final Ship & Completion
 
-For EACH feature, once all phases in that feature are complete (and have been individually reviewed):
-1. **Spawn Ship/Land Roles**: You MUST spawn the configured ship and land roles from `build/configure.cm` to merge and deploy the fully reviewed feature branch.
-   - Use the configured commands exactly.
-   - **CRITICAL: Do NOT substitute these skills with raw `gh pr create` or `gh pr merge` commands! You MUST use the GStack skills because they contain mandatory CI/CD safety gates.** Do NOT invoke the native `ship` tool!
-2. **Wait for Ship/Land Completion**: Run each ship/land sub-agent synchronously in the foreground. Wait for the Bash tool to return.
-3. **Origin Plan Feature Verification**: Re-open the original source plan and verify this landed feature satisfies the mapped origin-plan requirements. If gaps remain, record the issues in the living plan and restart that feature's implementation loop.
-4. **Feature Guardrail Verification**: After ship + land-and-deploy, run the following checks. If ANY fails, STOP and surface the error — do NOT report completion.
+For EACH feature, once all phases in that feature are complete (and have been individually reviewed by the CLI):
 
-   ```bash
-   # 1. PR is merged (not open)
-   gh pr list --state open --head <feature-branch>
-   # must return 0 rows
+1. **Spawn Ship/Land Roles** — only when `$_FLAGS` contains `--skip-ship`. When `--skip-ship` is absent, `gstack-build` already ran `/ship + /land-and-deploy` internally before reporting the feature complete. Re-spawning here would double-ship and create duplicate PRs. Check:
+   - If `--skip-ship` IS in `$_FLAGS`: spawn the configured ship and land roles from `build/configure.cm`. Use the configured commands exactly. **CRITICAL: Do NOT substitute with raw `gh pr create` or `gh pr merge` commands. You MUST use the GStack skills.** Do NOT invoke the native `ship` tool. Wait for each sub-agent synchronously.
+   - If `--skip-ship` is NOT in `$_FLAGS`: skip this step entirely. Proceed to step 3.2.
 
-   # 2. No unmerged feature branches remain for this completed feature
-   git fetch origin
-   git branch -r --no-merged origin/main | grep "feat/"
-   # must return empty (or only branches for future weeks not yet started)
+2. **Feature Verification (Claude subagent)**: After shipping, delegate origin-plan coverage check to a fresh Claude subagent — the main agent never re-reads the full source plan.
 
-   # 3. Main is up to date with the merge
-   git log origin/main --oneline -1
-   # commit sha must match the merge commit from /land-and-deploy
+   Write `.llm-tmp/build-verify-feature-<N>-input.md` (substitute actual values):
+   ```
+   You are a feature verifier for gstack-build.
 
-   # 4. Clean local state — no staged/unstaged changes from this build
-   git status --porcelain
-   # must be empty
+   Source plan path: <planPath from Step 1.4>
+   Feature name: <name>
+   Origin trace: <the exact "Origin trace:" line from this feature block in the living plan>
+   Living plan path: <LIVING_PLAN_FILE>
+   Feature block index: <N>
+   Feature branch (now merged): <branch name>
+
+   Steps:
+   1. Read ONLY the source plan sections named in the origin trace (not the full plan).
+   2. Read the Feature <N> acceptance criteria from the living plan.
+   3. Run: git log --oneline origin/main | head -20
+      to confirm the feature's commits landed.
+   4. Compare implementation against acceptance criteria.
+   5. Write a gap report to .llm-tmp/build-verify-feature-<N>-output.md:
+
+   VERIFICATION: PASS | GAPS
+   GAPS:
+   - <gap description referencing the source plan section> (or "none")
+
+   Return ONLY the output file path. No narrative.
    ```
 
-   After all checks pass, print the following status block **immediately, without waiting for user input**:
+   Spawn (model read from configure.cm `featureVerifier` role):
+   ```bash
+   _VERIFIER_MODEL=$(jq -r '.roles.featureVerifier.model // empty' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
+   ```
+   If `_VERIFIER_MODEL` is empty, STOP — configure.cm is missing or malformed.
+   ```bash
+   claude --model "$_VERIFIER_MODEL" -p "Read instructions at .llm-tmp/build-verify-feature-<N>-input.md. Read the relevant plan sections and git log. Write gap report to .llm-tmp/build-verify-feature-<N>-output.md. Return ONLY the output path. No narrative."
+   ```
 
+   Read `.llm-tmp/build-verify-feature-<N>-output.md`. If `VERIFICATION: GAPS`, record the issues in the living plan and restart that feature's implementation loop.
+
+3. **Feature Guardrail Verification**: After ship + land-and-deploy, run the guardrail script. The feature branch name is the branch the CLI created for this feature — extract it from the CLI state file or monitoring logs before this step, and store as `_FEATURE_BRANCH`:
+   ```bash
+   # _FEATURE_BRANCH must be set to the shipped feature branch (e.g. feat/my-feature-1)
+   ~/.claude/skills/gstack/bin/gstack-build-phase-guardrail \
+     "$LIVING_PLAN_FILE" "$_FEATURE_BRANCH" "$_PROJECT_ROOT"
+   # must output: GUARDRAIL: PASS
+   ```
+   If it outputs `GUARDRAIL: FAIL: <reason>`, STOP and surface the error.
+
+   After `GUARDRAIL: PASS`, print the following status block **immediately, without waiting for user input**:
    ```
    ╔══════════════════════════════════════════════════════╗
    ║  FEATURE COMPLETE — EXECUTION REPORT                 ║
@@ -1155,15 +1206,27 @@ For EACH feature, once all phases in that feature are complete (and have been in
    ```
 
 After ALL features are complete:
-1. **Final Completion Exam**: Confirm no feature branches remain unmerged locally or remotely; re-check the origin plan against the full implementation. If gaps remain, convert them into issues and restart the autonomous loop.
-2. **Archive Plans**: After the final completion exam passes, move the completed living plan from `<gstack-repo>/inbox/living-plan/` to `<gstack-repo>/archived/`. Move the completed origin plan from `<gstack-repo>/inbox/` to `<gstack-repo>/archived/`. Legacy living plans may still move from `<gstack-repo>/living-plans/`. If a file with the same name already exists in `archived/`, append a timestamp before moving. If you cannot determine the correct `*-gstack` repo, STOP and ask the user to specify it.
-3. Report the completion to the user: summarize what you built and confirm that all features have been shipped and deployed successfully.
+
+1. **Final Completion Exam (Claude subagent)**: Spawn a subagent to compare the full source plan against the complete git log and living plan. Write `.llm-tmp/build-final-exam-input.md` containing: source plan path, living plan path, and the output of `git log --oneline origin/main | head -40`. Spawn:
+   ```bash
+   _VERIFIER_MODEL=$(jq -r '.roles.featureVerifier.model // empty' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
+   ```
+   If `_VERIFIER_MODEL` is empty, STOP — configure.cm is missing or malformed.
+   ```bash
+   claude --model "$_VERIFIER_MODEL" -p "Read final-exam instructions at .llm-tmp/build-final-exam-input.md. Read source plan and living plan. Compare against git log. Write result to .llm-tmp/build-final-exam-output.md: EXAM: PASS | GAPS followed by gap list. Return ONLY the output path. No narrative."
+   ```
+   Read the output. If `EXAM: GAPS`, convert each gap into an issue and restart the autonomous loop for that feature.
+
+2. **Archive Plans**: Move the completed living plan from `<gstack-repo>/inbox/living-plan/` to `<gstack-repo>/archived/`. Move the completed source plan from `<gstack-repo>/inbox/` to `<gstack-repo>/archived/`. Legacy living plans may still move from `<gstack-repo>/living-plans/`. Append a timestamp to the filename if a file with the same name already exists in `archived/`. If you cannot determine the `*-gstack` repo, STOP and ask.
+
+3. Report completion to the user: summarize what was built and confirm all features are shipped and deployed successfully.
 
 **Rules:**
-- **Autonomous Continuity**: Do NOT ask for the user's confirmation to proceed between steps, phases, or loops unless you are critically blocked. Just narrate your current state and keep moving.
-- **Autonomous Skill Execution**: If you or your sub-agents use other GStack skills, you MUST run them as separate processes using the `Bash` tool. Use the configured commands from `build/configure.cm`. **CRITICAL BUG WARNING: NEVER invoke skills natively as tools (i.e., do NOT use the `review`, `qa`, or `ship` tools directly). Invoking them as native tools just dumps their source code into your context and will permanently break the autonomous loop. Always use the Bash tool.**
-- **Verbose State Reporting**: Always tell the user what you are currently doing (e.g., implementing, reviewing, debating, shipping, fixing, merging).
-- **Bias for action**: Write the code. Do not write meta-commentary.
-- **Strict adherence**: Stick to the plan. Do not expand scope unless strictly necessary to make the code compile. Do NOT hallucinate elaborate alternative processes if a file or command is missing—always STOP and report the error to the user.
-- **Fail forward**: If tests fail, try to fix them. Only escalate to the user if you are stuck after multiple attempts.
-- **Model Routing Discipline**: Use the role config from `build/configure.cm` plus CLI/env overrides, not hardcoded model assumptions. Defaults are data, not prose; check the config file before naming a model or provider.
+- **Autonomous Continuity**: Do NOT ask the user's confirmation between steps, phases, or loops unless critically blocked. Narrate your state and keep moving.
+- **Always use the CLI**: Never attempt to manually execute phases (test-write, implement, review) within this skill. That work belongs in `gstack-build`. **CRITICAL BUG WARNING: NEVER invoke skills natively as tools — use the Bash tool to run them as separate processes.** Invoking them as native tools dumps their source code into context and permanently breaks the autonomous loop.
+- **File-path I/O for all subagents**: Write inputs to disk, spawn the subagent with a short prompt pointing to the file, read the output file. Never inline large content in a spawn prompt.
+- **Verbose State Reporting**: Always tell the user what you are currently doing (e.g., locating plan, spawning synthesizer, launching CLI, monitoring).
+- **Bias for action**: Keep the loop going. Do not write meta-commentary.
+- **Strict adherence**: Stick to the plan. Do not expand scope unless strictly necessary to make the code compile. STOP and report the error if a file or command is missing — do NOT guess.
+- **Fail forward**: If a subagent fails, try once more. Escalate to the user only after two failed attempts.
+- **Model Routing Discipline**: Use the role config from `build/configure.cm` plus CLI/env overrides. Defaults are data, not prose; check the config file before naming a model or provider. Note: `planLocator`, `planSynthesizer`, and `featureVerifier` are template-only roles consumed by jq — they are intentionally absent from the CLI's `ROLE_DEFINITIONS` and require no CLI flags or env vars.
