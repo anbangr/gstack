@@ -260,6 +260,22 @@ describe('gen-skill-docs', () => {
     expect(content).toContain('gstack-learnings-search --limit 3');
   });
 
+  test('build skill launches gstack-build through an absolute CLI resolver', () => {
+    const files = [
+      path.join(ROOT, 'build', 'SKILL.md.tmpl'),
+      path.join(ROOT, 'build', 'SKILL.md'),
+    ];
+
+    for (const file of files) {
+      const content = fs.readFileSync(file, 'utf-8');
+      expect(content).toContain('_GSTACK_BUILD_CLI');
+      expect(content).toContain('command -v gstack-build');
+      expect(content).toContain('"$_GSTACK_BUILD_CLI" "$_PLAN_FILE"');
+      expect(content).not.toContain('\ngstack-build "$_PLAN_FILE"');
+      expect(content).not.toContain('GSTACK_BUILD_GEMINI_TIMEOUT=1200000 gstack-build "$_PLAN_FILE"');
+    }
+  });
+
   test('generated SKILL.md with LEARNINGS_LOG contains operational type', () => {
     // Check a skill that has LEARNINGS_LOG (e.g., review)
     const content = fs.readFileSync(path.join(ROOT, 'review', 'SKILL.md'), 'utf-8');
@@ -1706,6 +1722,15 @@ describe('Codex generation (--host codex)', () => {
     const reviewContent = fs.readFileSync(path.join(AGENTS_DIR, 'gstack-review', 'SKILL.md'), 'utf-8');
     expect(reviewContent).not.toContain('codex review --base');
     expect(reviewContent).not.toContain('CODEX_REVIEWS');
+  });
+
+  test('Codex build skill launches gstack-build through an absolute CLI resolver', () => {
+    const content = fs.readFileSync(path.join(AGENTS_DIR, 'gstack-build', 'SKILL.md'), 'utf-8');
+    expect(content).toContain('_GSTACK_BUILD_CLI');
+    expect(content).toContain('command -v gstack-build');
+    expect(content).toContain('"$_GSTACK_BUILD_CLI" "$_PLAN_FILE"');
+    expect(content).not.toContain('\ngstack-build "$_PLAN_FILE"');
+    expect(content).not.toContain('GSTACK_BUILD_GEMINI_TIMEOUT=1200000 gstack-build "$_PLAN_FILE"');
   });
 
   test('--host codex --dry-run freshness', () => {

@@ -877,7 +877,7 @@ B) Print the command to run manually instead
 Net: A is right for unattended builds; B is right if you want to drive it yourself in a separate terminal.
 ```
 
-If B: print the exact command (`gstack-build <plan-file> [flags]`) and exit. Do not enter the monitoring loop.
+If B: print the exact command (`<resolved-gstack-build-cli> <plan-file> [flags]`) and exit. Do not enter the monitoring loop.
 
 If A: proceed to Step M2.
 
@@ -896,11 +896,33 @@ _LOG_DIR="$HOME/.gstack/build-state/$_SLUG"
 mkdir -p "$_LOG_DIR"
 echo "SLUG: $_SLUG"
 echo "STATE: $_STATE_FILE"
+
+_GSTACK_BUILD_CLI="${GSTACK_BUILD_CLI:-}"
+if [ -z "$_GSTACK_BUILD_CLI" ]; then
+  _CMD_GSTACK_BUILD=$(command -v gstack-build 2>/dev/null || true)
+  _CURRENT_REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+  for _candidate in \
+    "$_CMD_GSTACK_BUILD" \
+    ~/.claude/skills/gstack/bin/gstack-build \
+    ./.claude/skills/gstack/bin/gstack-build \
+    "$_CURRENT_REPO_ROOT/bin/gstack-build"
+  do
+    if [ -n "$_candidate" ] && [ -x "$_candidate" ]; then
+      _GSTACK_BUILD_CLI="$_candidate"
+      break
+    fi
+  done
+fi
+if [ -z "$_GSTACK_BUILD_CLI" ] || [ ! -x "$_GSTACK_BUILD_CLI" ]; then
+  echo "ERROR: gstack-build CLI not found. Run ./setup --host claude or ./setup --host codex from the gstack repo, or set GSTACK_BUILD_CLI=/absolute/path/to/gstack-build." >&2
+  exit 127
+fi
+echo "GSTACK_BUILD_CLI: $_GSTACK_BUILD_CLI"
 ```
 
 Then launch in the background using `run_in_background: true` on the Bash tool:
 ```bash
-gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS 2>&1 | tee "$_LOG_DIR/agent-stdout.log"
+"$_GSTACK_BUILD_CLI" "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS 2>&1 | tee "$_LOG_DIR/agent-stdout.log"
 ```
 
 Store the slug and plan file path for use across poll ticks.
@@ -980,7 +1002,7 @@ Completed:   <lastUpdatedAt>
 
    **Contains `"timed out"`** → auto-remediate:
    ```bash
-   GSTACK_BUILD_GEMINI_TIMEOUT=1200000 gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS   # run_in_background: true
+   GSTACK_BUILD_GEMINI_TIMEOUT=1200000 "$_GSTACK_BUILD_CLI" "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS   # run_in_background: true
    ```
    Report to user: "Gemini timed out on Phase <N>. Raised timeout to 20 min and resumed automatically." Continue monitoring.
 
@@ -1010,7 +1032,7 @@ Completed:   <lastUpdatedAt>
      ❌ No forward progress; you'll need to re-run manually later
    Net: Fix root cause first; resuming blind re-hits the same wall.
    ```
-   If A: `gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS` (background) + continue monitoring.
+   If A: `"$_GSTACK_BUILD_CLI" "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS` (background) + continue monitoring.
    If B: exit the loop and print the manual resume command.
 
 #### On stale `lastUpdatedAt` (unchanged across 3 consecutive ticks ≈ 3 min)
@@ -1038,7 +1060,7 @@ When `_STALE_TICKS >= 3`:
 1. Check if the process is alive: `pgrep -f "gstack-build"`
 2. **Dead** (no process, no lock file): auto-resume.
    ```bash
-   gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS --skip-clean-check   # run_in_background: true
+   "$_GSTACK_BUILD_CLI" "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS --skip-clean-check   # run_in_background: true
    ```
    Report: "Build process appears to have crashed (state frozen, no process found). Auto-resumed." Reset `_STALE_TICKS` to 0. Continue monitoring.
 3. **Alive** (process running but state frozen): surface via `AskUserQuestion`:
@@ -1063,7 +1085,7 @@ When `_STALE_TICKS >= 3`:
    # Scope the kill to this build's project root to avoid killing unrelated builds.
    kill $(pgrep -f "gstack-build.*$_PROJECT_ROOT") 2>/dev/null || true
    sleep 2
-   gstack-build "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS --skip-clean-check   # run_in_background: true
+   "$_GSTACK_BUILD_CLI" "$_PLAN_FILE" --project-root "$_PROJECT_ROOT" "${_ORIGIN_FLAG[@]}" $_FLAGS --skip-clean-check   # run_in_background: true
    ```
    Reset `_STALE_TICKS` to 0. Continue monitoring.
 
