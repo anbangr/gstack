@@ -22,6 +22,12 @@ the gstack checkout and runs:
 bun run build/orchestrator/cli.ts <plan-file> [flags]
 ```
 
+For manual use, install setup should put `gstack-build` on `PATH`. When the
+`/build` skill launches the CLI, it first resolves an executable from
+`GSTACK_BUILD_CLI`, `PATH`, host-specific setup paths, or this checkout's
+`bin/gstack-build`, so spawned Claude/Codex shells do not depend on inherited
+interactive shell configuration.
+
 Common commands:
 
 ```bash
