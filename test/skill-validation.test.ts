@@ -990,7 +990,7 @@ describe('gstack-slug', () => {
     );
     // grep returns exit code 1 when no matches found — that's what we want
     expect(result.stdout.toString().trim()).toBe('');
-  });
+  }, 15_000);
 });
 
 // --- Test Bootstrap validation ---

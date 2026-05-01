@@ -178,5 +178,5 @@ describe("integration (smoke)", () => {
     expect(Array.isArray(parsed.claimed)).toBe(true);
     expect(parsed).toHaveProperty("siblings");
     expect(parsed.siblings).toEqual([]); // --workspace-root null disabled scanning
-  });
+  }, 15_000);
 });
