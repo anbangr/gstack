@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.26.0.0] - 2026-05-02
+
+## **Build plans can now preview safe parallel phase batches.**
+
+The build orchestrator now has an opt-in `--parallel-phases N` planner for
+checking which phases inside a feature can safely run together. It reads
+`Touches:` and `Depends on:` metadata, prints conservative dry-run batches, and
+blocks real parallel execution until the isolated executor is ready.
+
+### Added
+
+- `gstack-build --dry-run --parallel-phases N` now previews independent phase
+  batches within a feature.
+- The planner detects explicit `Depends on:` metadata, common prose dependencies
+  like `after Phase 1.1`, overlapping touch paths, and risky serial paths such
+  as lockfiles, migrations, workflows, and build configs.
+- Unit and CLI integration coverage exercise planner batching, dependency
+  parsing, missing metadata serialization, unknown dependency failures, and
+  non-dry-run fail-closed behavior.
+
+### Changed
+
+- The build skill and orchestrator README now document the planner as
+  planning-only, with production parallel execution intentionally blocked.
+- CLI validation now rejects `--parallel-phases > 1` with `--dual-impl` until the
+  executor model can safely combine both workflows.
+
 ## [1.25.1.1] - 2026-05-02
 
 ## **Local Claude settings stay out of commits.**
