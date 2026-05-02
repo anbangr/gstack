@@ -101,6 +101,52 @@ describe('--dual-impl flag wiring', () => {
   });
 });
 
+describe('--parallel-phases flag wiring', () => {
+  it('--help text mentions --parallel-phases', () => {
+    expect(HELP_TEXT).toContain('--parallel-phases');
+  });
+
+  it('parseArgs default -> parallelPhases=1', () => {
+    const args = parseArgs(['plan.md']);
+    expect(args.parallelPhases).toBe(1);
+  });
+
+  it('parseArgs([plan, --parallel-phases, 3]) sets parallelPhases=3', () => {
+    const args = parseArgs(['plan.md', '--parallel-phases', '3']);
+    expect(args.parallelPhases).toBe(3);
+  });
+
+  it('parseArgs rejects --parallel-phases below 1', () => {
+    const originalExit = process.exit;
+    const originalError = console.error;
+    console.error = () => {};
+    process.exit = ((code?: number) => {
+      throw new Error(`exit:${code}`);
+    }) as never;
+    try {
+      expect(() => parseArgs(['plan.md', '--parallel-phases', '0'])).toThrow('exit:2');
+    } finally {
+      process.exit = originalExit;
+      console.error = originalError;
+    }
+  });
+
+  it('parseArgs rejects combining --parallel-phases with --dual-impl', () => {
+    const originalExit = process.exit;
+    const originalError = console.error;
+    console.error = () => {};
+    process.exit = ((code?: number) => {
+      throw new Error(`exit:${code}`);
+    }) as never;
+    try {
+      expect(() => parseArgs(['plan.md', '--dual-impl', '--parallel-phases', '2'])).toThrow('exit:2');
+    } finally {
+      process.exit = originalExit;
+      console.error = originalError;
+    }
+  });
+});
+
 describe('--skip-clean-check / --skip-sweep flags', () => {
   it('parseArgs default -> skipCleanCheck=false, skipSweep=false', () => {
     const args = parseArgs(['plan.md']);

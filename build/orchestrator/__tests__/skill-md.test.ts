@@ -7,19 +7,17 @@ test("SKILL.md.tmpl contains TDD changes", () => {
   const content = fs.readFileSync(tmplPath, "utf-8");
 
   expect(content.includes('**Test Specification')).toBe(true);
-  expect(content.includes('version: 1.19.0')).toBe(true);
-  expect(content.includes('Verify Red')).toBe(true);
+  expect(content.includes('version: 1.20.0')).toBe(true);
+  expect(content.includes('tests_red')).toBe(true);
   expect(content.includes('Test Specification (test-writer role)')).toBe(true);
-  expect(content.includes('gemini-testspec-input')).toBe(true);
-  expect(content.includes('gemini-testspec-output')).toBe(true);
-  expect(content.includes('test-fix-input')).toBe(true);
-  expect(content.includes('test-fix-output')).toBe(true);
-  expect(content.includes('all three sub-checkboxes')).toBe(true);
+  expect(content.includes('exactly this sub-checkbox structure')).toBe(true);
   expect(content.includes('*-gstack/inbox/living-plan')).toBe(true);
   expect(content.includes('--project-root "$_PROJECT_ROOT"')).toBe(true);
   expect(content.includes('Archive Plans')).toBe(true);
   expect(content.includes('## Feature X: [Feature Name]')).toBe(true);
-  expect(content.includes('Origin Plan Feature Verification')).toBe(true);
+  expect(content.includes('Feature Verification')).toBe(true);
+  expect(content.includes('Origin trace:')).toBe(true);
+  expect(content.includes('Parallel Phase Planner (`--parallel-phases N`)')).toBe(true);
 });
 
 test("generated SKILL.md reflects TDD changes", () => {
@@ -27,12 +25,14 @@ test("generated SKILL.md reflects TDD changes", () => {
   const content = fs.readFileSync(skillPath, "utf-8");
 
   expect(content.includes('**Test Specification')).toBe(true);
-  expect(content.includes('1.18.0')).toBe(true);
-  expect(content.includes('Verify Red')).toBe(true);
+  expect(content.includes('version: 1.20.0')).toBe(true);
+  expect(content.includes('tests_red')).toBe(true);
   expect(content.includes('*-gstack/inbox/living-plan')).toBe(true);
   expect(content.includes('--project-root "$_PROJECT_ROOT"')).toBe(true);
   expect(content.includes('## Feature X: [Feature Name]')).toBe(true);
-  expect(content.includes('Origin Plan Feature Verification')).toBe(true);
+  expect(content.includes('Feature Verification')).toBe(true);
+  expect(content.includes('Origin trace:')).toBe(true);
+  expect(content.includes('Parallel Phase Planner (`--parallel-phases N`)')).toBe(true);
 });
 
 test("build skill and CLI do not hardcode default model names", () => {
