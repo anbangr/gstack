@@ -68,6 +68,7 @@ import {
 import { flipPhaseCheckboxes, flipTestSpecCheckbox } from "./plan-mutator";
 import { shipAndDeploy } from "./ship";
 import { createWorktrees, applyWinner, teardownWorktrees } from "./worktree";
+import { buildParallelPhasePlan, type ParallelPhasePlan } from "./parallel-planner";
 import type { BuildState, Phase, DualImplTestResult, SubAgentInvocation } from "./types";
 import type { Feature, FeatureState } from "./types";
 import {
@@ -98,6 +99,8 @@ export interface Args {
   projectRoot?: string;
   /** When true, every phase implements via configured primary/secondary tournament with configured judge. */
   dualImpl: boolean;
+  /** Max number of independent phases to execute together inside one feature. 1 keeps legacy sequential behavior. */
+  parallelPhases: number;
   /** Central provider/model/reasoning/command routing. */
   roles: RoleConfigs;
   /** Deprecated alias for roles.primaryImpl.model. */
@@ -132,6 +135,7 @@ export function parseArgs(argv: string[]): Args {
     maxCodexIter: DEFAULT_MAX_CODEX_ITERATIONS,
     projectRoot: undefined,
     dualImpl: false,
+    parallelPhases: 1,
     roles,
     geminiModel: DEFAULT_ROLE_CONFIGS.primaryImpl.model,
     codexModel: DEFAULT_ROLE_CONFIGS.secondaryImpl.model,
@@ -152,6 +156,15 @@ export function parseArgs(argv: string[]): Args {
     else if (a === "--skip-clean-check") args.skipCleanCheck = true;
     else if (a === "--skip-sweep") args.skipSweep = true;
     else if (a === "--dual-impl") args.dualImpl = true;
+    else if (a === "--parallel-phases") {
+      const next = argv[++i];
+      const n = Number(next);
+      if (!Number.isInteger(n) || n < 1) {
+        console.error(`--parallel-phases expects a positive integer, got: ${next}`);
+        process.exit(2);
+      }
+      args.parallelPhases = n;
+    }
     else if (roleFlags.has(a)) {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
@@ -243,7 +256,7 @@ export function parseArgs(argv: string[]): Args {
   return args;
 }
 
-export function validateRoleProviders(args: Pick<Args, "dualImpl" | "roles">): string[] {
+export function validateRoleProviders(args: Pick<Args, "dualImpl" | "parallelPhases" | "roles">): string[] {
   const errors: string[] = [];
   for (const name of ["review", "reviewSecondary", "qa"] as const) {
     if (args.roles[name].provider === "gemini") {
@@ -256,6 +269,9 @@ export function validateRoleProviders(args: Pick<Args, "dualImpl" | "roles">): s
     }
   }
   if (args.dualImpl) {
+    if (args.parallelPhases > 1) {
+      errors.push("--parallel-phases cannot be combined with --dual-impl yet");
+    }
     if (args.roles.primaryImpl.provider !== "gemini") {
       errors.push("--primary-impl-provider must be gemini when --dual-impl is enabled");
     }
@@ -411,6 +427,8 @@ Flags:
   --dual-impl          Tournament mode: Gemini and Codex implement in parallel
                        (isolated git worktrees), the configured judge picks the winner
                        is cherry-picked back. Existing TDD pipeline runs after.
+  --parallel-phases N  Opt-in planner for independent phases inside one feature.
+                       N=1 keeps sequential execution. N>1 fails closed on unsafe deps.
   --test-writer-model <m>          Default: ${DEFAULT_ROLE_CONFIGS.testWriter.model}.
   --primary-impl-model <m>         Default: ${DEFAULT_ROLE_CONFIGS.primaryImpl.model}.
   --test-fixer-model <m>           Default: ${DEFAULT_ROLE_CONFIGS.testFixer.model}.
@@ -470,6 +488,20 @@ function printPhaseTable(phases: Phase[]) {
     console.log(
       `  ${p.number.padEnd(numWidth)}  ${p.name.padEnd(nameWidth)}  ${impl}   ${rev} ${status}`,
     );
+  }
+}
+
+function printParallelPhasePlan(plan: ParallelPhasePlan, phases: Phase[]): void {
+  console.log(`\nParallel phase planner (max ${plan.maxParallel})`);
+  if (plan.warnings.length > 0) {
+    console.log("Warnings:");
+    for (const warning of plan.warnings) console.log(`  - ${warning}`);
+  }
+  for (let i = 0; i < plan.batches.length; i++) {
+    const batch = plan.batches[i];
+    const labels = batch.phaseIndexes.map((idx) => `Phase ${phases[idx]?.number ?? idx}`).join(", ");
+    console.log(`  Batch ${i + 1}: ${labels}`);
+    console.log(`    ${batch.reason}`);
   }
 }
 
@@ -2876,6 +2908,14 @@ async function main() {
     process.exit(2);
   }
 
+  if (args.parallelPhases > 1 && !args.dryRun) {
+    console.error(
+      "\n✗ --parallel-phases currently supports dependency planning only; " +
+        "rerun with --dry-run to inspect batches, or omit the flag for sequential execution.\n",
+    );
+    process.exit(2);
+  }
+
   let projectRoot: string;
   try {
     projectRoot = resolveProjectRoot({
@@ -3045,6 +3085,40 @@ async function main() {
           outcome: featureState.status,
           pauseState: "running",
         });
+
+        if (args.parallelPhases > 1 && !resumeAfterLanding && !resumeAtShip) {
+          const parallelPlan = buildParallelPhasePlan({
+            feature: featureDef,
+            phases,
+            maxParallel: args.parallelPhases,
+          });
+          if (parallelPlan.blockers.length > 0) {
+            console.error("\n✗ Parallel phase planner failed closed:");
+            for (const blocker of parallelPlan.blockers) console.error(`  - ${blocker}`);
+            featureState.status = "paused";
+            featureState.error = `parallel planner blocked feature ${featureState.number}`;
+            saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+            logStatus({
+              slug,
+              featureNumber: featureState.number,
+              featureName: featureState.name,
+              step: "parallel-phase-planner",
+              outcome: "blocked",
+              pauseState: "paused",
+            });
+            exitCode = 1;
+            break;
+          }
+          printParallelPhasePlan(parallelPlan, phases);
+          logStatus({
+            slug,
+            featureNumber: featureState.number,
+            featureName: featureState.name,
+            step: "parallel-phase-planner",
+            outcome: `${parallelPlan.batches.length} batches`,
+            pauseState: "running",
+          });
+        }
 
         if (!resumeAfterLanding && !ensureFeatureBranch({
           cwd,

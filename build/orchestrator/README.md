@@ -144,6 +144,9 @@ gstack-build plans/myproj-impl-plan-20260427.md --print-only
 # Walk the full TDD state machine without spawning sub-agents (smoke test):
 gstack-build plans/...md --dry-run --test-cmd "bun test"
 
+# Inspect independent phase batches for a feature before parallel execution work:
+gstack-build plans/...md --dry-run --parallel-phases 2 --test-cmd "bun test"
+
 # Run for real, but stop short of the ship step:
 gstack-build plans/...md --skip-ship
 
@@ -237,6 +240,32 @@ Manual recovery: `git worktree list` to find leftover worktrees, then `git workt
 ### Backward compat
 
 `--dual-impl` is a runtime-only flag. Plans don't need any per-phase frontmatter — when the flag is set, every parsed phase gets `dualImpl=true`. Prewritten test-spec phases (where `[x] **Test Specification` is already checked) now run `VERIFY_RED` first before spawning both implementors. Legacy 2-checkbox plans (no test-spec checkbox at all) still skip dual-impl and use the normal single-implementor path.
+
+## Parallel Phase Planner (`--parallel-phases N`)
+
+`--parallel-phases N` is the opt-in planner for Option 2: run independent phases inside a single feature in bounded batches. The current implementation is intentionally planning-only: use it with `--dry-run` to inspect batches. Real execution with `--parallel-phases > 1` fails closed until the isolated worktree executor and integration queue are wired.
+
+```bash
+gstack-build plans/...md --dry-run --parallel-phases 2 --test-cmd "bun test"
+```
+
+Planner metadata is read from each phase body:
+
+```md
+### Phase 1.2: UI shell
+Touches: src/ui/ProfileShell.tsx, src/ui/ProfileShell.test.tsx
+Depends on: 1.1
+```
+
+Guardrails:
+
+- `N=1` keeps the legacy sequential path.
+- Unknown dependency numbers fail closed.
+- Missing `Touches:` metadata serializes the phase as an unknown write set.
+- Overlapping touch paths serialize to avoid patch conflicts.
+- Lockfiles, package manager files, migrations, GitHub workflows, and common build config paths serialize automatically.
+- Common prose dependencies like `after Phase 1.1` are treated as dependencies.
+- `--parallel-phases > 1` cannot be combined with `--dual-impl` yet.
 
 ## Environment variables
 

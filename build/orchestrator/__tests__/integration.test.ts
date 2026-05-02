@@ -103,6 +103,170 @@ test("dry-run with --dual-impl announces Dual Impl, Judge, and Apply Winner", ()
   expect(result.status).toBe(0);
 });
 
+test("dry-run with --parallel-phases prints conservative dependency batches", () => {
+  const parallelPlanFile = path.join(tmpDir, "parallel-plan.md");
+  fs.writeFileSync(
+    parallelPlanFile,
+    `# Parallel Plan
+
+## Feature 1: Profile
+
+### Phase 1.1: API schema
+Touches: src/api/schema.ts
+Depends on: none
+- [ ] **Test Specification (Gemini Sub-agent)**: Write tests.
+- [ ] **Implementation (Gemini Sub-agent)**: Implement.
+- [ ] **Review & QA (Codex Sub-agent)**: Review.
+
+### Phase 1.2: UI shell
+Touches: src/ui/ProfileShell.tsx
+Depends on: none
+- [ ] **Test Specification (Gemini Sub-agent)**: Write tests.
+- [ ] **Implementation (Gemini Sub-agent)**: Implement.
+- [ ] **Review & QA (Codex Sub-agent)**: Review.
+
+### Phase 1.3: Wire UI
+Touches: src/ui/ProfilePage.tsx
+Depends on: 1.1, 1.2
+- [ ] **Test Specification (Gemini Sub-agent)**: Write tests.
+- [ ] **Implementation (Gemini Sub-agent)**: Implement.
+- [ ] **Review & QA (Codex Sub-agent)**: Review.
+`,
+  );
+  const cliPath = path.resolve(import.meta.dir, "../cli.ts");
+  const result = spawnSync(
+    "bun",
+    [
+      "run",
+      cliPath,
+      parallelPlanFile,
+      "--dry-run",
+      "--parallel-phases",
+      "2",
+      "--test-cmd",
+      "bun test",
+      "--no-gbrain",
+      "--no-resume",
+    ],
+    {
+      env: {
+        ...process.env,
+        HOME: tmpDir,
+        GSTACK_HOME: path.join(tmpDir, ".gstack-parallel"),
+      },
+      encoding: "utf8",
+      timeout: 30_000,
+    },
+  );
+
+  const out = result.stdout + result.stderr;
+
+  expect(result.status).toBe(0);
+  expect(out).toContain("Parallel phase planner");
+  expect(out).toContain("Batch 1: Phase 1.1, Phase 1.2");
+  expect(out).toContain("Batch 2: Phase 1.3");
+});
+
+test("dry-run with --parallel-phases fails closed on unknown dependencies", () => {
+  const badPlanFile = path.join(tmpDir, "parallel-bad-plan.md");
+  fs.writeFileSync(
+    badPlanFile,
+    `# Parallel Bad Plan
+
+## Feature 1: Bad
+
+### Phase 1.1: Consumer
+Depends on: 9.9
+Touches: src/consumer.ts
+- [ ] **Implementation (Gemini Sub-agent)**: Implement.
+- [ ] **Review & QA (Codex Sub-agent)**: Review.
+`,
+  );
+  const cliPath = path.resolve(import.meta.dir, "../cli.ts");
+  const result = spawnSync(
+    "bun",
+    [
+      "run",
+      cliPath,
+      badPlanFile,
+      "--dry-run",
+      "--parallel-phases",
+      "2",
+      "--test-cmd",
+      "bun test",
+      "--no-gbrain",
+      "--no-resume",
+    ],
+    {
+      env: {
+        ...process.env,
+        HOME: tmpDir,
+        GSTACK_HOME: path.join(tmpDir, ".gstack-parallel-bad"),
+      },
+      encoding: "utf8",
+      timeout: 30_000,
+    },
+  );
+
+  const out = result.stdout + result.stderr;
+
+  expect(result.status).toBe(1);
+  expect(out).toContain("Parallel phase planner failed closed");
+  expect(out).toContain("unknown dependency 9.9");
+});
+
+test("non-dry-run with --parallel-phases fails closed until executor is implemented", () => {
+  const parallelPlanFile = path.join(tmpDir, "parallel-non-dry-plan.md");
+  fs.writeFileSync(
+    parallelPlanFile,
+    `# Parallel Non Dry Plan
+
+## Feature 1: Profile
+
+### Phase 1.1: API schema
+Touches: src/api/schema.ts
+- [ ] **Implementation (Gemini Sub-agent)**: Implement.
+- [ ] **Review & QA (Codex Sub-agent)**: Review.
+
+### Phase 1.2: UI shell
+Touches: src/ui/ProfileShell.tsx
+- [ ] **Implementation (Gemini Sub-agent)**: Implement.
+- [ ] **Review & QA (Codex Sub-agent)**: Review.
+`,
+  );
+  const cliPath = path.resolve(import.meta.dir, "../cli.ts");
+  const result = spawnSync(
+    "bun",
+    [
+      "run",
+      cliPath,
+      parallelPlanFile,
+      "--parallel-phases",
+      "2",
+      "--skip-ship",
+      "--test-cmd",
+      "bun test",
+      "--no-gbrain",
+      "--no-resume",
+    ],
+    {
+      env: {
+        ...process.env,
+        HOME: tmpDir,
+        GSTACK_HOME: path.join(tmpDir, ".gstack-parallel-non-dry"),
+      },
+      encoding: "utf8",
+      timeout: 30_000,
+    },
+  );
+
+  const out = result.stdout + result.stderr;
+
+  expect(result.status).toBe(2);
+  expect(out).toContain("--parallel-phases currently supports dependency planning only");
+  expect(out).toContain("rerun with --dry-run");
+});
+
 test("resume stops on a paused feature instead of marking it running", () => {
   const pausedDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-paused-feature-"));
   try {

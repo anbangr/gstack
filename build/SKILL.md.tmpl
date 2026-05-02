@@ -189,6 +189,10 @@ Both gates are skipped when `--dry-run` or `--skip-ship` is active.
 
 For tournament-selection builds, pass `--dual-impl` to `gstack-build`. The CLI owns the full dual-impl loop: worktree creation, parallel impl, tests, judge, apply winner, test+fix, review gates, QA. Deprecated aliases (`--gemini-model`, `--codex-model`, `--codex-review-model`) still work. Full guide in `build/orchestrator/README.md`.
 
+### Parallel Phase Planner (`--parallel-phases N`)
+
+For Option 2 dependency planning, pass `--dry-run --parallel-phases N` to `gstack-build`. This inspects per-phase `Touches:` and `Depends on:` metadata, prints conservative independent batches, serializes missing or risky write sets, and fails closed on unknown dependencies. Real non-dry-run execution with `--parallel-phases > 1` is blocked until the isolated worktree executor and integration queue are implemented. Do not advertise it as production parallel execution yet. Full guide in `build/orchestrator/README.md`.
+
 ### Step M1: Confirm and Launch
 
 Before running, present a confirmation gate via `AskUserQuestion`:
