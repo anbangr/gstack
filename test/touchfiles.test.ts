@@ -93,8 +93,18 @@ describe('selectTests', () => {
     expect(result.selected).toContain('plan-review-prosons-format');
     expect(result.selected).toContain('plan-review-prosons-hardstop-neg');
     expect(result.selected).toContain('plan-review-prosons-neutral-neg');
-    expect(result.selected.length).toBe(15);
-    expect(result.skipped.length).toBe(Object.keys(E2E_TOUCHFILES).length - 15);
+    // v1.13.x real-PTY E2E batch entries that also depend on plan-ceo-review/**
+    expect(result.selected).toContain('ask-user-question-format-pty');
+    expect(result.selected).toContain('plan-ceo-mode-routing');
+    expect(result.selected).toContain('autoplan-chain-pty');
+    // Per-finding count + review-report-at-bottom (v1.21.x)
+    expect(result.selected).toContain('plan-ceo-finding-count');
+    // v1.22+ AskUserQuestion-blocked regression: autoplan-auto-mode +
+    // auto-decide-preserved also depend on plan-ceo-review/**
+    expect(result.selected).toContain('autoplan-auto-mode');
+    expect(result.selected).toContain('auto-decide-preserved');
+    expect(result.selected.length).toBe(21);
+    expect(result.skipped.length).toBe(Object.keys(E2E_TOUCHFILES).length - 21);
   });
 
   test('global touchfile triggers ALL tests', () => {

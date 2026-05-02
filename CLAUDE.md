@@ -119,6 +119,9 @@ gstack/
 ├── codex/           # /codex skill (multi-AI second opinion via OpenAI Codex CLI)
 ├── land-and-deploy/ # /land-and-deploy skill (merge → deploy → canary verify)
 ├── office-hours/    # /office-hours skill (YC Office Hours — startup diagnostic + builder brainstorm)
+├── build/           # /build skill (autonomous plan executor: TDD loop, dual-impl, Codex review)
+│   ├── SKILL.md, SKILL.md.tmpl
+│   └── orchestrator/  # gstack-build CLI: cli.ts, phase-runner.ts, sub-agents.ts, worktree.ts, etc.
 ├── investigate/     # /investigate skill (systematic root-cause debugging)
 ├── retro/           # Retrospective skill (includes /retro global cross-project mode)
 ├── bin/             # CLI utilities (gstack-repo-mode, gstack-slug, gstack-config, etc.)
@@ -258,7 +261,7 @@ through `POST /pty-session` only.
 **Transport-layer security** (v1.6.0.0+). When `pair-agent` starts an ngrok tunnel,
 the daemon binds two HTTP listeners: a local listener (127.0.0.1, full command
 surface, never forwarded) and a tunnel listener (locked allowlist: `/connect`,
-`/command` with a scoped token + 17-command browser-driving allowlist,
+`/command` with a scoped token + 26-command browser-driving allowlist,
 `/sidebar-chat`). ngrok forwards only the tunnel port. Root tokens over the tunnel
 return 403. SSE endpoints use a 30-minute HttpOnly `gstack_sse` cookie minted via
 `POST /sse-session` (never valid against `/command`). Tunnel-surface rejections go
@@ -460,9 +463,59 @@ claims v1.7.0.0 as a MINOR and branch B is also a MINOR, B lands at v1.8.0.0
 `bin/gstack-next-version` advances within the chosen bump level rather than
 repicking the level when collisions happen.
 
+**Scale-aware bumps — use common sense.** When the diff is big, bump MINOR (or
+MAJOR), not PATCH. PATCH is for bug fixes and small additions; MINOR is for
+substantial new capability or substantial reduction; MAJOR is for breaking
+changes. Rough guideposts (don't treat as rules, treat as smell-checks):
+
+- **PATCH (X.Y.Z+1.0)**: bug fix, doc tweak, small additive change, single
+  test/file added. Net diff under ~500 lines, no new user-facing capability.
+- **MINOR (X.Y+1.0.0)**: new capability shipped (skill, harness, command, big
+  refactor), substantial code reduction (compression, migration), or coordinated
+  multi-file change. Net diff over ~2000 lines added/removed, OR a user-visible
+  feature you'd put in a tweet.
+- **MAJOR (X+1.0.0.0)**: breaking change to public surface (CLI flag rename,
+  skill removed, config format changed), OR a release big enough to be the
+  headline of a blog post.
+
+If you find yourself debating "is 10K added + 24K removed really a PATCH?" — it
+isn't. Bump MINOR. Same for "this adds a whole new test harness with 6 new E2E
+tests + helper utilities" — MINOR. The bump level is communication to the user
+about what kind of release this is; don't undersell it.
+
+When merging origin/main brings a higher VERSION, re-evaluate the bump level
+against the SCALE of your branch's work, not just whether main moved forward.
+If main bumped MINOR and your branch is also a substantial change, you bump
+MINOR again on top (e.g., main at v1.14.0.0, your branch lands v1.15.0.0).
+
 **VERSION and CHANGELOG are branch-scoped.** Every feature branch that ships gets its
 own version bump and CHANGELOG entry. The entry describes what THIS branch adds —
 not what was already on main.
+
+**The CHANGELOG entry is the diff between main and the shipping branch — what users
+get when they upgrade. NOT how the branch got there.** A reader landing on the entry
+should learn what they can do now that they couldn't before; they should not learn
+about the branch's internal version bumps, the bugs we caught and fixed mid-branch,
+the plan reviews we ran, or the commits we squashed. That is branch development
+narrative. It belongs in PR descriptions and commit messages, not CHANGELOG.
+
+**Never reference branch-internal versions in a CHANGELOG entry.** If your branch
+bumped VERSION from v1.5.0.0 → v1.5.1.0 → v1.6.0.0 during development and only the
+final v1.6.0.0 ships to main, the entry must read as if v1.5.1.0 never existed.
+Concretely, NEVER write:
+- "v1.5.1.0 had a bug that v1.6.0.0 fixes" — readers don't know about v1.5.1.0; it's
+  a branch-internal artifact.
+- "The shipping headline of v1.5.1.0 was broken because..." — same reason. From main's
+  perspective, v1.5.1.0 was never released.
+- "Pre-fix tests encoded the broken behavior" — that's a contributor's victory lap,
+  not a user benefit.
+- "Two surgical edits, both in the dispatch path" — micro-narrative of the patch.
+
+Instead, describe the released system: "Browser-skills run end-to-end with the
+expected tab-access semantics." If a property of the shipped system is worth calling
+out (e.g., "skill spawns get permissive tab access; pair-agent tunnel tokens require
+ownership"), document it as a property, not as a fix. The shipped system is what
+the user gets; the path to that system is invisible to them.
 
 **When to write the CHANGELOG entry:**
 - At `/ship` time (Step 13), not during development or mid-branch.
@@ -583,6 +636,17 @@ above, plus:
 - **Always credit community contributions.** When an entry includes work from a
   community PR, name the contributor with `Contributed by @username`. Contributors
   did real work. Thank them publicly every time, no exceptions.
+
+## Fork versioning rule
+
+**Never bump the top-level `VERSION` file in this repo when working on fork-specific skills.**
+
+This repo (`anbangr/gstack`) is a personal fork of `garrytan/gstack`. The top-level `VERSION` file tracks the fork's release state relative to upstream. Bumping it creates divergence that makes `gstack-update-check` output confusing (`UPGRADE_AVAILABLE` with the local version higher than upstream).
+
+**The rule:**
+- Editing or building a custom skill (e.g. `build/SKILL.md.tmpl`)? Bump only the `version:` frontmatter field inside that skill file (e.g. `version: 1.19.0`). Do NOT touch `VERSION` or `package.json` version.
+- Merging upstream? Sync `VERSION` and `package.json` to upstream's version after the merge.
+- Only bump `VERSION` when merging or syncing with upstream, never for fork-local skill work.
 
 ## AI effort compression
 
@@ -706,3 +770,21 @@ The active skill lives at `~/.claude/skills/gstack/`. After making changes:
 Or copy the binaries directly:
 - `cp browse/dist/browse ~/.claude/skills/gstack/browse/dist/browse`
 - `cp design/dist/design ~/.claude/skills/gstack/design/dist/design`
+
+## Skill routing
+
+When the user's request matches an available skill, invoke it via the Skill tool. When in doubt, invoke the skill.
+
+Key routing rules:
+- Product ideas/brainstorming → invoke /office-hours
+- Strategy/scope → invoke /plan-ceo-review
+- Architecture → invoke /plan-eng-review
+- Design system/plan review → invoke /design-consultation or /plan-design-review
+- Full review pipeline → invoke /autoplan
+- Bugs/errors → invoke /investigate
+- QA/testing site behavior → invoke /qa or /qa-only
+- Code review/diff check → invoke /review
+- Visual polish → invoke /design-review
+- Ship/deploy/PR → invoke /ship or /land-and-deploy
+- Save progress → invoke /context-save
+- Resume context → invoke /context-restore

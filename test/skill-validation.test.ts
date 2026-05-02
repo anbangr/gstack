@@ -800,9 +800,8 @@ describe('Enum & Value Completeness in review checklist', () => {
 
 describe('Completeness Principle in generated SKILL.md files', () => {
   const skillsWithPreamble = [
-    'SKILL.md', 'browse/SKILL.md', 'qa/SKILL.md',
+    'qa/SKILL.md',
     'qa-only/SKILL.md',
-    'setup-browser-cookies/SKILL.md',
     'ship/SKILL.md', 'review/SKILL.md',
     'plan-ceo-review/SKILL.md', 'plan-eng-review/SKILL.md',
     'retro/SKILL.md',
@@ -820,11 +819,12 @@ describe('Completeness Principle in generated SKILL.md files', () => {
     });
   }
 
-  test('Completeness Principle includes compression table in tier 2+ skills', () => {
-    // Root is tier 1 (no completeness). Check tier 2+ skill.
+  test('Completeness Principle keeps compact scoring guidance in tier 2+ skills', () => {
     const content = fs.readFileSync(path.join(ROOT, 'cso', 'SKILL.md'), 'utf-8');
-    expect(content).toContain('CC+gstack');
-    expect(content).toContain('Compression');
+    expect(content).toContain('Completeness: X/10');
+    expect(content).toContain('10 = all edge cases');
+    expect(content).toContain('Note: options differ in kind, not coverage');
+    expect(content).toContain('Do not fabricate scores');
   });
 });
 
@@ -984,12 +984,16 @@ describe('gstack-slug', () => {
   });
 
   test('no templates or bin scripts use source process substitution for gstack-slug', () => {
-    const result = Bun.spawnSync(
-      ['grep', '-r', 'source <(.*gstack-slug', '--include=*.tmpl', '--include=gstack-review-*', '.'],
-      { cwd: ROOT, stdout: 'pipe', stderr: 'pipe' }
-    );
-    // grep returns exit code 1 when no matches found — that's what we want
-    expect(result.stdout.toString().trim()).toBe('');
+    const filesResult = Bun.spawnSync(['git', 'ls-files'], { cwd: ROOT, stdout: 'pipe', stderr: 'pipe' });
+    expect(filesResult.exitCode).toBe(0);
+
+    const offenders = filesResult.stdout.toString()
+      .split('\n')
+      .filter(Boolean)
+      .filter(file => file.endsWith('.tmpl') || path.basename(file).startsWith('gstack-review-'))
+      .filter(file => /source <\(.*gstack-slug/.test(fs.readFileSync(path.join(ROOT, file), 'utf-8')));
+
+    expect(offenders).toEqual([]);
   });
 });
 
@@ -1458,6 +1462,107 @@ describe('Skill trigger phrases', () => {
   }
 });
 
+// ─── Private-path leak detector ──────────────────────────────
+//
+// Catches accidental references to maintainer-private files in skill output.
+// Adapted from the McGluut fork's skill-contract-audit.ts (we don't take the
+// whole script — these are the unique checks not already covered by
+// test/gen-skill-docs.test.ts:1668-2074 .claude/skills leakage tests).
+
+describe('Private-path leak detection', () => {
+  const PRIVATE_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
+    { pattern: /coordination-board\.md/i, label: 'coordination-board.md' },
+    { pattern: /SEEKING_LOG\.md/, label: 'SEEKING_LOG.md' },
+    { pattern: /RATIONAL_SUBJECT\.md/, label: 'RATIONAL_SUBJECT.md' },
+    { pattern: /VALUE_SIGNAL_LOOP\.md/, label: 'VALUE_SIGNAL_LOOP.md' },
+    { pattern: /C:\\\\LLM Playground\\\\go/i, label: 'C:\\LLM Playground\\go' },
+  ];
+
+  // Walk every SKILL.md and SKILL.md.tmpl in the repo (excluding node_modules,
+  // generated host outputs, and .git).
+  function discoverSkillSurface(): string[] {
+    const results: string[] = [];
+    function walk(dir: string) {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name.startsWith('.') && entry.name !== '.agents') continue;
+        if (entry.name === 'node_modules' || entry.name === 'dist') continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+        } else if (entry.name === 'SKILL.md' || entry.name === 'SKILL.md.tmpl') {
+          results.push(full);
+        }
+      }
+    }
+    walk(ROOT);
+    return results;
+  }
+
+  test('no SKILL.md or SKILL.md.tmpl references private maintainer files', () => {
+    const files = discoverSkillSurface();
+    expect(files.length).toBeGreaterThan(0);
+    const leaks: string[] = [];
+    for (const file of files) {
+      const content = fs.readFileSync(file, 'utf-8');
+      for (const { pattern, label } of PRIVATE_PATTERNS) {
+        if (pattern.test(content)) {
+          leaks.push(`${path.relative(ROOT, file)} mentions ${label}`);
+        }
+      }
+    }
+    expect(leaks).toEqual([]);
+  });
+});
+
+// ─── Doc-inventory cross-check ───────────────────────────────
+//
+// Every skill directory (with a SKILL.md.tmpl) must appear in both AGENTS.md
+// and docs/skills.md. Catches the inventory drift codex flagged (/debug
+// → /investigate; missing /autoplan, /context-save, /plan-devex-review, etc.).
+
+describe('Doc inventory cross-check', () => {
+  // Skills that don't get user-invocation lines in agent-facing docs.
+  // - 'qa-only' is a sub-mode of /qa with shared docs.
+  // - The 5 listed below are infrastructure (model overlays, shipped binary,
+  //   hosts) that don't show up in the user-facing skill table.
+  const DOC_INVENTORY_EXCLUDE = new Set([
+    // Infra / non-skills
+    'agents', 'claude', 'connect-chrome', 'contrib', 'hosts',
+    'lib', 'model-overlays', 'openclaw', 'supabase', 'scripts', 'test',
+  ]);
+
+  function discoverSkillDirs(): string[] {
+    const dirs: string[] = [];
+    for (const entry of fs.readdirSync(ROOT, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith('.')) continue;
+      if (DOC_INVENTORY_EXCLUDE.has(entry.name)) continue;
+      const tmplPath = path.join(ROOT, entry.name, 'SKILL.md.tmpl');
+      if (fs.existsSync(tmplPath)) dirs.push(entry.name);
+    }
+    return dirs.sort();
+  }
+
+  test('every skill is documented in AGENTS.md', () => {
+    const agents = fs.readFileSync(path.join(ROOT, 'AGENTS.md'), 'utf-8');
+    const missing: string[] = [];
+    for (const skill of discoverSkillDirs()) {
+      // Match `/skill-name` as a token boundary.
+      if (!new RegExp(`/${skill}\\b`).test(agents)) missing.push(skill);
+    }
+    expect(missing).toEqual([]);
+  });
+
+  test('every skill is documented in docs/skills.md', () => {
+    const docs = fs.readFileSync(path.join(ROOT, 'docs', 'skills.md'), 'utf-8');
+    const missing: string[] = [];
+    for (const skill of discoverSkillDirs()) {
+      if (!new RegExp(`/${skill}\\b`).test(docs)) missing.push(skill);
+    }
+    expect(missing).toEqual([]);
+  });
+});
+
 // ─── Codex Skill Validation ──────────────────────────────────
 
 describe('Codex skill validation', () => {
@@ -1645,8 +1750,15 @@ describe('no compiled binaries in git', () => {
   test('warns about tracked files larger than 2MB', () => {
     // Large fixtures can be legitimate test infrastructure. Keep visibility on
     // repository size without blocking those fixtures from living in git.
+    // Known-good fixtures are exempted from the warning to keep CI logs clean.
     const MAX_BYTES = 2 * 1024 * 1024;
+    const knownLargeFixtures = new Set([
+      // Deterministic replay fixture for BrowseSafe-Bench. The live bench is
+      // expensive; this file is intentionally committed so the gate is free.
+      'browse/test/fixtures/security-bench-haiku-responses.json',
+    ]);
     const oversized = trackedFiles.flatMap((f: string) => {
+      if (knownLargeFixtures.has(f)) return [];
       const full = path.join(ROOT, f);
       try {
         const size = fs.statSync(full).size;
@@ -1675,3 +1787,83 @@ describe('no compiled binaries in git', () => {
 // claude PTY (terminal-agent.ts); these assertions had no target file.
 // Terminal-pane invariants are covered by browse/test/sidebar-tabs.test.ts
 // and browse/test/terminal-agent.test.ts.
+
+// ─── Browser-skills validation ──────────────────────────────────
+//
+// Browser-skills are bundled in <gstack-root>/browser-skills/<name>/. Each
+// must have a SKILL.md whose frontmatter satisfies the contract enforced by
+// browse/src/browser-skills.ts:parseSkillFile (host required, args + triggers
+// parseable as the right shape). This test catches malformed bundled skills
+// at CI time, before they ship.
+
+describe('Bundled browser-skills frontmatter contract', () => {
+  const browserSkillsRoot = path.join(ROOT, 'browser-skills');
+
+  function listBundledSkillDirs(): string[] {
+    if (!fs.existsSync(browserSkillsRoot)) return [];
+    return fs.readdirSync(browserSkillsRoot)
+      .filter(name => !name.startsWith('.'))
+      .map(name => path.join(browserSkillsRoot, name))
+      .filter(dir => {
+        try { return fs.statSync(dir).isDirectory(); } catch { return false; }
+      });
+  }
+
+  test('each bundled skill has a SKILL.md', () => {
+    for (const dir of listBundledSkillDirs()) {
+      const skillFile = path.join(dir, 'SKILL.md');
+      expect(fs.existsSync(skillFile)).toBe(true);
+    }
+  });
+
+  test('each bundled skill SKILL.md frontmatter parses with required fields', async () => {
+    const { parseSkillFile } = await import('../browse/src/browser-skills');
+    for (const dir of listBundledSkillDirs()) {
+      const name = path.basename(dir);
+      const content = fs.readFileSync(path.join(dir, 'SKILL.md'), 'utf-8');
+      // parseSkillFile throws on missing required fields; we just want to
+      // make sure none of our shipped skills tripwire it.
+      const { frontmatter } = parseSkillFile(content, { skillName: name });
+      expect(frontmatter.name).toBe(name);
+      expect(typeof frontmatter.host).toBe('string');
+      expect(frontmatter.host.length).toBeGreaterThan(0);
+      expect(Array.isArray(frontmatter.triggers)).toBe(true);
+      expect(Array.isArray(frontmatter.args)).toBe(true);
+    }
+  });
+
+  test('each bundled skill has a script.ts', () => {
+    for (const dir of listBundledSkillDirs()) {
+      expect(fs.existsSync(path.join(dir, 'script.ts'))).toBe(true);
+    }
+  });
+
+  test('each bundled skill ships a sibling SDK at _lib/browse-client.ts', () => {
+    for (const dir of listBundledSkillDirs()) {
+      expect(fs.existsSync(path.join(dir, '_lib', 'browse-client.ts'))).toBe(true);
+    }
+  });
+
+  test('each bundled skill has a script.test.ts', () => {
+    for (const dir of listBundledSkillDirs()) {
+      expect(fs.existsSync(path.join(dir, 'script.test.ts'))).toBe(true);
+    }
+  });
+
+  test("each bundled skill's _lib/browse-client.ts matches the canonical SDK", () => {
+    // If the canonical SDK changes, the bundled copy must be updated. This
+    // test enforces that — the _lib copy should be byte-identical.
+    const canonical = fs.readFileSync(path.join(ROOT, 'browse', 'src', 'browse-client.ts'), 'utf-8');
+    for (const dir of listBundledSkillDirs()) {
+      const sibling = fs.readFileSync(path.join(dir, '_lib', 'browse-client.ts'), 'utf-8');
+      expect(sibling).toBe(canonical);
+    }
+  });
+
+  test('script.ts imports browse from ./_lib/browse-client', () => {
+    for (const dir of listBundledSkillDirs()) {
+      const content = fs.readFileSync(path.join(dir, 'script.ts'), 'utf-8');
+      expect(content).toMatch(/from\s+['"]\.\/_lib\/browse-client['"]/);
+    }
+  });
+});

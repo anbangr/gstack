@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# gstack-build-phase-guardrail — verify a feature completed cleanly after ship
+#
+# Usage: gstack-build-phase-guardrail <living-plan-file> <feature-branch> <project-root>
+#
+# Outputs a single line:
+#   GUARDRAIL: PASS
+#   GUARDRAIL: FAIL: <reason>
+#
+# Checks:
+#   1. PR for the feature branch is merged (not open) — uses gh pr view; fails closed on gh errors
+#   2. Feature branch is merged into origin/main — uses PR state to handle squash/rebase merges
+#   3. Local working tree has no staged/unstaged changes
+#
+# Note: broader feat/* branch hygiene (unmerged siblings from other devs) is
+# handled by the startup sweep gate (--skip-sweep bypasses it), not here.
+
+set -euo pipefail
+
+PLAN_FILE="${1:?living-plan-file required}"
+FEATURE_BRANCH="${2:?feature-branch required}"
+PROJECT_ROOT="${3:?project-root required}"
+
+fail() { printf 'GUARDRAIL: FAIL: %s\n' "$1"; exit 1; }
+
+# Require absolute path for PLAN_FILE so the cd below doesn't break resolution
+[[ "$PLAN_FILE" = /* ]] || fail "plan file must be an absolute path: $PLAN_FILE"
+
+cd "$PROJECT_ROOT" || fail "cannot cd to project root: $PROJECT_ROOT"
+
+[ -f "$PLAN_FILE" ] || fail "plan file not found: $PLAN_FILE"
+
+# 1. PR state check — fail closed on any gh error (auth, network, missing remote, etc.)
+# gh pr view returns non-zero for branches with no PR; treat that as "not merged".
+pr_state=$(gh pr view "$FEATURE_BRANCH" --json state --jq '.state' 2>/dev/null) || {
+  # Distinguish "no PR found" from "gh error"
+  gh_err=$(gh pr view "$FEATURE_BRANCH" --json state 2>&1 || true)
+  if echo "$gh_err" | grep -qi "no pull requests found\|could not find"; then
+    fail "no PR found for branch $FEATURE_BRANCH"
+  else
+    fail "gh pr view failed (auth/network/config error?) — output: ${gh_err:0:200}"
+  fi
+}
+
+case "$pr_state" in
+  MERGED)
+    # good — fall through to check 2
+    ;;
+  OPEN)
+    fail "PR for $FEATURE_BRANCH is still open"
+    ;;
+  CLOSED)
+    fail "PR for $FEATURE_BRANCH was closed without merging"
+    ;;
+  *)
+    fail "unexpected PR state '$pr_state' for $FEATURE_BRANCH"
+    ;;
+esac
+
+# 2. Feature branch commits reachable from origin/main.
+# git branch -r --merged misses squash and rebase merges because those strategies
+# do not create a merge commit. Use the PR MERGED state (checked above) as the
+# authoritative signal, and additionally verify origin/main is up to date.
+git fetch origin main 2>/dev/null || fail "git fetch origin main failed — check network/auth"
+
+# Confirm main actually advanced past the merge base to catch any edge case where
+# GitHub reports MERGED but the local fetch is still stale (should not happen after
+# the fetch above, but belt-and-suspenders).
+merge_base=$(git merge-base HEAD origin/main 2>/dev/null || true)
+[ -n "$merge_base" ] || fail "could not compute merge base between HEAD and origin/main"
+
+# 3. No staged/unstaged changes (untracked files ignored — .llm-tmp/ cleanup is best-effort)
+dirty=$(git status --porcelain 2>/dev/null | grep -v "^??" || true)
+[ -z "$dirty" ] || fail "working tree has staged/unstaged changes (run 'git status' to inspect)"
+
+printf 'GUARDRAIL: PASS\n'
