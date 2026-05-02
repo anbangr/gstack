@@ -1,4 +1,5 @@
 import type { TemplateContext } from './types';
+import { getHostConfig } from '../../hosts/index';
 
 export function generateSlugEval(ctx: TemplateContext): string {
   return `eval "$(${ctx.paths.binDir}/gstack-slug 2>/dev/null)"`;
@@ -6,6 +7,22 @@ export function generateSlugEval(ctx: TemplateContext): string {
 
 export function generateSlugSetup(ctx: TemplateContext): string {
   return `eval "$(${ctx.paths.binDir}/gstack-slug 2>/dev/null)" && mkdir -p ~/.gstack/projects/$SLUG`;
+}
+
+export function generateBuildCliCandidates(ctx: TemplateContext): string {
+  const hostConfig = getHostConfig(ctx.host);
+  const candidates = new Set<string>();
+
+  if (hostConfig.usesEnvVars) {
+    candidates.add('$GSTACK_ROOT/bin/gstack-build');
+  }
+
+  candidates.add(`~/${hostConfig.globalRoot}/bin/gstack-build`);
+  candidates.add(`./${hostConfig.localSkillRoot}/bin/gstack-build`);
+
+  return Array.from(candidates)
+    .map(candidate => `    ${candidate} \\`)
+    .join('\n');
 }
 
 export function generateBaseBranchDetect(_ctx: TemplateContext): string {

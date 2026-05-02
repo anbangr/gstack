@@ -22,7 +22,20 @@ which gstack-build
 gstack-build --help
 ```
 
-If it's not on PATH, add `~/.claude/skills/gstack/bin` to your `PATH` or symlink the binary to `~/.local/bin`.
+Manual CLI usage still expects `gstack-build` on `PATH`. Add your host's install
+bin directory to `PATH`, for example `~/.claude/skills/gstack/bin` for Claude or
+`~/.codex/skills/gstack/bin` for Codex, or symlink the binary to `~/.local/bin`.
+
+When launched by the `/build` skill, the skill resolves the executable before
+starting the background process. Resolution order is:
+
+1. `GSTACK_BUILD_CLI=/absolute/path/to/gstack-build`
+2. `command -v gstack-build`
+3. host-specific global and repo-local setup paths
+4. the current checkout's `bin/gstack-build`
+
+If none is executable, rerun `./setup --host <claude|codex>` from the gstack repo
+or set `GSTACK_BUILD_CLI` explicitly.
 
 ## Usage
 
