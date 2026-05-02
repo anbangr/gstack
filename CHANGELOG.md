@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.25.1.1] - 2026-05-02
+
+## **Local Claude settings stay out of commits.**
+
+Host-local Claude settings are now ignored, so workspace-specific `.claude`
+configuration does not show up as accidental repository noise.
+
+### Fixed
+
+- `.claude/settings.local.json` is ignored as a local-only settings file.
+
 ## [1.25.1.0] - 2026-05-02
 
 ## **Build skills can launch the orchestrator even when spawned shells miss `PATH` setup.**
