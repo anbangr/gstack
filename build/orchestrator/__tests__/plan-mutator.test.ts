@@ -1,10 +1,16 @@
-import { describe, it, expect } from 'bun:test';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import { flipCheckbox, flipPhaseCheckboxes, _testWritePlan, flipTestSpecCheckbox } from '../plan-mutator';
+import { describe, it, expect } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import {
+  flipCheckbox,
+  flipPhaseCheckboxes,
+  _testWritePlan,
+  flipTestSpecCheckbox,
+  reconcilePhaseCheckboxes,
+} from "../plan-mutator";
 
-describe('flipCheckbox', () => {
-  it('flips [ ] to [x] on the target line', () => {
+describe("flipCheckbox", () => {
+  it("flips [ ] to [x] on the target line", () => {
     const md = `# Plan
 
 ### Phase 1: Foo
@@ -12,40 +18,52 @@ describe('flipCheckbox', () => {
 - [ ] **Review**: rev
 `;
     const p = _testWritePlan(md);
-    const r = flipCheckbox({ planFile: p, lineNumber: 4, expectedMarker: '**Implementation' });
+    const r = flipCheckbox({
+      planFile: p,
+      lineNumber: 4,
+      expectedMarker: "**Implementation",
+    });
     expect(r.flipped).toBe(true);
     expect(r.alreadyChecked).toBe(false);
-    const after = fs.readFileSync(p, 'utf8');
-    expect(after.split(/\r?\n/)[3]).toBe('- [x] **Implementation**: do');
-    expect(after.split(/\r?\n/)[4]).toBe('- [ ] **Review**: rev');
+    const after = fs.readFileSync(p, "utf8");
+    expect(after.split(/\r?\n/)[3]).toBe("- [x] **Implementation**: do");
+    expect(after.split(/\r?\n/)[4]).toBe("- [ ] **Review**: rev");
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 
-  it('is idempotent — flipping an already-checked box returns alreadyChecked', () => {
+  it("is idempotent — flipping an already-checked box returns alreadyChecked", () => {
     const md = `### Phase 1
 - [x] **Implementation**: done
 `;
     const p = _testWritePlan(md);
-    const r = flipCheckbox({ planFile: p, lineNumber: 2, expectedMarker: '**Implementation' });
+    const r = flipCheckbox({
+      planFile: p,
+      lineNumber: 2,
+      expectedMarker: "**Implementation",
+    });
     expect(r.flipped).toBe(false);
     expect(r.alreadyChecked).toBe(true);
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 
-  it('errors when the expected marker is not on the target line (file edited externally)', () => {
+  it("errors when the expected marker is not on the target line (file edited externally)", () => {
     const md = `### Phase 1
 - [ ] **Implementation**: x
 - [ ] **Review**: x
 `;
     const p = _testWritePlan(md);
     // Ask for "Review" at the Implementation line — simulates plan being edited
-    const r = flipCheckbox({ planFile: p, lineNumber: 2, expectedMarker: '**Review' });
+    const r = flipCheckbox({
+      planFile: p,
+      lineNumber: 2,
+      expectedMarker: "**Review",
+    });
     expect(r.flipped).toBe(false);
     expect(r.error).toMatch(/edited externally/);
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 
-  it('errors when the target line is not a checkbox', () => {
+  it("errors when the target line is not a checkbox", () => {
     const md = `### Phase 1
 not a checkbox at all
 - [ ] **Implementation**: x
@@ -56,7 +74,7 @@ not a checkbox at all
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 
-  it('errors on out-of-range line', () => {
+  it("errors on out-of-range line", () => {
     const md = `single line\n`;
     const p = _testWritePlan(md);
     const r = flipCheckbox({ planFile: p, lineNumber: 99 });
@@ -64,17 +82,21 @@ not a checkbox at all
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 
-  it('preserves CRLF line endings if the file uses them', () => {
+  it("preserves CRLF line endings if the file uses them", () => {
     const md = `### Phase 1\r\n- [ ] **Implementation**: x\r\n- [ ] **Review**: y\r\n`;
     const p = _testWritePlan(md);
-    flipCheckbox({ planFile: p, lineNumber: 2, expectedMarker: '**Implementation' });
-    const after = fs.readFileSync(p, 'utf8');
-    expect(after).toContain('\r\n');
-    expect(after).toContain('- [x] **Implementation**: x');
+    flipCheckbox({
+      planFile: p,
+      lineNumber: 2,
+      expectedMarker: "**Implementation",
+    });
+    const after = fs.readFileSync(p, "utf8");
+    expect(after).toContain("\r\n");
+    expect(after).toContain("- [x] **Implementation**: x");
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 
-  it('leaves other phase checkboxes untouched', () => {
+  it("leaves other phase checkboxes untouched", () => {
     const md = `### Phase 1
 - [ ] **Implementation**: x
 - [ ] **Review**: y
@@ -84,16 +106,20 @@ not a checkbox at all
 - [ ] **Review**: y
 `;
     const p = _testWritePlan(md);
-    flipCheckbox({ planFile: p, lineNumber: 2, expectedMarker: '**Implementation' });
-    const after = fs.readFileSync(p, 'utf8').split(/\r?\n/);
-    expect(after[1]).toBe('- [x] **Implementation**: x');
-    expect(after[2]).toBe('- [ ] **Review**: y');
-    expect(after[5]).toBe('- [ ] **Implementation**: x');
-    expect(after[6]).toBe('- [ ] **Review**: y');
+    flipCheckbox({
+      planFile: p,
+      lineNumber: 2,
+      expectedMarker: "**Implementation",
+    });
+    const after = fs.readFileSync(p, "utf8").split(/\r?\n/);
+    expect(after[1]).toBe("- [x] **Implementation**: x");
+    expect(after[2]).toBe("- [ ] **Review**: y");
+    expect(after[5]).toBe("- [ ] **Implementation**: x");
+    expect(after[6]).toBe("- [ ] **Review**: y");
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 
-  it('does not match checkbox-shaped text inside fenced code blocks', () => {
+  it("does not match checkbox-shaped text inside fenced code blocks", () => {
     // The MUTATOR is line-targeted, so the parser is responsible for not
     // recording line numbers inside fences. But we should still guard the
     // mutator: if asked to flip a checkbox INSIDE a fence (unusual but
@@ -110,47 +136,59 @@ not a checkbox at all
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 
-  it('cleans up temp file on success (no .tmp.* leftover)', () => {
+  it("cleans up temp file on success (no .tmp.* leftover)", () => {
     const md = `### P\n- [ ] **Implementation**: x\n`;
     const p = _testWritePlan(md);
-    flipCheckbox({ planFile: p, lineNumber: 2, expectedMarker: '**Implementation' });
+    flipCheckbox({
+      planFile: p,
+      lineNumber: 2,
+      expectedMarker: "**Implementation",
+    });
     const dir = path.dirname(p);
-    const stragglers = fs.readdirSync(dir).filter((f) => f.includes('.tmp.'));
+    const stragglers = fs.readdirSync(dir).filter((f) => f.includes(".tmp."));
     expect(stragglers).toHaveLength(0);
     fs.rmSync(dir, { recursive: true });
   });
 });
 
-describe('flipPhaseCheckboxes', () => {
-  it('flips both implementation and review in one call', () => {
+describe("flipPhaseCheckboxes", () => {
+  it("flips both implementation and review in one call", () => {
     const md = `### Phase 1
 - [ ] **Implementation**: x
 - [ ] **Review**: y
 `;
     const p = _testWritePlan(md);
-    const r = flipPhaseCheckboxes({ planFile: p, implementationLine: 2, reviewLine: 3 });
+    const r = flipPhaseCheckboxes({
+      planFile: p,
+      implementationLine: 2,
+      reviewLine: 3,
+    });
     expect(r.implementation.flipped).toBe(true);
     expect(r.review.flipped).toBe(true);
-    const after = fs.readFileSync(p, 'utf8').split(/\r?\n/);
-    expect(after[1]).toBe('- [x] **Implementation**: x');
-    expect(after[2]).toBe('- [x] **Review**: y');
+    const after = fs.readFileSync(p, "utf8").split(/\r?\n/);
+    expect(after[1]).toBe("- [x] **Implementation**: x");
+    expect(after[2]).toBe("- [x] **Review**: y");
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 
-  it('reports errors per-checkbox without short-circuiting', () => {
+  it("reports errors per-checkbox without short-circuiting", () => {
     const md = `### Phase 1
 - [ ] **Implementation**: x
 not a checkbox
 `;
     const p = _testWritePlan(md);
-    const r = flipPhaseCheckboxes({ planFile: p, implementationLine: 2, reviewLine: 3 });
+    const r = flipPhaseCheckboxes({
+      planFile: p,
+      implementationLine: 2,
+      reviewLine: 3,
+    });
     expect(r.implementation.flipped).toBe(true);
     expect(r.review.error).toBeDefined();
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 });
-describe('flipTestSpecCheckbox', () => {
-  it('flipTestSpecCheckbox flips only the test-spec line', () => {
+describe("flipTestSpecCheckbox", () => {
+  it("flipTestSpecCheckbox flips only the test-spec line", () => {
     const md = `### Phase 1: Test
 - [ ] **Test Specification (Gemini Sub-agent)**: Tests.
 - [ ] **Implementation (Gemini Sub-agent)**: Impl.
@@ -158,20 +196,98 @@ describe('flipTestSpecCheckbox', () => {
 `;
     const p = _testWritePlan(md);
     const phase = {
-      testSpecCheckboxLine: 2
+      testSpecCheckboxLine: 2,
     };
     const result = flipTestSpecCheckbox(p, phase as any);
     expect(result.flipped).toBe(true);
-    const after = fs.readFileSync(p, 'utf8').split(/\r?\n/);
-    expect(after[1]).toContain('[x] **Test Specification');
-    expect(after[2]).toContain('[ ] **Implementation');
-    expect(after[3]).toContain('[ ] **Review');
+    const after = fs.readFileSync(p, "utf8").split(/\r?\n/);
+    expect(after[1]).toContain("[x] **Test Specification");
+    expect(after[2]).toContain("[ ] **Implementation");
+    expect(after[3]).toContain("[ ] **Review");
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 
-  it('flipTestSpecCheckbox returns alreadyChecked for legacy plans', () => {
-    const result = flipTestSpecCheckbox('/fake/plan.md', { testSpecCheckboxLine: -1 } as any);
+  it("flipTestSpecCheckbox returns alreadyChecked for legacy plans", () => {
+    const result = flipTestSpecCheckbox("/fake/plan.md", {
+      testSpecCheckboxLine: -1,
+    } as any);
     expect(result.flipped).toBe(false);
     expect(result.alreadyChecked).toBe(true);
+  });
+});
+
+describe("reconcilePhaseCheckboxes", () => {
+  it("flips all three checkboxes for a TDD phase", () => {
+    const md = `### Phase 1: Foo
+- [ ] **Test Specification**: spec
+- [ ] **Implementation**: impl
+- [ ] **Review**: review
+`;
+    const p = _testWritePlan(md);
+    const phase = {
+      testSpecCheckboxLine: 2,
+      implementationCheckboxLine: 3,
+      reviewCheckboxLine: 4,
+    };
+    const r = reconcilePhaseCheckboxes(p, phase as any);
+    expect(r.flipped).toBe(3);
+    expect(r.errors).toHaveLength(0);
+    const after = fs.readFileSync(p, "utf8").split(/\r?\n/);
+    expect(after[1]).toContain("[x] **Test Specification");
+    expect(after[2]).toContain("[x] **Implementation");
+    expect(after[3]).toContain("[x] **Review");
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("skips test-spec flip when testSpecCheckboxLine is -1 (non-TDD phase)", () => {
+    const md = `### Phase 1: Foo
+- [ ] **Implementation**: impl
+- [ ] **Review**: review
+`;
+    const p = _testWritePlan(md);
+    const phase = {
+      testSpecCheckboxLine: -1,
+      implementationCheckboxLine: 2,
+      reviewCheckboxLine: 3,
+    };
+    const r = reconcilePhaseCheckboxes(p, phase as any);
+    expect(r.flipped).toBe(2);
+    expect(r.errors).toHaveLength(0);
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("is idempotent — already-checked boxes produce zero flipped and no errors", () => {
+    const md = `### Phase 1: Foo
+- [x] **Implementation**: impl
+- [x] **Review**: review
+`;
+    const p = _testWritePlan(md);
+    const phase = {
+      testSpecCheckboxLine: -1,
+      implementationCheckboxLine: 2,
+      reviewCheckboxLine: 3,
+    };
+    const r = reconcilePhaseCheckboxes(p, phase as any);
+    expect(r.flipped).toBe(0);
+    expect(r.errors).toHaveLength(0);
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("collects errors without throwing when a flip fails", () => {
+    const md = `### Phase 1: Foo
+not a checkbox
+- [ ] **Review**: review
+`;
+    const p = _testWritePlan(md);
+    const phase = {
+      testSpecCheckboxLine: -1,
+      implementationCheckboxLine: 2, // not a checkbox — will error
+      reviewCheckboxLine: 3,
+    };
+    const r = reconcilePhaseCheckboxes(p, phase as any);
+    expect(r.errors).toHaveLength(1);
+    expect(r.errors[0]).toMatch(/impl/);
+    expect(r.flipped).toBe(1); // review still flipped
+    fs.rmSync(path.dirname(p), { recursive: true });
   });
 });

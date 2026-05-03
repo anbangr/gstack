@@ -2085,7 +2085,13 @@ async function runPhase(args: {
           stdout: `[dry-run] ${roleLabel(args.roles.primaryImpl)} would have re-implemented with review feedback`,
         });
       } else {
-        const reviewContent = fs.existsSync(action.reviewFeedbackPath)
+        const reviewFeedbackExists = fs.existsSync(action.reviewFeedbackPath);
+        if (!reviewFeedbackExists) {
+          console.warn(
+            `[warn] reviewFeedbackPath not found on disk — Gemini re-run will proceed without reviewer feedback: ${action.reviewFeedbackPath}`,
+          );
+        }
+        const reviewContent = reviewFeedbackExists
           ? fs.readFileSync(action.reviewFeedbackPath, "utf8")
           : null;
         const inputFilePath = path.join(
@@ -2098,7 +2104,12 @@ async function runPhase(args: {
         );
         fs.writeFileSync(
           inputFilePath,
-          buildGeminiPromptBody(phase, state.planFile, state.branch, reviewContent),
+          buildGeminiPromptBody(
+            phase,
+            state.planFile,
+            state.branch,
+            reviewContent,
+          ),
         );
         fs.writeFileSync(outputFilePath, "");
         result = await runRoleTask({

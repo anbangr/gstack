@@ -14,10 +14,10 @@
  *      blocks or unrelated phases.
  */
 
-import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
-import type { Phase } from './types';
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { Phase } from "./types";
 
 export interface FlipResult {
   /** True if the line was found unchecked and flipped. */
@@ -43,7 +43,7 @@ export function flipCheckbox(args: {
    * if not, we error out (the plan was edited under us). */
   expectedMarker?: string;
 }): FlipResult {
-  const content = fs.readFileSync(args.planFile, 'utf8');
+  const content = fs.readFileSync(args.planFile, "utf8");
   const lines = content.split(/\r?\n/);
 
   if (args.lineNumber < 1 || args.lineNumber > lines.length) {
@@ -76,21 +76,26 @@ export function flipCheckbox(args: {
     };
   }
 
-  if (m[2].toLowerCase() === 'x') {
+  if (m[2].toLowerCase() === "x") {
     return { flipped: false, alreadyChecked: true };
   }
 
   lines[idx] = line.replace(checkboxRe, `$1x$3`);
   // Preserve trailing newline if the original had one.
-  const trailingNewline = content.endsWith('\n') ? '\n' : '';
-  const eol = content.includes('\r\n') ? '\r\n' : '\n';
-  const newContent = lines.join(eol) + (trailingNewline && !lines[lines.length - 1] ? '' : trailingNewline);
+  const trailingNewline = content.endsWith("\n") ? "\n" : "";
+  const eol = content.includes("\r\n") ? "\r\n" : "\n";
+  const newContent =
+    lines.join(eol) +
+    (trailingNewline && !lines[lines.length - 1] ? "" : trailingNewline);
 
   // Atomic write: temp + rename in same dir (so rename is atomic on POSIX).
   const dir = path.dirname(args.planFile);
   // Use the OS tmpdir for the temp file ONLY if same-dir is read-only.
   // Default to same-dir to keep rename atomic across filesystems.
-  const tmp = path.join(dir, `.${path.basename(args.planFile)}.tmp.${process.pid}.${Date.now()}`);
+  const tmp = path.join(
+    dir,
+    `.${path.basename(args.planFile)}.tmp.${process.pid}.${Date.now()}`,
+  );
   try {
     fs.writeFileSync(tmp, newContent);
     fs.renameSync(tmp, args.planFile);
@@ -120,35 +125,77 @@ export function flipPhaseCheckboxes(args: {
   const implementation = flipCheckbox({
     planFile: args.planFile,
     lineNumber: args.implementationLine,
-    expectedMarker: '**Implementation',
+    expectedMarker: "**Implementation",
   });
   const review = flipCheckbox({
     planFile: args.planFile,
     lineNumber: args.reviewLine,
-    expectedMarker: '**Review',
+    expectedMarker: "**Review",
   });
   return { implementation, review };
 }
 
 /** Helper for tests: write content to a fresh temp plan file and return the path. */
 export function _testWritePlan(content: string): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plan-mutator-test-'));
-  const p = path.join(dir, 'plan.md');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-mutator-test-"));
+  const p = path.join(dir, "plan.md");
   fs.writeFileSync(p, content);
   return p;
 }
+
+/** Marker string that must follow the test-spec checkbox in the plan file. */
+export const TEST_SPEC_MARKER = "**Test Specification";
 
 /**
  * Flip the Test Specification checkbox for a phase from [ ] to [x].
  * Uses the same atomic write-to-temp-and-rename pattern.
  */
-export function flipTestSpecCheckbox(planFile: string, phase: Phase): FlipResult {
+export function flipTestSpecCheckbox(
+  planFile: string,
+  phase: Phase,
+): FlipResult {
   if (phase.testSpecCheckboxLine > 0) {
     return flipCheckbox({
       planFile,
       lineNumber: phase.testSpecCheckboxLine,
-      expectedMarker: '**Test Specification',
+      expectedMarker: TEST_SPEC_MARKER,
     });
   }
   return { flipped: false, alreadyChecked: true };
+}
+
+/**
+ * Flip all checkboxes for a single phase. Used by both the startup
+ * reconcile (cli.ts) and the one-shot backfill CLI. Returns the count
+ * of boxes flipped and any error strings so callers can log differently.
+ */
+export function reconcilePhaseCheckboxes(
+  planFile: string,
+  phase: Phase,
+): { flipped: number; errors: string[] } {
+  const errors: string[] = [];
+  let flipped = 0;
+
+  if (phase.testSpecCheckboxLine !== -1) {
+    const r = flipCheckbox({
+      planFile,
+      lineNumber: phase.testSpecCheckboxLine,
+      expectedMarker: TEST_SPEC_MARKER,
+    });
+    if (r.error) errors.push(`test-spec: ${r.error}`);
+    else if (r.flipped) flipped++;
+  }
+
+  const result = flipPhaseCheckboxes({
+    planFile,
+    implementationLine: phase.implementationCheckboxLine,
+    reviewLine: phase.reviewCheckboxLine,
+  });
+  if (result.implementation.error)
+    errors.push(`impl: ${result.implementation.error}`);
+  else if (result.implementation.flipped) flipped++;
+  if (result.review.error) errors.push(`review: ${result.review.error}`);
+  else if (result.review.flipped) flipped++;
+
+  return { flipped, errors };
 }

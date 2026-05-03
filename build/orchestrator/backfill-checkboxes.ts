@@ -10,23 +10,38 @@
  * Idempotent: already-checked boxes are skipped silently.
  */
 
-import * as fs from 'node:fs';
-import { parsePlan } from './parser';
-import { flipCheckbox, flipPhaseCheckboxes, flipTestSpecCheckbox } from './plan-mutator';
+import * as fs from "node:fs";
+import { parsePlan } from "./parser";
+import { reconcilePhaseCheckboxes } from "./plan-mutator";
+import { deriveSlug, readLockInfo } from "./state";
 
 const [planFile, stateFile] = process.argv.slice(2);
 if (!planFile || !stateFile) {
-  console.error('Usage: bun run backfill-checkboxes.ts <plan.md> <state.json>');
+  console.error("Usage: bun run backfill-checkboxes.ts <plan.md> <state.json>");
   process.exit(1);
 }
 
-const planContent = fs.readFileSync(planFile, 'utf8');
-const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+// Refuse to run while gstack-build holds the lock — concurrent writes to
+// the plan file would clobber each other's atomic temp+rename operations.
+const slug = deriveSlug(planFile);
+const lockInfo = readLockInfo(slug);
+if (lockInfo !== null) {
+  console.error(
+    `gstack-build is currently running for this plan (${lockInfo}).`,
+  );
+  console.error(
+    "Wait for it to finish, or remove the lock file if it is stale.",
+  );
+  process.exit(1);
+}
+
+const planContent = fs.readFileSync(planFile, "utf8");
+const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
 const { phases, warnings } = parsePlan(planContent);
 
 if (warnings.length) {
-  console.warn('Parser warnings:');
-  warnings.forEach(w => console.warn(' ', w));
+  console.warn("Parser warnings:");
+  warnings.forEach((w) => console.warn(" ", w));
 }
 
 let flipped = 0;
@@ -35,50 +50,28 @@ let errors = 0;
 
 for (const phase of phases) {
   const phaseState = state.phases?.[phase.index];
-  if (!phaseState || phaseState.status !== 'committed') {
+  if (!phaseState || phaseState.status !== "committed") {
     skipped++;
     continue;
   }
 
-  // Test spec checkbox (only for TDD phases that actually ran the spec step)
-  if (phase.testSpecCheckboxLine !== -1) {
-    const r = flipCheckbox({
-      planFile,
-      lineNumber: phase.testSpecCheckboxLine,
-      expectedMarker: '**Test Specification',
-    });
-    if (r.error) {
-      console.error(`  Phase ${phase.number} test-spec: ${r.error}`);
-      errors++;
-    } else if (r.flipped) {
-      console.log(`  ✓ Phase ${phase.number} (${phase.name}) — test-spec flipped`);
-      flipped++;
-    }
-  }
-
-  // Implementation + Review checkboxes
-  const result = flipPhaseCheckboxes({
+  const { flipped: f, errors: errs } = reconcilePhaseCheckboxes(
     planFile,
-    implementationLine: phase.implementationCheckboxLine,
-    reviewLine: phase.reviewCheckboxLine,
-  });
-
-  if (result.implementation.error) {
-    console.error(`  Phase ${phase.number} impl: ${result.implementation.error}`);
-    errors++;
-  } else if (result.implementation.flipped) {
-    console.log(`  ✓ Phase ${phase.number} (${phase.name}) — implementation flipped`);
-    flipped++;
+    phase,
+  );
+  flipped += f;
+  errors += errs.length;
+  if (f > 0) {
+    console.log(
+      `  ✓ Phase ${phase.number} (${phase.name}) — ${f} checkbox(es) flipped`,
+    );
   }
-
-  if (result.review.error) {
-    console.error(`  Phase ${phase.number} review: ${result.review.error}`);
-    errors++;
-  } else if (result.review.flipped) {
-    console.log(`  ✓ Phase ${phase.number} (${phase.name}) — review flipped`);
-    flipped++;
+  for (const err of errs) {
+    console.error(`  Phase ${phase.number}: ${err}`);
   }
 }
 
-console.log(`\nDone. ${flipped} checkboxes flipped, ${skipped} phases skipped (not committed), ${errors} errors.`);
+console.log(
+  `\nDone. ${flipped} checkboxes flipped, ${skipped} phases skipped (not committed), ${errors} errors.`,
+);
 if (errors > 0) process.exit(1);
