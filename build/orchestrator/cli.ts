@@ -81,6 +81,7 @@ import {
   shouldSkipFeatureReview,
   type ParsedFeatureVerdict,
 } from "./feature-review";
+import { promptYesNo, buildBlockedFeatureMd } from "./feature-review-prompt";
 import { shipAndDeploy } from "./ship";
 import { createWorktrees, applyWinner, teardownWorktrees } from "./worktree";
 import {
@@ -4148,20 +4149,73 @@ async function main() {
             const currentIter =
               (featureState.featureReview?.iterations ?? 0) + 1;
             if (currentIter > cap) {
-              // F3: hard-fail at cap. F4 swaps this for the stdin prompt.
-              console.error(
-                `\n✗ Feature ${featureState.number} hit the feature-review cap (${cap} cycles) without converging.`,
-              );
-              featureState.status = "feature_blocked";
-              featureState.error =
-                featureState.error ??
-                `feature-review failed to converge after ${cap} cycles`;
-              saveState(state, {
-                noGbrain: args.noGbrain,
-                log: console.warn,
-              });
-              reviewLoopAction = "blocked";
-              break;
+              // F4: ask the user once whether to allow another cycle.
+              // userApprovedExtension is set after a yes so we don't
+              // re-prompt every additional cycle in a long extension.
+              // Non-TTY runs (CI, piped stdin) decline by default.
+              const alreadyExtended =
+                featureState.featureReview?.userApprovedExtension === true;
+              let allow = false;
+              if (!alreadyExtended) {
+                allow = await promptYesNo({
+                  question: `\nFeature ${featureState.number} (${featureState.name}) hit the feature-review cap (${cap} cycles). Run another review cycle?`,
+                  defaultValue: false,
+                });
+              }
+              if (allow) {
+                if (!featureState.featureReview) {
+                  featureState.featureReview = {
+                    iterations: 0,
+                    outputLogPaths: [],
+                    outputFilePaths: [],
+                  };
+                }
+                featureState.featureReview.userApprovedExtension = true;
+                saveState(state, {
+                  noGbrain: args.noGbrain,
+                  log: console.warn,
+                });
+                console.log(
+                  `  → User approved one extra review cycle (no further prompt this run).`,
+                );
+                // Fall through into the loop body for one more cycle.
+              } else {
+                const reason = alreadyExtended
+                  ? `feature-review failed to converge after ${cap} + 1 (user-approved) cycles`
+                  : `feature-review failed to converge after ${cap} cycles (user declined extension)`;
+                console.error(`\n✗ Feature ${featureState.number}: ${reason}`);
+                const lastReportPath =
+                  featureState.featureReview?.outputFilePaths?.at(-1);
+                const md = buildBlockedFeatureMd({
+                  feature: featureDef,
+                  featureState,
+                  reason,
+                  lastReportPath,
+                  planFile: args.planFile,
+                  timestamp: new Date().toISOString(),
+                });
+                const blockedPath = path.join(
+                  cwd,
+                  `BLOCKED-feature-${featureState.number}.md`,
+                );
+                try {
+                  fs.writeFileSync(blockedPath, md);
+                  console.error(`  → Wrote ${blockedPath}`);
+                } catch (err) {
+                  console.error(
+                    `  → Failed to write ${blockedPath}: ${(err as Error).message}`,
+                  );
+                }
+                ensureBlockedGitignored(cwd);
+                featureState.status = "feature_blocked";
+                featureState.error = featureState.error ?? reason;
+                saveState(state, {
+                  noGbrain: args.noGbrain,
+                  log: console.warn,
+                });
+                reviewLoopAction = "blocked";
+                break;
+              }
             }
             featureState.status = "feature_review_running";
             saveState(state, { noGbrain: args.noGbrain, log: console.warn });
