@@ -32,8 +32,13 @@ export const DEFAULT_MAX_RED_SPEC_ITERATIONS =
 export const DEFAULT_MAX_TEST_ITERATIONS =
   envNumberOrDefault('GSTACK_BUILD_TEST_MAX_ITER', BUILD_DEFAULTS.limits.testMaxIterations);
 
+/** After this many consecutive Codex GATE FAILs, re-invoke Gemini with reviewer findings. 0 = disabled. */
+export const DEFAULT_CODEX_GEMINI_RERUN_FREQ =
+  envNumberOrDefault('GSTACK_BUILD_CODEX_GEMINI_RERUN_FREQ', 2);
+
 export type Action =
   | { type: 'RUN_GEMINI'; phaseIndex: number; iteration: number }
+  | { type: 'RUN_GEMINI_FROM_REVIEW'; phaseIndex: number; iteration: number; reviewFeedbackPath: string }
   | { type: 'RUN_CODEX_REVIEW'; phaseIndex: number; iteration: number }
   | { type: 'MARK_COMPLETE'; phaseIndex: number }
   | { type: 'FAIL'; phaseIndex: number; reason: string }
@@ -64,7 +69,8 @@ export function decideNextAction(
   maxCodexIterations: number = DEFAULT_MAX_CODEX_ITERATIONS,
   phase?: Phase,
   maxTestIterations: number = DEFAULT_MAX_TEST_ITERATIONS,
-  maxRedSpecIterations: number = DEFAULT_MAX_RED_SPEC_ITERATIONS
+  maxRedSpecIterations: number = DEFAULT_MAX_RED_SPEC_ITERATIONS,
+  codexGeminiRerunFreq: number = DEFAULT_CODEX_GEMINI_RERUN_FREQ,
 ): Action {
   switch (phaseState.status) {
     case 'pending':
@@ -169,20 +175,30 @@ export function decideNextAction(
       };
 
     case 'codex_running': {
-      // Need another iteration. Cap is reached when we've already run
-      // maxIterations times — caller will see FAIL on the next call.
-      const iter = (phaseState.codexReview?.iterations ?? 0) + 1;
-      if (iter > maxCodexIterations) {
+      const nextIter = (phaseState.codexReview?.iterations ?? 0) + 1;
+      if (nextIter > maxCodexIterations) {
         return {
           type: 'FAIL',
           phaseIndex: phaseState.index,
           reason: `Codex review failed to converge after ${maxCodexIterations} iterations`,
         };
       }
+      // Every codexGeminiRerunFreq Codex GATE FAILs, re-invoke Gemini with reviewer context.
+      // Uses `iterations % freq === 0` so it fires at iterations 2, 4, 6 (with freq=2).
+      const reviewCount = phaseState.codexReview?.iterations ?? 0;
+      const feedbackPath = phaseState.codexReview?.outputLogPaths?.at(-1);
+      if (codexGeminiRerunFreq > 0 && reviewCount > 0 && reviewCount % codexGeminiRerunFreq === 0 && feedbackPath) {
+        return {
+          type: 'RUN_GEMINI_FROM_REVIEW',
+          phaseIndex: phaseState.index,
+          iteration: nextIter,
+          reviewFeedbackPath: feedbackPath,
+        };
+      }
       return {
         type: 'RUN_CODEX_REVIEW',
         phaseIndex: phaseState.index,
-        iteration: iter,
+        iteration: nextIter,
       };
     }
 
@@ -337,6 +353,32 @@ export function applyResult(
     next.status = 'failed';
     next.error =
       'Codex output did not contain GATE PASS or GATE FAIL — cannot determine review outcome';
+    return next;
+  }
+
+  if (action.type === 'RUN_GEMINI_FROM_REVIEW') {
+    next.codexReview = {
+      ...(phaseState.codexReview ?? { iterations: 0, outputLogPaths: [] }),
+      geminiReRunCount: (phaseState.codexReview?.geminiReRunCount ?? 0) + 1,
+    };
+    next.gemini = {
+      startedAt: new Date(Date.now() - result.durationMs).toISOString(),
+      completedAt: new Date().toISOString(),
+      outputLogPath: result.logPath,
+      retries: result.retries,
+      exitCode: result.exitCode ?? undefined,
+    };
+    if (result.timedOut) {
+      next.status = 'failed';
+      next.error = `Gemini re-run (from review feedback) timed out`;
+      return next;
+    }
+    if (result.exitCode !== 0) {
+      next.status = 'failed';
+      next.error = `Gemini re-run (from review feedback) exited ${result.exitCode}; see ${result.logPath}`;
+      return next;
+    }
+    next.status = 'impl_done';
     return next;
   }
 

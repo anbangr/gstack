@@ -156,6 +156,8 @@ export interface CodexReviewState {
   iterations: number;
   finalVerdict?: 'GATE PASS' | 'GATE FAIL' | 'TIMEOUT';
   outputLogPaths: string[];
+  /** Number of Gemini re-runs triggered by review feedback (RUN_GEMINI_FROM_REVIEW). */
+  geminiReRunCount?: number;
 }
 
 export interface PhaseState {

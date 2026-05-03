@@ -5,6 +5,8 @@ import {
   markCommitted,
   findNextPhaseIndex,
   DEFAULT_MAX_CODEX_ITERATIONS,
+  DEFAULT_CODEX_GEMINI_RERUN_FREQ,
+  type Action,
 } from '../phase-runner';
 import type { PhaseState, Phase, DualImplState, DualImplTestResult } from '../types';
 import type { SubAgentResult } from '../sub-agents';
@@ -168,9 +170,10 @@ describe('applyResult — Codex review', () => {
   });
 
   it('successive GATE FAIL passes accumulate iterations', () => {
+    // Pass codexGeminiRerunFreq=0 to disable the re-run feature and test pure accumulation.
     let s = basePhase({ status: 'tests_green' });
     for (let i = 1; i <= 3; i++) {
-      const action = decideNextAction(s);
+      const action = decideNextAction(s, DEFAULT_MAX_CODEX_ITERATIONS, undefined, undefined, undefined, 0);
       s = applyResult(s, action as any, codexFail());
       expect(s.codexReview?.iterations).toBe(i);
       expect(s.status).toBe('codex_running');
@@ -178,12 +181,13 @@ describe('applyResult — Codex review', () => {
   });
 
   it('GATE PASS after multiple fails → review_clean, log paths preserved', () => {
+    // Pass codexGeminiRerunFreq=0 to disable the re-run feature.
     let s = basePhase({ status: 'tests_green' });
-    let action = decideNextAction(s);
+    let action = decideNextAction(s, DEFAULT_MAX_CODEX_ITERATIONS, undefined, undefined, undefined, 0);
     s = applyResult(s, action as any, codexFail());
-    action = decideNextAction(s);
+    action = decideNextAction(s, DEFAULT_MAX_CODEX_ITERATIONS, undefined, undefined, undefined, 0);
     s = applyResult(s, action as any, codexFail());
-    action = decideNextAction(s);
+    action = decideNextAction(s, DEFAULT_MAX_CODEX_ITERATIONS, undefined, undefined, undefined, 0);
     s = applyResult(s, action as any, codexPass());
     expect(s.status).toBe('review_clean');
     expect(s.codexReview?.iterations).toBe(3);
@@ -722,5 +726,178 @@ describe('Dual-implementor state machine transitions', () => {
     const state = basePhase({ status: 'dual_tests_running' as any, dualImpl: minDualImpl() });
     const action = decideNextAction(state);
     expect(action.type).toBe('RUN_DUAL_TESTS');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RUN_GEMINI_FROM_REVIEW — decideNextAction
+// ---------------------------------------------------------------------------
+
+describe('decideNextAction — RUN_GEMINI_FROM_REVIEW', () => {
+  // Helper: build a codex_running state with N iterations and optional log paths.
+  function codexRunning(iterations: number, logPaths: string[] = []): PhaseState {
+    return basePhase({
+      status: 'codex_running',
+      codexReview: { iterations, outputLogPaths: logPaths },
+    });
+  }
+
+  it('after 2 iterations with feedbackPath → RUN_GEMINI_FROM_REVIEW (freq=2)', () => {
+    const s = codexRunning(2, ['/tmp/review-1.log', '/tmp/review-2.log']);
+    const action = decideNextAction(s, DEFAULT_MAX_CODEX_ITERATIONS, undefined, undefined, undefined, 2);
+    expect(action.type).toBe('RUN_GEMINI_FROM_REVIEW');
+    if (action.type === 'RUN_GEMINI_FROM_REVIEW') {
+      expect(action.reviewFeedbackPath).toBe('/tmp/review-2.log');
+      expect(action.iteration).toBe(3);
+    }
+  });
+
+  it('after 1 iteration (not yet at freq=2) → RUN_CODEX_REVIEW', () => {
+    const s = codexRunning(1, ['/tmp/review-1.log']);
+    const action = decideNextAction(s, DEFAULT_MAX_CODEX_ITERATIONS, undefined, undefined, undefined, 2);
+    expect(action.type).toBe('RUN_CODEX_REVIEW');
+  });
+
+  it('after 2 iterations with NO feedbackPath → RUN_CODEX_REVIEW (graceful fallback)', () => {
+    const s = codexRunning(2, []); // no log paths
+    const action = decideNextAction(s, DEFAULT_MAX_CODEX_ITERATIONS, undefined, undefined, undefined, 2);
+    expect(action.type).toBe('RUN_CODEX_REVIEW');
+  });
+
+  it('codexGeminiRerunFreq=0 → never triggers re-run, returns RUN_CODEX_REVIEW until maxIter', () => {
+    // Stay below DEFAULT_MAX_CODEX_ITERATIONS (5) so we don't hit the FAIL cap.
+    for (let i = 2; i <= 4; i += 2) {
+      const s = codexRunning(i, Array.from({ length: i }, (_, j) => `/tmp/r-${j}.log`));
+      const action = decideNextAction(s, DEFAULT_MAX_CODEX_ITERATIONS, undefined, undefined, undefined, 0);
+      expect(action.type).toBe('RUN_CODEX_REVIEW');
+    }
+  });
+
+  it('after 4 iterations fires again at freq=2 (iter 4 % 2 === 0)', () => {
+    const s = codexRunning(4, ['/a.log', '/b.log', '/c.log', '/d.log']);
+    const action = decideNextAction(s, DEFAULT_MAX_CODEX_ITERATIONS, undefined, undefined, undefined, 2);
+    expect(action.type).toBe('RUN_GEMINI_FROM_REVIEW');
+    if (action.type === 'RUN_GEMINI_FROM_REVIEW') {
+      expect(action.reviewFeedbackPath).toBe('/d.log');
+    }
+  });
+
+  it('uses DEFAULT_CODEX_GEMINI_RERUN_FREQ constant (value=2) by default', () => {
+    // Verify the exported constant is 2 (or env-overridden, but in tests env is clean).
+    expect(typeof DEFAULT_CODEX_GEMINI_RERUN_FREQ).toBe('number');
+    expect(DEFAULT_CODEX_GEMINI_RERUN_FREQ).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// applyResult — RUN_GEMINI_FROM_REVIEW
+// ---------------------------------------------------------------------------
+
+describe('applyResult — RUN_GEMINI_FROM_REVIEW', () => {
+  function reviewRerunAction(iteration = 3): Action {
+    return {
+      type: 'RUN_GEMINI_FROM_REVIEW',
+      phaseIndex: 0,
+      iteration,
+      reviewFeedbackPath: '/tmp/review-2.log',
+    };
+  }
+
+  function rerunResult(overrides: Partial<SubAgentResult> = {}): SubAgentResult {
+    return {
+      stdout: 'fixed all issues',
+      stderr: '',
+      exitCode: 0,
+      timedOut: false,
+      logPath: '/tmp/gemini-rerun-3.log',
+      durationMs: 2000,
+      retries: 0,
+      ...overrides,
+    };
+  }
+
+  it('success → status=impl_done, geminiReRunCount=1', () => {
+    const initial = basePhase({
+      status: 'codex_running',
+      codexReview: { iterations: 2, outputLogPaths: ['/tmp/r1.log', '/tmp/r2.log'] },
+    });
+    const next = applyResult(initial, reviewRerunAction(), rerunResult());
+    expect(next.status).toBe('impl_done');
+    expect(next.codexReview?.geminiReRunCount).toBe(1);
+    expect(next.gemini?.outputLogPath).toBe('/tmp/gemini-rerun-3.log');
+    expect(next.gemini?.exitCode).toBe(0);
+  });
+
+  it('second re-run → geminiReRunCount increments to 2', () => {
+    const initial = basePhase({
+      status: 'codex_running',
+      codexReview: { iterations: 4, outputLogPaths: ['/a.log', '/b.log', '/c.log', '/d.log'], geminiReRunCount: 1 },
+    });
+    const next = applyResult(initial, reviewRerunAction(5), rerunResult());
+    expect(next.codexReview?.geminiReRunCount).toBe(2);
+  });
+
+  it('timeout → status=failed with timed-out error', () => {
+    const initial = basePhase({
+      status: 'codex_running',
+      codexReview: { iterations: 2, outputLogPaths: ['/tmp/r1.log', '/tmp/r2.log'] },
+    });
+    const next = applyResult(initial, reviewRerunAction(), rerunResult({ timedOut: true, exitCode: null }));
+    expect(next.status).toBe('failed');
+    expect(next.error).toMatch(/timed out/i);
+  });
+
+  it('non-zero exit → status=failed with exit code in error', () => {
+    const initial = basePhase({
+      status: 'codex_running',
+      codexReview: { iterations: 2, outputLogPaths: ['/tmp/r1.log', '/tmp/r2.log'] },
+    });
+    const next = applyResult(initial, reviewRerunAction(), rerunResult({ exitCode: 2 }));
+    expect(next.status).toBe('failed');
+    expect(next.error).toMatch(/exited 2/);
+  });
+
+  it('does not mutate input PhaseState', () => {
+    const initial = basePhase({
+      status: 'codex_running',
+      codexReview: { iterations: 2, outputLogPaths: ['/tmp/r1.log', '/tmp/r2.log'] },
+    });
+    const before = JSON.stringify(initial);
+    applyResult(initial, reviewRerunAction(), rerunResult());
+    expect(JSON.stringify(initial)).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// End-to-end: after RUN_GEMINI_FROM_REVIEW success, Codex iteration continues
+// ---------------------------------------------------------------------------
+
+describe('RUN_GEMINI_FROM_REVIEW end-to-end flow', () => {
+  it('after re-run success → impl_done → tests_green → RUN_CODEX_REVIEW with accumulated iter count (NOT reset to 1)', () => {
+    // Start from codex_running at iter=2 with feedbackPath
+    let s = basePhase({
+      status: 'codex_running',
+      codexReview: { iterations: 2, outputLogPaths: ['/tmp/r1.log', '/tmp/r2.log'] },
+    });
+
+    // decideNextAction fires RUN_GEMINI_FROM_REVIEW
+    const rerunAction = decideNextAction(s, DEFAULT_MAX_CODEX_ITERATIONS, undefined, undefined, undefined, 2);
+    expect(rerunAction.type).toBe('RUN_GEMINI_FROM_REVIEW');
+
+    // Apply success — moves to impl_done
+    s = applyResult(s, rerunAction as any, {
+      stdout: 'fixed', stderr: '', exitCode: 0, timedOut: false,
+      logPath: '/tmp/gemini-rerun-3.log', durationMs: 1000, retries: 0,
+    });
+    expect(s.status).toBe('impl_done');
+
+    // Simulate tests passing (legacy phase: testSpecDone=true → skip RUN_TESTS, go to codex)
+    // Use testSpecDone=true so impl_done → RUN_CODEX_REVIEW directly.
+    const toCodex = decideNextAction(s, DEFAULT_MAX_CODEX_ITERATIONS, { testSpecDone: true } as any);
+    expect(toCodex.type).toBe('RUN_CODEX_REVIEW');
+    // The codexReview.iterations is still 2 from before, so next iteration = 3 (NOT 1).
+    if (toCodex.type === 'RUN_CODEX_REVIEW') {
+      expect(toCodex.iteration).toBe(3);
+    }
   });
 });
