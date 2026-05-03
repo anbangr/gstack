@@ -36,6 +36,10 @@ export type FeatureStatus =
   | "pending"
   | "running"
   | "phases_done"
+  | "feature_review_pending"
+  | "feature_review_running"
+  | "feature_redo_pending"
+  | "feature_blocked"
   | "shipping"
   | "landed"
   | "origin_verifying"
@@ -209,6 +213,42 @@ export interface PhaseState {
   error?: string;
 }
 
+/**
+ * Per-feature meta-review state. Populated when --skip-feature-review is
+ * NOT set and the feature has more than one phase OR any phase needed
+ * more than one Codex iteration to converge. Tracks the configurable
+ * post-implementation review cycle that runs after `phases_done` and
+ * before `shipping`.
+ */
+export interface FeatureReviewState {
+  /** Number of review cycles run so far for this feature. */
+  iterations: number;
+  /** Spawn shell logs for each review invocation (forensics). */
+  outputLogPaths: string[];
+  /**
+   * Parallel array of clean review report paths. Use these — NOT
+   * outputLogPaths — when feeding the prior verdict into the next loop
+   * iteration or building the BLOCKED-feature-N.md report.
+   */
+  outputFilePaths: string[];
+  /** Verdict from the most recent invocation. */
+  finalVerdict?:
+    | "FEATURE_PASS"
+    | "FEATURE_NEEDS_PHASES"
+    | "FEATURE_REDO"
+    | "FEATURE_BLOCKED"
+    | "TIMEOUT";
+  /** Phase indexes the reviewer asked us to reset (FEATURE_REDO). */
+  phasesReset?: number[];
+  /** Count of phases the reviewer appended to the plan (FEATURE_NEEDS_PHASES). */
+  phasesAdded?: number;
+  /**
+   * True after the user explicitly opted in to a 4th+ cycle past the
+   * convergence cap. Resets when the verdict becomes FEATURE_PASS.
+   */
+  userApprovedExtension?: boolean;
+}
+
 export interface FeatureState {
   index: number;
   number: string;
@@ -223,6 +263,8 @@ export interface FeatureState {
   issueLogPath?: string;
   originIssueLogPaths?: string[];
   originVerificationAttempts?: number;
+  /** Meta-review state (populated when feature-level review fires). */
+  featureReview?: FeatureReviewState;
   error?: string;
 }
 

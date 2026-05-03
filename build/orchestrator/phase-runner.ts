@@ -45,6 +45,18 @@ export const DEFAULT_CODEX_GEMINI_RERUN_FREQ = envNumberOrDefault(
 );
 
 /**
+ * Default cap on per-feature meta-review cycles. After this many cycles
+ * without FEATURE_PASS, the orchestrator pauses and prompts the user via
+ * stdin readline whether to allow another cycle. Non-TTY runs (CI,
+ * background) take the cap as final and write BLOCKED-feature-N.md.
+ * 0 disables the feature-level review entirely.
+ */
+export const DEFAULT_FEATURE_REVIEW_MAX_ITER = envNumberOrDefault(
+  "GSTACK_BUILD_FEATURE_REVIEW_MAX_ITER",
+  BUILD_DEFAULTS.limits.featureReviewMaxIterations,
+);
+
+/**
  * Stable prefix the FAIL action's `reason` carries when convergence is the
  * cause. Consumers (cli.ts BLOCKED.md handler) match on this prefix instead
  * of substring-matching against the human-readable error message — the
@@ -77,7 +89,21 @@ export type Action =
   | { type: "RUN_DUAL_IMPL"; phaseIndex: number; iteration: number }
   | { type: "RUN_DUAL_TESTS"; phaseIndex: number }
   | { type: "RUN_JUDGE"; phaseIndex: number }
-  | { type: "APPLY_WINNER"; phaseIndex: number; winner: "gemini" | "codex" };
+  | { type: "APPLY_WINNER"; phaseIndex: number; winner: "gemini" | "codex" }
+  // Feature-level meta-review (fires after all phases of a feature commit).
+  // Carries featureIndex (NOT phaseIndex) and the iteration counter so the
+  // handler can build the prompt with prior verdict context.
+  | {
+      type: "RUN_FEATURE_REVIEW";
+      featureIndex: number;
+      iteration: number;
+      /**
+       * Optional path to the prior review's clean report. Set when iter>1
+       * so the reviewer can see what it asked for last cycle and whether
+       * the orchestrator complied.
+       */
+      priorReportPath?: string;
+    };
 
 /**
  * Given a phase's runtime state, decide what to do next.

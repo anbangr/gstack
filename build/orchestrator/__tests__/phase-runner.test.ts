@@ -1119,6 +1119,53 @@ describe("decideNextAction — RUN_GEMINI_FROM_REVIEW", () => {
 });
 
 // ---------------------------------------------------------------------------
+// F1: Feature-level review state machine surface
+// ---------------------------------------------------------------------------
+
+describe("DEFAULT_FEATURE_REVIEW_MAX_ITER", () => {
+  it("is a positive integer sourced from BUILD_DEFAULTS.limits", () => {
+    // Cap on per-feature meta-review cycles. After this count, the
+    // orchestrator pauses on a TTY and prompts whether to allow another
+    // cycle; non-TTY runs treat the cap as final and write
+    // BLOCKED-feature-N.md. 3 is the shipped default.
+    const { DEFAULT_FEATURE_REVIEW_MAX_ITER } = require("../phase-runner");
+    expect(typeof DEFAULT_FEATURE_REVIEW_MAX_ITER).toBe("number");
+    expect(Number.isInteger(DEFAULT_FEATURE_REVIEW_MAX_ITER)).toBe(true);
+    expect(DEFAULT_FEATURE_REVIEW_MAX_ITER).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("RUN_FEATURE_REVIEW action shape", () => {
+  // The Action union now includes RUN_FEATURE_REVIEW which carries
+  // featureIndex (NOT phaseIndex — feature-level), iteration, and an
+  // optional priorReportPath set when iter>1 so the reviewer can see
+  // what it asked for last cycle. Compile-time check via TS narrowing
+  // — this test exists to fail at type-check time if the shape drifts.
+  it("constructs without phaseIndex; carries featureIndex + iteration + optional priorReportPath", () => {
+    const a: Action = {
+      type: "RUN_FEATURE_REVIEW",
+      featureIndex: 2,
+      iteration: 1,
+    };
+    expect(a.type).toBe("RUN_FEATURE_REVIEW");
+    if (a.type === "RUN_FEATURE_REVIEW") {
+      expect(a.featureIndex).toBe(2);
+      expect(a.iteration).toBe(1);
+      expect(a.priorReportPath).toBeUndefined();
+    }
+    const b: Action = {
+      type: "RUN_FEATURE_REVIEW",
+      featureIndex: 0,
+      iteration: 3,
+      priorReportPath: "/logs/feature-1-review-2.md",
+    };
+    if (b.type === "RUN_FEATURE_REVIEW") {
+      expect(b.priorReportPath).toBe("/logs/feature-1-review-2.md");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // applyResult — RUN_GEMINI_FROM_REVIEW
 // ---------------------------------------------------------------------------
 

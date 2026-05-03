@@ -61,6 +61,11 @@
       "reasoning": "high",
       "command": "/context-save"
     },
+    "featureReview": {
+      "provider": "codex",
+      "model": "gpt-5.5",
+      "reasoning": "xhigh"
+    },
     "planLocator": {
       "provider": "claude",
       "model": "claude-haiku-4-5-20251001",
@@ -81,13 +86,15 @@
     "codexMaxIterations": 5,
     "redSpecMaxIterations": 3,
     "testMaxIterations": 5,
-    "originVerificationMaxIterations": 3
+    "originVerificationMaxIterations": 3,
+    "featureReviewMaxIterations": 3
   },
   "timeoutsMs": {
     "gemini": 600000,
     "codex": 900000,
     "ship": 1800000,
     "test": 300000,
-    "judge": 600000
+    "judge": 600000,
+    "featureReview": 1200000
   }
 }
