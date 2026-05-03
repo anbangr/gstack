@@ -44,6 +44,19 @@ export const DEFAULT_CODEX_GEMINI_RERUN_FREQ = envNumberOrDefault(
   2,
 );
 
+/**
+ * Stable prefix the FAIL action's `reason` carries when convergence is the
+ * cause. Consumers (cli.ts BLOCKED.md handler) match on this prefix instead
+ * of substring-matching against the human-readable error message — the
+ * latter would silently disable the BLOCKED.md write on any rephrasing.
+ */
+export const CODEX_CONVERGENCE_FAILURE_REASON_PREFIX =
+  "Codex review failed to converge";
+
+export function isCodexConvergenceFailure(reason: string): boolean {
+  return reason.startsWith(CODEX_CONVERGENCE_FAILURE_REASON_PREFIX);
+}
+
 export type Action =
   | { type: "RUN_GEMINI"; phaseIndex: number; iteration: number }
   | {
@@ -205,7 +218,7 @@ export function decideNextAction(
         return {
           type: "FAIL",
           phaseIndex: phaseState.index,
-          reason: `Codex review failed to converge after ${maxCodexIterations} iterations`,
+          reason: `${CODEX_CONVERGENCE_FAILURE_REASON_PREFIX} after ${maxCodexIterations} iterations`,
         };
       }
       // Every codexGeminiRerunFreq Codex GATE FAILs, re-invoke Gemini with reviewer context.

@@ -52,6 +52,7 @@ import {
   DEFAULT_MAX_TEST_ITERATIONS,
   DEFAULT_MAX_RED_SPEC_ITERATIONS,
   DEFAULT_CODEX_GEMINI_RERUN_FREQ,
+  isCodexConvergenceFailure,
   type Action,
 } from "./phase-runner";
 import {
@@ -1044,6 +1045,56 @@ export function sanitizeReviewFeedback(raw: string): string {
  * Returns the resolved absolute path on success, or null if containment
  * fails. Callers should warn-and-skip on null rather than throw.
  */
+/**
+ * Marker line we look for / append to .gitignore. Matches BLOCKED.md
+ * AND any per-phase variant (BLOCKED-phase-3.md). We do not match
+ * arbitrary `BLOCKED*` files in case a project legitimately tracks
+ * something like `BLOCKED_USERS_LIST.md`.
+ */
+export const BLOCKED_GITIGNORE_PATTERN = "BLOCKED*.md";
+
+/**
+ * Append the BLOCKED*.md gitignore pattern to a project's .gitignore
+ * exactly once per project. Idempotent. Best-effort: write failures are
+ * logged but not fatal — the BLOCKED.md write is the primary user-visible
+ * surface, .gitignore protection is a defense-in-depth nice-to-have.
+ *
+ * The pattern matches both the historical BLOCKED.md filename and the
+ * new per-phase variants (BLOCKED-phase-N.md) so resuming a project
+ * that already had a BLOCKED.md from before this change still gets
+ * coverage.
+ */
+export function ensureBlockedGitignored(repoRoot: string): void {
+  const gi = path.join(repoRoot, ".gitignore");
+  try {
+    let content = "";
+    if (fs.existsSync(gi)) {
+      content = fs.readFileSync(gi, "utf8");
+      // Already covered by an exact pattern OR a broader rule that includes it.
+      const lines = content
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0 && !l.startsWith("#"));
+      const covered = lines.some(
+        (l) =>
+          l === BLOCKED_GITIGNORE_PATTERN ||
+          l === "BLOCKED.md" ||
+          l === "BLOCKED-*.md" ||
+          l === "BLOCKED-phase-*.md" ||
+          l === "/BLOCKED*.md",
+      );
+      if (covered) return;
+    }
+    const trailing = content.length > 0 && !content.endsWith("\n") ? "\n" : "";
+    const block = `${trailing}# gstack-build convergence-failure reports — see /docs or run \`gstack-build\` for context\n${BLOCKED_GITIGNORE_PATTERN}\n`;
+    fs.appendFileSync(gi, block);
+  } catch (err) {
+    console.warn(
+      `[warn] could not update .gitignore to cover BLOCKED reports: ${(err as Error).message}`,
+    );
+  }
+}
+
 export function validateLogPathInScope(
   candidate: string | undefined,
   slug: string,
@@ -2022,7 +2073,7 @@ async function runPhase(args: {
       state.failureReason = action.reason;
       saveState(state, { noGbrain, log: console.warn });
 
-      if (action.reason.includes("Codex review failed to converge")) {
+      if (isCodexConvergenceFailure(action.reason)) {
         // Read the artifact path (clean merged review report), NOT the shell
         // log. outputFilePaths is the parallel array populated by applyResult
         // when extra.outputFilePath is supplied; outputLogPaths captures the
@@ -2062,14 +2113,24 @@ async function runPhase(args: {
         lines.push(divider);
         console.error(lines.join("\n"));
 
-        // Write BLOCKED.md to the repo root (cwd) so it's immediately visible.
+        // Per-phase BLOCKED filename so concurrent phase failures don't
+        // race-clobber each other (parallel-phases mode is in development
+        // via parallel-planner.ts) and so a second convergence failure on
+        // a different phase doesn't overwrite the prior report. The repo
+        // root sits inside the user's project working tree, so we also
+        // ensure BLOCKED*.md is .gitignored — otherwise `git add .`
+        // would ship the file (which may contain LLM output and
+        // potentially sensitive review excerpts) to the remote.
         const timestamp = new Date().toISOString();
         const iterCount = phaseState.codexReview?.iterations ?? 0;
+        const blockedFilename = `BLOCKED-phase-${phase.number}.md`;
+        const blockedPath = path.join(cwd, blockedFilename);
         const blockedMd = [
           `# BLOCKED — Phase ${phase.number}: ${phase.name}`,
           "",
-          `**Failure:** Codex review failed to converge after ${iterCount} iterations`,
+          `**Failure:** ${action.reason}`,
           `**Date:** ${timestamp}`,
+          `**Iterations:** ${iterCount}`,
           `**Last review output:** ${lastReviewPath ?? "(none)"}`,
           "",
           "## Reviewer findings",
@@ -2084,7 +2145,18 @@ async function runPhase(args: {
           "```",
           "Then re-run `gstack-build`.",
         ].join("\n");
-        fs.writeFileSync(path.join(cwd, "BLOCKED.md"), blockedMd);
+        // Wrap the write in try/catch — a write failure here (BLOCKED-*.md
+        // already exists as a directory or symlink, disk full, permissions)
+        // must not mask the underlying phase failure that the FAIL handler
+        // is reporting.
+        try {
+          fs.writeFileSync(blockedPath, blockedMd);
+        } catch (err) {
+          console.error(
+            `[warn] failed to write ${blockedFilename}: ${(err as Error).message}`,
+          );
+        }
+        ensureBlockedGitignored(cwd);
       }
 
       console.error(
