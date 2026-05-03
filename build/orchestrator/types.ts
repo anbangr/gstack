@@ -9,40 +9,40 @@
  * Plus the top-level BuildState that the persistence layer reads/writes.
  */
 
-import type { RoleConfigs } from './role-config';
+import type { RoleConfigs } from "./role-config";
 
 export type PhaseStatus =
-  | 'pending'
-  | 'test_spec_running'
-  | 'test_spec_done'
-  | 'tests_red'
-  | 'gemini_running'
-  | 'impl_done'
-  | 'test_fix_running'
-  | 'tests_green'
-  | 'codex_running'
-  | 'review_clean'
-  | 'committed'
-  | 'failed'
+  | "pending"
+  | "test_spec_running"
+  | "test_spec_done"
+  | "tests_red"
+  | "gemini_running"
+  | "impl_done"
+  | "test_fix_running"
+  | "tests_green"
+  | "codex_running"
+  | "review_clean"
+  | "committed"
+  | "failed"
   // Dual-implementor states (--dual-impl flag)
-  | 'dual_impl_running'
-  | 'dual_impl_done'
-  | 'dual_tests_running'
-  | 'dual_judge_pending'
-  | 'dual_judge_running'
-  | 'dual_winner_pending';
+  | "dual_impl_running"
+  | "dual_impl_done"
+  | "dual_tests_running"
+  | "dual_judge_pending"
+  | "dual_judge_running"
+  | "dual_winner_pending";
 
 export type FeatureStatus =
-  | 'pending'
-  | 'running'
-  | 'phases_done'
-  | 'shipping'
-  | 'landed'
-  | 'origin_verifying'
-  | 'origin_verified'
-  | 'committed'
-  | 'failed'
-  | 'paused';
+  | "pending"
+  | "running"
+  | "phases_done"
+  | "shipping"
+  | "landed"
+  | "origin_verifying"
+  | "origin_verified"
+  | "committed"
+  | "failed"
+  | "paused";
 
 export interface Feature {
   /** Zero-based index in the order features appear in the plan file. */
@@ -134,11 +134,11 @@ export interface DualImplState {
    */
   judgeHardeningNotes?: string;
   judgeLogPath?: string;
-  judgeVerdict?: 'gemini' | 'codex';
+  judgeVerdict?: "gemini" | "codex";
   judgeReasoning?: string;
-  selectedImplementor?: 'gemini' | 'codex';
+  selectedImplementor?: "gemini" | "codex";
   /** 'judge' = judge decided; 'auto' = one passed/fewer failures; winner was obvious */
-  selectedBy?: 'judge' | 'auto';
+  selectedBy?: "judge" | "auto";
   /** ISO timestamp when worktrees were torn down. */
   worktreesTornDownAt?: string;
 }
@@ -147,6 +147,15 @@ export interface SubAgentInvocation {
   startedAt: string;
   completedAt?: string;
   outputLogPath: string;
+  /**
+   * Path to the structured output file the sub-agent wrote (the artifact —
+   * a clean review report or implementation summary). Distinct from
+   * `outputLogPath`, which is the raw spawn shell capture (command + stdout +
+   * stderr) used for forensics. Consumers that want to FEED a sub-agent's
+   * artifact into the next sub-agent (e.g. RUN_GEMINI_FROM_REVIEW reading the
+   * prior review report) MUST read `outputFilePath`, not `outputLogPath`.
+   */
+  outputFilePath?: string;
   retries: number;
   exitCode?: number;
   error?: string;
@@ -154,8 +163,17 @@ export interface SubAgentInvocation {
 
 export interface CodexReviewState {
   iterations: number;
-  finalVerdict?: 'GATE PASS' | 'GATE FAIL' | 'TIMEOUT';
+  finalVerdict?: "GATE PASS" | "GATE FAIL" | "TIMEOUT";
   outputLogPaths: string[];
+  /**
+   * Parallel array to `outputLogPaths`: each entry is the path to the
+   * structured review report (the artifact Codex wrote to its outputFilePath).
+   * Use this — NOT outputLogPaths — when feeding prior reviewer findings
+   * back to a sub-agent or when building escalation reports (BLOCKED.md).
+   * Optional for backwards compatibility with state files written before
+   * this field existed.
+   */
+  outputFilePaths?: string[];
   /** Number of Gemini re-runs triggered by review feedback (RUN_GEMINI_FROM_REVIEW). */
   geminiReRunCount?: number;
 }
@@ -173,7 +191,7 @@ export interface PhaseState {
   /** State of the post-testspec / post-impl test runs. */
   testRun?: {
     iterations: number;
-    finalStatus: 'red' | 'green' | 'timeout';
+    finalStatus: "red" | "green" | "timeout";
   };
   /** State of the recursive Gemini fix calls when tests fail post-impl. */
   testFix?: {

@@ -1568,9 +1568,16 @@ async function runReviewGates(opts: {
   slug: string;
   phaseNumber: string;
   iteration: number;
-}): Promise<SubAgentResult> {
+}): Promise<{ result: SubAgentResult; mergedReportPath: string }> {
   const outputs: SubAgentResult[] = [];
   const combined: string[] = [];
+  // Persist the combined multi-gate report to a single file so consumers
+  // (RUN_GEMINI_FROM_REVIEW, BLOCKED.md) can read all gates' findings, not
+  // just the last gate's spawn log.
+  const mergedReportPath = path.join(
+    logDir(opts.slug),
+    `phase-${opts.phaseNumber}-review-merged-${opts.iteration}.md`,
+  );
   const runGate = async (
     name: "review" | "reviewSecondary" | "qa",
     role: RoleConfig,
@@ -1622,10 +1629,24 @@ async function runReviewGates(opts: {
     );
     const verdict = parseVerdict(result.stdout + "\n" + result.stderr);
     if (result.timedOut || result.exitCode !== 0 || verdict !== "pass") {
-      return mergeGateResults(outputs, combined, "GATE FAIL");
+      return {
+        result: mergeGateResults(outputs, combined, "GATE FAIL"),
+        mergedReportPath: writeMergedReport(
+          mergedReportPath,
+          combined,
+          "GATE FAIL",
+        ),
+      };
     }
   }
-  return mergeGateResults(outputs, combined, "GATE PASS");
+  return {
+    result: mergeGateResults(outputs, combined, "GATE PASS"),
+    mergedReportPath: writeMergedReport(
+      mergedReportPath,
+      combined,
+      "GATE PASS",
+    ),
+  };
 }
 
 function mergeGateResults(
@@ -1642,6 +1663,21 @@ function mergeGateResults(
     durationMs: outputs.reduce((sum, r) => sum + r.durationMs, 0),
     retries: outputs.reduce((sum, r) => sum + r.retries, 0),
   };
+}
+
+function writeMergedReport(
+  reportPath: string,
+  combined: string[],
+  verdict: "GATE PASS" | "GATE FAIL",
+): string {
+  try {
+    fs.writeFileSync(reportPath, `${combined.join("\n\n")}\n\n${verdict}\n`);
+  } catch (err) {
+    console.warn(
+      `[warn] failed to write merged review report ${reportPath}: ${(err as Error).message}`,
+    );
+  }
+  return reportPath;
 }
 
 /**
@@ -1921,7 +1957,13 @@ async function runPhase(args: {
       saveState(state, { noGbrain, log: console.warn });
 
       if (action.reason.includes("Codex review failed to converge")) {
-        const lastReviewPath = phaseState.codexReview?.outputLogPaths?.at(-1);
+        // Read the artifact path (clean merged review report), NOT the shell
+        // log. outputFilePaths is the parallel array populated by applyResult
+        // when extra.outputFilePath is supplied; outputLogPaths captures the
+        // noisy spawn capture for forensics only.
+        const lastReviewPath =
+          phaseState.codexReview?.outputFilePaths?.at(-1) ??
+          phaseState.codexReview?.outputLogPaths?.at(-1);
         const divider = "─".repeat(70);
         const lines: string[] = [
           divider,
@@ -2035,6 +2077,12 @@ async function runPhase(args: {
       console.log(
         `  → Primary implementor ${roleLabel(args.roles.primaryImpl)}: Phase ${phase.number} (iter ${action.iteration})`,
       );
+      // Define artifact path outside dryRun so we can persist it on phaseState
+      // for downstream consumers (next codex review, BLOCKED.md, etc.).
+      const outputFilePath = path.join(
+        logDir(state.slug),
+        `phase-${phase.number}-gemini-${action.iteration}-output.md`,
+      );
       let result: SubAgentResult;
       if (dryRun) {
         result = mockResult({
@@ -2046,10 +2094,6 @@ async function runPhase(args: {
         const inputFilePath = path.join(
           logDir(state.slug),
           `phase-${phase.number}-gemini-${action.iteration}-input.md`,
-        );
-        const outputFilePath = path.join(
-          logDir(state.slug),
-          `phase-${phase.number}-gemini-${action.iteration}-output.md`,
         );
         fs.writeFileSync(
           inputFilePath,
@@ -2068,7 +2112,7 @@ async function runPhase(args: {
           logPrefix: "primary-impl",
         });
       }
-      phaseState = applyResult(phaseState, action, result);
+      phaseState = applyResult(phaseState, action, result, { outputFilePath });
       state.phases[phase.index] = phaseState;
       saveState(state, { noGbrain, log: console.warn });
       continue;
@@ -2077,6 +2121,10 @@ async function runPhase(args: {
     if (action.type === "RUN_GEMINI_FROM_REVIEW") {
       console.log(
         `  → Primary implementor re-run (reviewer feedback): Phase ${phase.number} (iter ${action.iteration})`,
+      );
+      const outputFilePath = path.join(
+        logDir(state.slug),
+        `phase-${phase.number}-gemini-rerun-${action.iteration}-output.md`,
       );
       let result: SubAgentResult;
       if (dryRun) {
@@ -2097,10 +2145,6 @@ async function runPhase(args: {
         const inputFilePath = path.join(
           logDir(state.slug),
           `phase-${phase.number}-gemini-rerun-${action.iteration}-input.md`,
-        );
-        const outputFilePath = path.join(
-          logDir(state.slug),
-          `phase-${phase.number}-gemini-rerun-${action.iteration}-output.md`,
         );
         fs.writeFileSync(
           inputFilePath,
@@ -2123,7 +2167,7 @@ async function runPhase(args: {
           logPrefix: "primary-impl-rerun",
         });
       }
-      phaseState = applyResult(phaseState, action, result);
+      phaseState = applyResult(phaseState, action, result, { outputFilePath });
       state.phases[phase.index] = phaseState;
       saveState(state, { noGbrain, log: console.warn });
       continue;
@@ -2132,6 +2176,13 @@ async function runPhase(args: {
     if (action.type === "RUN_CODEX_REVIEW") {
       console.log(
         `  → Review gates: ${roleLabel(args.roles.review)} + ${roleLabel(args.roles.reviewSecondary)} + QA ${roleLabel(args.roles.qa)} (iter ${action.iteration})`,
+      );
+      // Always declare the merged-report path so applyResult can persist it
+      // even on dry-run paths. The file is only actually written by
+      // runReviewGates' writeMergedReport on real execution.
+      const mergedReportPath = path.join(
+        logDir(state.slug),
+        `phase-${phase.number}-review-merged-${action.iteration}.md`,
       );
       let result: SubAgentResult;
       if (dryRun) {
@@ -2146,11 +2197,18 @@ async function runPhase(args: {
           logDir(state.slug),
           `phase-${phase.number}-codex-${action.iteration}-input.md`,
         );
-        // Locate Gemini's output from this iteration so Codex can read it.
-        const geminiOutputPath = path.join(
+        // Locate Gemini's output for this iteration. Prefer the artifact path
+        // persisted on phaseState.gemini (set by applyResult) — this is the
+        // authoritative path regardless of whether the prior step was a
+        // standard RUN_GEMINI (output.md) or a RUN_GEMINI_FROM_REVIEW rerun
+        // (output writes to a -rerun-K- filename). Falling back to the
+        // filename convention preserves resume-from-old-state behavior.
+        const geminiOutputPathFallback = path.join(
           logDir(state.slug),
           `phase-${phase.number}-gemini-${action.iteration}-output.md`,
         );
+        const geminiOutputPath =
+          phaseState.gemini?.outputFilePath ?? geminiOutputPathFallback;
         const geminiOutputExists = fs.existsSync(geminiOutputPath);
         fs.writeFileSync(
           inputFilePath,
@@ -2164,7 +2222,7 @@ async function runPhase(args: {
             phaseState.originIssueLogPath,
           ),
         );
-        result = await runReviewGates({
+        const gateRun = await runReviewGates({
           roles: args.roles,
           inputFilePath,
           cwd,
@@ -2172,8 +2230,11 @@ async function runPhase(args: {
           phaseNumber: phase.number,
           iteration: action.iteration,
         });
+        result = gateRun.result;
       }
-      phaseState = applyResult(phaseState, action, result);
+      phaseState = applyResult(phaseState, action, result, {
+        outputFilePath: mergedReportPath,
+      });
       state.phases[phase.index] = phaseState;
       saveState(state, { noGbrain, log: console.warn });
       continue;

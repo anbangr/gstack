@@ -213,7 +213,10 @@ export function decideNextAction(
       // The cap check above takes priority: if maxCodexIterations is e.g. 4, the re-run
       // at iterations=4 is preempted by FAIL before this check runs.
       const reviewCount = phaseState.codexReview?.iterations ?? 0;
-      const feedbackPath = phaseState.codexReview?.outputLogPaths?.at(-1);
+      // Read the artifact path (clean review report), NOT the shell log path.
+      // outputFilePaths is the parallel array of structured report paths;
+      // outputLogPaths captures noisy spawn-stdout/stderr forensics.
+      const feedbackPath = phaseState.codexReview?.outputFilePaths?.at(-1);
       if (
         codexGeminiRerunFreq > 0 &&
         reviewCount > 0 &&
@@ -320,6 +323,15 @@ export interface ApplyResultExtra {
   judgeVerdict?: "gemini" | "codex";
   judgeReasoning?: string;
   judgeHardeningNotes?: string;
+  /**
+   * Path to the structured artifact written by the sub-agent (the review
+   * report or implementation summary file — NOT the spawn shell log).
+   * Stored on phaseState so consumers that want the clean artifact (e.g.
+   * RUN_GEMINI_FROM_REVIEW reading the prior review report, or BLOCKED.md
+   * embedding it) can read from a known-clean path instead of the noisy
+   * shell capture in `result.logPath`.
+   */
+  outputFilePath?: string;
 }
 
 /**
@@ -341,6 +353,7 @@ export function applyResult(
         new Date(Date.now() - result.durationMs).toISOString(),
       completedAt: new Date().toISOString(),
       outputLogPath: result.logPath,
+      outputFilePath: extra?.outputFilePath,
       retries: result.retries,
       exitCode: result.exitCode ?? undefined,
     };
@@ -361,10 +374,21 @@ export function applyResult(
 
   if (action.type === "RUN_CODEX_REVIEW") {
     const prevIters = phaseState.codexReview?.iterations ?? 0;
-    const prevPaths = phaseState.codexReview?.outputLogPaths ?? [];
+    const prevLogPaths = phaseState.codexReview?.outputLogPaths ?? [];
+    const prevFilePaths = phaseState.codexReview?.outputFilePaths ?? [];
+    // Spread prior codexReview to preserve forensic fields (geminiReRunCount,
+    // finalVerdict from a prior cycle) — they were silently dropped before
+    // because the object was rebuilt from scratch on every iteration.
     next.codexReview = {
+      ...(phaseState.codexReview ?? {}),
       iterations: prevIters + 1,
-      outputLogPaths: [...prevPaths, result.logPath],
+      outputLogPaths: [...prevLogPaths, result.logPath],
+      // Track the artifact path (clean review report) alongside the shell
+      // log. Consumers that feed reviewer findings to a sub-agent should
+      // read from outputFilePaths, not outputLogPaths.
+      outputFilePaths: extra?.outputFilePath
+        ? [...prevFilePaths, extra.outputFilePath]
+        : prevFilePaths,
     };
     if (result.timedOut) {
       next.codexReview.finalVerdict = "TIMEOUT";
@@ -401,12 +425,23 @@ export function applyResult(
       geminiReRunCount: (phaseState.codexReview?.geminiReRunCount ?? 0) + 1,
     };
     next.gemini = {
-      startedAt: new Date(Date.now() - result.durationMs).toISOString(),
+      // Preserve the original startedAt across reruns so per-phase wall-clock
+      // metrics reflect the cumulative gemini work, not just the last rerun.
+      startedAt:
+        phaseState.gemini?.startedAt ??
+        new Date(Date.now() - result.durationMs).toISOString(),
       completedAt: new Date().toISOString(),
       outputLogPath: result.logPath,
+      outputFilePath: extra?.outputFilePath,
       retries: result.retries,
       exitCode: result.exitCode ?? undefined,
     };
+    // Clear stale fix-loop bookkeeping: this rerun produces a fresh
+    // implementation, so any prior testRun/testFix counters from before the
+    // rerun would mislead the next RUN_TESTS path (premature FAIL on max-iter,
+    // confusing iteration numbers in logs).
+    next.testRun = undefined;
+    next.testFix = undefined;
     if (result.timedOut) {
       next.status = "failed";
       next.error = `Gemini re-run (from review feedback) timed out`;
