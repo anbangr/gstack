@@ -65,7 +65,7 @@ import {
   parseJudgeVerdict,
   type SubAgentResult,
 } from "./sub-agents";
-import { flipPhaseCheckboxes, flipTestSpecCheckbox } from "./plan-mutator";
+import { flipCheckbox, flipPhaseCheckboxes, flipTestSpecCheckbox } from "./plan-mutator";
 import { shipAndDeploy } from "./ship";
 import { createWorktrees, applyWinner, teardownWorktrees } from "./worktree";
 import { buildParallelPhasePlan, type ParallelPhasePlan } from "./parallel-planner";
@@ -2868,6 +2868,59 @@ function mockResult(overrides: Partial<SubAgentResult>): SubAgentResult {
   };
 }
 
+/**
+ * Reconcile plan-file checkboxes against the runtime state.
+ *
+ * If a phase reached `committed` via direct JSON state patching (e.g., to
+ * escape a stuck Codex review loop) the MARK_COMPLETE handler never ran, so
+ * the plan markdown still has `- [ ]` even though the work is done. This
+ * function flips any such boxes at startup so the markdown always mirrors the
+ * JSON state. Idempotent — already-checked boxes are skipped silently.
+ */
+function reconcileCommittedCheckboxes(
+  planFile: string,
+  phases: Phase[],
+  state: BuildState
+): void {
+  let flipped = 0;
+  for (const phase of phases) {
+    const ps = state.phases?.[phase.index];
+    if (!ps || ps.status !== "committed") continue;
+
+    if (phase.testSpecCheckboxLine !== -1) {
+      const r = flipCheckbox({
+        planFile,
+        lineNumber: phase.testSpecCheckboxLine,
+        expectedMarker: "**Test Specification",
+      });
+      if (r.error) {
+        console.warn(`[reconcile] Phase ${phase.number} test-spec checkbox: ${r.error}`);
+      } else if (r.flipped) {
+        flipped++;
+      }
+    }
+
+    const result = flipPhaseCheckboxes({
+      planFile,
+      implementationLine: phase.implementationCheckboxLine,
+      reviewLine: phase.reviewCheckboxLine,
+    });
+    if (result.implementation.error) {
+      console.warn(`[reconcile] Phase ${phase.number} impl checkbox: ${result.implementation.error}`);
+    } else if (result.implementation.flipped) {
+      flipped++;
+    }
+    if (result.review.error) {
+      console.warn(`[reconcile] Phase ${phase.number} review checkbox: ${result.review.error}`);
+    } else if (result.review.flipped) {
+      flipped++;
+    }
+  }
+  if (flipped > 0) {
+    console.log(`[reconcile] flipped ${flipped} checkbox${flipped === 1 ? "" : "es"} in ${planFile} to match committed state`);
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
@@ -3013,6 +3066,14 @@ async function main() {
       });
       saveState(state, { noGbrain: args.noGbrain, log: console.warn });
     }
+  }
+
+  // Reconcile plan-file checkboxes: any phase that reached `committed` via
+  // direct JSON state patching (e.g., bypassing MARK_COMPLETE to escape a
+  // stuck Codex review loop) will have its checkboxes still unchecked.
+  // This runs at startup so the markdown always reflects the JSON truth.
+  if (!args.dryRun) {
+    reconcileCommittedCheckboxes(args.planFile, phases, state);
   }
 
   // SIGINT — release lock, save state, exit 130.
