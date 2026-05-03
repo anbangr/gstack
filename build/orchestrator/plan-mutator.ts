@@ -165,6 +165,116 @@ export function flipTestSpecCheckbox(
 }
 
 /**
+ * Append phase blocks to a named feature in the plan file. Used by
+ * the FEATURE_NEEDS_PHASES verdict path: when the feature reviewer
+ * says "you also need to do X", the orchestrator writes new phase
+ * headings under the matching `## Feature N:` block and re-parses.
+ *
+ * Insertion point is the line BEFORE the next `## Feature ...` heading
+ * (or end-of-file when this is the last feature). Atomic temp+rename
+ * matches the rest of the module — concurrent reads see either the
+ * pre- or post-insertion content, never a partial write.
+ *
+ * Returns the line number (1-based) where insertion began, or throws
+ * on irrecoverable errors (feature heading not found in plan).
+ */
+export interface AppendFeaturePhasesArgs {
+  planFile: string;
+  /** Feature.number (string, matching the plan heading e.g. "1", "2"). */
+  featureNumber: string;
+  /**
+   * Verbatim markdown to insert. Should start with `### Phase N.review-K`
+   * heading(s); caller is responsible for shape. The block is inserted
+   * with one blank line of padding above and below.
+   */
+  phasesMd: string;
+}
+
+export function appendFeaturePhases(args: AppendFeaturePhasesArgs): {
+  insertedAtLine: number;
+} {
+  const content = fs.readFileSync(args.planFile, "utf8");
+  const lines = content.split(/\r?\n/);
+
+  // Find the target `## Feature N:` heading. Match exact number with
+  // word-boundary so "Feature 1" doesn't also match "Feature 10".
+  // The heading regex is intentionally flexible on whitespace + colon
+  // style ("## Feature 1: foo" vs "##  Feature  1 :  foo").
+  const target = new RegExp(
+    `^##\\s*Feature\\s+${args.featureNumber.replace(/[.*+?^${}()|[\\]/g, "\\$&")}\\b`,
+  );
+  let featureLineIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (target.test(lines[i])) {
+      featureLineIdx = i;
+      break;
+    }
+  }
+  if (featureLineIdx === -1) {
+    throw new Error(
+      `appendFeaturePhases: could not find "## Feature ${args.featureNumber}" heading in ${args.planFile}`,
+    );
+  }
+
+  // Find the next `## Feature ...` heading after our target — that's
+  // the upper bound of our feature's body. If no next feature heading,
+  // append at end-of-file.
+  let nextFeatureLineIdx = lines.length;
+  for (let i = featureLineIdx + 1; i < lines.length; i++) {
+    if (/^##\s*Feature\s+/i.test(lines[i])) {
+      nextFeatureLineIdx = i;
+      break;
+    }
+  }
+
+  // Trim trailing blank lines from our feature's body so the insertion
+  // gets exactly one blank line of separation, regardless of how the
+  // user authored the gap before the next feature. We walk up from the
+  // next-feature index, skipping blanks; `before` keeps only the
+  // non-blank tail of the feature body, and `after` starts at the next
+  // feature heading so the consumed blanks are dropped (not duplicated
+  // alongside the inserted padding).
+  let trimEnd = nextFeatureLineIdx;
+  while (trimEnd > featureLineIdx + 1 && lines[trimEnd - 1].trim() === "") {
+    trimEnd--;
+  }
+
+  const block = args.phasesMd.replace(/\s+$/, ""); // strip trailing whitespace
+  const padded = ["", block, ""];
+  const before = lines.slice(0, trimEnd);
+  const after = lines.slice(nextFeatureLineIdx);
+  const merged = [...before, ...padded, ...after];
+  const insertIdx = trimEnd;
+
+  // Preserve EOL style.
+  const trailingNewline = content.endsWith("\n") ? "\n" : "";
+  const eol = content.includes("\r\n") ? "\r\n" : "\n";
+  const newContent =
+    merged.join(eol) +
+    (trailingNewline && !merged[merged.length - 1] ? "" : trailingNewline);
+
+  // Atomic write via temp+rename in same dir.
+  const dir = path.dirname(args.planFile);
+  const tmp = path.join(
+    dir,
+    `.${path.basename(args.planFile)}.tmp.${process.pid}.${Date.now()}`,
+  );
+  try {
+    fs.writeFileSync(tmp, newContent);
+    fs.renameSync(tmp, args.planFile);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
+
+  return { insertedAtLine: insertIdx + 1 };
+}
+
+/**
  * Flip all checkboxes for a single phase. Used by both the startup
  * reconcile (cli.ts) and the one-shot backfill CLI. Returns the count
  * of boxes flipped and any error strings so callers can log differently.

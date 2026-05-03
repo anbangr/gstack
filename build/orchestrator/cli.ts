@@ -52,6 +52,7 @@ import {
   DEFAULT_MAX_TEST_ITERATIONS,
   DEFAULT_MAX_RED_SPEC_ITERATIONS,
   DEFAULT_CODEX_GEMINI_RERUN_FREQ,
+  DEFAULT_FEATURE_REVIEW_MAX_ITER,
   isCodexConvergenceFailure,
   type Action,
 } from "./phase-runner";
@@ -72,7 +73,14 @@ import {
   flipPhaseCheckboxes,
   flipTestSpecCheckbox,
   reconcilePhaseCheckboxes,
+  appendFeaturePhases,
 } from "./plan-mutator";
+import {
+  buildFeatureReviewPrompt,
+  parseFeatureReviewVerdict,
+  shouldSkipFeatureReview,
+  type ParsedFeatureVerdict,
+} from "./feature-review";
 import { shipAndDeploy } from "./ship";
 import { createWorktrees, applyWinner, teardownWorktrees } from "./worktree";
 import {
@@ -131,6 +139,16 @@ export interface Args {
   skipSweep: boolean;
   /** Original source plan to verify and archive after the living plan completes. */
   originPlan?: string;
+  /**
+   * Skip the per-feature meta-review pass that fires after all phases of
+   * a feature commit. Default off — review runs unless the skip heuristic
+   * (single-phase feature, iter-1 codex pass, no Gemini reruns, no test-
+   * fix loops) trips. Set this to bypass entirely (CI, fast iterations,
+   * cost-sensitive runs).
+   */
+  skipFeatureReview: boolean;
+  /** Cap on per-feature review cycles. Defaults to BUILD_DEFAULTS.limits.featureReviewMaxIterations (3). */
+  featureReviewMaxIter: number;
 }
 
 export function parseArgs(argv: string[]): Args {
@@ -159,6 +177,8 @@ export function parseArgs(argv: string[]): Args {
     skipCleanCheck: false,
     skipSweep: false,
     originPlan: undefined,
+    skipFeatureReview: false,
+    featureReviewMaxIter: DEFAULT_FEATURE_REVIEW_MAX_ITER,
   };
   const positional: string[] = [];
   const roleFlags = buildRoleFlagMap();
@@ -171,7 +191,18 @@ export function parseArgs(argv: string[]): Args {
     else if (a === "--skip-ship") args.skipShip = true;
     else if (a === "--skip-clean-check") args.skipCleanCheck = true;
     else if (a === "--skip-sweep") args.skipSweep = true;
-    else if (a === "--dual-impl") args.dualImpl = true;
+    else if (a === "--skip-feature-review") args.skipFeatureReview = true;
+    else if (a === "--feature-review-max-iter") {
+      const next = argv[++i];
+      const n = Number(next);
+      if (!Number.isInteger(n) || n < 1) {
+        console.error(
+          `--feature-review-max-iter expects a positive integer, got: ${next}`,
+        );
+        process.exit(2);
+      }
+      args.featureReviewMaxIter = n;
+    } else if (a === "--dual-impl") args.dualImpl = true;
     else if (a === "--parallel-phases") {
       const next = argv[++i];
       const n = Number(next);
@@ -465,6 +496,11 @@ Flags:
   --skip-ship          Skip per-feature /ship + /land-and-deploy steps.
   --skip-clean-check   Skip the pre-build working tree dirty check.
   --skip-sweep         Skip the unshipped feat/* branch sweep at startup.
+  --skip-feature-review  Skip the per-feature meta-review pass.
+  --feature-review-max-iter N  Cap on per-feature review cycles before
+                       hard-fail (F4 will swap this for an interactive
+                       prompt to allow a 4th cycle).
+  --feature-review-model <m>       Default: ${DEFAULT_ROLE_CONFIGS.featureReview.model}.
   --dual-impl          Tournament mode: Gemini and Codex implement in parallel
                        (isolated git worktrees), the configured judge picks the winner
                        is cherry-picked back. Existing TDD pipeline runs after.
@@ -2033,6 +2069,234 @@ function countCommitsSinceBase(
   return Number.isFinite(n) ? n : null;
 }
 
+// ===========================================================================
+// Feature-level meta-review (F3 wiring)
+// ===========================================================================
+
+/**
+ * Reset a phase's runtime state so the orchestrator's main loop will
+ * re-run it. Used by the FEATURE_REDO verdict path. Clears the codex
+ * review history, gemini invocation record, test-run/test-fix counters,
+ * and committedAt timestamp; flips status back to "pending". Does NOT
+ * touch the on-disk plan markdown — checkboxes will be re-flipped when
+ * the phase commits again. Mirrors the behavior of the startup
+ * `--reset-phase N` flag but operates on a single phase by index for
+ * mid-run reset.
+ */
+function resetPhaseStateForRedo(state: BuildState, phaseIndex: number): void {
+  const ps = state.phases[phaseIndex];
+  if (!ps) return;
+  ps.status = "pending";
+  delete (ps as any).codexReview;
+  delete (ps as any).gemini;
+  delete (ps as any).geminiTestSpec;
+  delete (ps as any).testRun;
+  delete (ps as any).testFix;
+  delete (ps as any).contextSave;
+  delete (ps as any).originIssueLogPath;
+  delete (ps as any).committedAt;
+  delete (ps as any).error;
+  delete (ps as any).redSpecAttempts;
+  delete (ps as any).dualImpl;
+}
+
+/**
+ * Single iteration of the feature-level review loop. Builds the prompt,
+ * spawns the configured reviewer (see configure.cm featureReview role),
+ * parses the verdict, and applies the verdict's side effects:
+ *
+ *   FEATURE_PASS          → no-op (caller proceeds to ship)
+ *   FEATURE_NEEDS_PHASES  → append to plan, return new phases for
+ *                           caller to re-parse + merge into BuildState
+ *   FEATURE_REDO          → reset named phases in-place
+ *   UNCLEAR / cap-hit     → caller-side decision (F4 prompt or fail)
+ *
+ * Returns the parsed verdict + the action taken so the caller can
+ * advance the outer loop.
+ */
+async function runFeatureReviewIteration(args: {
+  state: BuildState;
+  feature: Feature;
+  featureState: FeatureState;
+  phases: Phase[];
+  cwd: string;
+  planFile: string;
+  iteration: number;
+  roles: RoleConfigs;
+  dryRun: boolean;
+  noGbrain: boolean;
+}): Promise<{
+  verdict: ParsedFeatureVerdict;
+  action: "ship" | "phases_added" | "redo" | "unclear";
+  outputFilePath: string;
+}> {
+  const slug = args.state.slug;
+  const inputFilePath = path.join(
+    logDir(slug),
+    `feature-${args.feature.number}-review-${args.iteration}-input.md`,
+  );
+  const outputFilePath = path.join(
+    logDir(slug),
+    `feature-${args.feature.number}-review-${args.iteration}-output.md`,
+  );
+
+  // Containment-checked prior report (F2 trust-boundary defense).
+  const priorRaw = args.featureState.featureReview?.outputFilePaths?.at(-1);
+  const priorReportPath = priorRaw
+    ? (validateLogPathInScope(priorRaw, slug) ?? undefined)
+    : undefined;
+
+  // Compute feature commits + diff. Best-effort — if either git call
+  // fails (no commits yet, detached HEAD, etc) we pass an empty string
+  // and the prompt builder embeds a `(no commits captured)` note.
+  const branchPoint = args.featureState.branch
+    ? `${args.featureState.branch}^{tree}` // first commit on the feature branch is fine; we just need an ancestor
+    : "HEAD~10";
+  const commitsR = spawnSync(
+    "git",
+    ["log", `${branchPoint}..HEAD`, "--oneline", "--no-decorate"],
+    { cwd: args.cwd, encoding: "utf8" },
+  );
+  const featureCommitsOneline =
+    commitsR.status === 0 ? (commitsR.stdout || "").trim() : "";
+  const diffR = spawnSync("git", ["diff", `${branchPoint}..HEAD`], {
+    cwd: args.cwd,
+    encoding: "utf8",
+  });
+  // Cap to ~80KB to avoid blowing the reviewer's context window. The
+  // header explains the truncation so the reviewer knows the diff is
+  // partial.
+  let featureDiff = diffR.status === 0 ? diffR.stdout || "" : "";
+  const DIFF_CAP = 80_000;
+  if (featureDiff.length > DIFF_CAP) {
+    featureDiff =
+      `[diff truncated — first ${DIFF_CAP} of ${featureDiff.length} chars shown]\n` +
+      featureDiff.slice(0, DIFF_CAP);
+  }
+
+  const promptBody = buildFeatureReviewPrompt({
+    feature: args.feature,
+    featureState: args.featureState,
+    phases: args.phases,
+    phaseStates: args.state.phases,
+    planFile: args.planFile,
+    branch: args.state.branch,
+    iteration: args.iteration,
+    priorReportPath,
+    featureCommitsOneline,
+    featureDiff,
+    outputFilePath,
+  });
+  fs.writeFileSync(inputFilePath, promptBody);
+  fs.writeFileSync(outputFilePath, "");
+
+  let result: SubAgentResult;
+  if (args.dryRun) {
+    // Default dry-run verdict: PASS so the orchestrator walks the happy
+    // path. Tests can opt into other verdicts by writing the file.
+    fs.writeFileSync(
+      outputFilePath,
+      "## VERDICT\nFEATURE_PASS\n\n## Findings\n- [dry-run] no real review performed\n",
+    );
+    result = mockResult({
+      exitCode: 0,
+      stdout: "## VERDICT\nFEATURE_PASS\n",
+      logPath: inputFilePath,
+    });
+  } else {
+    result = await runRoleTask({
+      role: args.roles.featureReview,
+      inputFilePath,
+      outputFilePath,
+      cwd: args.cwd,
+      slug,
+      phaseNumber: `feature-${args.feature.number}`,
+      iteration: args.iteration,
+      logPrefix: "feature-review",
+    });
+  }
+
+  // Persist iteration onto featureState.featureReview.
+  if (!args.featureState.featureReview) {
+    args.featureState.featureReview = {
+      iterations: 0,
+      outputLogPaths: [],
+      outputFilePaths: [],
+    };
+  }
+  const fr = args.featureState.featureReview;
+  fr.iterations += 1;
+  fr.outputLogPaths.push(result.logPath);
+  fr.outputFilePaths!.push(outputFilePath);
+
+  // Read the artifact (mergeOutputFile populated result.stdout from
+  // outputFilePath, but the file itself is the canonical source for
+  // future iterations to read back).
+  let artifactRaw = "";
+  try {
+    artifactRaw = fs.readFileSync(outputFilePath, "utf8");
+  } catch {
+    artifactRaw = result.stdout || "";
+  }
+  const verdict = parseFeatureReviewVerdict(artifactRaw);
+  fr.finalVerdict =
+    verdict.verdict === "UNCLEAR"
+      ? "TIMEOUT" // surface unclear as the closest existing enum so dashboards don't choke
+      : (verdict.verdict as any);
+
+  if (result.timedOut || result.exitCode !== 0) {
+    fr.finalVerdict = "TIMEOUT";
+    return { verdict, action: "unclear", outputFilePath };
+  }
+
+  if (verdict.verdict === "FEATURE_PASS") {
+    return { verdict, action: "ship", outputFilePath };
+  }
+
+  if (verdict.verdict === "FEATURE_REDO") {
+    // Map phase numbers (strings, matching plan headings) to indexes
+    // within THIS feature only. Reviewer-supplied phase numbers that
+    // don't belong to this feature are silently ignored — the prompt
+    // tells the reviewer to scope to its feature, but if a stray
+    // number sneaks through we don't reach into other features.
+    const featurePhases = args.feature.phaseIndexes.map((i) => args.phases[i]);
+    const targets: number[] = [];
+    for (const num of verdict.phasesToRedo) {
+      const phase = featurePhases.find((p) => p?.number === num);
+      if (phase) targets.push(phase.index);
+    }
+    if (targets.length === 0) {
+      // Reviewer said REDO but named no valid phase in this feature.
+      // Treat as UNCLEAR — caller will decide.
+      return { verdict, action: "unclear", outputFilePath };
+    }
+    for (const i of targets) {
+      resetPhaseStateForRedo(args.state, i);
+    }
+    fr.phasesReset = targets;
+    saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
+    return { verdict, action: "redo", outputFilePath };
+  }
+
+  if (verdict.verdict === "FEATURE_NEEDS_PHASES") {
+    if (!verdict.additionalPhasesMd) {
+      // Verdict claims new phases needed but supplied no markdown body.
+      // Caller will treat as UNCLEAR.
+      return { verdict, action: "unclear", outputFilePath };
+    }
+    appendFeaturePhases({
+      planFile: args.planFile,
+      featureNumber: args.feature.number,
+      phasesMd: verdict.additionalPhasesMd,
+    });
+    fr.phasesAdded = (fr.phasesAdded ?? 0) + 1;
+    saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
+    return { verdict, action: "phases_added", outputFilePath };
+  }
+
+  return { verdict, action: "unclear", outputFilePath };
+}
+
 async function runPhase(args: {
   state: BuildState;
   phase: Phase;
@@ -3513,7 +3777,13 @@ async function main() {
   }
 
   const content = fs.readFileSync(args.planFile, "utf8");
-  const { features, phases, warnings } = parsePlan(content, {
+  // `let` (not `const`) for features + phases — the F3 feature-review
+  // FEATURE_NEEDS_PHASES path appends to the plan file mid-run and
+  // re-parses, replacing both arrays in-place. Other call sites in this
+  // function read from these references, so the rebinding has to be
+  // visible to them.
+  // eslint-disable-next-line prefer-const
+  let { features, phases, warnings } = parsePlan(content, {
     dualImpl: args.dualImpl,
   });
 
@@ -3850,6 +4120,166 @@ async function main() {
         if (exitCode !== 0) break;
 
         if (!resumeAfterLanding) {
+          featureState.status = "phases_done";
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+        }
+
+        // F3: feature-level meta-review. Fires AFTER phases_done and
+        // BEFORE shipping. The reviewer sees the full feature: plan body,
+        // every phase's status + iteration counts, all commits + net diff.
+        // Verdict actions:
+        //   FEATURE_PASS         → fall through to ship (current behavior)
+        //   FEATURE_NEEDS_PHASES → plan was appended; re-parse, mark feature
+        //                          running, continue outer loop to process
+        //                          the new phases
+        //   FEATURE_REDO         → named phases reset in-place; mark feature
+        //                          running, continue outer loop
+        //   UNCLEAR / cap-hit    → F3 ships hard-fail; F4 adds the user
+        //                          stdin prompt for a 4th cycle
+        const skipReview =
+          args.skipFeatureReview ||
+          resumeAfterLanding ||
+          shouldSkipFeatureReview(featureDef, state.phases);
+        if (!skipReview) {
+          const cap = args.featureReviewMaxIter;
+          let reviewLoopAction: "ship" | "phases_added" | "redo" | "blocked" =
+            "ship";
+          while (true) {
+            const currentIter =
+              (featureState.featureReview?.iterations ?? 0) + 1;
+            if (currentIter > cap) {
+              // F3: hard-fail at cap. F4 swaps this for the stdin prompt.
+              console.error(
+                `\n✗ Feature ${featureState.number} hit the feature-review cap (${cap} cycles) without converging.`,
+              );
+              featureState.status = "feature_blocked";
+              featureState.error =
+                featureState.error ??
+                `feature-review failed to converge after ${cap} cycles`;
+              saveState(state, {
+                noGbrain: args.noGbrain,
+                log: console.warn,
+              });
+              reviewLoopAction = "blocked";
+              break;
+            }
+            featureState.status = "feature_review_running";
+            saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+            console.log(
+              `\n▶ Feature ${featureState.number} review cycle ${currentIter}/${cap} (${roleLabel(args.roles.featureReview)})`,
+            );
+            const out = await runFeatureReviewIteration({
+              state,
+              feature: featureDef,
+              featureState,
+              phases,
+              cwd,
+              planFile: args.planFile,
+              iteration: currentIter,
+              roles: args.roles,
+              dryRun: args.dryRun,
+              noGbrain: args.noGbrain,
+            });
+            console.log(
+              `  feature-review verdict: ${out.verdict.verdict} (${out.outputFilePath})`,
+            );
+            if (out.action === "ship") {
+              reviewLoopAction = "ship";
+              break;
+            }
+            if (out.action === "phases_added") {
+              // Re-parse the plan and merge new phases into BuildState.
+              // The plan-mutator appended under the current feature; new
+              // entries land at the end of the phases array (parser walks
+              // top-to-bottom).
+              const newContent = fs.readFileSync(args.planFile, "utf8");
+              const reparsed = parsePlan(newContent, {
+                dualImpl: args.dualImpl,
+              });
+              const oldPhaseCount = phases.length;
+              const addedPhases = reparsed.phases.slice(oldPhaseCount);
+              for (const np of addedPhases) {
+                state.phases.push({
+                  index: np.index,
+                  number: np.number,
+                  name: np.name,
+                  status: "pending",
+                });
+                if (np.featureIndex === featureDef.index) {
+                  featureState.phaseIndexes.push(np.index);
+                }
+              }
+              // Replace outer-scope arrays so subsequent iterations see
+              // the new shape.
+              phases = reparsed.phases;
+              features = reparsed.features;
+              // The featureDef reference is now stale (parser produced a
+              // new object). Rebind so the next loop iteration sees the
+              // up-to-date phaseIndexes array.
+              const refreshed = features[featureDef.index];
+              if (refreshed) {
+                // featureDef is `const` in scope above so we cannot
+                // reassign — but its mutable fields (phaseIndexes) are
+                // updated in-place above. Verify identity holds.
+                if (
+                  refreshed.phaseIndexes.length <
+                  featureState.phaseIndexes.length
+                ) {
+                  // Defensive: parser may strip phases that lost their
+                  // checkboxes. Trust the parser's view in that case.
+                  featureState.phaseIndexes = [...refreshed.phaseIndexes];
+                }
+              }
+              featureState.status = "running";
+              saveState(state, {
+                noGbrain: args.noGbrain,
+                log: console.warn,
+              });
+              console.log(
+                `  → Plan amended with ${addedPhases.length} new phase(s); re-running phase loop.`,
+              );
+              reviewLoopAction = "phases_added";
+              break;
+            }
+            if (out.action === "redo") {
+              const resetCount = out.verdict.phasesToRedo.length;
+              featureState.status = "running";
+              saveState(state, {
+                noGbrain: args.noGbrain,
+                log: console.warn,
+              });
+              console.log(
+                `  → ${resetCount} phase(s) reset for redo; re-running phase loop.`,
+              );
+              reviewLoopAction = "redo";
+              break;
+            }
+            // out.action === "unclear" — verdict was malformed or
+            // missing. Loop back and try again until the cap. The
+            // iteration counter has already been incremented by
+            // runFeatureReviewIteration, so the cap check at the
+            // top of the next pass will fire.
+            console.warn(
+              `  → review verdict was UNCLEAR; retrying (cycle ${currentIter + 1}/${cap})`,
+            );
+          }
+
+          if (reviewLoopAction === "blocked") {
+            exitCode = 1;
+            break;
+          }
+          if (
+            reviewLoopAction === "phases_added" ||
+            reviewLoopAction === "redo"
+          ) {
+            // Bail out of the rest of this feature's iteration (skip
+            // ship). The outer `while (true)` will pick up the same
+            // feature (now status=running) on the next pass and re-run
+            // the phase loop.
+            continue;
+          }
+          // reviewLoopAction === "ship" → restore status and fall
+          // through to the existing ship logic below.
           featureState.status = "phases_done";
           saveState(state, { noGbrain: args.noGbrain, log: console.warn });
         }

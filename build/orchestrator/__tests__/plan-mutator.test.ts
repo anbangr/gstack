@@ -216,6 +216,170 @@ describe("flipTestSpecCheckbox", () => {
   });
 });
 
+describe("appendFeaturePhases", () => {
+  // Local require to avoid restructuring the existing imports.
+  const { appendFeaturePhases } = require("../plan-mutator");
+
+  it("inserts the markdown block before the next feature heading", () => {
+    const md = `# Plan
+
+## Feature 1: Auth
+Body for feature 1.
+
+### Phase 1: Schema
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+
+## Feature 2: Billing
+Body for feature 2.
+`;
+    const p = _testWritePlan(md);
+    const block = `### Phase 1.review-1: Add migration
+- [ ] **Implementation**: write the migration
+- [ ] **Review**: review for safety`;
+    const r = appendFeaturePhases({
+      planFile: p,
+      featureNumber: "1",
+      phasesMd: block,
+    });
+    expect(r.insertedAtLine).toBeGreaterThan(0);
+    const after = fs.readFileSync(p, "utf8");
+    // Block landed under Feature 1, before Feature 2 heading.
+    const feat1Idx = after.indexOf("## Feature 1: Auth");
+    const feat2Idx = after.indexOf("## Feature 2: Billing");
+    const blockIdx = after.indexOf("### Phase 1.review-1");
+    expect(feat1Idx).toBeGreaterThanOrEqual(0);
+    expect(feat2Idx).toBeGreaterThan(feat1Idx);
+    expect(blockIdx).toBeGreaterThan(feat1Idx);
+    expect(blockIdx).toBeLessThan(feat2Idx);
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("appends at end-of-file when the target is the last feature", () => {
+    const md = `# Plan
+
+## Feature 1: Only Feature
+
+### Phase 1: A
+- [ ] **Implementation**: a
+- [ ] **Review**: b
+`;
+    const p = _testWritePlan(md);
+    const block = `### Phase 1.review-1: Late addition
+- [ ] **Implementation**: x
+- [ ] **Review**: y`;
+    appendFeaturePhases({
+      planFile: p,
+      featureNumber: "1",
+      phasesMd: block,
+    });
+    const after = fs.readFileSync(p, "utf8");
+    expect(after).toContain("### Phase 1.review-1: Late addition");
+    // Original Phase 1 is still present.
+    expect(after).toContain("### Phase 1: A");
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("matches feature numbers with word boundary (Feature 1 does not match Feature 10)", () => {
+    const md = `## Feature 10: Big
+
+### Phase 10: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+
+## Feature 1: Small
+
+### Phase 1: y
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+`;
+    const p = _testWritePlan(md);
+    appendFeaturePhases({
+      planFile: p,
+      featureNumber: "1",
+      phasesMd: `### Phase 1.review-1: Belongs to Feature 1`,
+    });
+    const after = fs.readFileSync(p, "utf8");
+    // Block must land under Feature 1 (the second heading), NOT under Feature 10.
+    const feat10Idx = after.indexOf("## Feature 10: Big");
+    const feat1Idx = after.indexOf("## Feature 1: Small");
+    const blockIdx = after.indexOf("### Phase 1.review-1");
+    expect(feat10Idx).toBeLessThan(feat1Idx);
+    expect(blockIdx).toBeGreaterThan(feat1Idx);
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("throws when the named feature heading is not in the plan", () => {
+    const md = `## Feature 1: Only
+
+### Phase 1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+`;
+    const p = _testWritePlan(md);
+    expect(() =>
+      appendFeaturePhases({
+        planFile: p,
+        featureNumber: "99",
+        phasesMd: `### Phase X: ghost`,
+      }),
+    ).toThrow(/could not find "## Feature 99"/);
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("preserves CRLF line endings if the plan uses them", () => {
+    const md = `## Feature 1: A\r\n\r\n### Phase 1: x\r\n- [ ] **Implementation**: x\r\n- [ ] **Review**: y\r\n\r\n## Feature 2: B\r\n`;
+    const p = _testWritePlan(md);
+    appendFeaturePhases({
+      planFile: p,
+      featureNumber: "1",
+      phasesMd: `### Phase 1.review-1: Added`,
+    });
+    const after = fs.readFileSync(p, "utf8");
+    expect(after).toContain("\r\n");
+    expect(after).toContain("### Phase 1.review-1: Added");
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("normalizes the gap so insertion gets exactly one blank line of separation", () => {
+    const md = `## Feature 1: A
+
+### Phase 1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+
+
+
+## Feature 2: B
+`;
+    const p = _testWritePlan(md);
+    appendFeaturePhases({
+      planFile: p,
+      featureNumber: "1",
+      phasesMd: `### Phase 1.review-1: Added\n- [ ] **Implementation**: i\n- [ ] **Review**: r`,
+    });
+    const after = fs.readFileSync(p, "utf8");
+    // No quadruple blank lines (the original triple gap was collapsed
+    // before insertion + the inserted block adds its own padding).
+    expect(after).not.toMatch(/\n\n\n\n/);
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("cleans up temp file on success (no .tmp.* leftover)", () => {
+    const md = `## Feature 1: A\n\n### Phase 1: x\n- [ ] **Implementation**: x\n- [ ] **Review**: y\n`;
+    const p = _testWritePlan(md);
+    appendFeaturePhases({
+      planFile: p,
+      featureNumber: "1",
+      phasesMd: `### Phase 1.review-1: x`,
+    });
+    const dir = path.dirname(p);
+    const stragglers = fs.readdirSync(dir).filter((f) => f.includes(".tmp."));
+    expect(stragglers).toHaveLength(0);
+    fs.rmSync(dir, { recursive: true });
+  });
+});
+
 describe("reconcilePhaseCheckboxes", () => {
   it("flips all three checkboxes for a TDD phase", () => {
     const md = `### Phase 1: Foo
