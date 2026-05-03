@@ -16,42 +16,55 @@
  * we can unit-test every branch with a few lines and a mock result.
  */
 
-import type { PhaseState, Phase, DualImplTestResult } from './types';
-import type { SubAgentResult, Verdict } from './sub-agents';
-import { parseVerdict } from './sub-agents';
-import { BUILD_DEFAULTS, envNumberOrDefault } from './build-config';
+import type { PhaseState, Phase, DualImplTestResult } from "./types";
+import type { SubAgentResult, Verdict } from "./sub-agents";
+import { parseVerdict } from "./sub-agents";
+import { BUILD_DEFAULTS, envNumberOrDefault } from "./build-config";
 
 /** Maximum recursive Codex review iterations before giving up. */
-export const DEFAULT_MAX_CODEX_ITERATIONS =
-  envNumberOrDefault('GSTACK_BUILD_CODEX_MAX_ITER', BUILD_DEFAULTS.limits.codexMaxIterations);
+export const DEFAULT_MAX_CODEX_ITERATIONS = envNumberOrDefault(
+  "GSTACK_BUILD_CODEX_MAX_ITER",
+  BUILD_DEFAULTS.limits.codexMaxIterations,
+);
 
 /** Maximum times Gemini may re-write tests when VERIFY_RED shows tests pass trivially. */
-export const DEFAULT_MAX_RED_SPEC_ITERATIONS =
-  envNumberOrDefault('GSTACK_BUILD_RED_MAX_ITER', BUILD_DEFAULTS.limits.redSpecMaxIterations);
+export const DEFAULT_MAX_RED_SPEC_ITERATIONS = envNumberOrDefault(
+  "GSTACK_BUILD_RED_MAX_ITER",
+  BUILD_DEFAULTS.limits.redSpecMaxIterations,
+);
 
-export const DEFAULT_MAX_TEST_ITERATIONS =
-  envNumberOrDefault('GSTACK_BUILD_TEST_MAX_ITER', BUILD_DEFAULTS.limits.testMaxIterations);
+export const DEFAULT_MAX_TEST_ITERATIONS = envNumberOrDefault(
+  "GSTACK_BUILD_TEST_MAX_ITER",
+  BUILD_DEFAULTS.limits.testMaxIterations,
+);
 
 /** After this many consecutive Codex GATE FAILs, re-invoke Gemini with reviewer findings. 0 = disabled. */
-export const DEFAULT_CODEX_GEMINI_RERUN_FREQ =
-  envNumberOrDefault('GSTACK_BUILD_CODEX_GEMINI_RERUN_FREQ', 2);
+export const DEFAULT_CODEX_GEMINI_RERUN_FREQ = envNumberOrDefault(
+  "GSTACK_BUILD_CODEX_GEMINI_RERUN_FREQ",
+  2,
+);
 
 export type Action =
-  | { type: 'RUN_GEMINI'; phaseIndex: number; iteration: number }
-  | { type: 'RUN_GEMINI_FROM_REVIEW'; phaseIndex: number; iteration: number; reviewFeedbackPath: string }
-  | { type: 'RUN_CODEX_REVIEW'; phaseIndex: number; iteration: number }
-  | { type: 'MARK_COMPLETE'; phaseIndex: number }
-  | { type: 'FAIL'; phaseIndex: number; reason: string }
-  | { type: 'DONE'; phaseIndex: number }
-  | { type: 'RUN_GEMINI_TEST_SPEC'; phaseIndex: number; iteration: number }
-  | { type: 'VERIFY_RED'; phaseIndex: number }
-  | { type: 'RUN_TESTS'; phaseIndex: number; iteration: number }
-  | { type: 'RUN_GEMINI_FIX'; phaseIndex: number; iteration: number }
+  | { type: "RUN_GEMINI"; phaseIndex: number; iteration: number }
+  | {
+      type: "RUN_GEMINI_FROM_REVIEW";
+      phaseIndex: number;
+      iteration: number;
+      reviewFeedbackPath: string;
+    }
+  | { type: "RUN_CODEX_REVIEW"; phaseIndex: number; iteration: number }
+  | { type: "MARK_COMPLETE"; phaseIndex: number }
+  | { type: "FAIL"; phaseIndex: number; reason: string }
+  | { type: "DONE"; phaseIndex: number }
+  | { type: "RUN_GEMINI_TEST_SPEC"; phaseIndex: number; iteration: number }
+  | { type: "VERIFY_RED"; phaseIndex: number }
+  | { type: "RUN_TESTS"; phaseIndex: number; iteration: number }
+  | { type: "RUN_GEMINI_FIX"; phaseIndex: number; iteration: number }
   // Dual-implementor actions (--dual-impl flag)
-  | { type: 'RUN_DUAL_IMPL'; phaseIndex: number; iteration: number }
-  | { type: 'RUN_DUAL_TESTS'; phaseIndex: number }
-  | { type: 'RUN_JUDGE'; phaseIndex: number }
-  | { type: 'APPLY_WINNER'; phaseIndex: number; winner: 'gemini' | 'codex' };
+  | { type: "RUN_DUAL_IMPL"; phaseIndex: number; iteration: number }
+  | { type: "RUN_DUAL_TESTS"; phaseIndex: number }
+  | { type: "RUN_JUDGE"; phaseIndex: number }
+  | { type: "APPLY_WINNER"; phaseIndex: number; winner: "gemini" | "codex" };
 
 /**
  * Given a phase's runtime state, decide what to do next.
@@ -73,9 +86,13 @@ export function decideNextAction(
   codexGeminiRerunFreq: number = DEFAULT_CODEX_GEMINI_RERUN_FREQ,
 ): Action {
   switch (phaseState.status) {
-    case 'pending':
+    case "pending":
       if (phase && !phase.testSpecDone) {
-        return { type: 'RUN_GEMINI_TEST_SPEC', phaseIndex: phaseState.index, iteration: 1 };
+        return {
+          type: "RUN_GEMINI_TEST_SPEC",
+          phaseIndex: phaseState.index,
+          iteration: 1,
+        };
       }
       // Prewritten test spec + dual-impl: confirm tests are red before spawning
       // both implementors — same guarantee as the standard TDD path.
@@ -83,162 +100,182 @@ export function decideNextAction(
       // (which set testSpecDone=true via the "no checkbox = already done" compat
       // path). Legacy plans should run the unchanged single-Gemini flow.
       if (phase?.dualImpl && phase.testSpecCheckboxLine !== -1) {
-        return { type: 'VERIFY_RED', phaseIndex: phaseState.index };
+        return { type: "VERIFY_RED", phaseIndex: phaseState.index };
       }
       return {
-        type: 'RUN_GEMINI',
+        type: "RUN_GEMINI",
         phaseIndex: phaseState.index,
         iteration: (phaseState.gemini?.retries ?? 0) + 1,
       };
 
-    case 'gemini_running':
+    case "gemini_running":
       // Should not happen in practice: caller should have applied the
       // gemini result before re-asking. But if we resumed from a crash
       // mid-gemini, treat as pending and start over.
       return {
-        type: 'RUN_GEMINI',
+        type: "RUN_GEMINI",
         phaseIndex: phaseState.index,
         iteration: 1,
       };
 
-    case 'test_spec_running':
+    case "test_spec_running":
       if (phase?.testSpecDone) {
         // Prewritten test spec: VERIFY_RED ran and found tests pass trivially.
         // Re-running the test spec generator makes no sense — the spec is
         // user-authored. Fail with a clear message.
         if ((phaseState.redSpecAttempts ?? 0) > 0) {
           return {
-            type: 'FAIL',
+            type: "FAIL",
             phaseIndex: phaseState.index,
             reason:
-              'Prewritten tests pass before implementation — fix the tests so they fail first, then re-run with --dual-impl',
+              "Prewritten tests pass before implementation — fix the tests so they fail first, then re-run with --dual-impl",
           };
         }
         // redSpecAttempts=0: process crashed between writing test_spec_running
         // and launching VERIFY_RED. Retry VERIFY_RED rather than spuriously
         // failing or running the test spec generator on a prewritten spec.
-        return { type: 'VERIFY_RED', phaseIndex: phaseState.index };
+        return { type: "VERIFY_RED", phaseIndex: phaseState.index };
       }
       return {
-        type: 'RUN_GEMINI_TEST_SPEC',
+        type: "RUN_GEMINI_TEST_SPEC",
         phaseIndex: phaseState.index,
         iteration: (phaseState.redSpecAttempts ?? 0) + 1,
       };
 
-    case 'test_spec_done':
-      return { type: 'VERIFY_RED', phaseIndex: phaseState.index };
+    case "test_spec_done":
+      return { type: "VERIFY_RED", phaseIndex: phaseState.index };
 
-    case 'tests_red':
+    case "tests_red":
       if (phase?.dualImpl) {
-        return { type: 'RUN_DUAL_IMPL', phaseIndex: phaseState.index, iteration: 1 };
+        return {
+          type: "RUN_DUAL_IMPL",
+          phaseIndex: phaseState.index,
+          iteration: 1,
+        };
       }
       return {
-        type: 'RUN_GEMINI',
+        type: "RUN_GEMINI",
         phaseIndex: phaseState.index,
         iteration: (phaseState.gemini?.retries ?? 0) + 1,
       };
 
-    case 'impl_done':
+    case "impl_done":
       // For TDD phases (testSpecDone=false) or prewritten-testspec+dual-impl phases,
       // run tests to verify the adopted code on main cwd.
       // For legacy phases (testSpecDone=true, !dualImpl), go straight to Codex review.
       if (phase && (!phase.testSpecDone || phase.dualImpl)) {
         return {
-          type: 'RUN_TESTS',
+          type: "RUN_TESTS",
           phaseIndex: phaseState.index,
           iteration: (phaseState.testRun?.iterations ?? 0) + 1,
         };
       }
       return {
-        type: 'RUN_CODEX_REVIEW',
+        type: "RUN_CODEX_REVIEW",
         phaseIndex: phaseState.index,
         iteration: (phaseState.codexReview?.iterations ?? 0) + 1,
       };
 
-    case 'test_fix_running': {
+    case "test_fix_running": {
       const nextIter = (phaseState.testFix?.iterations ?? 0) + 1;
       if (nextIter > maxTestIterations) {
         return {
-          type: 'FAIL',
+          type: "FAIL",
           phaseIndex: phaseState.index,
           reason: `Tests still failing after ${maxTestIterations} fix iterations`,
         };
       }
-      return { type: 'RUN_GEMINI_FIX', phaseIndex: phaseState.index, iteration: nextIter };
+      return {
+        type: "RUN_GEMINI_FIX",
+        phaseIndex: phaseState.index,
+        iteration: nextIter,
+      };
     }
 
-    case 'tests_green':
+    case "tests_green":
       return {
-        type: 'RUN_CODEX_REVIEW',
+        type: "RUN_CODEX_REVIEW",
         phaseIndex: phaseState.index,
         iteration: (phaseState.codexReview?.iterations ?? 0) + 1,
       };
 
-    case 'codex_running': {
+    case "codex_running": {
       const nextIter = (phaseState.codexReview?.iterations ?? 0) + 1;
       if (nextIter > maxCodexIterations) {
         return {
-          type: 'FAIL',
+          type: "FAIL",
           phaseIndex: phaseState.index,
           reason: `Codex review failed to converge after ${maxCodexIterations} iterations`,
         };
       }
       // Every codexGeminiRerunFreq Codex GATE FAILs, re-invoke Gemini with reviewer context.
       // Uses `iterations % freq === 0` so it fires at iterations 2, 4, 6 (with freq=2).
+      // The cap check above takes priority: if maxCodexIterations is e.g. 4, the re-run
+      // at iterations=4 is preempted by FAIL before this check runs.
       const reviewCount = phaseState.codexReview?.iterations ?? 0;
       const feedbackPath = phaseState.codexReview?.outputLogPaths?.at(-1);
-      if (codexGeminiRerunFreq > 0 && reviewCount > 0 && reviewCount % codexGeminiRerunFreq === 0 && feedbackPath) {
+      if (
+        codexGeminiRerunFreq > 0 &&
+        reviewCount > 0 &&
+        reviewCount % codexGeminiRerunFreq === 0 &&
+        feedbackPath
+      ) {
         return {
-          type: 'RUN_GEMINI_FROM_REVIEW',
+          type: "RUN_GEMINI_FROM_REVIEW",
           phaseIndex: phaseState.index,
           iteration: nextIter,
           reviewFeedbackPath: feedbackPath,
         };
       }
       return {
-        type: 'RUN_CODEX_REVIEW',
+        type: "RUN_CODEX_REVIEW",
         phaseIndex: phaseState.index,
         iteration: nextIter,
       };
     }
 
-    case 'review_clean':
-      return { type: 'MARK_COMPLETE', phaseIndex: phaseState.index };
+    case "review_clean":
+      return { type: "MARK_COMPLETE", phaseIndex: phaseState.index };
 
-    case 'committed':
-      return { type: 'DONE', phaseIndex: phaseState.index };
+    case "committed":
+      return { type: "DONE", phaseIndex: phaseState.index };
 
-    case 'failed':
+    case "failed":
       return {
-        type: 'FAIL',
+        type: "FAIL",
         phaseIndex: phaseState.index,
-        reason: phaseState.error || 'phase previously failed',
+        reason: phaseState.error || "phase previously failed",
       };
 
     // Dual-implementor states
-    case 'dual_impl_running':
-      return { type: 'RUN_DUAL_IMPL', phaseIndex: phaseState.index, iteration: 1 };
+    case "dual_impl_running":
+      return {
+        type: "RUN_DUAL_IMPL",
+        phaseIndex: phaseState.index,
+        iteration: 1,
+      };
 
-    case 'dual_impl_done':
-      return { type: 'RUN_DUAL_TESTS', phaseIndex: phaseState.index };
+    case "dual_impl_done":
+      return { type: "RUN_DUAL_TESTS", phaseIndex: phaseState.index };
 
-    case 'dual_tests_running':
-      return { type: 'RUN_DUAL_TESTS', phaseIndex: phaseState.index };
+    case "dual_tests_running":
+      return { type: "RUN_DUAL_TESTS", phaseIndex: phaseState.index };
 
-    case 'dual_judge_pending':
-    case 'dual_judge_running':
-      return { type: 'RUN_JUDGE', phaseIndex: phaseState.index };
+    case "dual_judge_pending":
+    case "dual_judge_running":
+      return { type: "RUN_JUDGE", phaseIndex: phaseState.index };
 
-    case 'dual_winner_pending': {
+    case "dual_winner_pending": {
       const winner = phaseState.dualImpl?.selectedImplementor;
       if (!winner) {
         return {
-          type: 'FAIL',
+          type: "FAIL",
           phaseIndex: phaseState.index,
-          reason: 'dual_winner_pending without selectedImplementor — state corrupted',
+          reason:
+            "dual_winner_pending without selectedImplementor — state corrupted",
         };
       }
-      return { type: 'APPLY_WINNER', phaseIndex: phaseState.index, winner };
+      return { type: "APPLY_WINNER", phaseIndex: phaseState.index, winner };
     }
 
     default: {
@@ -246,7 +283,7 @@ export function decideNextAction(
       const _never: never = phaseState.status;
       void _never;
       return {
-        type: 'FAIL',
+        type: "FAIL",
         phaseIndex: phaseState.index,
         reason: `unknown status: ${phaseState.status}`,
       };
@@ -280,7 +317,7 @@ export interface ApplyResultExtra {
   geminiTestResult?: DualImplTestResult;
   codexTestResult?: DualImplTestResult;
   /** RUN_JUDGE: configured judge decision */
-  judgeVerdict?: 'gemini' | 'codex';
+  judgeVerdict?: "gemini" | "codex";
   judgeReasoning?: string;
   judgeHardeningNotes?: string;
 }
@@ -293,34 +330,36 @@ export function applyResult(
   phaseState: PhaseState,
   action: Action,
   result: SubAgentResult,
-  extra?: ApplyResultExtra
+  extra?: ApplyResultExtra,
 ): PhaseState {
   const next: PhaseState = { ...phaseState };
 
-  if (action.type === 'RUN_GEMINI') {
+  if (action.type === "RUN_GEMINI") {
     next.gemini = {
-      startedAt: phaseState.gemini?.startedAt ?? new Date(Date.now() - result.durationMs).toISOString(),
+      startedAt:
+        phaseState.gemini?.startedAt ??
+        new Date(Date.now() - result.durationMs).toISOString(),
       completedAt: new Date().toISOString(),
       outputLogPath: result.logPath,
       retries: result.retries,
       exitCode: result.exitCode ?? undefined,
     };
     if (result.timedOut) {
-      next.status = 'failed';
-      next.error = `Gemini timed out (after ${result.retries} retry${result.retries === 1 ? '' : 'es'})`;
+      next.status = "failed";
+      next.error = `Gemini timed out (after ${result.retries} retry${result.retries === 1 ? "" : "es"})`;
       return next;
     }
     if (result.exitCode !== 0) {
-      next.status = 'failed';
+      next.status = "failed";
       next.error = `Gemini exited ${result.exitCode}; see ${result.logPath}`;
       next.gemini.error = next.error;
       return next;
     }
-    next.status = 'impl_done';
+    next.status = "impl_done";
     return next;
   }
 
-  if (action.type === 'RUN_CODEX_REVIEW') {
+  if (action.type === "RUN_CODEX_REVIEW") {
     const prevIters = phaseState.codexReview?.iterations ?? 0;
     const prevPaths = phaseState.codexReview?.outputLogPaths ?? [];
     next.codexReview = {
@@ -328,35 +367,35 @@ export function applyResult(
       outputLogPaths: [...prevPaths, result.logPath],
     };
     if (result.timedOut) {
-      next.codexReview.finalVerdict = 'TIMEOUT';
-      next.status = 'failed';
-      next.error = `Codex review timed out after ${result.retries} retry${result.retries === 1 ? '' : 'es'}`;
+      next.codexReview.finalVerdict = "TIMEOUT";
+      next.status = "failed";
+      next.error = `Codex review timed out after ${result.retries} retry${result.retries === 1 ? "" : "es"}`;
       return next;
     }
     if (result.exitCode !== 0) {
-      next.status = 'failed';
+      next.status = "failed";
       next.error = `Codex exited ${result.exitCode}; see ${result.logPath}`;
       return next;
     }
     const verdict: Verdict = parseVerdict(result.stdout);
-    if (verdict === 'pass') {
-      next.codexReview.finalVerdict = 'GATE PASS';
-      next.status = 'review_clean';
+    if (verdict === "pass") {
+      next.codexReview.finalVerdict = "GATE PASS";
+      next.status = "review_clean";
       return next;
     }
-    if (verdict === 'fail') {
-      next.codexReview.finalVerdict = 'GATE FAIL';
-      next.status = 'codex_running';
+    if (verdict === "fail") {
+      next.codexReview.finalVerdict = "GATE FAIL";
+      next.status = "codex_running";
       return next;
     }
     // verdict === 'unclear'
-    next.status = 'failed';
+    next.status = "failed";
     next.error =
-      'Codex output did not contain GATE PASS or GATE FAIL — cannot determine review outcome';
+      "Codex output did not contain GATE PASS or GATE FAIL — cannot determine review outcome";
     return next;
   }
 
-  if (action.type === 'RUN_GEMINI_FROM_REVIEW') {
+  if (action.type === "RUN_GEMINI_FROM_REVIEW") {
     next.codexReview = {
       ...(phaseState.codexReview ?? { iterations: 0, outputLogPaths: [] }),
       geminiReRunCount: (phaseState.codexReview?.geminiReRunCount ?? 0) + 1,
@@ -369,76 +408,82 @@ export function applyResult(
       exitCode: result.exitCode ?? undefined,
     };
     if (result.timedOut) {
-      next.status = 'failed';
+      next.status = "failed";
       next.error = `Gemini re-run (from review feedback) timed out`;
       return next;
     }
     if (result.exitCode !== 0) {
-      next.status = 'failed';
+      next.status = "failed";
       next.error = `Gemini re-run (from review feedback) exited ${result.exitCode}; see ${result.logPath}`;
       return next;
     }
-    next.status = 'impl_done';
+    next.status = "impl_done";
     return next;
   }
 
-  if (action.type === 'RUN_GEMINI_TEST_SPEC') {
+  if (action.type === "RUN_GEMINI_TEST_SPEC") {
     next.geminiTestSpec = {
-      startedAt: phaseState.geminiTestSpec?.startedAt ?? new Date(Date.now() - result.durationMs).toISOString(),
+      startedAt:
+        phaseState.geminiTestSpec?.startedAt ??
+        new Date(Date.now() - result.durationMs).toISOString(),
       completedAt: new Date().toISOString(),
       outputLogPath: result.logPath,
       retries: result.retries,
       exitCode: result.exitCode ?? undefined,
     };
     if (result.timedOut || result.exitCode !== 0) {
-      next.status = 'failed';
+      next.status = "failed";
       next.error = `Gemini test-spec step failed: exit ${result.exitCode}`;
       return next;
     }
-    next.status = 'test_spec_done';
+    next.status = "test_spec_done";
     return next;
   }
 
-  if (action.type === 'VERIFY_RED') {
+  if (action.type === "VERIFY_RED") {
     if (result.timedOut) {
-      next.status = 'failed';
-      next.error = 'Test verification timed out';
+      next.status = "failed";
+      next.error = "Test verification timed out";
       return next;
     }
     if (result.exitCode !== 0) {
       // Tests fail as expected → Red phase confirmed. Proceed to implementation.
       next.redSpecAttempts = 0;
-      next.status = 'tests_red';
+      next.status = "tests_red";
       return next;
     }
     // Tests trivially pass before implementation → need harder tests.
     const attempts = (phaseState.redSpecAttempts ?? 0) + 1;
     next.redSpecAttempts = attempts;
     if (attempts >= DEFAULT_MAX_RED_SPEC_ITERATIONS) {
-      next.status = 'failed';
+      next.status = "failed";
       next.error = `Gemini could not produce failing tests after ${attempts} attempts (GSTACK_BUILD_RED_MAX_ITER)`;
       return next;
     }
-    next.status = 'test_spec_running';
+    next.status = "test_spec_running";
     return next;
   }
 
-  if (action.type === 'RUN_TESTS') {
+  if (action.type === "RUN_TESTS") {
     const prevIter = phaseState.testRun?.iterations ?? 0;
     next.testRun = {
       iterations: prevIter + 1,
-      finalStatus: result.timedOut ? 'timeout' : result.exitCode === 0 ? 'green' : 'red',
+      finalStatus: result.timedOut
+        ? "timeout"
+        : result.exitCode === 0
+          ? "green"
+          : "red",
     };
     if (result.timedOut) {
-      next.status = 'failed';
-      next.error = 'Test run timed out';
+      next.status = "failed";
+      next.error = "Test run timed out";
       return next;
     }
-    next.status = result.exitCode === 0 ? 'tests_green' : 'test_fix_running';
+    next.status = result.exitCode === 0 ? "tests_green" : "test_fix_running";
     return next;
   }
 
-  if (action.type === 'RUN_GEMINI_FIX') {
+  if (action.type === "RUN_GEMINI_FIX") {
     const prevIter = phaseState.testFix?.iterations ?? 0;
     const prevPaths = phaseState.testFix?.outputLogPaths ?? [];
     next.testFix = {
@@ -446,37 +491,39 @@ export function applyResult(
       outputLogPaths: [...prevPaths, result.logPath],
     };
     if (result.timedOut || result.exitCode !== 0) {
-      next.status = 'failed';
+      next.status = "failed";
       next.error = `Gemini fix step failed: exit ${result.exitCode}`;
       return next;
     }
     // After a successful fix, re-run tests (route back through impl_done → RUN_TESTS).
-    next.status = 'impl_done';
+    next.status = "impl_done";
     return next;
   }
 
-  if (action.type === 'RUN_DUAL_IMPL') {
+  if (action.type === "RUN_DUAL_IMPL") {
     if (result.timedOut || result.exitCode !== 0) {
-      next.status = 'failed';
+      next.status = "failed";
       next.error = `Dual implementation failed: exit ${result.exitCode}`;
       return next;
     }
     if (!extra?.dualImplInit) {
-      next.status = 'failed';
-      next.error = 'RUN_DUAL_IMPL requires dualImplInit (worktree paths/branches/baseCommit) in extra';
+      next.status = "failed";
+      next.error =
+        "RUN_DUAL_IMPL requires dualImplInit (worktree paths/branches/baseCommit) in extra";
       return next;
     }
     next.dualImpl = { ...(phaseState.dualImpl ?? {}), ...extra.dualImplInit };
-    next.status = 'dual_impl_done';
+    next.status = "dual_impl_done";
     return next;
   }
 
-  if (action.type === 'RUN_DUAL_TESTS') {
+  if (action.type === "RUN_DUAL_TESTS") {
     const g = extra?.geminiTestResult;
     const c = extra?.codexTestResult;
     if (!g || !c) {
-      next.status = 'failed';
-      next.error = 'RUN_DUAL_TESTS requires geminiTestResult and codexTestResult in extra';
+      next.status = "failed";
+      next.error =
+        "RUN_DUAL_TESTS requires geminiTestResult and codexTestResult in extra";
       return next;
     }
     // Both timing out is treated as a hard failure — no test evidence to pick a winner.
@@ -486,24 +533,25 @@ export function applyResult(
         geminiTestResult: g,
         codexTestResult: c,
       };
-      next.status = 'failed';
-      next.error = 'Both dual-impl test runs timed out — cannot select a winner';
+      next.status = "failed";
+      next.error =
+        "Both dual-impl test runs timed out — cannot select a winner";
       return next;
     }
 
     const gPass = g.testExitCode === 0 && !g.timedOut;
     const cPass = c.testExitCode === 0 && !c.timedOut;
 
-    let selectedImplementor: 'gemini' | 'codex' | undefined;
-    let nextStatus: PhaseState['status'];
+    let selectedImplementor: "gemini" | "codex" | undefined;
+    let nextStatus: PhaseState["status"];
     if (gPass && cPass) {
-      nextStatus = 'dual_judge_pending';
+      nextStatus = "dual_judge_pending";
     } else if (gPass) {
-      selectedImplementor = 'gemini';
-      nextStatus = 'dual_winner_pending';
+      selectedImplementor = "gemini";
+      nextStatus = "dual_winner_pending";
     } else if (cPass) {
-      selectedImplementor = 'codex';
-      nextStatus = 'dual_winner_pending';
+      selectedImplementor = "codex";
+      nextStatus = "dual_winner_pending";
     } else {
       // Both failed (no timeouts). If failureCount is missing on both, fail closed —
       // we have no signal to choose a winner.
@@ -513,37 +561,41 @@ export function applyResult(
           geminiTestResult: g,
           codexTestResult: c,
         };
-        next.status = 'failed';
-        next.error = 'Both dual-impl test runs failed and failureCount is missing on both — cannot select winner';
+        next.status = "failed";
+        next.error =
+          "Both dual-impl test runs failed and failureCount is missing on both — cannot select winner";
         return next;
       }
       const gFails = g.failureCount ?? Number.MAX_SAFE_INTEGER;
       const cFails = c.failureCount ?? Number.MAX_SAFE_INTEGER;
       // Ties (cFails === gFails) intentionally pick gemini — documented preference.
-      selectedImplementor = cFails < gFails ? 'codex' : 'gemini';
-      nextStatus = 'dual_winner_pending';
+      selectedImplementor = cFails < gFails ? "codex" : "gemini";
+      nextStatus = "dual_winner_pending";
     }
 
     next.dualImpl = {
       ...(phaseState.dualImpl as any),
       geminiTestResult: g,
       codexTestResult: c,
-      ...(selectedImplementor && { selectedImplementor, selectedBy: 'auto' as const }),
+      ...(selectedImplementor && {
+        selectedImplementor,
+        selectedBy: "auto" as const,
+      }),
     };
     next.status = nextStatus;
     return next;
   }
 
-  if (action.type === 'RUN_JUDGE') {
+  if (action.type === "RUN_JUDGE") {
     if (result.timedOut || result.exitCode !== 0) {
-      next.status = 'failed';
+      next.status = "failed";
       next.error = `Judge failed: exit ${result.exitCode}`;
       return next;
     }
     const verdict = extra?.judgeVerdict;
     if (!verdict) {
-      next.status = 'failed';
-      next.error = 'RUN_JUDGE requires judgeVerdict in extra';
+      next.status = "failed";
+      next.error = "RUN_JUDGE requires judgeVerdict in extra";
       return next;
     }
     next.dualImpl = {
@@ -553,20 +605,20 @@ export function applyResult(
       judgeHardeningNotes: extra?.judgeHardeningNotes,
       judgeLogPath: result.logPath,
       selectedImplementor: verdict,
-      selectedBy: 'judge',
+      selectedBy: "judge",
     };
-    next.status = 'dual_winner_pending';
+    next.status = "dual_winner_pending";
     return next;
   }
 
-  if (action.type === 'APPLY_WINNER') {
+  if (action.type === "APPLY_WINNER") {
     // The CLI runs applyWinner() + teardownWorktrees() before calling this.
     // We just transition state — the cherry-pick + teardown have happened.
     next.dualImpl = {
       ...(phaseState.dualImpl as any),
       worktreesTornDownAt: new Date().toISOString(),
     };
-    next.status = 'impl_done';
+    next.status = "impl_done";
     return next;
   }
 
@@ -581,7 +633,7 @@ export function applyResult(
 export function markCommitted(phaseState: PhaseState): PhaseState {
   return {
     ...phaseState,
-    status: 'committed',
+    status: "committed",
     committedAt: new Date().toISOString(),
   };
 }
@@ -593,7 +645,7 @@ export function markCommitted(phaseState: PhaseState): PhaseState {
  */
 export function findNextPhaseIndex(phaseStates: PhaseState[]): number {
   for (let i = 0; i < phaseStates.length; i++) {
-    if (phaseStates[i].status !== 'committed') return i;
+    if (phaseStates[i].status !== "committed") return i;
   }
   return -1;
 }
