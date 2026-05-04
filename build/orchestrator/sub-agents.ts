@@ -188,6 +188,48 @@ function stageGeminiIO(opts: {
 }
 
 /**
+ * Stage Codex I/O inside the workspace cwd (.llm-tmp/) so the workspace-write
+ * sandbox can write the output file. The real outputFilePath (typically inside
+ * ~/.gstack/build-state/) is outside the sandbox boundary and is silently
+ * blocked, leaving an empty output file and an UNCLEAR verdict.
+ */
+function stageCodexIO(opts: {
+  slug: string;
+  phaseNumber: string;
+  iteration: number;
+  suffix: string;
+  cwd: string;
+  inputFilePath: string;
+  outputFilePath: string;
+}): { stagedInput: string; stagedOutput: string; cleanup: () => void } {
+  const stagingDir = path.join(opts.cwd, ".llm-tmp");
+  fs.mkdirSync(stagingDir, { recursive: true });
+
+  const base = `gstack-codex-${opts.phaseNumber}-${opts.iteration}-${opts.suffix}`;
+  const stagedInput = path.join(stagingDir, `${base}-input.md`);
+  const stagedOutput = path.join(stagingDir, `${base}-output.md`);
+
+  fs.copyFileSync(opts.inputFilePath, stagedInput);
+  fs.writeFileSync(stagedOutput, "");
+
+  const cleanup = () => {
+    try {
+      fs.unlinkSync(stagedInput);
+    } catch {}
+    try {
+      if (fs.existsSync(stagedOutput) && fs.statSync(stagedOutput).size > 0) {
+        fs.copyFileSync(stagedOutput, opts.outputFilePath);
+      }
+    } catch {}
+    try {
+      fs.unlinkSync(stagedOutput);
+    } catch {}
+  };
+
+  return { stagedInput, stagedOutput, cleanup };
+}
+
+/**
  * Run a Gemini implementation pass via FILE-PATH I/O.
  *
  * The caller writes the full instruction body to `inputFilePath` BEFORE calling
@@ -413,9 +455,20 @@ export async function runCodexReview(opts: {
   timeoutMs?: number;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
-  const argv = buildCodexReviewArgv({
+
+  const { stagedInput, stagedOutput, cleanup } = stageCodexIO({
+    slug: opts.slug,
+    phaseNumber: opts.phaseNumber,
+    iteration: opts.iteration,
+    suffix: opts.logPrefix ?? "review",
+    cwd: opts.cwd,
     inputFilePath: opts.inputFilePath,
     outputFilePath: opts.outputFilePath,
+  });
+
+  const argv = buildCodexReviewArgv({
+    inputFilePath: stagedInput,
+    outputFilePath: stagedOutput,
     cwd: opts.cwd,
     command: opts.command,
     sandbox: opts.sandbox,
@@ -454,8 +507,10 @@ export async function runCodexReview(opts: {
       closeStdin: true,
     });
     retryResult.retries = 1;
+    cleanup();
     return mergeOutputFile(retryResult, opts.outputFilePath);
   }
+  cleanup();
   return mergeOutputFile(result, opts.outputFilePath);
 }
 
@@ -962,7 +1017,26 @@ export async function runCodexImpl(opts: {
   logPrefix?: string;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
-  const argv = buildCodexImplArgv(opts);
+
+  // Stage I/O inside the cwd so the workspace-write sandbox can write the
+  // output file. The real outputFilePath is typically in ~/.gstack/build-state/
+  // which is outside the sandbox boundary — writes there are silently rejected,
+  // leaving an empty output file and an UNCLEAR verdict.
+  const { stagedInput, stagedOutput, cleanup } = stageCodexIO({
+    slug: opts.slug,
+    phaseNumber: opts.phaseNumber,
+    iteration: opts.iteration,
+    suffix: opts.logPrefix ?? "impl",
+    cwd: opts.cwd,
+    inputFilePath: opts.inputFilePath,
+    outputFilePath: opts.outputFilePath,
+  });
+
+  const argv = buildCodexImplArgv({
+    ...opts,
+    inputFilePath: stagedInput,
+    outputFilePath: stagedOutput,
+  });
 
   const logName = opts.logPrefix ?? "codex-impl";
   const logPath = path.join(
@@ -992,9 +1066,11 @@ export async function runCodexImpl(opts: {
       logPath: retryLog,
       closeStdin: true,
     });
+    cleanup();
     retryResult.retries = 1;
     return mergeOutputFile(retryResult, opts.outputFilePath);
   }
+  cleanup();
   return mergeOutputFile(result, opts.outputFilePath);
 }
 
