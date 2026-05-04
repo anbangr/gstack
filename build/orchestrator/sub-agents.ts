@@ -19,24 +19,38 @@
  *   - --yolo on Gemini for autonomous file edits
  */
 
-import { execFile } from 'node:child_process';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import { logDir, ensureLogDir } from './state';
-import type { RoleReasoning } from './role-config';
-import { BUILD_DEFAULTS, envNumberOrDefault } from './build-config';
+import { execFile } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { logDir, ensureLogDir } from "./state";
+import type { RoleReasoning } from "./role-config";
+import { BUILD_DEFAULTS, envNumberOrDefault } from "./build-config";
+
+export type CodexSandbox =
+  | "read-only"
+  | "workspace-write"
+  | "danger-full-access";
 
 const MAX_BUFFER = 20 * 1024 * 1024;
 
-const GEMINI_BIN = process.env.GEMINI_BIN || 'gemini';
-const CODEX_BIN = process.env.CODEX_BIN || 'codex';
-const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
+const GEMINI_BIN = process.env.GEMINI_BIN || "gemini";
+const CODEX_BIN = process.env.CODEX_BIN || "codex";
+const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 
-const GEMINI_TIMEOUT_MS = envNumberOrDefault('GSTACK_BUILD_GEMINI_TIMEOUT', BUILD_DEFAULTS.timeoutsMs.gemini);
-const CODEX_TIMEOUT_MS = envNumberOrDefault('GSTACK_BUILD_CODEX_TIMEOUT', BUILD_DEFAULTS.timeoutsMs.codex);
-const SHIP_TIMEOUT_MS = envNumberOrDefault('GSTACK_BUILD_SHIP_TIMEOUT', BUILD_DEFAULTS.timeoutsMs.ship);
+const GEMINI_TIMEOUT_MS = envNumberOrDefault(
+  "GSTACK_BUILD_GEMINI_TIMEOUT",
+  BUILD_DEFAULTS.timeoutsMs.gemini,
+);
+const CODEX_TIMEOUT_MS = envNumberOrDefault(
+  "GSTACK_BUILD_CODEX_TIMEOUT",
+  BUILD_DEFAULTS.timeoutsMs.codex,
+);
+const SHIP_TIMEOUT_MS = envNumberOrDefault(
+  "GSTACK_BUILD_SHIP_TIMEOUT",
+  BUILD_DEFAULTS.timeoutsMs.ship,
+);
 
-export type Verdict = 'pass' | 'fail' | 'unclear';
+export type Verdict = "pass" | "fail" | "unclear";
 
 export interface SubAgentResult {
   /** Captured stdout (also written to logPath). */
@@ -86,29 +100,31 @@ function spawnCaptured(args: {
         try {
           fs.writeFileSync(
             args.logPath,
-            `# command: ${args.bin} ${args.argv.map(quote).join(' ')}\n` +
+            `# command: ${args.bin} ${args.argv.map(quote).join(" ")}\n` +
               `# cwd: ${args.cwd || process.cwd()}\n` +
               `# started: ${new Date(startedAt).toISOString()}\n` +
               `# duration_ms: ${Date.now() - startedAt}\n` +
               `# timed_out: ${timedOut}\n` +
-              `# exit: ${err ? (err as any).code ?? 'killed' : 0}\n` +
-              `\n# ---- stdout ----\n${stdout}\n# ---- stderr ----\n${stderr}\n`
+              `# exit: ${err ? ((err as any).code ?? "killed") : 0}\n` +
+              `\n# ---- stdout ----\n${stdout}\n# ---- stderr ----\n${stderr}\n`,
           );
         } catch {
           // Log file write failures shouldn't sink the orchestrator.
         }
 
-        const exitCode = err ? ((err as any).code as number | null) ?? null : 0;
+        const exitCode = err
+          ? (((err as any).code as number | null) ?? null)
+          : 0;
         resolve({
-          stdout: String(stdout || ''),
-          stderr: String(stderr || ''),
+          stdout: String(stdout || ""),
+          stderr: String(stderr || ""),
           exitCode,
           timedOut,
           logPath: args.logPath,
           durationMs: Date.now() - startedAt,
           retries: 0,
         });
-      }
+      },
     );
 
     if (args.closeStdin) child.stdin?.end();
@@ -118,6 +134,57 @@ function spawnCaptured(args: {
 function quote(s: string): string {
   if (/^[a-zA-Z0-9_\/\.\-]+$/.test(s)) return s;
   return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Stage Gemini I/O files in ~/.gemini/tmp/<slug>/ — a path Gemini's --yolo
+ * file tools accept, and one that never lives inside the user's project repo
+ * (so crash-surviving leftovers can't be accidentally committed).
+ *
+ * Returns { stagedInput, stagedOutput, cleanup }.
+ * Call cleanup() after spawnCaptured returns; it copies the output back to
+ * outputFilePath and deletes both staged files. The copy and the delete are
+ * in separate try/catch blocks so a copy failure surfaces (instead of being
+ * swallowed) and the delete still runs regardless.
+ */
+function stageGeminiIO(opts: {
+  slug: string;
+  phaseNumber: string;
+  iteration: number;
+  suffix: string;
+  inputFilePath: string;
+  outputFilePath: string;
+}): { stagedInput: string; stagedOutput: string; cleanup: () => void } {
+  const stagingDir = path.join(
+    process.env.HOME ?? "~",
+    ".gemini",
+    "tmp",
+    opts.slug,
+  );
+  fs.mkdirSync(stagingDir, { recursive: true });
+
+  const base = `gstack-gemini-${opts.phaseNumber}-${opts.iteration}-${opts.suffix}`;
+  const stagedInput = path.join(stagingDir, `${base}-input.md`);
+  const stagedOutput = path.join(stagingDir, `${base}-output.md`);
+
+  fs.copyFileSync(opts.inputFilePath, stagedInput);
+  fs.writeFileSync(stagedOutput, "");
+
+  const cleanup = () => {
+    try {
+      fs.unlinkSync(stagedInput);
+    } catch {}
+    try {
+      if (fs.existsSync(stagedOutput) && fs.statSync(stagedOutput).size > 0) {
+        fs.copyFileSync(stagedOutput, opts.outputFilePath);
+      }
+    } catch {}
+    try {
+      fs.unlinkSync(stagedOutput);
+    } catch {}
+  };
+
+  return { stagedInput, stagedOutput, cleanup };
 }
 
 /**
@@ -149,21 +216,34 @@ export async function runGemini(opts: {
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
 
+  const {
+    stagedInput,
+    stagedOutput,
+    cleanup: cleanupStaged,
+  } = stageGeminiIO({
+    slug: opts.slug,
+    phaseNumber: opts.phaseNumber,
+    iteration: opts.iteration,
+    suffix: opts.logPrefix ?? "impl",
+    inputFilePath: opts.inputFilePath,
+    outputFilePath: opts.outputFilePath,
+  });
+
   const shellPrompt = [
-    `Read instructions at ${opts.inputFilePath}.`,
+    `Read instructions at ${stagedInput}.`,
     `Do the work autonomously using your --yolo file tools.`,
-    `When done, write your output summary (what files changed, what tests pass, what was committed) to ${opts.outputFilePath}.`,
+    `When done, write your output summary (what files changed, what tests pass, what was committed) to ${stagedOutput}.`,
     `Return ONLY the output file path. No narrative.`,
-  ].join(' ');
+  ].join(" ");
 
-  const argv = ['-p', shellPrompt];
-  if (opts.model) argv.push('-m', opts.model);
-  argv.push('--yolo');
+  const argv = ["-p", shellPrompt];
+  if (opts.model) argv.push("-m", opts.model);
+  argv.push("--yolo");
 
-  const prefix = opts.logPrefix ?? 'gemini';
+  const prefix = opts.logPrefix ?? "gemini";
   const logPath = path.join(
     logDir(opts.slug),
-    `phase-${opts.phaseNumber}-${prefix}-${opts.iteration}.log`
+    `phase-${opts.phaseNumber}-${prefix}-${opts.iteration}.log`,
   );
 
   let result = await spawnCaptured({
@@ -179,7 +259,7 @@ export async function runGemini(opts: {
   if (result.timedOut) {
     const retryLog = path.join(
       logDir(opts.slug),
-      `phase-${opts.phaseNumber}-gemini-${opts.iteration}-retry.log`
+      `phase-${opts.phaseNumber}-gemini-${opts.iteration}-retry.log`,
     );
     const retryResult = await spawnCaptured({
       bin: GEMINI_BIN,
@@ -190,8 +270,10 @@ export async function runGemini(opts: {
       closeStdin: false,
     });
     retryResult.retries = 1;
+    cleanupStaged();
     return mergeOutputFile(retryResult, opts.outputFilePath);
   }
+  cleanupStaged();
   return mergeOutputFile(result, opts.outputFilePath);
 }
 
@@ -209,11 +291,11 @@ export async function runGemini(opts: {
 function mergeOutputFile(
   result: SubAgentResult,
   outputFilePath: string,
-  opts?: { emptyFileIsError?: boolean }
+  opts?: { emptyFileIsError?: boolean },
 ): SubAgentResult {
   try {
-    const fileContent = fs.readFileSync(outputFilePath, 'utf8');
-    if (fileContent.trim() === '') {
+    const fileContent = fs.readFileSync(outputFilePath, "utf8");
+    if (fileContent.trim() === "") {
       if (opts?.emptyFileIsError) {
         // For judge calls the output file is the only authoritative source.
         // An empty file means the judge didn't write its verdict. Do NOT embed
@@ -225,8 +307,10 @@ function mergeOutputFile(
           stderr:
             result.stderr +
             `\n# judge output file ${outputFilePath} was empty — treating as parse failure` +
-            (result.stdout ? `\n# original shell stdout:\n${result.stdout}` : ''),
-          stdout: '',
+            (result.stdout
+              ? `\n# original shell stdout:\n${result.stdout}`
+              : ""),
+          stdout: "",
         };
       }
       // Sub-agent left the output file empty (e.g. Codex applied edits inline but
@@ -234,18 +318,22 @@ function mergeOutputFile(
       // still find GATE PASS / GATE FAIL — Codex writes its verdict to stderr.
       return {
         ...result,
-        stdout: [result.stdout, result.stderr].filter(Boolean).join('\n'),
+        stdout: [result.stdout, result.stderr].filter(Boolean).join("\n"),
       };
     }
     return {
       ...result,
-      stderr: result.stderr + (result.stdout ? `\n# original stdout:\n${result.stdout}` : ''),
+      stderr:
+        result.stderr +
+        (result.stdout ? `\n# original stdout:\n${result.stdout}` : ""),
       stdout: fileContent,
     };
   } catch (err) {
     return {
       ...result,
-      stderr: result.stderr + `\n# expected output file ${outputFilePath} not readable: ${(err as Error).message}`,
+      stderr:
+        result.stderr +
+        `\n# expected output file ${outputFilePath} not readable: ${(err as Error).message}`,
       stdout: `Sub-agent did not write expected output file ${outputFilePath}. Original shell stdout:\n${result.stdout}`,
     };
   }
@@ -256,14 +344,23 @@ export function buildCodexReviewArgv(opts: {
   outputFilePath: string;
   cwd: string;
   command?: string;
-  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
+  sandbox?: CodexSandbox;
   reasoning?: RoleReasoning;
   model?: string;
   gate?: boolean;
 }): string[] {
-  const command = opts.command || '/gstack-review';
-  const reasoning = opts.reasoning || 'high';
-  const sandbox = opts.sandbox || 'workspace-write';
+  const command = opts.command || "/gstack-review";
+  const reasoning = opts.reasoning || "high";
+  // Default sandbox is workspace-write. Git worktrees share .git/remotes with
+  // the parent repo — danger-full-access would let the review agent push or
+  // delete remote branches. Override via GSTACK_BUILD_CODEX_REVIEW_SANDBOX
+  // only in environments where that risk is accepted.
+  const sandbox =
+    opts.sandbox ||
+    (process.env.GSTACK_BUILD_CODEX_REVIEW_SANDBOX as
+      | CodexSandbox
+      | undefined) ||
+    "workspace-write";
 
   const codexPrompt = [
     `Read review context at ${opts.inputFilePath}.`,
@@ -273,17 +370,17 @@ export function buildCodexReviewArgv(opts: {
       ? `Report whether the command completed successfully.`
       : `The report MUST include a final 'GATE PASS' or 'GATE FAIL' line on its own.`,
     `Return ONLY the output file path. No narrative.`,
-  ].join(' ');
+  ].join(" ");
 
   return [
-    'exec',
+    "exec",
     codexPrompt,
-    ...(opts.model ? ['-m', opts.model] : []),
-    '-s',
+    ...(opts.model ? ["-m", opts.model] : []),
+    "-s",
     sandbox,
-    '-c',
+    "-c",
     `model_reasoning_effort="${reasoning}"`,
-    '-C',
+    "-C",
     opts.cwd,
   ];
 }
@@ -309,7 +406,7 @@ export async function runCodexReview(opts: {
   /** Sandbox mode. `workspace-write` lets the review loop fix bugs;
    * `read-only` makes it report-only. Default workspace-write because the
    * recursive loop expects fix-and-rereview. */
-  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
+  sandbox?: CodexSandbox;
   model?: string;
   gate?: boolean;
   logPrefix?: string;
@@ -329,7 +426,7 @@ export async function runCodexReview(opts: {
 
   const logPath = path.join(
     logDir(opts.slug),
-    `phase-${opts.phaseNumber}-${opts.logPrefix ?? 'codex'}-${opts.iteration}.log`
+    `phase-${opts.phaseNumber}-${opts.logPrefix ?? "codex"}-${opts.iteration}.log`,
   );
 
   const timeoutMs = opts.timeoutMs ?? CODEX_TIMEOUT_MS;
@@ -346,7 +443,7 @@ export async function runCodexReview(opts: {
   if (result.timedOut) {
     const retryLog = path.join(
       logDir(opts.slug),
-      `phase-${opts.phaseNumber}-${opts.logPrefix ?? 'codex'}-${opts.iteration}-retry.log`
+      `phase-${opts.phaseNumber}-${opts.logPrefix ?? "codex"}-${opts.iteration}-retry.log`,
     );
     const retryResult = await spawnCaptured({
       bin: CODEX_BIN,
@@ -375,19 +472,23 @@ export function buildClaudeTaskArgv(opts: {
   reasoning?: RoleReasoning;
   gate?: boolean;
 }): string[] {
-  const commandLine = opts.command ? `Run ${opts.command}.` : 'Do the requested work.';
+  const commandLine = opts.command
+    ? `Run ${opts.command}.`
+    : "Do the requested work.";
   const gateLine = opts.gate
     ? `The report MUST include a final 'GATE PASS' or 'GATE FAIL' line on its own.`
-    : '';
+    : "";
   const prompt = [
-    `Use ${opts.reasoning || 'high'} thinking.`,
+    `Use ${opts.reasoning || "high"} thinking.`,
     `Read instructions at ${opts.inputFilePath}.`,
     commandLine,
     `Write your complete output to ${opts.outputFilePath}.`,
     gateLine,
     `Return ONLY the output file path. No narrative.`,
-  ].filter(Boolean).join(' ');
-  return [...(opts.model ? ['--model', opts.model] : []), '-p', prompt];
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return [...(opts.model ? ["--model", opts.model] : []), "-p", prompt];
 }
 
 export async function runClaudeTask(opts: {
@@ -410,7 +511,7 @@ export async function runClaudeTask(opts: {
     logDir(opts.slug),
     opts.phaseNumber
       ? `phase-${opts.phaseNumber}-${opts.logPrefix}-${opts.iteration ?? 1}.log`
-      : `${opts.logPrefix}.log`
+      : `${opts.logPrefix}.log`,
   );
   let result = await spawnCaptured({
     bin: CLAUDE_BIN,
@@ -421,7 +522,7 @@ export async function runClaudeTask(opts: {
     closeStdin: false,
   });
   if (result.timedOut) {
-    const retryLog = logPath.replace(/\.log$/, '-retry.log');
+    const retryLog = logPath.replace(/\.log$/, "-retry.log");
     const retryResult = await spawnCaptured({
       bin: CLAUDE_BIN,
       argv,
@@ -444,13 +545,13 @@ export async function runShip(opts: {
   cwd: string;
   slug: string;
   ship: {
-    provider: 'claude' | 'codex';
+    provider: "claude" | "codex";
     model: string;
     reasoning: RoleReasoning;
     command: string;
   };
   land: {
-    provider: 'claude' | 'codex';
+    provider: "claude" | "codex";
     model: string;
     reasoning: RoleReasoning;
     command: string;
@@ -458,16 +559,19 @@ export async function runShip(opts: {
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
 
-  const shipInput = path.join(logDir(opts.slug), 'ship-input.md');
-  const shipOutput = path.join(logDir(opts.slug), 'ship-output.md');
-  fs.writeFileSync(shipInput, `Run ${opts.ship.command} for this repository. Report exactly what happened.`);
-  fs.writeFileSync(shipOutput, '');
+  const shipInput = path.join(logDir(opts.slug), "ship-input.md");
+  const shipOutput = path.join(logDir(opts.slug), "ship-output.md");
+  fs.writeFileSync(
+    shipInput,
+    `Run ${opts.ship.command} for this repository. Report exactly what happened.`,
+  );
+  fs.writeFileSync(shipOutput, "");
   const shipResult = await runSlashCommand({
     inputFilePath: shipInput,
     outputFilePath: shipOutput,
     cwd: opts.cwd,
     slug: opts.slug,
-    logPrefix: 'ship',
+    logPrefix: "ship",
     role: opts.ship,
     timeoutMs: SHIP_TIMEOUT_MS,
     gate: false,
@@ -478,16 +582,19 @@ export async function runShip(opts: {
     return shipResult;
   }
 
-  const landInput = path.join(logDir(opts.slug), 'land-and-deploy-input.md');
-  const landOutput = path.join(logDir(opts.slug), 'land-and-deploy-output.md');
-  fs.writeFileSync(landInput, `Run ${opts.land.command} for this repository. Report exactly what happened.`);
-  fs.writeFileSync(landOutput, '');
+  const landInput = path.join(logDir(opts.slug), "land-and-deploy-input.md");
+  const landOutput = path.join(logDir(opts.slug), "land-and-deploy-output.md");
+  fs.writeFileSync(
+    landInput,
+    `Run ${opts.land.command} for this repository. Report exactly what happened.`,
+  );
+  fs.writeFileSync(landOutput, "");
   return runSlashCommand({
     inputFilePath: landInput,
     outputFilePath: landOutput,
     cwd: opts.cwd,
     slug: opts.slug,
-    logPrefix: 'land-and-deploy',
+    logPrefix: "land-and-deploy",
     role: opts.land,
     timeoutMs: SHIP_TIMEOUT_MS,
     gate: false,
@@ -503,7 +610,7 @@ export async function runSlashCommand(opts: {
   iteration?: number;
   logPrefix: string;
   role: {
-    provider: 'claude' | 'codex';
+    provider: "claude" | "codex";
     model: string;
     reasoning: RoleReasoning;
     command: string;
@@ -511,7 +618,7 @@ export async function runSlashCommand(opts: {
   timeoutMs?: number;
   gate?: boolean;
 }): Promise<SubAgentResult> {
-  if (opts.role.provider === 'claude') {
+  if (opts.role.provider === "claude") {
     return runClaudeTask({
       inputFilePath: opts.inputFilePath,
       outputFilePath: opts.outputFilePath,
@@ -532,7 +639,7 @@ export async function runSlashCommand(opts: {
     outputFilePath: opts.outputFilePath,
     cwd: opts.cwd,
     slug: opts.slug,
-    phaseNumber: opts.phaseNumber ?? 'ship',
+    phaseNumber: opts.phaseNumber ?? "ship",
     iteration: opts.iteration ?? 1,
     command: opts.role.command,
     model: opts.role.model,
@@ -549,7 +656,7 @@ export async function runSlashCommand(opts: {
  */
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 export function stripAnsi(s: string): string {
-  return s.replace(ANSI_RE, '');
+  return s.replace(ANSI_RE, "");
 }
 
 /**
@@ -562,29 +669,33 @@ export function stripAnsi(s: string): string {
  */
 export function parseVerdict(stdout: string): Verdict {
   const clean = stripAnsi(stdout);
-  const passIdx = clean.lastIndexOf('GATE PASS');
-  const failIdx = clean.lastIndexOf('GATE FAIL');
-  if (passIdx < 0 && failIdx < 0) return 'unclear';
-  if (passIdx > failIdx) return 'pass';
-  return 'fail';
+  const passIdx = clean.lastIndexOf("GATE PASS");
+  const failIdx = clean.lastIndexOf("GATE FAIL");
+  if (passIdx < 0 && failIdx < 0) return "unclear";
+  if (passIdx > failIdx) return "pass";
+  return "fail";
 }
 
 export function detectTestCmd(cwd: string): string | null {
-  if (fs.existsSync(path.join(cwd, 'package.json'))) {
+  if (fs.existsSync(path.join(cwd, "package.json"))) {
     try {
-      const pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8'));
+      const pkg = JSON.parse(
+        fs.readFileSync(path.join(cwd, "package.json"), "utf8"),
+      );
       if (pkg.scripts && pkg.scripts.test) return pkg.scripts.test;
     } catch {
-      console.warn('  ⚠ package.json is not valid JSON; skipping npm/bun test detection');
+      console.warn(
+        "  ⚠ package.json is not valid JSON; skipping npm/bun test detection",
+      );
     }
   }
-  if (fs.existsSync(path.join(cwd, 'pytest.ini'))) return 'pytest';
-  if (fs.existsSync(path.join(cwd, 'pyproject.toml'))) {
-    const toml = fs.readFileSync(path.join(cwd, 'pyproject.toml'), 'utf8');
-    if (toml.includes('[tool.pytest.ini_options]')) return 'pytest';
+  if (fs.existsSync(path.join(cwd, "pytest.ini"))) return "pytest";
+  if (fs.existsSync(path.join(cwd, "pyproject.toml"))) {
+    const toml = fs.readFileSync(path.join(cwd, "pyproject.toml"), "utf8");
+    if (toml.includes("[tool.pytest.ini_options]")) return "pytest";
   }
-  if (fs.existsSync(path.join(cwd, 'go.mod'))) return 'go test ./...';
-  if (fs.existsSync(path.join(cwd, 'Cargo.toml'))) return 'cargo test';
+  if (fs.existsSync(path.join(cwd, "go.mod"))) return "go test ./...";
+  if (fs.existsSync(path.join(cwd, "Cargo.toml"))) return "cargo test";
   return null;
 }
 
@@ -599,20 +710,33 @@ export async function runGeminiTestSpec(opts: {
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
 
-  const shellPrompt = [
-    `Read instructions at ${opts.inputFilePath}.`,
-    `Do the work autonomously using your --yolo file tools.`,
-    `When done, write your output summary (what files changed, what tests pass, what was committed) to ${opts.outputFilePath}.`,
-    `Return ONLY the output file path. No narrative.`,
-  ].join(' ');
+  const {
+    stagedInput,
+    stagedOutput,
+    cleanup: cleanupStaged,
+  } = stageGeminiIO({
+    slug: opts.slug,
+    phaseNumber: opts.phaseNumber,
+    iteration: opts.iteration,
+    suffix: "testspec",
+    inputFilePath: opts.inputFilePath,
+    outputFilePath: opts.outputFilePath,
+  });
 
-  const argv = ['-p', shellPrompt];
-  if (opts.model) argv.push('-m', opts.model);
-  argv.push('--yolo');
+  const shellPrompt = [
+    `Read instructions at ${stagedInput}.`,
+    `Do the work autonomously using your --yolo file tools.`,
+    `When done, write your output summary (what files changed, what tests pass, what was committed) to ${stagedOutput}.`,
+    `Return ONLY the output file path. No narrative.`,
+  ].join(" ");
+
+  const argv = ["-p", shellPrompt];
+  if (opts.model) argv.push("-m", opts.model);
+  argv.push("--yolo");
 
   const logPath = path.join(
     logDir(opts.slug),
-    `phase-${opts.phaseNumber}-gemini-testspec-${opts.iteration}.log`
+    `phase-${opts.phaseNumber}-gemini-testspec-${opts.iteration}.log`,
   );
 
   let result = await spawnCaptured({
@@ -627,7 +751,7 @@ export async function runGeminiTestSpec(opts: {
   if (result.timedOut) {
     const retryLog = path.join(
       logDir(opts.slug),
-      `phase-${opts.phaseNumber}-gemini-testspec-${opts.iteration}-retry.log`
+      `phase-${opts.phaseNumber}-gemini-testspec-${opts.iteration}-retry.log`,
     );
     const retryResult = await spawnCaptured({
       bin: GEMINI_BIN,
@@ -638,8 +762,10 @@ export async function runGeminiTestSpec(opts: {
       closeStdin: false,
     });
     retryResult.retries = 1;
+    cleanupStaged();
     return mergeOutputFile(retryResult, opts.outputFilePath);
   }
+  cleanupStaged();
   return mergeOutputFile(result, opts.outputFilePath);
 }
 
@@ -657,17 +783,20 @@ export async function runTests(opts: {
   const bin = parts[0];
   const argv = parts.slice(1);
 
-  const suffix = opts.logSuffix ? `-${opts.logSuffix}` : '';
+  const suffix = opts.logSuffix ? `-${opts.logSuffix}` : "";
   const logPath = path.join(
     logDir(opts.slug),
-    `phase-${opts.phaseNumber}-tests-${opts.iteration}${suffix}.log`
+    `phase-${opts.phaseNumber}-tests-${opts.iteration}${suffix}.log`,
   );
 
   return spawnCaptured({
     bin,
     argv,
     cwd: opts.cwd,
-    timeoutMs: envNumberOrDefault('GSTACK_BUILD_TEST_TIMEOUT', BUILD_DEFAULTS.timeoutsMs.test),
+    timeoutMs: envNumberOrDefault(
+      "GSTACK_BUILD_TEST_TIMEOUT",
+      BUILD_DEFAULTS.timeoutsMs.test,
+    ),
     logPath,
     closeStdin: true,
   });
@@ -729,34 +858,39 @@ export function parseFailureCount(output: string): number | undefined {
  * defect; null surfaces it instead.)
  */
 export function parseJudgeVerdict(output: string): {
-  verdict: 'gemini' | 'codex' | null;
+  verdict: "gemini" | "codex" | null;
   reasoning: string;
   hardeningNotes: string;
 } {
-  const clean = stripAnsi(output || '').replace(/\r/g, '');
+  const clean = stripAnsi(output || "").replace(/\r/g, "");
   // Anchored: WINNER must be at start of line. Avoids false matches like
   // "I think the WINNER: gemini is better" embedded in narrative prose.
   const winnerMatch = clean.match(/^\s*WINNER:\s*(gemini|codex)\b/im);
   if (!winnerMatch) {
     return {
       verdict: null,
-      reasoning: 'no anchored WINNER line found in judge output — caller must fail-closed',
-      hardeningNotes: '',
+      reasoning:
+        "no anchored WINNER line found in judge output — caller must fail-closed",
+      hardeningNotes: "",
     };
   }
-  const verdict = winnerMatch[1].toLowerCase() as 'gemini' | 'codex';
+  const verdict = winnerMatch[1].toLowerCase() as "gemini" | "codex";
 
   // REASONING: runs from marker to next anchored HARDENING section or EOS.
   // Lookahead on HARDENING: captures any inline value (e.g. "HARDENING: none"),
   // not just standalone lines, so prose that contains "HARDENING:" mid-sentence
   // still requires it to be at the start of a line before truncating.
-  const reasoningMatch = clean.match(/^\s*REASONING:\s*([\s\S]*?)(?=^\s*HARDENING:\s|$(?![\s\S]))/im);
-  const reasoning = reasoningMatch ? reasoningMatch[1].trim() : '';
+  const reasoningMatch = clean.match(
+    /^\s*REASONING:\s*([\s\S]*?)(?=^\s*HARDENING:\s|$(?![\s\S]))/im,
+  );
+  const reasoning = reasoningMatch ? reasoningMatch[1].trim() : "";
 
   // HARDENING: runs from its marker to the next known section keyword or EOS.
   // Non-greedy so trailing prose / section order variations don't bleed in.
-  const hardeningMatch = clean.match(/^\s*HARDENING:\s*([\s\S]*?)(?=^\s*WINNER:|^\s*REASONING:|$(?![\s\S]))/im);
-  const hardeningNotes = hardeningMatch ? hardeningMatch[1].trim() : '';
+  const hardeningMatch = clean.match(
+    /^\s*HARDENING:\s*([\s\S]*?)(?=^\s*WINNER:|^\s*REASONING:|$(?![\s\S]))/im,
+  );
+  const hardeningNotes = hardeningMatch ? hardeningMatch[1].trim() : "";
 
   return { verdict, reasoning, hardeningNotes };
 }
@@ -775,7 +909,7 @@ export function buildCodexImplArgv(opts: {
   inputFilePath: string;
   outputFilePath: string;
   cwd: string;
-  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
+  sandbox?: CodexSandbox;
   reasoning?: RoleReasoning;
   model?: string;
 }): string[] {
@@ -785,28 +919,24 @@ export function buildCodexImplArgv(opts: {
     `Do NOT change test assertions — only make tests pass.`,
     `When done, write your output summary (files changed, tests run, what's verified) to ${opts.outputFilePath}.`,
     `Return ONLY the output file path. No narrative.`,
-  ].join(' ');
+  ].join(" ");
 
   const sandbox =
     opts.sandbox ||
-    (process.env.GSTACK_BUILD_CODEX_IMPL_SANDBOX as
-      | 'read-only'
-      | 'workspace-write'
-      | 'danger-full-access'
-      | undefined) ||
-    'workspace-write';
+    (process.env.GSTACK_BUILD_CODEX_IMPL_SANDBOX as CodexSandbox | undefined) ||
+    "workspace-write";
 
-  const reasoning = opts.reasoning || 'high';
+  const reasoning = opts.reasoning || "high";
 
   return [
-    'exec',
+    "exec",
     codexPrompt,
-    ...(opts.model ? ['-m', opts.model] : []),
-    '-s',
+    ...(opts.model ? ["-m", opts.model] : []),
+    "-s",
     sandbox,
-    '-c',
+    "-c",
     `model_reasoning_effort="${reasoning}"`,
-    '-C',
+    "-C",
     opts.cwd,
   ];
 }
@@ -834,10 +964,10 @@ export async function runCodexImpl(opts: {
   ensureLogDir(opts.slug);
   const argv = buildCodexImplArgv(opts);
 
-  const logName = opts.logPrefix ?? 'codex-impl';
+  const logName = opts.logPrefix ?? "codex-impl";
   const logPath = path.join(
     logDir(opts.slug),
-    `phase-${opts.phaseNumber}-${logName}-${opts.iteration}.log`
+    `phase-${opts.phaseNumber}-${logName}-${opts.iteration}.log`,
   );
 
   let result = await spawnCaptured({
@@ -852,7 +982,7 @@ export async function runCodexImpl(opts: {
   if (result.timedOut) {
     const retryLog = path.join(
       logDir(opts.slug),
-      `phase-${opts.phaseNumber}-${logName}-${opts.iteration}-retry.log`
+      `phase-${opts.phaseNumber}-${logName}-${opts.iteration}-retry.log`,
     );
     const retryResult = await spawnCaptured({
       bin: CODEX_BIN,
@@ -868,7 +998,10 @@ export async function runCodexImpl(opts: {
   return mergeOutputFile(result, opts.outputFilePath);
 }
 
-const JUDGE_TIMEOUT_MS = envNumberOrDefault('GSTACK_BUILD_JUDGE_TIMEOUT', BUILD_DEFAULTS.timeoutsMs.judge);
+const JUDGE_TIMEOUT_MS = envNumberOrDefault(
+  "GSTACK_BUILD_JUDGE_TIMEOUT",
+  BUILD_DEFAULTS.timeoutsMs.judge,
+);
 
 /**
  * Run the configured Claude judge. Caller writes the full judge prompt
@@ -891,20 +1024,27 @@ export async function runJudge(opts: {
   ensureLogDir(opts.slug);
 
   const shellPrompt = [
-    `Use ${opts.reasoning || 'xhigh'} thinking.`,
+    `Use ${opts.reasoning || "xhigh"} thinking.`,
     `Read judge prompt at ${opts.inputFilePath}.`,
     `Pick the better of the two implementations described inside.`,
     `Write your verdict to ${opts.outputFilePath} in this exact format:`,
     `WINNER: gemini|codex`,
     `REASONING: <one paragraph, concrete reasons>`,
     `Return ONLY the output file path. No narrative.`,
-  ].join(' ');
+  ].join(" ");
 
-  const argv = ['--model', opts.model || process.env.GSTACK_BUILD_JUDGE_MODEL || BUILD_DEFAULTS.roles.judge.model, '-p', shellPrompt];
+  const argv = [
+    "--model",
+    opts.model ||
+      process.env.GSTACK_BUILD_JUDGE_MODEL ||
+      BUILD_DEFAULTS.roles.judge.model,
+    "-p",
+    shellPrompt,
+  ];
 
   const logPath = path.join(
     logDir(opts.slug),
-    `phase-${opts.phaseNumber}-judge.log`
+    `phase-${opts.phaseNumber}-judge.log`,
   );
 
   let result = await spawnCaptured({
@@ -919,7 +1059,7 @@ export async function runJudge(opts: {
   if (result.timedOut) {
     const retryLog = path.join(
       logDir(opts.slug),
-      `phase-${opts.phaseNumber}-judge-retry.log`
+      `phase-${opts.phaseNumber}-judge-retry.log`,
     );
     const retryResult = await spawnCaptured({
       bin: CLAUDE_BIN,
@@ -930,7 +1070,11 @@ export async function runJudge(opts: {
       closeStdin: false,
     });
     retryResult.retries = 1;
-    return mergeOutputFile(retryResult, opts.outputFilePath, { emptyFileIsError: true });
+    return mergeOutputFile(retryResult, opts.outputFilePath, {
+      emptyFileIsError: true,
+    });
   }
-  return mergeOutputFile(result, opts.outputFilePath, { emptyFileIsError: true });
+  return mergeOutputFile(result, opts.outputFilePath, {
+    emptyFileIsError: true,
+  });
 }
