@@ -295,6 +295,78 @@ describe('classifyVisible (runtime path through the runner classifier)', () => {
     // recent-tail window would surface here.
     expect(TAIL_SCAN_BYTES).toBe(1500);
   });
+
+  // D4-B: strictPlanWrites detector. Catches the transcript bug where the
+  // model writes findings to the plan file before any AskUserQuestion fires.
+  test('strictPlanWrites: plan write before any AUQ → wrote_findings_before_asking', () => {
+    const visible = `
+      ⏺ Edit(/Users/me/.claude/plans/some-plan.md)
+      ⎿  Updated 12 lines
+    `;
+    const result = classifyVisible(visible, { strictPlanWrites: true });
+    expect(result?.outcome).toBe('wrote_findings_before_asking');
+    expect(result?.summary).toContain('.claude/plans/some-plan.md');
+  });
+
+  test('strictPlanWrites: plan write AFTER an AUQ render → not flagged', () => {
+    // AUQ renders first, then the model writes the plan post-answer. This is
+    // the legitimate end-of-workflow flow and must NOT trigger the detector.
+    const visible = `
+      D1 — Some scope question
+
+      ❯ 1. Option A
+        2. Option B
+
+      ⏺ Edit(/Users/me/.claude/plans/some-plan.md)
+      ⎿  Updated 12 lines
+    `;
+    const result = classifyVisible(visible, { strictPlanWrites: true });
+    // Outcome is 'asked' (the numbered list rendered); the post-AUQ plan
+    // write is ignored by the detector.
+    expect(result?.outcome).toBe('asked');
+  });
+
+  test('strictPlanWrites: AUQ first then plan write — write_pos > auq_pos → not flagged', () => {
+    // Same scenario, more explicit ordering: the regex finds the write at a
+    // position AFTER the numbered list. Detector lets it through.
+    const visible = [
+      'D1 — Choose your approach',
+      '',
+      '❯ 1. Approach A',
+      '  2. Approach B',
+      '',
+      '⏺ Write(/Users/me/.claude/plans/draft.md)',
+      '⎿  Wrote 42 lines',
+    ].join('\n');
+    const result = classifyVisible(visible, { strictPlanWrites: true });
+    expect(result?.outcome).toBe('asked');
+  });
+
+  test('strictPlanWrites: only a permission dialog visible → plan write still flagged', () => {
+    // A permission dialog ❯ 1./2. is NOT an AUQ; pre-AUQ plan writes still
+    // hit the detector even when a permission prompt is on screen.
+    const visible = `
+      ⏺ Edit(/Users/me/.claude/plans/some-plan.md)
+
+      Edit to /Users/me/.claude/plans/some-plan.md
+
+      Do you want to proceed?
+
+      ❯ 1. Yes
+        2. No
+    `;
+    const result = classifyVisible(visible, { strictPlanWrites: true });
+    expect(result?.outcome).toBe('wrote_findings_before_asking');
+  });
+
+  test('strictPlanWrites OFF: plan write before AUQ → returns null (legacy behavior preserved)', () => {
+    const visible = `
+      ⏺ Edit(/Users/me/.claude/plans/some-plan.md)
+      ⎿  Updated 12 lines
+    `;
+    // Without strictPlanWrites, the sanctioned-path list lets this through.
+    expect(classifyVisible(visible)).toBeNull();
+  });
 });
 
 describe('parseNumberedOptions', () => {

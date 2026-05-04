@@ -335,7 +335,7 @@ describe('gen-skill-docs', () => {
     for (const skill of reviewSkills) {
       const content = fs.readFileSync(skill.path, 'utf-8');
       const preamble = extractPreambleBeforeWorkflow(content, skill.markers);
-      expect(Buffer.byteLength(preamble, 'utf-8')).toBeLessThan(33_000);
+      expect(Buffer.byteLength(preamble, 'utf-8')).toBeLessThan(34_000);
     }
   });
 

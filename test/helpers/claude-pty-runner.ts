@@ -454,6 +454,7 @@ export function optionsSignature(
  */
 export type ClassifyResult =
   | { outcome: 'silent_write'; summary: string }
+  | { outcome: 'wrote_findings_before_asking'; summary: string }
   | { outcome: 'auto_decided'; summary: string }
   | { outcome: 'plan_ready'; summary: string }
   | { outcome: 'asked'; summary: string }
@@ -467,16 +468,73 @@ const SANCTIONED_WRITE_SUBSTRINGS = [
   'TODOS.md',
 ];
 
-export function classifyVisible(visible: string): ClassifyResult {
+/**
+ * Find the position of the first AskUserQuestion-style numbered-option list
+ * that is NOT a permission dialog. Returns -1 if none has rendered yet.
+ *
+ * Used by the strict-plan-writes detector (D4) to distinguish legitimate
+ * post-AUQ plan writes from the transcript bug ("write findings to plan
+ * before asking").
+ */
+function findFirstAuqRenderIndex(visible: string): number {
+  const re = /❯\s*1\./g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(visible)) !== null) {
+    // 200 bytes back + TAIL_SCAN_BYTES forward gives enough context for
+    // isPermissionDialogVisible to recognize the typical permission UI.
+    const surroundStart = Math.max(0, m.index - 200);
+    const surroundEnd = Math.min(visible.length, m.index + TAIL_SCAN_BYTES);
+    const surround = visible.slice(surroundStart, surroundEnd);
+    if (!isPermissionDialogVisible(surround)) {
+      return m.index;
+    }
+  }
+  return -1;
+}
+
+export function classifyVisible(
+  visible: string,
+  opts?: {
+    /**
+     * When true, treat Write/Edit to `.claude/plans/*` BEFORE any
+     * AskUserQuestion render as `wrote_findings_before_asking` rather than
+     * letting the sanctioned-write list silently approve it. Used by tests
+     * that seed a draft plan with guaranteed-finding-triggering complexity
+     * (D3-B), where a pre-AUQ plan write is the precise transcript bug.
+     * Default false — preserves existing behavior for unseeded smoke tests
+     * where zero-findings → write plan → plan_ready is legitimate.
+     */
+    strictPlanWrites?: boolean;
+  },
+): ClassifyResult {
   // Silent-write detection: any Write/Edit tool render that targets a path
   // OUTSIDE the sanctioned dirs, AND no numbered prompt is currently on screen
   // (a numbered prompt means a permission/AskUserQuestion is gating the write,
   // not an actual silent write).
   const writeRe = /⏺\s*(?:Write|Edit)\(([^)]+)\)/g;
   let m: RegExpExecArray | null;
+  const auqRenderIdx = opts?.strictPlanWrites ? findFirstAuqRenderIndex(visible) : -1;
   while ((m = writeRe.exec(visible)) !== null) {
     const target = m[1] ?? '';
+    const writePos = m.index;
+    const isPlanWrite = target.includes('.claude/plans');
     const sanctioned = SANCTIONED_WRITE_SUBSTRINGS.some((s) => target.includes(s));
+
+    // D4-B: when strictPlanWrites is on, plan writes that precede the first
+    // AUQ render are flagged. Legitimate end-of-workflow plan writes happen
+    // AFTER an AUQ has rendered (i.e., the user has been asked). The
+    // transcript bug is a plan write WITHOUT any AUQ render preceding it.
+    if (opts?.strictPlanWrites && isPlanWrite) {
+      if (auqRenderIdx < 0 || writePos < auqRenderIdx) {
+        return {
+          outcome: 'wrote_findings_before_asking',
+          summary: `Write/Edit to ${target} fired before any AskUserQuestion render`,
+        };
+      }
+      // post-AUQ plan write — legitimate, fall through to other writes
+      continue;
+    }
+
     if (!sanctioned && !isNumberedOptionListVisible(visible)) {
       return {
         outcome: 'silent_write',
@@ -710,6 +768,36 @@ export function assertReviewReportAtBottom(
     };
   }
   return { ok: true };
+}
+
+/**
+ * Test helper: if `obs.planFile` was set, read it and assert
+ * `## GSTACK REVIEW REPORT` is the last `## ` section. Throws on
+ * violation with a diagnostic message including the plan path,
+ * the reason, any trailing headings, and the last 2KB of TTY output.
+ *
+ * Used by the four plan-mode E2E tests
+ * (skill-e2e-plan-{eng,ceo,design,devex}-plan-mode.test.ts) to enforce
+ * the {{PLAN_FILE_REVIEW_REPORT}} resolver contract uniformly. Gates on
+ * `obs.planFile` (artifact existing), not on `obs.outcome === 'plan_ready'`,
+ * so it also catches the report-missing case under `'asked'` /
+ * `'wrote_findings_before_asking'` when a plan was already written.
+ */
+export function assertReportAtBottomIfPlanWritten(
+  obs: { planFile?: string; evidence: string },
+): void {
+  if (!obs.planFile) return;
+  const content = fs.readFileSync(obs.planFile, 'utf-8');
+  const verdict = assertReviewReportAtBottom(content);
+  if (!verdict.ok) {
+    const trailing = verdict.trailingHeadings?.length
+      ? `\ntrailing headings: ${verdict.trailingHeadings.join(', ')}`
+      : '';
+    throw new Error(
+      `GSTACK REVIEW REPORT contract violation in ${obs.planFile}: ${verdict.reason}${trailing}\n` +
+        `--- evidence (last 2KB) ---\n${obs.evidence}`,
+    );
+  }
 }
 
 /**
@@ -1085,6 +1173,20 @@ export async function runPlanSkillObservation(opts: {
    * rendered AskUserQuestion list).
    */
   env?: Record<string, string>;
+  /**
+   * Seed an initial plan that the spawned `claude` process operates on.
+   * STOP-gate regression tests need a plan with guaranteed-finding-triggering
+   * complexity (8+ files, custom-vs-builtin smell) so the skill MUST emit
+   * AskUserQuestion or fall back to a Decisions section. Without this,
+   * plan-mode creates a fresh empty plan and the skill has nothing to find
+   * issues with.
+   *
+   * Implementation: claude has no `--plan-file` flag (verified via
+   * `claude --help`). We pre-pump a user message containing the draft
+   * plan, wait for it to register, then invoke the skill. The skill's
+   * Step 0 reads the prior conversation context so it sees the draft.
+   */
+  initialPlanContent?: string;
 }): Promise<PlanSkillObservation> {
   const startedAt = Date.now();
   const session = await launchClaudePty({
@@ -1098,6 +1200,21 @@ export async function runPlanSkillObservation(opts: {
   try {
     // Boot grace + trust-dialog auto-handle.
     await Bun.sleep(8000);
+    if (opts.initialPlanContent) {
+      // Pre-pump the draft as a user message so the skill's Step 0 has
+      // concrete content to scope-challenge. The trailing `\r` submits
+      // the message; embedded `\n` are preserved as line breaks within
+      // the message (claude-code uses Enter to send, Shift+Enter for
+      // newlines, but raw `\r` from a PTY just submits whatever's in
+      // the input buffer).
+      const seed = `Please review the following draft plan when I run the skill below:\n\n${opts.initialPlanContent}`;
+      session.send(`${seed}\r`);
+      // Wait for the seed message to render before sending the skill
+      // command. Without this gap the two messages can fuse and the
+      // skill name becomes part of the user prompt instead of a slash
+      // command.
+      await Bun.sleep(3000);
+    }
     const since = session.mark();
     session.send(`/${opts.skillName}\r`);
 
@@ -1123,20 +1240,24 @@ export async function runPlanSkillObservation(opts: {
           elapsedMs: Date.now() - startedAt,
         };
       }
-      const classified = classifyVisible(visible);
+      const classified = classifyVisible(visible, {
+        strictPlanWrites: !!opts.initialPlanContent,
+      });
       if (classified) {
         const obs: PlanSkillObservation = {
           ...classified,
           evidence: visible.slice(-2000),
           elapsedMs: Date.now() - startedAt,
         };
-        // For plan_ready outcomes, capture the plan file path from the full
-        // visible buffer — tests under --disallowedTools verify the file's
-        // contents to distinguish legitimate fallback flow from silent-skip.
-        if (classified.outcome === 'plan_ready') {
-          const planFile = extractPlanFilePath(visible);
-          if (planFile) obs.planFile = planFile;
-        }
+        // Capture the plan file path on any outcome where one may have been
+        // written. Gating only on 'plan_ready' missed two cases: (1) the
+        // 'asked' outcome where the model wrote a plan partway through then
+        // paused on a question, and (2) 'wrote_findings_before_asking' where
+        // the bug is precisely that the plan was written. The
+        // assertReviewReportAtBottom checks downstream gate on planFile
+        // existing, not on the outcome.
+        const planFile = extractPlanFilePath(visible);
+        if (planFile) obs.planFile = planFile;
         return obs;
       }
     }
