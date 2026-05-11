@@ -1585,6 +1585,7 @@ The `status` field is the current CLI phase status when available, including nor
 | 11 | `USER_ACTION_REQUIRED` |
 | 11 | `MONITOR_AGENT_ESCALATION` |
 | 12 | `MONITOR_REENTER` |
+| 13 | `FINALIZATION_REQUIRED` |
 | 20 | `RUN_FAILED` |
 | 30 | `MONITOR_ERROR` |
 
@@ -1754,8 +1755,14 @@ if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
     done < <(printf '%s\n' "$_FAULT_ROWS")
   fi
 fi
+{ [ "$_MONITOR_EXIT" = "0" ] || [ "$_MONITOR_EXIT" = "13" ]; } && printf '\n⚠ MANDATORY: %s — proceed to Step 3 (Final Ship & Completion). Plans NOT archived. Branches may be unshipped. Do NOT stop here.\n' "$([ "$_MONITOR_EXIT" = "13" ] && echo "FINALIZATION_REQUIRED" || echo "ALL_RUNS_COMPLETE")"
 exit "$_MONITOR_EXIT"
 ```
+
+**MANDATORY NEXT ACTION — read before continuing:**
+
+- If `_MONITOR_EXIT` is `0` (`ALL_RUNS_COMPLETE`) or `13` (`FINALIZATION_REQUIRED`): **do NOT stop. Do NOT report build complete.** Immediately proceed to **Step 3: Final Ship & Completion** below. The build is not done until Step 3 completes — branches may be unshipped and plans are almost certainly unarchived.
+- If `_MONITOR_EXIT` is non-zero (and not 13): handle per the exit code table above. Do not proceed to Step 3.
 
 ---
 
@@ -1873,6 +1880,8 @@ When in Reexamine Mode, spawn one configured `featureVerifier` subagent per feat
 6. **Proceed to CLI Monitoring Loop** if any feature was FIXED and new phases remain. Otherwise report completion.
 
 ## Step 3: Final Ship & Completion
+
+> **ALWAYS RUN after monitor exit 0 or 13.** This step is mandatory every time `gstack-build monitor` exits with `ALL_RUNS_COMPLETE` (0) or `FINALIZATION_REQUIRED` (13) — regardless of whether `--skip-ship` was used. Plans are not archived and branches may be unshipped until this step finishes.
 
 For EACH feature, once all phases in that feature are complete (and have been individually reviewed by the CLI):
 
