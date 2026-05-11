@@ -722,7 +722,7 @@ test("SKILL.md.tmpl contains Monitor tool task notifications prohibition (Locati
   expect(content).toContain("Monitor tool task notifications");
   // Verify the new text is in the top-level monitoring ban context (near ScheduleWakeup)
   expect(content).toContain(
-    "Never use `ScheduleWakeup`, Monitor tool task notifications",
+    "Never use `ScheduleWakeup` for `/build` monitoring, Monitor tool task notifications",
   );
 });
 
