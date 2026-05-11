@@ -715,6 +715,62 @@ test("gen:skill-docs exits cleanly", () => {
   expect(result.status).toBe(0);
 });
 
+test("SKILL.md.tmpl contains Monitor tool task notifications prohibition (Location 1)", () => {
+  const tmplPath = path.resolve(import.meta.dir, "../../SKILL.md.tmpl");
+  const content = fs.readFileSync(tmplPath, "utf-8");
+
+  expect(content).toContain("Monitor tool task notifications");
+  // Verify the new text is in the top-level monitoring ban context (near ScheduleWakeup)
+  expect(content).toContain(
+    "Never use `ScheduleWakeup`, Monitor tool task notifications",
+  );
+});
+
+test("SKILL.md.tmpl contains run_in_background: true prohibition in Step M3 hard-rule context (Location 2)", () => {
+  const tmplPath = path.resolve(import.meta.dir, "../../SKILL.md.tmpl");
+  const content = fs.readFileSync(tmplPath, "utf-8");
+
+  // Check for the specific new forbidden-pattern sentence added to Step M3 hard rule
+  expect(content).toContain(
+    "Also forbidden: running the monitor command with `run_in_background: true`",
+  );
+  // Ensure the prohibition is near the Step M3 hard rule, not just anywhere
+  const m3Index = content.indexOf("### Step M3: Foreground CLI Monitor");
+  const forbiddenIndex = content.indexOf(
+    "Also forbidden: running the monitor command with `run_in_background: true`",
+  );
+  expect(m3Index).toBeGreaterThan(0);
+  expect(forbiddenIndex).toBeGreaterThan(m3Index);
+});
+
+test("SKILL.md.tmpl contains Ship Failure Recovery sub-section (Location 3)", () => {
+  const tmplPath = path.resolve(import.meta.dir, "../../SKILL.md.tmpl");
+  const content = fs.readFileSync(tmplPath, "utf-8");
+
+  expect(content).toContain("Ship Failure Recovery");
+  expect(content).toContain("#### Ship Failure Recovery");
+  // Verify it's near the failure handling section
+  const reenterIndex = content.indexOf("MONITOR_REENTER");
+  const recoveryIndex = content.indexOf("#### Ship Failure Recovery");
+  expect(reenterIndex).toBeGreaterThan(0);
+  expect(recoveryIndex).toBeGreaterThan(reenterIndex);
+});
+
+test("generated SKILL.md reflects Monitor tool task notifications prohibition", () => {
+  const skillPath = path.resolve(import.meta.dir, "../../SKILL.md");
+  const content = fs.readFileSync(skillPath, "utf-8");
+
+  expect(content).toContain("Monitor tool task notifications");
+});
+
+test("generated SKILL.md reflects Ship Failure Recovery sub-section", () => {
+  const skillPath = path.resolve(import.meta.dir, "../../SKILL.md");
+  const content = fs.readFileSync(skillPath, "utf-8");
+
+  expect(content).toContain("Ship Failure Recovery");
+  expect(content).toContain("#### Ship Failure Recovery");
+});
+
 test("bin/gstack-build wrapper prints CLI help", () => {
   const wrapperPath = path.resolve(
     import.meta.dir,
