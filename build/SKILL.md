@@ -1118,8 +1118,10 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
      by deliverable feature. Only preserve an origin group as a feature when it naturally matches.
    - Traceability from every feature block back to the source plan sections it satisfies.
    - A phase-by-phase checklist inside each feature block using [ ] markdown checkboxes.
-   - For EVERY phase, use this TDD lifecycle in order: Test Specification →
+   - For every `code` phase, use the TDD lifecycle in order: Test Specification →
      Verify Red → Implementation → Green tests → Review/QA.
+     For non-code phases (`writing`, `experiment`, `research`, `manual`), use the
+     kind's 2-checkpoint structure instead — see 'Non-Coding Phase Templates' below.
    - Keep exactly this durable sub-checkbox structure so `gstack-build` can parse
      and resume the plan. Verify Red and Green tests are CLI-owned gates, not
      additional markdown checkboxes:
@@ -1155,7 +1157,7 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
      - [specific edge case 2]
 
    - A dedicated test plan strategy section.
-   - For EVERY phase, include a `#### Test Spec` section in the phase body with:
+   - For every `code` phase, include a `#### Test Spec` section in the phase body with:
      a `**Coverage target: ≥80%**` line, a scenario table with at least 3 rows
      (ID, Scenario, Given, When, Then columns), and an explicit edge cases list.
      Use the phase description to derive concrete inputs/outputs — name real values
@@ -1164,6 +1166,49 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
      location from the repo layout. Write enough detail that no design judgment is
      needed — the test-writer implements these cases as a quality floor and MAY add
      additional cases on top.
+   - When a phase produces no runnable source files — only documents, data files, or
+     requires external human action — annotate the heading with the appropriate `[kind]`
+     bracket: `[writing]`, `[experiment]`, `[research]`, or `[manual]`. Omitting the
+     bracket defaults to `code`. See 'Non-Coding Phase Templates' below for examples.
+
+   **Non-Coding Phase Templates**
+
+   Use these 2-checkpoint structures for non-code phases. No `Test Specification`
+   checkbox and no `#### Test Spec` section — the TDD lifecycle does not apply.
+
+   `[writing]` — papers, docs, blog posts, READMEs:
+
+     ### Phase X.Y [writing]: Write Methodology Section
+     - [ ] **Draft**: Write the methodology section covering experimental design,
+       data collection, and evaluation protocol. Target: 2,000–3,000 words.
+       Commit to `paper/sections/methodology.md`.
+     - [ ] **Review & QA (review roles)**: Check clarity, completeness, and accuracy.
+       Rubric: a reader unfamiliar with the project understands it after one read.
+
+   `[experiment]` — benchmarks, ablations, data collection, ML evaluations:
+
+     ### Phase X.Y [experiment]: Run Ablation Benchmark
+     - [ ] **Execute**: Run `scripts/run-ablations.sh`, collect results to
+       `results/ablations.json`. Verify output files exist and are non-empty
+       before marking complete. Do not summarize — raw results only.
+     - [ ] **Review & QA (review roles)**: Review reproducibility, statistical
+       validity, and artifact completeness.
+
+   `[research]` — literature review, tech assessment, codebase exploration:
+
+     ### Phase X.Y [research]: Survey Prior Work
+     - [ ] **Explore**: Produce a synthesis of the relevant literature and commit
+       to `docs/prior-work.md`. Cite primary sources. Label speculation explicitly.
+     - [ ] **Review & QA (review roles)**: Verify coverage, source quality, and
+       absence of uncited speculation.
+
+   `[manual]` — vendor signup, API key setup, approval gates, user studies:
+
+     ### Phase X.Y [manual]: Vendor API Key Setup
+     - [ ] **Action Required**: Complete the vendor signup at vendor.example.com
+       and save the API key to `.env.VENDOR_KEY`. Reply here when done.
+     - [ ] **Verify Completion**: Confirm the key is present and the integration
+       test passes (or describe the verification you performed).
 
    Living plan filenames MUST be unique and must never use date-only names. Use:
    `<repoSlug>-impl-plan-<sourceSlug>-<YYYYMMDD-HHMMSS>-<hash>.md`.

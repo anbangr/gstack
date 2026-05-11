@@ -97,7 +97,11 @@ import {
   type ParsedFeatureVerdict,
 } from "./feature-review";
 import { promptYesNo, buildBlockedFeatureMd } from "./feature-review-prompt";
-import { runPlanReview, reconcilePlanReview } from "./plan-reviewer";
+import {
+  runPlanReview,
+  reconcilePlanReview,
+  readPlanReviewRound,
+} from "./plan-reviewer";
 import { shipAndDeploy, shipOnly } from "./ship";
 import { runReleaseDaemon, retryReleaseQueueRecord } from "./release-daemon";
 import {
@@ -6291,6 +6295,7 @@ async function main() {
           timeoutMs: BUILD_DEFAULTS.timeoutsMs.planReview,
           logDirPath: logDir(slug),
           cwd,
+          round: readPlanReviewRound(planReviewReportPath),
         });
         const outcome = await reconcilePlanReview(verdict, args.planFile, {
           planReviewReportPath,
