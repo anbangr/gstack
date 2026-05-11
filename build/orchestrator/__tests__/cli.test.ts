@@ -3540,7 +3540,7 @@ describe("ship failure sets state.failureReason at paused paths", () => {
     const fakeKimi = path.join(tmpDir!, "kimi");
     fs.writeFileSync(
       fakeKimi,
-      `#!/usr/bin/env node
+      `#!${process.execPath}
 const fs = require("node:fs");
 const argv = process.argv.slice(2);
 const prompt = argv[argv.indexOf("-p") + 1] || "";
@@ -3681,6 +3681,9 @@ describe("monitor emits RUN_FAILED when failureReason set (regression)", () => {
       spawnResume: false,
     });
 
+    // This assertion documents the pre-fix bug. When the TODOS.md
+    // "dead process + paused state = terminal" invariant is moved to
+    // readRunSnapshot in monitor.ts, this expectation must flip to RUN_FAILED.
     expect(result.terminalEvent?.event).toBe("RUN_RESUMED");
   });
 

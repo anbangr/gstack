@@ -1579,7 +1579,7 @@ When the monitor emits `RUN_FAILED` with a message like "Feature N: ship succeed
 
 To recover:
 1. Diagnose why /ship failed (check the log path in the error message).
-2. Fix the underlying issue (e.g., broken `gh` CLI auth, missing PR template, base sync conflict — see the `featureState.error` field in the state JSON).
+2. Fix the underlying issue (e.g., broken `gh` CLI auth, missing PR template, base sync conflict — see the `features[N].error` field in the state JSON).
 3. Edit the state JSON to clear the failure and reset the feature:
    - File: `~/.gstack/build-state/<slug>.json` (logs remain under `~/.gstack/build-state/<slug>/`)
    - Remove the top-level `failureReason` key.
