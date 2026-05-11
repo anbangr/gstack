@@ -622,6 +622,11 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     "build/orchestrator/monitor.ts",
     "test/skill-e2e-build-fault-investigator.test.ts",
   ],
+  "build-step-transition-eval": [
+    "build/SKILL.md",
+    "build/SKILL.md.tmpl",
+    "test/skill-e2e-build-step-transition.test.ts",
+  ],
 
   // CSO
   "cso-full-audit": ["cso/**"],
@@ -1125,6 +1130,8 @@ export const E2E_TIERS: Record<string, "gate" | "periodic"> = {
   "build-skill-cli-handoff": "periodic",
   // Build fault investigator — periodic (non-deterministic LLM session, requires agent)
   "build-fault-investigator-e2e": "periodic",
+  // Build step-transition — periodic (quality benchmark: verifies agent proceeds to Step 3)
+  "build-step-transition-eval": "periodic",
 
   // CSO — gate for security guardrails, periodic for quality
   "cso-full-audit": "gate", // Hardcoded secrets detection
