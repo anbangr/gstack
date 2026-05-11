@@ -7187,6 +7187,15 @@ async function main() {
         // queued PRs.
         state.completed = !args.dryRun && !args.skipShip;
         saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+        // When --skip-ship leaves features at origin_verified, exit 13
+        // (FINALIZATION_REQUIRED) instead of 0 so the skill agent cannot infer
+        // "done" from exit 0 — Step 3 (ship + archive) is mandatory.
+        if (
+          args.skipShip &&
+          state.features?.some((f) => f.status === "origin_verified")
+        ) {
+          exitCode = 13;
+        }
       }
       if (exitCode === 0 && state.completed && !args.dryRun && !args.skipShip) {
         const archivedPath = archiveLivingPlan(state.planFile);
