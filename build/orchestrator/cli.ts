@@ -2904,7 +2904,7 @@ export function extractCoverageTarget(phaseBody: string): number {
   const m = phaseBody.match(
     /\*\*Coverage target:\s*(?:>=|[≥>])\s*(\d+(?:\.\d+)?)%\*\*/i,
   );
-  return m ? parseInt(m[1], 10) : 80;
+  return m ? parseFloat(m[1]) : 80;
 }
 
 export function buildGeminiTestSpecPrompt(
