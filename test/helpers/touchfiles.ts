@@ -589,7 +589,11 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     "land-and-deploy/**",
   ],
   "ship-plan-completion": ["ship/**", "scripts/gen-skill-docs.ts"],
-  "ship-plan-verification": ["ship/**", "scripts/gen-skill-docs.ts"],
+  "ship-plan-verification": [
+    "ship/**",
+    "qa-only/**",
+    "scripts/gen-skill-docs.ts",
+  ],
 
   // Retro
   retro: ["retro/**"],
@@ -707,13 +711,6 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
   ],
   "ship-triage": ["ship/**", "bin/gstack-repo-mode"],
 
-  // Plan completion audit + verification
-  "ship-plan-completion": ["ship/**", "scripts/gen-skill-docs.ts"],
-  "ship-plan-verification": [
-    "ship/**",
-    "qa-only/**",
-    "scripts/gen-skill-docs.ts",
-  ],
   "ship-idempotency": ["ship/**", "scripts/resolvers/utility.ts"],
   "review-plan-completion": ["review/**", "scripts/gen-skill-docs.ts"],
 
