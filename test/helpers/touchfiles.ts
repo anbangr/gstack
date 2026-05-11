@@ -1129,13 +1129,10 @@ export const E2E_TIERS: Record<string, "gate" | "periodic"> = {
 
   // Build — live handoff is periodic because it uses an LLM session.
   "build-skill-cli-handoff": "periodic",
-<<<<<<< HEAD
-=======
   // Build fault investigator — periodic (non-deterministic LLM session, requires agent)
   "build-fault-investigator-e2e": "periodic",
   // Build step-transition — periodic (quality benchmark: verifies agent proceeds to Step 3)
   "build-step-transition-eval": "periodic",
->>>>>>> e5a61a36 (fix(build): add step-transition guardrails (MANDATORY prose, FINALIZATION_REQUIRED, eval))
 
   // CSO — gate for security guardrails, periodic for quality
   "cso-full-audit": "gate", // Hardcoded secrets detection
