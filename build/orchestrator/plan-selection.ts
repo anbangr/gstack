@@ -489,7 +489,6 @@ function activeRunOnlyCandidates(
   const records = readActiveRunRecords(registryDir);
   const cleaned: ActiveRunRecord[] = [];
   for (const record of records) {
-    const terminal = record.status === "completed" || record.status === "failed";
     if (record.status === "paused" && !isPidAlive(record.pid)) {
       removeActiveRunRecord(registryDir, record.runId);
       continue;
