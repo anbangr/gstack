@@ -490,7 +490,7 @@ function activeRunOnlyCandidates(
   const cleaned: ActiveRunRecord[] = [];
   for (const record of records) {
     const terminal = record.status === "completed" || record.status === "failed";
-    if (!terminal && !isPidAlive(record.pid)) {
+    if (record.status === "paused" && !isPidAlive(record.pid)) {
       removeActiveRunRecord(registryDir, record.runId);
       continue;
     }

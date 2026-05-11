@@ -601,6 +601,43 @@ describe("plan resolver", () => {
     expect(result.result).toBe("selected");
     expect(result.selected?.runId).toBe("run-live-paused");
   });
+
+  test("T6 (Feature 3): running + dead pid remains a stale resume candidate", () => {
+    const repo = gstackRepo();
+    const app = path.join(tmpDir, "app");
+    const activeRunRegistry = path.join(tmpDir, "active-runs-t6");
+    const plan = livingPlan(repo, "app-impl-plan-running-dead-1.md");
+
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-running-dead",
+      stateSlug: "build-run-running-dead",
+      repoPath: path.join(tmpDir, "worktrees", "run-running-dead"),
+      baseProjectRoot: app,
+      planFile: plan,
+      pid: 999999,
+      status: "running",
+      startedAt: "2026-05-11T00:00:00Z",
+      lastUpdatedAt: "2026-05-11T00:00:00Z",
+      branches: [],
+    });
+
+    const recordFile = activeRunRecordPath(
+      activeRunRegistry,
+      "run-running-dead",
+    );
+
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      projectRoot: app,
+      resumeOnly: true,
+      activeRunRegistry,
+    });
+
+    expect(fs.existsSync(recordFile)).toBe(true);
+    expect(result.result).toBe("selected");
+    expect(result.selected?.runId).toBe("run-running-dead");
+    expect(result.selected?.status).toBe("stale");
+  });
 });
 
 function manifestRun(args: {
