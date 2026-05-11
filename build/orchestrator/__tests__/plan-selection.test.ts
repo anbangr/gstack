@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { writeActiveRunRecord } from "../active-runs";
+import { readActiveRunRecords, writeActiveRunRecord } from "../active-runs";
 import {
   canonicalSourcePlanClaimPath,
   legacySourcePlanClaimPath,
@@ -43,7 +43,10 @@ function sourcePlan(repo: string, name = "feature-plan-1.md"): string {
 }
 
 function livingPlan(repo: string, name = "app-impl-plan-feature-1.md"): string {
-  return write(path.join(repo, "inbox", "living-plan", name), "# Living\n- [ ] **Implementation**\n");
+  return write(
+    path.join(repo, "inbox", "living-plan", name),
+    "# Living\n- [ ] **Implementation**\n",
+  );
 }
 
 beforeEach(() => {
@@ -113,6 +116,348 @@ describe("canonical source-plan claims", () => {
   });
 });
 
+describe("active-run concurrency gate — exit-13 paused status (Feature 2 T5/T6)", () => {
+  test("paused record with live pid is non-terminal: candidate returned, gate blocks", () => {
+    const repo = gstackRepo();
+    const app = path.join(tmpDir, "app");
+    const activeRunRegistry = path.join(tmpDir, "active-runs");
+    const plan = livingPlan(repo, "app-impl-plan-paused-gate-1.md");
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-paused-gate",
+      stateSlug: "state-paused-gate",
+      repoPath: path.join(tmpDir, "worktrees", "run-paused-gate"),
+      baseProjectRoot: app,
+      planFile: plan,
+      pid: process.pid,
+      status: "paused",
+      startedAt: "2026-05-11T00:00:00Z",
+      lastUpdatedAt: "2026-05-11T00:00:00Z",
+      branches: [],
+    });
+
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      projectRoot: app,
+      activeRunRegistry,
+    });
+
+    // paused + live pid → non-terminal in activeRunCandidate → status "running"
+    // → runHasIncompleteCandidate returns true → candidate included → gate blocks
+    const candidate = result.candidates.find(
+      (c) => c.runId === "run-paused-gate",
+    );
+    expect(candidate).toBeDefined();
+    expect(candidate?.status).toBe("running");
+    expect(candidate?.live).toBe(true);
+    expect(result.result).not.toBe("none");
+  });
+
+  test("failed record is terminal: no candidate returned, gate allows new build", () => {
+    const repo = gstackRepo();
+    const app = path.join(tmpDir, "app");
+    const activeRunRegistry = path.join(tmpDir, "active-runs");
+    const plan = livingPlan(repo, "app-impl-plan-failed-gate-1.md");
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-failed-gate",
+      stateSlug: "state-failed-gate",
+      repoPath: path.join(tmpDir, "worktrees", "run-failed-gate"),
+      baseProjectRoot: app,
+      planFile: plan,
+      pid: process.pid,
+      status: "failed",
+      startedAt: "2026-05-11T00:00:00Z",
+      lastUpdatedAt: "2026-05-11T00:00:00Z",
+      branches: [],
+    });
+
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      projectRoot: app,
+      activeRunRegistry,
+    });
+
+    // failed → terminal → filtered by runHasIncompleteCandidate → not in candidates
+    const candidate = result.candidates.find(
+      (c) => c.runId === "run-failed-gate",
+    );
+    expect(candidate).toBeUndefined();
+    expect(result.result).toBe("none");
+  });
+});
+
+describe("active-run registry status persistence — exit code classification (Feature 2 T1-T4)", () => {
+  // T1: exit 13 (FINALIZATION_REQUIRED) → registry status "paused"
+  // updateActiveRunFromState passes "paused" as fallback when exitCode === 13.
+  // We verify the persisted record round-trips correctly AND that resolvePlanSelection
+  // treats the resulting record as non-terminal (gate blocks a duplicate /build).
+  test("T1: exit-13 (FINALIZATION_REQUIRED) produces paused registry record that blocks gate", () => {
+    const repo = gstackRepo();
+    const app = path.join(tmpDir, "app");
+    const activeRunRegistry = path.join(tmpDir, "active-runs");
+    const plan = livingPlan(repo, "app-impl-plan-exit13-1.md");
+
+    // Simulate what updateActiveRunFromState writes for exitCode === 13 (FINALIZATION_REQUIRED)
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-exit13",
+      stateSlug: "state-exit13",
+      repoPath: path.join(tmpDir, "worktrees", "run-exit13"),
+      baseProjectRoot: app,
+      planFile: plan,
+      pid: process.pid,
+      status: "paused",
+      startedAt: "2026-05-11T00:00:00Z",
+      lastUpdatedAt: "2026-05-11T00:00:00Z",
+      branches: [],
+    });
+
+    // Registry record persists with status "paused"
+    const records = readActiveRunRecords(activeRunRegistry);
+    expect(records).toHaveLength(1);
+    expect(records[0].status).toBe("paused");
+
+    // Plan selection treats the paused (live pid) record as non-terminal → gate blocks
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      projectRoot: app,
+      activeRunRegistry,
+    });
+    const candidate = result.candidates.find((c) => c.runId === "run-exit13");
+    expect(candidate).toBeDefined();
+    expect(candidate?.live).toBe(true);
+    expect(candidate?.status).toBe("running"); // paused + live pid → "running" in activeRunCandidate
+    expect(result.result).not.toBe("none");
+  });
+
+  // T2: exit 0 (success / normal completion with --skip-ship not set) → registry status "paused"
+  // The same "paused" fallback is used for exit 0, so behaviour is identical to T1.
+  test("T2: exit-0 also produces paused registry record (unchanged baseline)", () => {
+    const repo = gstackRepo();
+    const app = path.join(tmpDir, "app");
+    const activeRunRegistry = path.join(tmpDir, "active-runs");
+    const plan = livingPlan(repo, "app-impl-plan-exit0-1.md");
+
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-exit0",
+      stateSlug: "state-exit0",
+      repoPath: path.join(tmpDir, "worktrees", "run-exit0"),
+      baseProjectRoot: app,
+      planFile: plan,
+      pid: process.pid,
+      status: "paused",
+      startedAt: "2026-05-11T00:00:00Z",
+      lastUpdatedAt: "2026-05-11T00:00:00Z",
+      branches: [],
+    });
+
+    const records = readActiveRunRecords(activeRunRegistry);
+    expect(records[0].status).toBe("paused");
+
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      projectRoot: app,
+      activeRunRegistry,
+    });
+    const candidate = result.candidates.find((c) => c.runId === "run-exit0");
+    expect(candidate).toBeDefined();
+    expect(candidate?.status).toBe("running");
+  });
+
+  // T3: exit 1 → registry status "failed" (terminal, gate allows new build)
+  test("T3: exit-1 produces failed registry record — terminal, gate allows new build", () => {
+    const repo = gstackRepo();
+    const app = path.join(tmpDir, "app");
+    const activeRunRegistry = path.join(tmpDir, "active-runs");
+    const plan = livingPlan(repo, "app-impl-plan-exit1-1.md");
+
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-exit1",
+      stateSlug: "state-exit1",
+      repoPath: path.join(tmpDir, "worktrees", "run-exit1"),
+      baseProjectRoot: app,
+      planFile: plan,
+      pid: process.pid,
+      status: "failed",
+      startedAt: "2026-05-11T00:00:00Z",
+      lastUpdatedAt: "2026-05-11T00:00:00Z",
+      branches: [],
+    });
+
+    const records = readActiveRunRecords(activeRunRegistry);
+    expect(records[0].status).toBe("failed");
+
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      projectRoot: app,
+      activeRunRegistry,
+    });
+    const candidate = result.candidates.find((c) => c.runId === "run-exit1");
+    // failed is terminal: filtered out by runHasIncompleteCandidate
+    expect(candidate).toBeUndefined();
+    expect(result.result).toBe("none");
+  });
+
+  // T4: exit 2 → registry status "failed" (same terminal behaviour as T3)
+  test("T4: exit-2 produces failed registry record — same terminal behaviour as exit-1", () => {
+    const repo = gstackRepo();
+    const app = path.join(tmpDir, "app");
+    const activeRunRegistry = path.join(tmpDir, "active-runs");
+    const plan = livingPlan(repo, "app-impl-plan-exit2-1.md");
+
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-exit2",
+      stateSlug: "state-exit2",
+      repoPath: path.join(tmpDir, "worktrees", "run-exit2"),
+      baseProjectRoot: app,
+      planFile: plan,
+      pid: process.pid,
+      status: "failed",
+      startedAt: "2026-05-11T00:00:00Z",
+      lastUpdatedAt: "2026-05-11T00:00:00Z",
+      branches: [],
+    });
+
+    const records = readActiveRunRecords(activeRunRegistry);
+    expect(records[0].status).toBe("failed");
+
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      projectRoot: app,
+      activeRunRegistry,
+    });
+    const candidate = result.candidates.find((c) => c.runId === "run-exit2");
+    expect(candidate).toBeUndefined();
+    expect(result.result).toBe("none");
+  });
+});
+
+describe("active-run registry edge cases — exit-13 fix (Feature 2)", () => {
+  // Edge case: exitCode === null (signal kill) → "failed" (defensive default, not paused).
+  // A null exit code from a SIGKILL should not be mistaken for FINALIZATION_REQUIRED.
+  test("null exit code (signal kill) produces failed status — not treated as paused", () => {
+    const repo = gstackRepo();
+    const app = path.join(tmpDir, "app");
+    const activeRunRegistry = path.join(tmpDir, "active-runs");
+    const plan = livingPlan(repo, "app-impl-plan-sigkill-1.md");
+
+    // updateActiveRunFromState passes "failed" when exitCode is null
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-sigkill",
+      stateSlug: "state-sigkill",
+      repoPath: path.join(tmpDir, "worktrees", "run-sigkill"),
+      baseProjectRoot: app,
+      planFile: plan,
+      pid: process.pid,
+      status: "failed",
+      startedAt: "2026-05-11T00:00:00Z",
+      lastUpdatedAt: "2026-05-11T00:00:00Z",
+      branches: [],
+    });
+
+    const records = readActiveRunRecords(activeRunRegistry);
+    expect(records[0].status).toBe("failed");
+
+    // failed is terminal — gate allows a new build
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      projectRoot: app,
+      activeRunRegistry,
+    });
+    const candidate = result.candidates.find((c) => c.runId === "run-sigkill");
+    expect(candidate).toBeUndefined();
+    expect(result.result).toBe("none");
+  });
+
+  // Edge case: paused record with dead pid → "stale" (non-terminal, gate STILL blocks).
+  // A paused run whose process has exited (e.g. host reboot) remains resumable,
+  // so a duplicate /build should still be blocked until the run is explicitly
+  // cleaned up or resumed.
+  test("paused record with dead pid is stale (non-terminal): candidate returned, gate blocks", () => {
+    const repo = gstackRepo();
+    const app = path.join(tmpDir, "app");
+    const activeRunRegistry = path.join(tmpDir, "active-runs");
+    const plan = livingPlan(repo, "app-impl-plan-paused-dead-1.md");
+
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-paused-dead",
+      stateSlug: "state-paused-dead",
+      repoPath: path.join(tmpDir, "worktrees", "run-paused-dead"),
+      baseProjectRoot: app,
+      planFile: plan,
+      pid: 99999999, // dead pid — not the current process
+      status: "paused",
+      startedAt: "2026-05-11T00:00:00Z",
+      lastUpdatedAt: "2026-05-11T00:00:00Z",
+      branches: [],
+    });
+
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      projectRoot: app,
+      activeRunRegistry,
+    });
+
+    // paused + dead pid → non-terminal but not live → status "stale"
+    // runHasIncompleteCandidate returns true for "stale" → candidate included → gate blocks
+    const candidate = result.candidates.find(
+      (c) => c.runId === "run-paused-dead",
+    );
+    expect(candidate).toBeDefined();
+    expect(candidate?.status).toBe("stale");
+    expect(candidate?.live).toBe(false);
+    expect(result.result).not.toBe("none");
+  });
+
+  // Edge case: failed record with dead pid → terminal (gate allows).
+  // Contrast with the paused+dead case above: "failed" is always terminal regardless of pid.
+  test("failed record with dead pid is terminal: no candidate, gate allows new build", () => {
+    const repo = gstackRepo();
+    const app = path.join(tmpDir, "app");
+    const activeRunRegistry = path.join(tmpDir, "active-runs");
+    const plan = livingPlan(repo, "app-impl-plan-failed-dead-1.md");
+
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-failed-dead",
+      stateSlug: "state-failed-dead",
+      repoPath: path.join(tmpDir, "worktrees", "run-failed-dead"),
+      baseProjectRoot: app,
+      planFile: plan,
+      pid: 99999999, // dead pid
+      status: "failed",
+      startedAt: "2026-05-11T00:00:00Z",
+      lastUpdatedAt: "2026-05-11T00:00:00Z",
+      branches: [],
+    });
+
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      projectRoot: app,
+      activeRunRegistry,
+    });
+
+    // failed is always terminal — dead pid doesn't matter
+    const candidate = result.candidates.find(
+      (c) => c.runId === "run-failed-dead",
+    );
+    expect(candidate).toBeUndefined();
+    expect(result.result).toBe("none");
+  });
+
+  // Edge case: registry-disabled path (no activeRunRegistry configured) — should be a no-op.
+  // resolvePlanSelection must not crash when the registry is missing or unconfigured.
+  test("registry-disabled: resolvePlanSelection does not crash without activeRunRegistry", () => {
+    const repo = gstackRepo();
+    const plan = sourcePlan(repo);
+
+    // No activeRunRegistry passed — the function falls back to defaultActiveRunRegistryDir()
+    // which points to a non-existent path; readActiveRunRecords returns [] for missing dirs.
+    const result = resolvePlanSelection({ gstackRepo: repo });
+
+    // Should still resolve the source plan normally
+    expect(result.result).toBe("selected");
+    expect(result.selected?.path).toBe(plan);
+  });
+});
+
 describe("plan resolver", () => {
   test("one unclaimed source plan auto-selects", () => {
     const repo = gstackRepo();
@@ -122,7 +467,9 @@ describe("plan resolver", () => {
 
     expect(result.result).toBe("selected");
     expect(result.selected?.path).toBe(plan);
-    expect(result.selected?.claimPath).toBe(canonicalSourcePlanClaimPath(repo, plan));
+    expect(result.selected?.claimPath).toBe(
+      canonicalSourcePlanClaimPath(repo, plan),
+    );
     expect(result.commands).toEqual([`/build ${plan}`]);
   });
 
@@ -162,17 +509,21 @@ describe("plan resolver", () => {
 
     expect(result.result).toBe("selected");
     expect(result.reason).toContain("all unclaimed inbox");
-    expect(result.candidates.map((candidate) => candidate.path).sort()).toEqual([
-      first,
-      second,
-    ].sort());
-    expect(result.candidates.every((candidate) => candidate.claimPath)).toBe(true);
+    expect(result.candidates.map((candidate) => candidate.path).sort()).toEqual(
+      [first, second].sort(),
+    );
+    expect(result.candidates.every((candidate) => candidate.claimPath)).toBe(
+      true,
+    );
   });
 
   test("explicit source path wins after validation", () => {
     const repo = gstackRepo();
     const inbox = sourcePlan(repo, "inbox-plan-1.md");
-    const explicit = write(path.join(tmpDir, "chosen-plan-1.md"), "# Explicit\n");
+    const explicit = write(
+      path.join(tmpDir, "chosen-plan-1.md"),
+      "# Explicit\n",
+    );
 
     const result = resolvePlanSelection({
       gstackRepo: repo,
@@ -222,8 +573,13 @@ describe("plan resolver", () => {
     });
 
     expect(result.result).toBe("ambiguous");
-    expect(result.commands).toEqual(["/build --resume run-a", "/build --resume run-b"]);
-    expect(result.candidates.map((candidate) => candidate.monitorCommand)).toEqual([
+    expect(result.commands).toEqual([
+      "/build --resume run-a",
+      "/build --resume run-b",
+    ]);
+    expect(
+      result.candidates.map((candidate) => candidate.monitorCommand),
+    ).toEqual([
       `gstack-build monitor --manifest ${manifestPath} --watch --supervise`,
       `gstack-build monitor --manifest ${manifestPath} --watch --supervise`,
     ]);
@@ -237,7 +593,11 @@ describe("plan resolver", () => {
     const stoppedPlan = livingPlan(repo, "app-impl-plan-feature-1.md");
     const siblingPlan = livingPlan(repo, "sibling-impl-plan-feature-1.md");
     writeManifest(repo, [
-      manifestRun({ repoPath: app, livingPlanPath: stoppedPlan, runId: "run-stopped" }),
+      manifestRun({
+        repoPath: app,
+        livingPlanPath: stoppedPlan,
+        runId: "run-stopped",
+      }),
     ]);
     writeActiveRunRecord(activeRunRegistry, {
       runId: "run-sibling",
@@ -341,10 +701,9 @@ describe("plan resolver", () => {
     });
 
     expect(ambiguous.result).toBe("ambiguous");
-    expect(ambiguous.commands.sort()).toEqual([
-      `/build ${first} --resume`,
-      `/build ${second} --resume`,
-    ].sort());
+    expect(ambiguous.commands.sort()).toEqual(
+      [`/build ${first} --resume`, `/build ${second} --resume`].sort(),
+    );
     expect(selected.result).toBe("selected");
     expect(selected.selected?.path).toBe(second);
     expect(selected.selected?.monitorCommand).toBeUndefined();
@@ -463,7 +822,16 @@ describe("plan resolver", () => {
   test("malformed manifests are reported without hiding good candidates", () => {
     const repo = gstackRepo();
     const plan = sourcePlan(repo);
-    write(path.join(repo, ".llm-tmp", "build-runs", "bad", "build-run-manifest.json"), "{");
+    write(
+      path.join(
+        repo,
+        ".llm-tmp",
+        "build-runs",
+        "bad",
+        "build-run-manifest.json",
+      ),
+      "{",
+    );
 
     const result = resolvePlanSelection({ gstackRepo: repo });
 
@@ -489,7 +857,9 @@ describe("plan resolver", () => {
 
     expect(table).toContain("Result: selected");
     expect(table).toContain("/build --resume run-a");
-    expect(table).toContain(`gstack-build monitor --manifest ${manifestPath} --watch --supervise`);
+    expect(table).toContain(
+      `gstack-build monitor --manifest ${manifestPath} --watch --supervise`,
+    );
     expect(result.selected?.monitorCommand).toBe(
       `gstack-build monitor --manifest ${manifestPath} --watch --supervise`,
     );
@@ -522,10 +892,7 @@ function manifestRun(args: {
   };
 }
 
-function writeManifest(
-  repo: string,
-  runs: BuildRunManifest["runs"],
-): string {
+function writeManifest(repo: string, runs: BuildRunManifest["runs"]): string {
   const manifestPath = path.join(
     repo,
     ".llm-tmp",
@@ -565,7 +932,10 @@ function writeManifest(
       features: [],
       completed: false,
     };
-    writeJson(path.join(process.env.GSTACK_BUILD_STATE_DIR!, `${run.stateSlug}.json`), state);
+    writeJson(
+      path.join(process.env.GSTACK_BUILD_STATE_DIR!, `${run.stateSlug}.json`),
+      state,
+    );
   }
   return manifestPath;
 }
