@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.31.0.1] - 2026-05-12
+
+### Fixed
+- Auto-clean stale paused records from active-run registry. Previously, paused records with dead PIDs accumulated indefinitely.
+- Preserve stale running active-run candidates correctly — running records with dead PIDs remain visible as stale resume candidates instead of being silently dropped.
+
+### Added
+- Regression tests for exit-13 active-run registry status: verify that skip-ship writes `paused` (not `failed`) and that non-zero non-13 exits write `failed`.
+- Unit tests for stale paused record cleanup: dead-pid paused records are removed, live-pid paused records are preserved, and running records are never auto-removed.
+
 ## [1.31.0.0] - 2026-05-09
 
 ## **AskUserQuestion stops getting silently buried in plan files.**
