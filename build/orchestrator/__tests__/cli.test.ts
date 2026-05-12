@@ -315,6 +315,12 @@ describe("--single-branch flag wiring", () => {
     expect(args.skipShip).toBe(false);
     expect(args.releaseMode).toBe("auto-land");
   });
+
+  it("--single-branch with --dry-run leaves dryRun=true and singleBranch=true", () => {
+    const args = parseArgs(["plan.md", "--single-branch", "--dry-run"]);
+    expect(args.singleBranch).toBe(true);
+    expect(args.dryRun).toBe(true);
+  });
 });
 
 describe("release-daemon CLI", () => {
