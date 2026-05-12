@@ -57,6 +57,8 @@ Use this mode when the user asks `/build merge` or wants past build branches mer
    Include only user-requested flags such as `--dry-run`, `--skip-clean-check`, role overrides, or `--max-codex-iter`. Do not pass a plan file. Do not run raw `git merge`, `gh pr create`, or `gh pr merge`; the CLI must use the configured GStack `/review`, `/ship`, and `/land-and-deploy` skills.
 5. Monitor the CLI output. If it exits nonzero, report the blocked branch and point to the merge logs under `~/.gstack/build-state/build-merge-*/`. Do not continue manually.
 
+If the branch already has an open PR on GitHub, the CLI detects it via `gh pr list`, pushes any local fixer commits to the remote, then calls `/land-and-deploy` directly — skipping `/ship`. If no open PR exists, the full ship + land flow runs as normal.
+
 ## Step 1: Set Up Resolver & Synthesize Living Plan (Normal/Resume Mode)
 
 Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the shared resolver bootstrap so repo identity and run identity are resolved by `plan-status`, not selected directly from the current Claude/Codex session.

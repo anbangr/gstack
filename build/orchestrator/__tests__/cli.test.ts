@@ -37,6 +37,8 @@ import {
   renderSystemdReleaseDaemonService,
   runRoleTask,
   buildKindInstructions,
+  findOpenPRForBranch,
+  chooseMergePath,
   HELP_TEXT,
 } from "../cli";
 import type {
@@ -3340,74 +3342,120 @@ describe("buildKindInstructions", () => {
 
   // Shared requirements — all kinds
   it("all kinds: contains 'Commit'", () => {
-    for (const kind of ["code", "writing", "experiment", "research", "manual"] as const) {
-      const result = joinInstructions(buildKindInstructions(makePhaseWithKind(kind)));
+    for (const kind of [
+      "code",
+      "writing",
+      "experiment",
+      "research",
+      "manual",
+    ] as const) {
+      const result = joinInstructions(
+        buildKindInstructions(makePhaseWithKind(kind)),
+      );
       expect(result).toContain("Commit");
     }
   });
 
   it("all kinds: contains 'Do NOT run /review'", () => {
-    for (const kind of ["code", "writing", "experiment", "research", "manual"] as const) {
-      const result = joinInstructions(buildKindInstructions(makePhaseWithKind(kind)));
+    for (const kind of [
+      "code",
+      "writing",
+      "experiment",
+      "research",
+      "manual",
+    ] as const) {
+      const result = joinInstructions(
+        buildKindInstructions(makePhaseWithKind(kind)),
+      );
       expect(result).toContain("Do NOT run /review");
     }
   });
 
   it("all kinds: contains 'Do NOT update the plan file'", () => {
-    for (const kind of ["code", "writing", "experiment", "research", "manual"] as const) {
-      const result = joinInstructions(buildKindInstructions(makePhaseWithKind(kind)));
+    for (const kind of [
+      "code",
+      "writing",
+      "experiment",
+      "research",
+      "manual",
+    ] as const) {
+      const result = joinInstructions(
+        buildKindInstructions(makePhaseWithKind(kind)),
+      );
       expect(result).toContain("Do NOT update the plan file");
     }
   });
 
   // code phase
   it("code phase: contains 'Make all failing tests pass'", () => {
-    const result = joinInstructions(buildKindInstructions(makePhaseWithKind("code")));
+    const result = joinInstructions(
+      buildKindInstructions(makePhaseWithKind("code")),
+    );
     expect(result).toContain("Make all failing tests pass");
   });
 
   it("code phase: contains 'Fail forward'", () => {
-    const result = joinInstructions(buildKindInstructions(makePhaseWithKind("code")));
+    const result = joinInstructions(
+      buildKindInstructions(makePhaseWithKind("code")),
+    );
     expect(result).toContain("Fail forward");
   });
 
   // writing phase
   it("writing phase: contains 'Quality bar: a reader'", () => {
-    const result = joinInstructions(buildKindInstructions(makePhaseWithKind("writing")));
+    const result = joinInstructions(
+      buildKindInstructions(makePhaseWithKind("writing")),
+    );
     expect(result).toContain("Quality bar: a reader");
   });
 
   it("writing phase: does NOT contain 'write failing tests'", () => {
-    const result = joinInstructions(buildKindInstructions(makePhaseWithKind("writing")));
+    const result = joinInstructions(
+      buildKindInstructions(makePhaseWithKind("writing")),
+    );
     expect(result).not.toContain("write failing tests");
     expect(result).not.toContain("Make all failing tests pass");
   });
 
   // experiment phase
   it("experiment phase: contains 'Commit raw results'", () => {
-    const result = joinInstructions(buildKindInstructions(makePhaseWithKind("experiment")));
+    const result = joinInstructions(
+      buildKindInstructions(makePhaseWithKind("experiment")),
+    );
     expect(result).toContain("Commit raw results");
   });
 
   // research phase
   it("research phase: contains 'Cite primary sources'", () => {
-    const result = joinInstructions(buildKindInstructions(makePhaseWithKind("research")));
+    const result = joinInstructions(
+      buildKindInstructions(makePhaseWithKind("research")),
+    );
     expect(result).toContain("Cite primary sources");
   });
 
   // manual phase
   it("manual phase: contains 'human action'", () => {
-    const result = joinInstructions(buildKindInstructions(makePhaseWithKind("manual")));
+    const result = joinInstructions(
+      buildKindInstructions(makePhaseWithKind("manual")),
+    );
     expect(result).toContain("human action");
   });
 
   it("manual phase: contains 'Do NOT attempt to automate'", () => {
-    const result = joinInstructions(buildKindInstructions(makePhaseWithKind("manual")));
+    const result = joinInstructions(
+      buildKindInstructions(makePhaseWithKind("manual")),
+    );
     expect(result).toContain("Do NOT attempt to automate");
   });
 
   it("returns an array of strings (one per instruction line)", () => {
-    for (const kind of ["code", "writing", "experiment", "research", "manual"] as const) {
+    for (const kind of [
+      "code",
+      "writing",
+      "experiment",
+      "research",
+      "manual",
+    ] as const) {
       const result = buildKindInstructions(makePhaseWithKind(kind));
       expect(Array.isArray(result)).toBe(true);
       expect(result.length).toBeGreaterThanOrEqual(6);
@@ -3415,5 +3463,71 @@ describe("buildKindInstructions", () => {
         expect(typeof line).toBe("string");
       }
     }
+  });
+});
+
+describe("findOpenPRForBranch", () => {
+  let tmpBin: string;
+  let ghBin: string;
+
+  function writeFakeGh(stdout: string, exitCode = 0): void {
+    fs.writeFileSync(
+      ghBin,
+      `#!/bin/sh\nprintf '%s' '${stdout.replace(/'/g, "'\\''")}'\nexit ${exitCode}\n`,
+    );
+    fs.chmodSync(ghBin, 0o755);
+  }
+
+  beforeEach(() => {
+    tmpBin = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-fake-gh-"));
+    ghBin = path.join(tmpBin, "gh");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpBin, { recursive: true, force: true });
+  });
+
+  it("returns PR number when an open PR is found", () => {
+    writeFakeGh('[{"number":42}]');
+    expect(findOpenPRForBranch("/tmp", "feat/my-branch", ghBin)).toBe(42);
+  });
+
+  it("returns null when no PRs exist", () => {
+    writeFakeGh("[]");
+    expect(findOpenPRForBranch("/tmp", "feat/my-branch", ghBin)).toBeNull();
+  });
+
+  it("returns null and logs a warning when gh exits non-zero", () => {
+    writeFakeGh("", 1);
+    const warns: unknown[][] = [];
+    const orig = console.warn;
+    console.warn = (...args: unknown[]) => warns.push(args);
+    try {
+      expect(findOpenPRForBranch("/tmp", "feat/my-branch", ghBin)).toBeNull();
+      expect(warns.length).toBeGreaterThan(0);
+      expect(String(warns[0])).toContain("gh pr list failed");
+    } finally {
+      console.warn = orig;
+    }
+  });
+
+  it("returns null when JSON output is malformed", () => {
+    writeFakeGh("not-json");
+    expect(findOpenPRForBranch("/tmp", "feat/my-branch", ghBin)).toBeNull();
+  });
+
+  it("returns null when PR number is 0", () => {
+    writeFakeGh('[{"number":0}]');
+    expect(findOpenPRForBranch("/tmp", "feat/my-branch", ghBin)).toBeNull();
+  });
+});
+
+describe("chooseMergePath", () => {
+  it("returns 'land-only' when an open PR number is provided", () => {
+    expect(chooseMergePath(42)).toBe("land-only");
+  });
+
+  it("returns 'ship-and-deploy' when no open PR exists", () => {
+    expect(chooseMergePath(null)).toBe("ship-and-deploy");
   });
 });
