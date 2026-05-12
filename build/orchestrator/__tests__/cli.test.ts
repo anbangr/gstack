@@ -291,6 +291,30 @@ describe("--skip-ship flag wiring", () => {
   });
 });
 
+describe("--single-branch flag wiring", () => {
+  it("parseArgs default -> singleBranch=false", () => {
+    const args = parseArgs(["plan.md"]);
+    expect(args.singleBranch).toBe(false);
+  });
+
+  it("parseArgs([plan, --single-branch]) sets singleBranch=true", () => {
+    const args = parseArgs(["plan.md", "--single-branch"]);
+    expect(args.singleBranch).toBe(true);
+  });
+
+  it("--single-branch is independent of --skip-ship", () => {
+    const args = parseArgs([
+      "plan.md",
+      "--single-branch",
+      "--release-mode",
+      "auto-land",
+    ]);
+    expect(args.singleBranch).toBe(true);
+    expect(args.skipShip).toBe(false);
+    expect(args.releaseMode).toBe("auto-land");
+  });
+});
+
 describe("release-daemon CLI", () => {
   it("parses release-daemon run defaults", () => {
     const args = parseArgs(["release-daemon", "run"]);

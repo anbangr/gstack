@@ -523,6 +523,8 @@ export interface Args {
   noResume: boolean;
   noGbrain: boolean;
   skipShip: boolean;
+  /** When true, all features share one feat/<prefix> branch; /ship + /land-and-deploy run once after all features complete. */
+  singleBranch: boolean;
   releaseMode: "queued" | "auto-land";
   maxCodexIter: number;
   testCmd?: string;
@@ -622,6 +624,7 @@ export function parseArgs(argv: string[]): Args {
     noResume: false,
     noGbrain: false,
     skipShip: false,
+    singleBranch: false,
     releaseMode: "queued",
     maxCodexIter: DEFAULT_MAX_CODEX_ITERATIONS,
     projectRoot: undefined,
@@ -673,6 +676,7 @@ export function parseArgs(argv: string[]): Args {
     else if (a === "--no-resume" || a === "--restart") args.noResume = true;
     else if (a === "--no-gbrain") args.noGbrain = true;
     else if (a === "--skip-ship") args.skipShip = true;
+    else if (a === "--single-branch") args.singleBranch = true;
     else if (a === "--release-mode") {
       const next = argv[++i];
       if (next !== "queued" && next !== "auto-land") {
@@ -1734,6 +1738,10 @@ Flags:
   --no-resume          Ignore existing state, start fresh.
   --no-gbrain          Skip gbrain mirror; local JSON only.
   --skip-ship          Skip per-feature /ship + /land-and-deploy steps.
+  --single-branch      All features share one feat/<prefix> branch. /ship +
+                       /land-and-deploy runs once after all features complete
+                       instead of after each feature. Auto-selected by the
+                       driver agent based on plan cohesion.
   --release-mode <m>   queued (default) runs /ship then queues PR for the
                        release daemon. auto-land preserves legacy /ship +
                        /land-and-deploy behavior.
