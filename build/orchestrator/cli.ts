@@ -2529,6 +2529,12 @@ export function sanitizeReviewFeedback(raw: string): string {
 export const BLOCKED_GITIGNORE_PATTERN = "BLOCKED*.md";
 
 /**
+ * Exit code used when --skip-ship leaves features at origin_verified.
+ * Step 3 (ship + archive) is still pending finalization.
+ */
+export const FINALIZATION_REQUIRED = 13;
+
+/**
  * Append the BLOCKED*.md gitignore pattern to a project's .gitignore
  * exactly once per project. Idempotent. Best-effort: write failures are
  * logged but not fatal — the BLOCKED.md write is the primary user-visible
@@ -7308,9 +7314,15 @@ async function main() {
         // queued PRs.
         state.completed = !args.dryRun && !args.skipShip;
         saveState(state, { noGbrain: args.noGbrain, log: console.warn });
-        // --skip-ship leaves features at origin_verified, which is a normal
-        // paused state that resumes cleanly on the next run without forcing
-        // a non-zero exit code.
+        // When --skip-ship leaves features at origin_verified, exit 13
+        // (FINALIZATION_REQUIRED) instead of 0 so the skill agent cannot infer
+        // "done" from the exit code — Step 3 (ship + archive) is mandatory.
+        if (
+          args.skipShip &&
+          state.features?.some((f) => f.status === "origin_verified")
+        ) {
+          exitCode = FINALIZATION_REQUIRED;
+        }
       }
       if (exitCode === 0 && state.completed && !args.dryRun && !args.skipShip) {
         const archivedPath = archiveLivingPlan(state.planFile);
@@ -7340,7 +7352,7 @@ async function main() {
         } else {
           updateActiveRunFromState(
             state,
-            exitCode === 0 ? "paused" : "failed",
+            exitCode === 0 || exitCode === FINALIZATION_REQUIRED ? "paused" : "failed",
           );
         }
       } else if (launch.runId && launch.activeRunRegistry) {
@@ -7363,7 +7375,7 @@ async function main() {
       exitCode = 1;
     }
     logActivity({
-      event: exitCode === 0 || exitCode === 13 ? "success" : "failed",
+      event: exitCode === 0 || exitCode === FINALIZATION_REQUIRED ? "success" : "failed",
       slug,
       durationMs: Date.now() - startedAt,
       exitCode,
