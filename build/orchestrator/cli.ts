@@ -7401,13 +7401,15 @@ async function main() {
         );
       }
       if (exitCode === 0) {
-        // In --release-mode queued, all features may reach release_queued status
-        // while the release daemon handles the actual landing asynchronously.
-        // state.completed = true means "the orchestrator's job is done" — not
-        // "all PRs have merged." The release daemon is responsible for landing
-        // queued PRs.
-        state.completed = !args.dryRun && !args.skipShip;
-        saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+        if (!args.singleBranch) {
+          // In --release-mode queued, all features may reach release_queued status
+          // while the release daemon handles the actual landing asynchronously.
+          // state.completed = true means "the orchestrator's job is done" — not
+          // "all PRs have merged." The release daemon is responsible for landing
+          // queued PRs.
+          state.completed = !args.dryRun && !args.skipShip;
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+        }
         // When --skip-ship leaves features at origin_verified, exit 13
         // (FINALIZATION_REQUIRED) instead of 0 so the skill agent cannot infer
         // "done" from the exit code — Step 3 (ship + archive) is mandatory.
