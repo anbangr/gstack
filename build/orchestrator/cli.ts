@@ -6500,7 +6500,7 @@ async function main() {
       do {
         rerunAutonomousLoop = false;
         while (true) {
-          const skipUnshippedVerified = args.skipShip || args.dryRun;
+          const skipUnshippedVerified = args.skipShip || args.singleBranch || args.dryRun;
           const featureIndex = findNextFeatureIndex(state, {
             skipOriginVerified: skipUnshippedVerified,
           });
@@ -6949,7 +6949,7 @@ async function main() {
             saveState(state, { noGbrain: args.noGbrain, log: console.warn });
           }
 
-          if (!resumeAfterLanding && !args.skipShip && !args.dryRun) {
+          if (!resumeAfterLanding && !args.skipShip && !args.singleBranch && !args.dryRun) {
             const branchForShip = featureState.branch || state.branch;
             const baseSync = syncFeatureBranchWithBase(cwd, branchForShip);
             if (!baseSync.ok) {
@@ -7123,6 +7123,7 @@ async function main() {
           if (
             (resumeAfterLanding || featureState.status === "landed") &&
             !args.skipShip &&
+            !args.singleBranch &&
             !args.dryRun
           ) {
             const synced = syncLandedBase(cwd);
@@ -7161,7 +7162,7 @@ async function main() {
             originPlanFile: args.originPlan,
             cwd,
             roles: args.roles,
-            dryRun: args.dryRun || args.skipShip,
+            dryRun: args.dryRun || args.skipShip || args.singleBranch,
           });
           featureState.issueLogPath = originCheck.issueLogPath;
           if (!originCheck.ok) {
@@ -7205,7 +7206,9 @@ async function main() {
           }
 
           featureState.status =
-            args.skipShip || args.dryRun ? "origin_verified" : "committed";
+            args.skipShip || args.singleBranch || args.dryRun
+              ? "origin_verified"
+              : "committed";
           featureState.originVerificationAttempts = 0;
           featureState.error = undefined;
           featureState.originVerifiedAt = new Date().toISOString();
@@ -7229,7 +7232,7 @@ async function main() {
         if (exitCode === 0) {
           const remainingPhase = findNextPhaseIndex(state.phases);
           const remainingFeature = findNextFeatureIndex(state, {
-            skipOriginVerified: args.skipShip || args.dryRun,
+            skipOriginVerified: args.skipShip || args.singleBranch || args.dryRun,
           });
           if (remainingPhase !== -1 || remainingFeature !== -1) {
             console.error(
