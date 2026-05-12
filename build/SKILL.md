@@ -1,7 +1,7 @@
 ---
 name: build
 preamble-tier: 4
-version: 1.22.0
+version: 1.22.2
 description: |
   gstack autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -1087,6 +1087,15 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
          --arg pid "$$" \
          --arg createdAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
          '{runGroupId:$runGroupId,sourcePlanPath:$sourcePlanPath,hostname:$hostname,pid:($pid|tonumber),status:"claimed",createdAt:$createdAt}')
+       # Clean up abandoned setup claim: status "claimed", no runIds, dead PID
+       if [ -f "$_CLAIM_PATH" ]; then
+         _EXISTING_STATUS=$(jq -r '.status // "unknown"' "$_CLAIM_PATH" 2>/dev/null || echo "unknown")
+         _EXISTING_RUN_COUNT=$(jq '.runIds // [] | length' "$_CLAIM_PATH" 2>/dev/null || echo "1")
+         _EXISTING_PID=$(jq -r '.pid // 0' "$_CLAIM_PATH" 2>/dev/null || echo "0")
+         if [ "$_EXISTING_STATUS" = "claimed" ] && [ "$_EXISTING_RUN_COUNT" = "0" ] && ! kill -0 "$_EXISTING_PID" 2>/dev/null; then
+           rm -f "$_CLAIM_PATH"
+         fi
+       fi
        if ! (set -C; printf '%s\n' "$_CLAIM_JSON" > "$_CLAIM_PATH") 2>/dev/null; then
          "$_GSTACK_BUILD_CLI" plan-status --gstack-repo "$GSTACK_REPO" "${_PLAN_STATUS_PROJECT_ARGS[@]}"
          echo "ERROR: source plan already claimed after selection: $_SOURCE_PLAN_PATH ($_CLAIM_PATH)" >&2
@@ -1096,6 +1105,12 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
    }
    _claim_selected_source_plans
    ```
+
+   > **Compaction recovery (setup phase):** If this session resumed after context compaction
+   > and `plan-status` shows a stale setup claim (no manifest, no runIds), re-run `/build`
+   > from Step 1. Do NOT implement the plan directly — all builds must route through
+   > `gstack-build`. The orchestrator enforces TDD loop, worktree isolation, dual-impl,
+   > and Codex review — bypassing it silently drops those quality gates.
 
 4. **Select target product repo(s)**: Target selection happens after source-plan discovery and before any branch work. Do not run `git checkout`, `git pull`, or branch creation here; `gstack-build` owns branch changes and receives the selected child repo through `--project-root`.
 
@@ -1141,10 +1156,10 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
      by deliverable feature. Only preserve an origin group as a feature when it naturally matches.
    - Traceability from every feature block back to the source plan sections it satisfies.
    - A phase-by-phase checklist inside each feature block using [ ] markdown checkboxes.
-   - For every **`code`** phase, use this TDD lifecycle in order: Test Specification →
+   - For every `code` phase, use the TDD lifecycle in order: Test Specification →
      Verify Red → Implementation → Green tests → Review/QA.
-   - For **non-code phases** (`writing`, `experiment`, `research`, `manual`), use the
-     kind's 2-checkpoint structure instead (see "Non-Coding Phase Templates" section below).
+     For non-code phases (`writing`, `experiment`, `research`, `manual`), use the
+     kind's 2-checkpoint structure instead — see 'Non-Coding Phase Templates' below.
    - Keep exactly this durable sub-checkbox structure so `gstack-build` can parse
      and resume the plan. Verify Red and Green tests are CLI-owned gates, not
      additional markdown checkboxes:
@@ -1189,6 +1204,102 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
      location from the repo layout. Write enough detail that no design judgment is
      needed — the test-writer implements these cases as a quality floor and MAY add
      additional cases on top.
+   - When a phase produces no runnable source files — only documents, data files, or
+     requires external human action — annotate the heading with the appropriate `[kind]`
+     bracket: `[writing]`, `[experiment]`, `[research]`, or `[manual]`. Omitting the
+     bracket defaults to `code`. See 'Non-Coding Phase Templates' below for examples.
+
+   **Non-Coding Phase Templates**
+
+   Use these 2-checkpoint structures for non-code phases. No `Test Specification`
+   checkbox and no `#### Test Spec` section — the TDD lifecycle does not apply.
+
+   `[writing]` — papers, docs, blog posts, READMEs:
+
+     ### Phase X.Y [writing]: Write Methodology Section
+     - [ ] **Draft**: Write the methodology section covering experimental design,
+       data collection, and evaluation protocol. Target: 2,000–3,000 words.
+       Commit to `paper/sections/methodology.md`.
+     - [ ] **Review & QA (review roles)**: Check clarity, completeness, and accuracy.
+       Rubric: a reader unfamiliar with the project understands it after one read.
+
+   `[experiment]` — benchmarks, ablations, data collection, ML evaluations:
+
+     ### Phase X.Y [experiment]: Run Ablation Benchmark
+     - [ ] **Execute**: Run `scripts/run-ablations.sh`, collect results to
+       `results/ablations.json`. Verify output files exist and are non-empty
+       before marking complete. Do not summarize — raw results only.
+     - [ ] **Review & QA (review roles)**: Review reproducibility, statistical
+       validity, and artifact completeness.
+
+   `[research]` — literature review, tech assessment, codebase exploration:
+
+     ### Phase X.Y [research]: Survey Prior Work
+     - [ ] **Explore**: Produce a synthesis of the relevant literature and commit
+       to `docs/prior-work.md`. Cite primary sources. Label speculation explicitly.
+     - [ ] **Review & QA (review roles)**: Verify coverage, source quality, and
+       absence of uncited speculation.
+
+   `[manual]` — vendor signup, API key setup, approval gates, user studies:
+
+     ### Phase X.Y [manual]: Vendor API Key Setup
+     - [ ] **Action Required**: Complete the vendor signup at vendor.example.com
+       and save the API key to `.env.VENDOR_KEY`. Reply here when done.
+     - [ ] **Verify Completion**: Confirm the key is present and the integration
+       test passes (or describe the verification you performed).
+
+## Non-Coding Phase Templates
+
+When a plan phase does not produce testable code, annotate the heading with a bracket kind
+and use the corresponding 2-checkpoint structure. The `[kind]` bracket goes between the
+phase number and the colon: `### Phase N [kind]: Name`.
+
+**`writing`** — produces written artifacts (academic papers, blog posts, documentation, reports):
+
+     ### Phase N [writing]: Draft the paper intro
+     [Phase description: what to write, who the audience is, what claims to support]
+
+     - [ ] **Draft (primary-impl role)**: Produce the written artifact. Quality bar: a reader
+       with domain expertise should find the argument clear and the claims supported. Commit
+       all deliverable files to the branch before returning.
+     - [ ] **Review (review roles)**: Check the argument, citations, and completeness against
+       the phase description. Gate passes when all stated objectives are met.
+
+**`experiment`** — produces raw data from running code, benchmarks, or ML training:
+
+     ### Phase N [experiment]: Run the benchmark suite
+     [Phase description: what to run, input params, expected output files]
+
+     - [ ] **Execute (primary-impl role)**: Run the experiment. Commit raw results (logs, CSV,
+       JSON) to the repository. Do not summarise without source data. Record variance if the
+       run is non-deterministic.
+     - [ ] **Review (review roles)**: Verify result files exist, are complete, and match the
+       expected format. Gate passes when artifacts are present and reproducible.
+
+**`research`** — produces a findings document from literature review or codebase exploration:
+
+     ### Phase N [research]: Survey recent LLM evaluation approaches
+     [Phase description: what to explore, which sources or tools to use, what to produce]
+
+     - [ ] **Explore (primary-impl role)**: Survey the topic. Cite primary sources (paper
+       titles, URLs, commit SHAs). Write findings to the output file. Flag gaps explicitly.
+     - [ ] **Review (review roles)**: Check that claims are supported by the cited sources and
+       that the coverage is sufficient for downstream phases. Gate passes when no unsupported
+       claims remain.
+
+**`manual`** — requires a human action that cannot be automated:
+
+     ### Phase N [manual]: Deploy the model to staging
+     [Phase description: what human action is needed, what preparation the agent can do]
+
+     - [ ] **Action Required (primary-impl role)**: Prepare the action (stage files, write a
+       runbook, draft the command for the human). Commit the preparation. Record in the output
+       file exactly what the human still needs to do.
+     - [ ] **Verify Completion (review roles)**: After the human confirms the action is done,
+       verify the expected post-action state. Gate passes when confirmation is recorded.
+
+**Mixed plans:** A plan may contain both `code` and non-code phases. Each phase uses its own
+kind's checkpoint structure. The orchestrator handles all kinds without special config.
 
 ## Non-Coding Phase Templates
 
@@ -1618,6 +1729,7 @@ The `status` field is the current CLI phase status when available, including nor
 | 11 | `USER_ACTION_REQUIRED` |
 | 11 | `MONITOR_AGENT_ESCALATION` |
 | 12 | `MONITOR_REENTER` |
+| 13 | `FINALIZATION_REQUIRED` |
 | 20 | `RUN_FAILED` |
 | 30 | `MONITOR_ERROR` |
 
@@ -1756,6 +1868,9 @@ if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
 
       _FAULT_SOURCE_LIST=$(printf '%s' "$_FAULT_JSON" | jq -r '(.sourceFiles // [])[]' 2>/dev/null | while IFS= read -r _FAULT_FILE; do [ -n "$_FAULT_FILE" ] && _resolve_fault_path "$_FAULT_FILE"; done)
 
+      _FAULT_LOG_CATEGORY=$(printf '%s' "$_FAULT_CATEGORY" | tr '/[:space:]' '___')
+      _LOG_PATH=~/.gstack/skill-faults/"$(basename "$_FAULT_ABS").${_FAULT_LOG_CATEGORY}.log"
+
       if [ -n "$GSTACK_FAULT_INVESTIGATOR_COMMAND" ]; then
         (FAULT_PRIMARY="$_FAULT_PRIMARY" FAULT_SECONDARY="$_FAULT_SECONDARY" FAULT_EVENT="$_FAULT_EVENT" FAULT_CATEGORY="$_FAULT_CATEGORY" FAULT_RUN_ID="$_FAULT_RUN_ID" FAULT_REPORT_NAME="$_FAULT_REPORT_NAME" FAULT_INVESTIGATOR_MODEL="$_FAULT_INVESTIGATOR_MODEL" bash -lc "$GSTACK_FAULT_INVESTIGATOR_COMMAND"; _FAULT_RC=$?; [ -n "$_FAULT_SECONDARY" ] && [ -s "$_FAULT_PRIMARY" ] && cp "$_FAULT_PRIMARY" "$_FAULT_SECONDARY" 2>/dev/null || true; exit "$_FAULT_RC") > "$_FAULT_PRIMARY" 2>&1 &
       else
@@ -1787,8 +1902,14 @@ if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
     done < <(printf '%s\n' "$_FAULT_ROWS")
   fi
 fi
+{ [ "$_MONITOR_EXIT" = "0" ] || [ "$_MONITOR_EXIT" = "13" ]; } && printf '\n⚠ MANDATORY: %s — proceed to Step 3 (Final Ship & Completion). Plans NOT archived. Branches may be unshipped. Do NOT stop here.\n' "$([ "$_MONITOR_EXIT" = "13" ] && echo "FINALIZATION_REQUIRED" || echo "ALL_RUNS_COMPLETE")"
 exit "$_MONITOR_EXIT"
 ```
+
+**MANDATORY NEXT ACTION — read before continuing:**
+
+- If `_MONITOR_EXIT` is `0` (`ALL_RUNS_COMPLETE`) or `13` (`FINALIZATION_REQUIRED`): **do NOT stop. Do NOT report build complete.** Immediately proceed to **Step 3: Final Ship & Completion** below. The build is not done until Step 3 completes — branches may be unshipped and plans are almost certainly unarchived.
+- If `_MONITOR_EXIT` is non-zero (and not 13): handle per the exit code table above. Do not proceed to Step 3.
 
 ---
 
@@ -1906,6 +2027,8 @@ When in Reexamine Mode, spawn one configured `featureVerifier` subagent per feat
 6. **Proceed to CLI Monitoring Loop** if any feature was FIXED and new phases remain. Otherwise report completion.
 
 ## Step 3: Final Ship & Completion
+
+> **ALWAYS RUN after monitor exit 0 or 13.** This step is mandatory every time `gstack-build monitor` exits with `ALL_RUNS_COMPLETE` (0) or `FINALIZATION_REQUIRED` (13) — regardless of whether `--skip-ship` was used. Plans are not archived and branches may be unshipped until this step finishes.
 
 For EACH feature, once all phases in that feature are complete (and have been individually reviewed by the CLI):
 

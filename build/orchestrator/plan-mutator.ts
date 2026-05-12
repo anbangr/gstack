@@ -226,12 +226,11 @@ export function flipPhaseCheckboxes(args: {
   planFile: string;
   implementationLine: number;
   reviewLine: number;
-  /** Phase kind — used to select the correct checkbox marker. Defaults to "code". */
+  /** Phase kind — determines the expected checkbox label. Defaults to "code". */
   kind?: PhaseKind;
 }): { implementation: FlipResult; review: FlipResult } {
-  const kind = args.kind ?? "code";
-  const implMarker = IMPL_MARKER_BY_KIND[kind];
-  const reviewMarker = REVIEW_MARKER_BY_KIND[kind];
+  const implMarker = IMPL_MARKER_BY_KIND[args.kind ?? "code"];
+  const reviewMarker = REVIEW_MARKER_BY_KIND[args.kind ?? "code"];
   const implementation = flipCheckbox({
     planFile: args.planFile,
     lineNumber: args.implementationLine,

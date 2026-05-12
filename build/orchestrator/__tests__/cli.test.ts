@@ -38,8 +38,7 @@ import {
   renderSystemdReleaseDaemonService,
   runRoleTask,
   buildKindInstructions,
-  findOpenPRForBranch,
-  chooseMergePath,
+  extractCoverageTarget,
   HELP_TEXT,
 } from "../cli";
 import type {
@@ -238,6 +237,10 @@ describe("extractCoverageTarget", () => {
       "| T1 | ...",
     ].join("\n");
     expect(extractCoverageTarget(body)).toBe(82);
+  });
+
+  it("handles decimal coverage targets like ≥90.5%", () => {
+    expect(extractCoverageTarget("**Coverage target: ≥90.5%**")).toBe(90.5);
   });
 });
 
@@ -3851,68 +3854,67 @@ describe("monitor emits RUN_FAILED when failureReason set (regression)", () => {
   });
 });
 
-describe("findOpenPRForBranch", () => {
-  let tmpBin: string;
-  let ghBin: string;
-
-  function writeFakeGh(stdout: string, exitCode = 0): void {
-    fs.writeFileSync(
-      ghBin,
-      `#!/bin/sh\nprintf '%s' '${stdout.replace(/'/g, "'\\''")}'\nexit ${exitCode}\n`,
-    );
-    fs.chmodSync(ghBin, 0o755);
+describe("buildKindInstructions — non-code phase prompts", () => {
+  function makePhase(kind: Phase["kind"]): Phase {
+    return {
+      ...basePhase,
+      kind,
+      testSpecDone: true,
+      testSpecCheckboxLine: -1,
+    };
   }
 
-  beforeEach(() => {
-    tmpBin = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-fake-gh-"));
-    ghBin = path.join(tmpBin, "gh");
+  it("writing phase: prompt contains quality bar and no test instructions", () => {
+    const lines = buildKindInstructions(makePhase("writing"));
+    const joined = lines.join("\n");
+    expect(joined).toContain("Quality bar: a reader unfamiliar");
+    expect(joined).not.toContain("write failing tests");
+    expect(joined).not.toContain("Make all failing tests pass");
   });
 
-  afterEach(() => {
-    fs.rmSync(tmpBin, { recursive: true, force: true });
+  it("experiment phase: prompt contains raw results and no test instructions", () => {
+    const lines = buildKindInstructions(makePhase("experiment"));
+    const joined = lines.join("\n");
+    expect(joined).toContain("Commit raw results");
+    expect(joined).not.toContain("Make all failing tests pass");
+    expect(joined).not.toContain("write failing tests");
   });
 
-  it("returns PR number when an open PR is found", () => {
-    writeFakeGh('[{"number":42}]');
-    expect(findOpenPRForBranch("/tmp", "feat/my-branch", ghBin)).toBe(42);
+  it("research phase: prompt contains cite primary sources and no test instructions", () => {
+    const lines = buildKindInstructions(makePhase("research"));
+    const joined = lines.join("\n");
+    expect(joined).toContain("Cite primary sources");
+    expect(joined).not.toContain("Make all failing tests pass");
   });
 
-  it("returns null when no PRs exist", () => {
-    writeFakeGh("[]");
-    expect(findOpenPRForBranch("/tmp", "feat/my-branch", ghBin)).toBeNull();
+  it("manual phase: prompt mentions human gate and no automation", () => {
+    const lines = buildKindInstructions(makePhase("manual"));
+    const joined = lines.join("\n");
+    expect(joined).toContain("human action");
+    expect(joined).toContain("Do NOT attempt to automate");
+    expect(joined).not.toContain("Make all failing tests pass");
   });
 
-  it("returns null and logs a warning when gh exits non-zero", () => {
-    writeFakeGh("", 1);
-    const warns: unknown[][] = [];
-    const orig = console.warn;
-    console.warn = (...args: unknown[]) => warns.push(args);
-    try {
-      expect(findOpenPRForBranch("/tmp", "feat/my-branch", ghBin)).toBeNull();
-      expect(warns.length).toBeGreaterThan(0);
-      expect(String(warns[0])).toContain("gh pr list failed");
-    } finally {
-      console.warn = orig;
+  it("code phase: prompt contains standard TDD instructions", () => {
+    const lines = buildKindInstructions(makePhase("code"));
+    const joined = lines.join("\n");
+    expect(joined).toContain("Make all failing tests pass");
+    expect(joined).toContain("Fail forward");
+  });
+
+  it("all kinds include commit and boundary instructions", () => {
+    for (const kind of [
+      "code",
+      "writing",
+      "experiment",
+      "research",
+      "manual",
+    ] as const) {
+      const lines = buildKindInstructions(makePhase(kind));
+      const joined = lines.join("\n");
+      expect(joined).toContain("Commit");
+      expect(joined).toContain("Do NOT run /review");
+      expect(joined).toContain("Do NOT update the plan file");
     }
-  });
-
-  it("returns null when JSON output is malformed", () => {
-    writeFakeGh("not-json");
-    expect(findOpenPRForBranch("/tmp", "feat/my-branch", ghBin)).toBeNull();
-  });
-
-  it("returns null when PR number is 0", () => {
-    writeFakeGh('[{"number":0}]');
-    expect(findOpenPRForBranch("/tmp", "feat/my-branch", ghBin)).toBeNull();
-  });
-});
-
-describe("chooseMergePath", () => {
-  it("returns 'land-only' when an open PR number is provided", () => {
-    expect(chooseMergePath(42)).toBe("land-only");
-  });
-
-  it("returns 'ship-and-deploy' when no open PR exists", () => {
-    expect(chooseMergePath(null)).toBe("ship-and-deploy");
   });
 });

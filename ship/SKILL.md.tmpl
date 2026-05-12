@@ -83,24 +83,21 @@ Never skip a verification step because a prior `/ship` run already performed it.
 
 {{REVIEW_DASHBOARD}}
 
-**Determine whether this is a pure non-code feature** by checking the diff for source code changes:
+Evaluate the dashboard:
 
-```bash
-git diff <base>...HEAD --name-only | grep -E '\.(ts|js|py|go|rs|java|c|cpp|rb|sh)$' | head -5
-```
+- **If Content Review is "CLEAR" and Eng Review is absent or "N/A (non-code feature)":**
+  This is a non-code feature. Content Review clears the gate — no Eng Review needed.
+  Continue to Step 2.
 
-If NO source code files are in the diff (only markdown, data files, or documents): this is a **pure non-code feature**. Check the Content Review row in the dashboard instead of Eng Review.
+- **If Eng Review is "CLEAR":**
+  Standard code review cleared. Continue to Step 2.
 
-- If Content Review shows CONTENT_REVIEW_PASS: **gate is cleared**. Continue to Step 2.
-- If Content Review is missing: Print "No Content Review found — ship will run its own content check in Step 9." Continue to Step 2.
+- **If neither is CLEAR:**
+  Print: "No prior review found — ship will run its own pre-landing review in Step 9."
 
-If source code files ARE in the diff: check Eng Review as normal.
+  Check diff size: `git diff <base>...HEAD --stat | tail -1`. If the diff is >200 lines, add: "Note: This is a large diff. Consider running `/plan-eng-review` or `/autoplan` for architecture-level review before shipping."
 
-If the Eng Review is NOT "CLEAR":
-
-Print: "No prior eng review found — ship will run its own pre-landing review in Step 9."
-
-Check diff size: `git diff <base>...HEAD --stat | tail -1`. If the diff is >200 lines, add: "Note: This is a large diff. Consider running `/plan-eng-review` or `/autoplan` for architecture-level review before shipping."
+If this is a **mixed feature** (some non-code phases in the diff): also check Content Review. If Content Review is missing, note: "Content Review not run — some phases in this diff are non-code. Consider running /review after ship to check artifact completeness."
 
 If this is a **mixed feature** (some non-code phases in the diff): also check Content Review. If Content Review is missing, note: "Content Review not run — some phases in this diff are non-code. Consider running /review after ship to check artifact completeness."
 

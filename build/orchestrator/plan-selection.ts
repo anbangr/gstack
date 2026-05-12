@@ -205,7 +205,7 @@ function claimStatus(claim: PlanClaimRecord | null): PlanCandidateStatus {
   ) {
     return raw;
   }
-  if (raw === "manifested") return "claimed";
+  if ((raw as string) === "manifested") return "claimed";
   return "unknown";
 }
 
@@ -245,8 +245,19 @@ function sourceCandidate(
 ): PlanCandidate {
   const status = claimStatus(claim);
   const live = claim ? claimHasLiveOwner(claim) : false;
+  // Abandoned setup: raw status is "claimed" (never promoted), no runs ever launched,
+  // and the owning process is dead. Safe to retry from scratch.
+  const isAbandonedSetup =
+    !live &&
+    claim?.status === "claimed" &&
+    !claim?.runIds?.length &&
+    !claim?.repoPaths?.length;
   const effectiveStatus =
-    live && LIVE_CLAIM_STATUSES.has(status) ? "running" : status;
+    live && LIVE_CLAIM_STATUSES.has(status)
+      ? "running"
+      : isAbandonedSetup
+        ? "stale"
+        : status;
   return {
     id: canonicalSourcePlanClaimId(gstackRepo, sourcePath),
     kind: "source-plan",
@@ -259,11 +270,13 @@ function sourceCandidate(
     legacyClaimPath,
     live,
     reason: claim
-      ? live
-        ? "source plan has a live claim"
-        : TERMINAL_STATUSES.has(status)
-          ? `source plan has terminal claim: ${status}`
-          : `source plan has claim: ${status}`
+      ? isAbandonedSetup
+        ? "source plan has an abandoned claim (setup was interrupted — safe to retry)"
+        : live
+          ? "source plan has a live claim"
+          : TERMINAL_STATUSES.has(status)
+            ? `source plan has terminal claim: ${status}`
+            : `source plan has claim: ${status}`
       : "unclaimed source plan",
     command: sourcePlanCommand(path.resolve(sourcePath)),
   };
@@ -513,20 +526,18 @@ function activeRunOnlyCandidates(
   manifestRunIds: Set<string>,
 ): PlanCandidate[] {
   const registryDir = opts.activeRunRegistry ?? defaultActiveRunRegistryDir();
-  const records = readActiveRunRecords(registryDir);
-  const cleaned: ActiveRunRecord[] = [];
-  for (const record of records) {
-    if (record.status === "paused" && !isPidAlive(record.pid)) {
-      removeActiveRunRecord(registryDir, record.runId);
-      continue;
-    }
-    cleaned.push(record);
-  }
-  return cleaned
+  return readActiveRunRecords(registryDir)
     .filter((record) => !manifestRunIds.has(record.runId))
     .filter((record) =>
       repoMatches(activeRunRepoPath(record), opts.projectRoot),
     )
+    .filter((record) => {
+      if (record.status === "paused" && !isPidAlive(record.pid)) {
+        removeActiveRunRecord(registryDir, record.runId);
+        return false;
+      }
+      return true;
+    })
     .map(activeRunCandidate);
 }
 

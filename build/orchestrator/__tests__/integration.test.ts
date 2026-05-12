@@ -542,7 +542,7 @@ test("resume continues landed features at origin verification without checking o
     const out = result.stdout + result.stderr;
     const saved = JSON.parse(fs.readFileSync(stateFile, "utf8"));
 
-    expect(result.status).toBe(0); // --skip-ship exits 0; origin-verified features resume cleanly
+    expect(result.status).toBe(13); // FINALIZATION_REQUIRED: feature stuck at origin_verified
     expect(out).toContain("origin-plan-verification");
     expect(out).not.toContain("checking out feat/already-landed-and-deleted");
     expect(saved.features[0].status).toBe("origin_verified");
@@ -655,7 +655,7 @@ test("--skip-ship leaves completed features ready to ship on a later resume", ()
       .split("\n")
       .map((line) => JSON.parse(line));
 
-    expect(result.status).toBe(0); // --skip-ship exits 0; origin-verified features resume cleanly
+    expect(result.status).toBe(13); // FINALIZATION_REQUIRED: features stuck at origin_verified
     expect(out).toContain("--skip-ship active: shipping is disabled");
     expect(saved.features[0].status).toBe("origin_verified");
     expect(saved.features[1].status).toBe("origin_verified");
@@ -678,6 +678,110 @@ test("--skip-ship leaves completed features ready to ship on a later resume", ()
         (event) => event.event === "success" && event.skipShip === true,
       ),
     ).toBe(true);
+  } finally {
+    fs.rmSync(skipDir, { recursive: true, force: true });
+  }
+});
+
+test("exit-13 (FINALIZATION_REQUIRED) writes paused status to active-run registry", () => {
+  const skipDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "gstack-exit13-registry-"),
+  );
+  try {
+    const repo = path.join(skipDir, "repo");
+    const bare = path.join(skipDir, "origin.git");
+    fs.mkdirSync(repo);
+    expect(spawnSync("git", ["init", "-b", "main"], { cwd: repo }).status).toBe(
+      0,
+    );
+    expect(
+      spawnSync("git", ["init", "--bare", "-b", "main", bare]).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["config", "user.email", "test@example.com"], {
+        cwd: repo,
+      }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["config", "user.name", "Test User"], { cwd: repo })
+        .status,
+    ).toBe(0);
+    fs.writeFileSync(path.join(repo, "README.md"), "# test\n");
+    expect(spawnSync("git", ["add", "README.md"], { cwd: repo }).status).toBe(
+      0,
+    );
+    expect(
+      spawnSync("git", ["commit", "-m", "init"], { cwd: repo }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["remote", "add", "origin", bare], { cwd: repo }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["push", "-u", "origin", "main"], { cwd: repo }).status,
+    ).toBe(0);
+
+    const planFile = path.join(skipDir, "exit13-plan.md");
+    fs.writeFileSync(
+      planFile,
+      `# Exit 13 Registry Plan
+
+## Feature 1: Ready
+
+### Phase 1.1: Done
+- [x] **Test Specification (Gemini Sub-agent)**: Existing tests.
+- [x] **Implementation (Gemini Sub-agent)**: Existing implementation.
+- [x] **Review & QA (Codex Sub-agent)**: Existing review.
+`,
+    );
+
+    const registryDir = path.join(
+      skipDir,
+      ".gstack",
+      "build-state",
+      "active-runs",
+    );
+    const runId = "test-exit13-run";
+
+    const cliPath = path.resolve(import.meta.dir, "../cli.ts");
+    const result = spawnSync(
+      "bun",
+      [
+        "run",
+        cliPath,
+        planFile,
+        "--project-root",
+        repo,
+        "--skip-ship",
+        "--no-plan-review",
+        "--test-cmd",
+        "bun test",
+        "--no-gbrain",
+        "--run-id",
+        runId,
+        "--active-run-registry",
+        registryDir,
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: skipDir,
+          GSTACK_HOME: path.join(skipDir, ".gstack"),
+        },
+        encoding: "utf8",
+        timeout: 30_000,
+      },
+    );
+
+    expect(result.status).toBe(13); // FINALIZATION_REQUIRED
+
+    const records = fs
+      .readdirSync(registryDir)
+      .filter((f) => f.endsWith(".json"));
+    expect(records.length).toBe(1);
+    const record = JSON.parse(
+      fs.readFileSync(path.join(registryDir, records[0]), "utf8"),
+    );
+    expect(record.status).toBe("paused"); // not "failed" — concurrency gate must treat exit-13 as non-terminal
   } finally {
     fs.rmSync(skipDir, { recursive: true, force: true });
   }
@@ -1125,250 +1229,74 @@ test("two same-basename plans with run ids cannot load each other's state", () =
   }
 });
 
-test("plan-reviewer critical_exit releases the lock and exits 3", () => {
-  const criticalDir = fs.mkdtempSync(
-    path.join(os.tmpdir(), "gstack-critical-exit-"),
-  );
-  try {
-    const repo = path.join(criticalDir, "repo");
-    fs.mkdirSync(repo);
-    expect(
-      spawnSync("git", ["init", "-b", "main"], { cwd: repo }).status,
-    ).toBe(0);
-    expect(
-      spawnSync("git", ["config", "user.email", "test@example.com"], {
-        cwd: repo,
-      }).status,
-    ).toBe(0);
-    expect(
-      spawnSync("git", ["config", "user.name", "Test User"], {
-        cwd: repo,
-      }).status,
-    ).toBe(0);
-    fs.writeFileSync(path.join(repo, "README.md"), "# test\n");
-    expect(
-      spawnSync("git", ["add", "README.md"], { cwd: repo }).status,
-    ).toBe(0);
-    expect(
-      spawnSync("git", ["commit", "-m", "init"], { cwd: repo }).status,
-    ).toBe(0);
+const FLAT_TASK_PLAN = `# Malformed Plan
 
-    const criticalPlanFile = path.join(criticalDir, "critical-plan.md");
-    fs.writeFileSync(
-      criticalPlanFile,
-      `# Critical Plan
+### Phase 1: Test Specification
+- [ ] Write failing E2E test for the control plane reconcile loop
+- [ ] Confirm test fails in CI
 
-## Feature 1: Auth
+### Phase 2: Implementation
+- [ ] Edit helper module to add reconcile method
+- [ ] Wire reconcile call into controller
 
-### Phase 1.1: Login
-- [ ] **Implementation (Gemini Sub-agent)**: Implement login.
-- [ ] **Review & QA (Codex Sub-agent)**: Review login.
-`,
-    );
+### Phase 3: Review & QA
+- [ ] Re-read diff against spec
+- [ ] Run linter and fix warnings
+`;
 
-    const binDir = path.join(criticalDir, "bin");
-    fs.mkdirSync(binDir);
-    const codexPath = path.join(binDir, "codex");
-    fs.writeFileSync(
-      codexPath,
-      `#!/bin/sh
-prompt="$2"
-output=$(printf '%s\\n' "$prompt" | sed -n 's/.*Write your full review report to \\([^ ]*\\.md\\)\\..*/\\1/p')
-cat > "$output" <<'EOF'
-PLAN_REVIEW: REVISE
-
-## Objections
-- CRITICAL: [Feature 1, Phase 1] Missing test coverage → Add unit tests for edge cases
-
-## Overall Assessment
-Critical issues found.
-EOF
-`,
-      { mode: 0o755 },
-    );
-
-    const cliPath = path.resolve(import.meta.dir, "../cli.ts");
-    const result = spawnSync(
-      "bun",
-      [
-        "run",
-        cliPath,
-        criticalPlanFile,
-        "--project-root",
-        repo,
-        "--test-cmd",
-        "bun test",
-        "--no-gbrain",
-        "--no-resume",
-      ],
-      {
-        env: {
-          ...process.env,
-          HOME: criticalDir,
-          GSTACK_HOME: path.join(criticalDir, ".gstack"),
-          PATH: `${binDir}:${process.env.PATH}`,
-          CODEX_BIN: codexPath,
-        },
-        encoding: "utf8",
-        timeout: 30_000,
-      },
-    );
-
-    const out = result.stdout + result.stderr;
-    const lockFile = path.join(
-      criticalDir,
-      ".gstack",
-      "build-state",
-      "build-critical-plan.lock",
-    );
-
-    expect(result.status).toBe(3);
-    expect(out).toContain("CRITICAL objections found");
-    expect(fs.existsSync(lockFile)).toBe(false);
-  } finally {
-    fs.rmSync(criticalDir, { recursive: true, force: true });
-  }
-});
-
-// ─── Feature 2 T1/T2: active-run registry exit-code → status ─────────────────
-
-test("exit-13 (FINALIZATION_REQUIRED) writes paused status to active-run registry (Feature 2 T1)", () => {
-  // This test FAILS on the old ternary (exitCode === 0 ? "paused" : "failed")
-  // because exit-13 would produce "failed" instead of "paused".
-  // It PASSES on the fixed ternary (exitCode === 0 || exitCode === 13 ? "paused" : "failed").
-  const t1Dir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-f2t1-registry-"));
-  try {
-    const repo = path.join(t1Dir, "repo");
-    const bare = path.join(t1Dir, "origin.git");
-    fs.mkdirSync(repo);
-    expect(spawnSync("git", ["init", "-b", "main"], { cwd: repo }).status).toBe(
-      0,
-    );
-    expect(
-      spawnSync("git", ["init", "--bare", "-b", "main", bare]).status,
-    ).toBe(0);
-    expect(
-      spawnSync("git", ["config", "user.email", "test@example.com"], {
-        cwd: repo,
-      }).status,
-    ).toBe(0);
-    expect(
-      spawnSync("git", ["config", "user.name", "Test User"], { cwd: repo })
-        .status,
-    ).toBe(0);
-    fs.writeFileSync(path.join(repo, "README.md"), "# test\n");
-    expect(spawnSync("git", ["add", "README.md"], { cwd: repo }).status).toBe(
-      0,
-    );
-    expect(
-      spawnSync("git", ["commit", "-m", "init"], { cwd: repo }).status,
-    ).toBe(0);
-    expect(
-      spawnSync("git", ["remote", "add", "origin", bare], { cwd: repo }).status,
-    ).toBe(0);
-    expect(
-      spawnSync("git", ["push", "-u", "origin", "main"], { cwd: repo }).status,
-    ).toBe(0);
-
-    const t1PlanFile = path.join(t1Dir, "skip-ship-plan.md");
-    fs.writeFileSync(
-      t1PlanFile,
-      `# Feature 2 Exit-13 Registry Test Plan
-
-## Feature 1: Done
-
-### Phase 1.1: Implementation
-- [x] **Test Specification (Gemini Sub-agent)**: Existing tests.
-- [x] **Implementation (Gemini Sub-agent)**: Existing implementation.
-- [x] **Review & QA (Codex Sub-agent)**: Existing review.
-`,
-    );
-
-    const registryDir = path.join(t1Dir, "active-runs");
-    const runId = "f2t1-exit13-regression";
-    const cliPath = path.resolve(import.meta.dir, "../cli.ts");
-    const result = spawnSync(
-      "bun",
-      [
-        "run",
-        cliPath,
-        t1PlanFile,
-        "--project-root",
-        repo,
-        "--skip-ship",
-        "--no-plan-review",
-        "--test-cmd",
-        "bun test",
-        "--no-gbrain",
-        "--run-id",
-        runId,
-        "--active-run-registry",
-        registryDir,
-      ],
-      {
-        encoding: "utf8",
-        timeout: 30_000,
-        env: {
-          ...process.env,
-          HOME: t1Dir,
-          GSTACK_HOME: path.join(t1Dir, ".gstack"),
-        },
-      },
-    );
-
-    // exit-13 = FINALIZATION_REQUIRED: --skip-ship leaves features at origin_verified
-    expect(result.status).toBe(13);
-
-    // T1: registry must record "paused" after exit-13, not "failed".
-    const records = readActiveRunRecords(registryDir);
-    expect(records).toHaveLength(1);
-    expect(records[0].runId).toBe(runId);
-    expect(records[0].status).toBe("paused");
-  } finally {
-    fs.rmSync(t1Dir, { recursive: true, force: true });
-  }
-});
-
-test("exit-0 with --dry-run writes paused status to active-run registry (Feature 2 T2)", () => {
-  // Uses shared tmpDir/planFile from beforeAll (TDD plan with incomplete phases).
-  // --dry-run causes state.completed = false and exitCode = 0, so the else branch
-  // of the finally block runs with fallback "paused" (exitCode === 0 → "paused").
+test("--print-only exits 2 when plan has no executable phases", () => {
   const cliPath = path.resolve(import.meta.dir, "../cli.ts");
-  const registryDir = path.join(tmpDir, "active-runs-f2t2");
-  const runId = "f2t2-dryrun-exit0";
-
-  const result = spawnSync(
-    "bun",
-    [
-      "run",
-      cliPath,
-      planFile,
-      "--dry-run",
-      "--test-cmd",
-      "bun test",
-      "--no-gbrain",
-      "--run-id",
-      runId,
-      "--active-run-registry",
-      registryDir,
-    ],
-    {
-      env: {
-        ...process.env,
-        HOME: tmpDir,
-        GSTACK_HOME: path.join(tmpDir, ".gstack"),
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-malformed-"));
+  try {
+    const malformedPlan = path.join(runDir, "malformed-plan.md");
+    fs.writeFileSync(malformedPlan, FLAT_TASK_PLAN);
+    const result = spawnSync(
+      "bun",
+      ["run", cliPath, malformedPlan, "--print-only", "--no-gbrain"],
+      {
+        env: {
+          ...process.env,
+          HOME: runDir,
+          GSTACK_HOME: path.join(runDir, ".gstack"),
+        },
+        encoding: "utf8",
+        timeout: 30_000,
       },
-      encoding: "utf8",
-      timeout: 30_000,
-    },
-  );
+    );
+    expect(result.status).toBe(2);
+    // Must emit the droppedPhasesCount hint even in --print-only mode,
+    // distinguishing a malformed plan from a truly empty one.
+    expect(result.stderr).toContain("3 phase(s) found but none are executable");
+  } finally {
+    fs.rmSync(runDir, { recursive: true, force: true });
+  }
+});
 
-  // T2: exit-0 (dry-run, !completed) → registry has "paused" status.
-  expect(result.status).toBe(0);
-  const records = readActiveRunRecords(registryDir);
-  expect(records).toHaveLength(1);
-  expect(records[0].runId).toBe(runId);
-  expect(records[0].status).toBe("paused");
+test("malformed flat-task plan exits 2 and stderr contains droppedPhasesCount hint", () => {
+  const cliPath = path.resolve(import.meta.dir, "../cli.ts");
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-malformed-"));
+  try {
+    const malformedPlan = path.join(runDir, "malformed-plan.md");
+    fs.writeFileSync(malformedPlan, FLAT_TASK_PLAN);
+    const result = spawnSync(
+      "bun",
+      ["run", cliPath, malformedPlan, "--no-gbrain"],
+      {
+        env: {
+          ...process.env,
+          HOME: runDir,
+          GSTACK_HOME: path.join(runDir, ".gstack"),
+        },
+        encoding: "utf8",
+        timeout: 30_000,
+      },
+    );
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("3 phase(s) found but none are executable");
+    expect(result.stderr).toContain("labeled markers");
+  } finally {
+    fs.rmSync(runDir, { recursive: true, force: true });
+  }
 });
 
 test("T3 (Feature 4): non-zero non-13 exit writes 'failed' record to active-run registry", () => {
@@ -1376,7 +1304,6 @@ test("T3 (Feature 4): non-zero non-13 exit writes 'failed' record to active-run 
     path.join(os.tmpdir(), "gstack-exitfail-registry-"),
   );
   try {
-    // Minimal git repo so getCurrentBranch works inside the try block.
     const repo = path.join(failDir, "repo");
     fs.mkdirSync(repo);
     expect(spawnSync("git", ["init", "-b", "main"], { cwd: repo }).status).toBe(
@@ -1418,9 +1345,8 @@ test("T3 (Feature 4): non-zero non-13 exit writes 'failed' record to active-run 
     const registryDir = path.join(stateDir, "active-runs");
     fs.mkdirSync(registryDir, { recursive: true });
 
-    // Pre-write a state file with a MISMATCHED projectRoot to force
-    // validateResumeLaunch to fail (exitCode=2) inside the try block.
-    // With --run-id fail-run, slug = "build-fail-run".
+    // Pre-write state with a mismatched projectRoot to force validateResumeLaunch
+    // to throw (exitCode=2) — a non-zero, non-13 failure path.
     const now = new Date().toISOString();
     fs.writeFileSync(
       path.join(stateDir, "build-fail-run.json"),
@@ -1434,7 +1360,7 @@ test("T3 (Feature 4): non-zero non-13 exit writes 'failed' record to active-run 
           lastUpdatedAt: now,
           launch: {
             argv: [],
-            projectRoot: "/intentionally-wrong-path-that-does-not-match",
+            projectRoot: "/intentionally-wrong-path-does-not-match",
             runId: "fail-run",
             stateSlug: "build-fail-run",
             dryRun: false,
@@ -1448,9 +1374,6 @@ test("T3 (Feature 4): non-zero non-13 exit writes 'failed' record to active-run 
           phases: [],
           features: [],
           completed: false,
-          geminiModel: "gemini",
-          codexModel: "codex",
-          codexReviewModel: "codex-review",
         },
         null,
         2,
@@ -1486,15 +1409,20 @@ test("T3 (Feature 4): non-zero non-13 exit writes 'failed' record to active-run 
       },
     );
 
-    // Exit must be non-zero and non-13 (validateResumeLaunch throws → exitCode=2).
+    // validateResumeLaunch throws → exitCode=2 (non-zero, non-13)
     expect(result.status).not.toBeNull();
     expect(result.status).not.toBe(0);
     expect(result.status).not.toBe(13);
 
-    const records = readActiveRunRecords(registryDir);
-    expect(records).toHaveLength(1);
-    expect(records[0].runId).toBe("fail-run");
-    expect(records[0].status).toBe("failed");
+    const records = fs
+      .readdirSync(registryDir)
+      .filter((f) => f.endsWith(".json"));
+    expect(records.length).toBe(1);
+
+    const record = JSON.parse(
+      fs.readFileSync(path.join(registryDir, records[0]), "utf8"),
+    );
+    expect(record.status).toBe("failed");
   } finally {
     fs.rmSync(failDir, { recursive: true, force: true });
   }

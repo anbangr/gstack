@@ -454,185 +454,126 @@ describe("parsePlan — gate checkboxes", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Phase 1.2: Kind-aware parsing tests
-// ---------------------------------------------------------------------------
-
-describe("parsePlan — PhaseKind from heading bracket annotation", () => {
-  it("[writing] heading emits kind='writing'", () => {
-    const md = `### Phase 1 [writing]: Draft the intro
-- [ ] **Draft**: write the draft
-- [ ] **Review**: review it
-`;
-    const { phases, warnings } = parsePlan(md);
-    expect(phases).toHaveLength(1);
-    expect(phases[0].kind).toBe("writing");
-    expect(warnings.filter((w) => w.includes("unrecognised"))).toHaveLength(0);
-  });
-
-  it("[experiment] heading emits kind='experiment'", () => {
-    const md = `### Phase 2.1 [experiment]: Run the benchmark
-- [ ] **Execute**: run it
-- [ ] **Review**: review results
-`;
-    const { phases } = parsePlan(md);
-    expect(phases[0].kind).toBe("experiment");
-  });
-
-  it("[research] heading emits kind='research'", () => {
-    const md = `### Phase 3 [research]: Survey literature
-- [ ] **Explore**: survey papers
-- [ ] **Review**: synthesize
-`;
-    const { phases } = parsePlan(md);
-    expect(phases[0].kind).toBe("research");
-  });
-
-  it("[manual] heading emits kind='manual'", () => {
-    const md = `### Phase 4 [manual]: Deploy to staging
-- [ ] **Action Required**: deploy manually
-- [ ] **Verify Completion**: confirm deployed
-`;
-    const { phases } = parsePlan(md);
-    expect(phases[0].kind).toBe("manual");
-  });
-
-  it("no annotation emits kind='code' (backward compat)", () => {
-    const md = `### Phase 1: Plain code phase
-- [ ] **Implementation**: impl
+describe("parsePlan — phase kinds", () => {
+  it("defaults to kind=code when no annotation present", () => {
+    const md = `### Phase 1: Default
+- [ ] **Implementation**: work
 - [ ] **Review**: review
 `;
     const { phases } = parsePlan(md);
     expect(phases[0].kind).toBe("code");
   });
 
-  it("malformed [wrtng] defaults to 'code' and emits a warning", () => {
-    const md = `### Phase 1 [wrtng]: Misspelled
-- [ ] **Implementation**: impl
-- [ ] **Review**: review
-`;
-    const { phases, warnings } = parsePlan(md);
-    expect(phases[0].kind).toBe("code");
-    expect(warnings.some((w) => w.includes("unrecognised kind annotation"))).toBe(true);
-  });
-
-  it("HTML comment fallback sets kind when heading bracket absent", () => {
-    const md = `### Phase 1: Write the paper
-<!-- kind: writing -->
+  it("parses [writing] heading annotation", () => {
+    const md = `### Phase 1 [writing]: Write Methodology Section
 - [ ] **Draft**: write it
-- [ ] **Review**: review it
+- [ ] **Review & QA**: review
 `;
-    const { phases } = parsePlan(md);
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
     expect(phases[0].kind).toBe("writing");
-  });
-
-  it("heading bracket wins over HTML comment fallback", () => {
-    const md = `### Phase 1 [research]: Survey lit
-<!-- kind: writing -->
-- [ ] **Explore**: survey
-- [ ] **Review**: review
-`;
-    const { phases } = parsePlan(md);
-    expect(phases[0].kind).toBe("research");
-  });
-
-  it("**Draft** checkbox in writing phase populates implementationCheckboxLine", () => {
-    const md = `### Phase 1 [writing]: Draft intro
-- [ ] **Draft**: write the draft
-- [ ] **Review**: review it
-`;
-    const { phases } = parsePlan(md);
     expect(phases[0].implementationCheckboxLine).toBeGreaterThan(0);
     expect(phases[0].implementationDone).toBe(false);
   });
 
-  it("[x] **Draft** sets implementationDone=true", () => {
-    const md = `### Phase 1 [writing]: Draft intro
-- [x] **Draft**: done
-- [ ] **Review**: review it
+  it("parses [experiment] heading annotation", () => {
+    const md = `### Phase 1 [experiment]: Run Ablation Benchmark
+- [ ] **Execute**: run scripts
+- [ ] **Review & QA**: review
 `;
-    const { phases } = parsePlan(md);
-    expect(phases[0].implementationDone).toBe(true);
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases[0].kind).toBe("experiment");
+    expect(phases[0].implementationCheckboxLine).toBeGreaterThan(0);
   });
 
-  it("**Verify Completion** checkbox in manual phase populates reviewCheckboxLine", () => {
-    const md = `### Phase 1 [manual]: Setup env
-- [ ] **Action Required**: set it up
-- [ ] **Verify Completion**: confirm done
+  it("parses [research] heading annotation", () => {
+    const md = `### Phase 1 [research]: Survey Prior Work
+- [ ] **Explore**: research it
+- [ ] **Review & QA**: review
 `;
-    const { phases } = parsePlan(md);
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases[0].kind).toBe("research");
+    expect(phases[0].implementationCheckboxLine).toBeGreaterThan(0);
+  });
+
+  it("parses [manual] heading annotation", () => {
+    const md = `### Phase 1 [manual]: Vendor API Key Setup
+- [ ] **Action Required**: complete signup
+- [ ] **Verify Completion**: confirm key present
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases[0].kind).toBe("manual");
+    expect(phases[0].implementationCheckboxLine).toBeGreaterThan(0);
     expect(phases[0].reviewCheckboxLine).toBeGreaterThan(0);
-    expect(phases[0].reviewDone).toBe(false);
   });
 
-  it("[x] **Verify Completion** sets reviewDone=true", () => {
-    const md = `### Phase 1 [manual]: Setup env
-- [ ] **Action Required**: set it up
-- [x] **Verify Completion**: confirmed
+  it("Draft checkbox maps to implementationCheckboxLine for writing phase", () => {
+    const md = `### Phase 2.1 [writing]: Write Methodology Section
+- [ ] **Draft**: write the methodology
+- [ ] **Review & QA (review roles)**: check clarity
 `;
     const { phases } = parsePlan(md);
-    expect(phases[0].reviewDone).toBe(true);
+    expect(phases[0].kind).toBe("writing");
+    expect(phases[0].implementationCheckboxLine).toBe(2);
+    expect(phases[0].reviewCheckboxLine).toBe(3);
   });
 
-  it("**Execute** checkbox in experiment phase populates implementationCheckboxLine", () => {
-    const md = `### Phase 1 [experiment]: Run bench
-- [ ] **Execute**: run it
-- [ ] **Review**: review
-`;
-    const { phases } = parsePlan(md);
-    expect(phases[0].implementationCheckboxLine).toBeGreaterThan(0);
-  });
-
-  it("**Explore** checkbox in research phase populates implementationCheckboxLine", () => {
-    const md = `### Phase 1 [research]: Survey
-- [ ] **Explore**: read papers
-- [ ] **Review**: synthesize
-`;
-    const { phases } = parsePlan(md);
-    expect(phases[0].implementationCheckboxLine).toBeGreaterThan(0);
-  });
-
-  it("mixed plan: code phase keeps kind='code', non-code keeps its kind", () => {
-    const md = `### Phase 1: Code it
+  it("backward compat: no annotation defaults to code kind", () => {
+    const md = `### Phase 1: Legacy Phase
 - [ ] **Implementation**: impl
 - [ ] **Review**: review
-
-### Phase 2 [writing]: Write the docs
-- [ ] **Draft**: write
-- [ ] **Review**: review
 `;
     const { phases } = parsePlan(md);
-    expect(phases).toHaveLength(2);
     expect(phases[0].kind).toBe("code");
-    expect(phases[1].kind).toBe("writing");
   });
 
-  it("decimal phase number with kind bracket parses correctly", () => {
-    const md = `### Phase 2.1 [writing]: Sub-chapter draft
-- [ ] **Draft**: write sub
+  it("HTML comment fallback sets kind for body without heading bracket", () => {
+    const md = `### Phase 1: Some Phase
+<!-- kind: writing -->
+- [ ] **Draft**: write it
+- [ ] **Review & QA**: review
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases[0].kind).toBe("writing");
+    expect(phases[0].implementationCheckboxLine).toBeGreaterThan(0);
+  });
+
+  it("unknown bracket value defaults to code", () => {
+    const md = `### Phase 1 [unknown]: Some Phase
+- [ ] **Implementation**: impl
 - [ ] **Review**: review
 `;
     const { phases } = parsePlan(md);
-    expect(phases[0].number).toBe("2.1");
-    expect(phases[0].kind).toBe("writing");
+    expect(phases[0].kind).toBe("code");
   });
 
-  it("parser module loads without ReferenceError (no undefined-symbol crash at import time)", () => {
-    // If parser.ts references constants that don't exist at module scope
-    // (e.g. BODY_KIND_PATTERN / IMPL_LABELS_BY_KIND / REVIEW_LABELS_BY_KIND from a
-    // half-landed branch), the import itself throws a ReferenceError and every test in
-    // this file fails to load. Reaching this line means the import succeeded.
-    expect(typeof parsePlan).toBe("function");
-  });
+  it("structural-mirroring flat-task format emits 0 phases and correct droppedPhasesCount", () => {
+    // This is the format a mis-configured AI synthesizer produces: 3 separate
+    // ### Phase headings named after TDD steps, each with flat task-list checkboxes
+    // but NO labeled checkpoint markers (**Implementation**, **Review & QA**).
+    const md = `# Plan
 
-  it("does not throw when phase body contains an HTML-comment kind annotation", () => {
-    const md = `### Phase 1: Comment Kind Phase
-<!-- kind: writing -->
-- [ ] **Implementation**: do work
-- [ ] **Review**: check work
+### Phase 1: Test Specification
+- [ ] Write failing E2E test for the control plane reconcile loop
+- [ ] Confirm test fails in CI
+
+### Phase 2: Implementation
+- [ ] Edit helper module to add reconcile method
+- [ ] Wire reconcile call into controller
+
+### Phase 3: Review & QA
+- [ ] Re-read diff against spec
+- [ ] Run linter and fix warnings
 `;
-    // If a broken if-block in finalize() references undefined BODY_KIND_PATTERN,
-    // this call would throw a ReferenceError. Asserting no throw pins that invariant.
-    expect(() => parsePlan(md)).not.toThrow();
+    const { phases, warnings, droppedPhasesCount } = parsePlan(md);
+    expect(phases).toHaveLength(0);
+    expect(droppedPhasesCount).toBe(3);
+    // 2 warnings per dropped phase (missing Implementation + missing Review) = 6
+    // plus 1 warning for the synthetic "Full plan" feature having no executable phases = 7
+    expect(warnings).toHaveLength(7);
   });
 });

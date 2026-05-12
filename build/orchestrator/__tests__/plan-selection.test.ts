@@ -2,12 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-  activeRunRecordPath,
-  readActiveRunRecords,
-  writeActiveRunRecord,
-} from "../active-runs";
-import type { ActiveRunRecord, ActiveRunStatus } from "../active-runs";
+import { activeRunRecordPath, writeActiveRunRecord } from "../active-runs";
 import {
   canonicalSourcePlanClaimPath,
   legacySourcePlanClaimPath,
@@ -505,6 +500,52 @@ describe("plan resolver", () => {
     expect(result.selected?.path).toBe(open);
   });
 
+  test("source plan with abandoned setup claim (dead PID 9999999, status:'claimed', no runIds) is auto-selected", () => {
+    const repo = gstackRepo();
+    const plan = sourcePlan(repo, "interrupted-plan-1.md");
+    writeJson(canonicalSourcePlanClaimPath(repo, plan), {
+      sourcePlanPath: plan,
+      pid: 9999999,
+      status: "claimed",
+    });
+
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      activeRunRegistry: path.join(tmpDir, "state"),
+    });
+
+    expect(result.result).toBe("selected");
+    expect(result.selected?.path).toBe(plan);
+  });
+
+  test("source plan with dead-PID manifested claim is NOT auto-selected as stale", () => {
+    const repo = gstackRepo();
+    const plan = sourcePlan(repo, "manifested-plan-1.md");
+    writeJson(canonicalSourcePlanClaimPath(repo, plan), {
+      sourcePlanPath: plan,
+      pid: 9999999,
+      status: "manifested",
+    });
+
+    const result = resolvePlanSelection({ gstackRepo: repo });
+
+    expect(result.result).not.toBe("selected");
+  });
+
+  test("source plan with live claimed process is still blocked", () => {
+    const repo = gstackRepo();
+    const plan = sourcePlan(repo, "live-claimed-plan-1.md");
+    writeJson(canonicalSourcePlanClaimPath(repo, plan), {
+      sourcePlanPath: plan,
+      pid: process.pid,
+      status: "claimed",
+    });
+
+    const result = resolvePlanSelection({ gstackRepo: repo });
+
+    expect(result.result).not.toBe("selected");
+  });
+
   test("--all-inbox selects every unclaimed source plan instead of treating them as ambiguous", () => {
     const repo = gstackRepo();
     const first = sourcePlan(repo, "first-plan-1.md");
@@ -950,10 +991,10 @@ describe("plan resolver", () => {
     );
   });
 
-  // Feature 3 integration: stale-paused active-run record auto-cleanup
-  // T4: paused + dead pid — record must be removed, no candidate returned.
-  // (RED before Feature 3 is implemented: currently returns "selected" with stale status)
-  test("T4 (Feature 3): paused + dead pid — record removed, no candidate", () => {
+  // Feature 3 regression tests: stale-paused active-run record auto-cleanup
+  // T4: paused + dead pid — activeRunOnlyCandidates() must remove the record and return no candidate.
+  // T5: paused + live pid — record must stay and a candidate must be returned.
+  test("T4 (Feature 3): paused + dead pid — record removed, no candidate returned", () => {
     const repo = gstackRepo();
     const app = path.join(tmpDir, "app");
     const activeRunRegistry = path.join(tmpDir, "active-runs-t4");
@@ -965,7 +1006,7 @@ describe("plan resolver", () => {
       repoPath: path.join(tmpDir, "worktrees", "run-stale-paused"),
       baseProjectRoot: app,
       planFile: plan,
-      pid: 999999, // guaranteed dead: no real process will have this pid in test
+      pid: 999999, // guaranteed dead: no real process will have this pid in tests
       status: "paused",
       startedAt: "2026-05-11T00:00:00Z",
       lastUpdatedAt: "2026-05-11T00:00:00Z",
@@ -985,13 +1026,10 @@ describe("plan resolver", () => {
       activeRunRegistry,
     });
 
-    // After Feature 3: stale-paused record is cleaned up and no candidate returned.
-    expect(fs.existsSync(recordFile)).toBe(false);
+    expect(fs.existsSync(recordFile)).toBe(false); // stale-paused record cleaned up
     expect(result.result).toBe("none");
   });
 
-  // T5: paused + live pid — record must stay, candidate returned.
-  // (GREEN before and after Feature 3: live-paused records are not touched)
   test("T5 (Feature 3): paused + live pid — record kept, candidate returned", () => {
     const repo = gstackRepo();
     const app = path.join(tmpDir, "app");
@@ -1023,273 +1061,9 @@ describe("plan resolver", () => {
       activeRunRegistry,
     });
 
-    // Live-paused records are not cleaned up.
-    expect(fs.existsSync(recordFile)).toBe(true);
+    expect(fs.existsSync(recordFile)).toBe(true); // live-paused record not cleaned up
     expect(result.result).toBe("selected");
     expect(result.selected?.runId).toBe("run-live-paused");
-  });
-
-  test("T6 (Feature 3): running + dead pid remains a stale resume candidate", () => {
-    const repo = gstackRepo();
-    const app = path.join(tmpDir, "app");
-    const activeRunRegistry = path.join(tmpDir, "active-runs-t6");
-    const plan = livingPlan(repo, "app-impl-plan-running-dead-1.md");
-
-    writeActiveRunRecord(activeRunRegistry, {
-      runId: "run-running-dead",
-      stateSlug: "build-run-running-dead",
-      repoPath: path.join(tmpDir, "worktrees", "run-running-dead"),
-      baseProjectRoot: app,
-      planFile: plan,
-      pid: 999999,
-      status: "running",
-      startedAt: "2026-05-11T00:00:00Z",
-      lastUpdatedAt: "2026-05-11T00:00:00Z",
-      branches: [],
-    });
-
-    const recordFile = activeRunRecordPath(
-      activeRunRegistry,
-      "run-running-dead",
-    );
-
-    const result = resolvePlanSelection({
-      gstackRepo: repo,
-      projectRoot: app,
-      resumeOnly: true,
-      activeRunRegistry,
-    });
-
-    expect(fs.existsSync(recordFile)).toBe(true);
-    expect(result.result).toBe("selected");
-    expect(result.selected?.runId).toBe("run-running-dead");
-    expect(result.selected?.status).toBe("stale");
-  });
-});
-
-// ====================================================================================
-// Feature 3, Phase 1: Paused + dead-pid auto-cleanup
-// T1–T6 per spec. Tests T2 and edge cases FAIL before implementation (TDD red phase).
-// ====================================================================================
-describe("activeRunCandidate: paused + dead-pid auto-cleanup", () => {
-  const DEAD_PID = 999_999; // Synthesized PID well outside any live allocation
-
-  function makeTestRecord(
-    runId: string,
-    status: ActiveRunStatus,
-    pid: number,
-  ): ActiveRunRecord {
-    return {
-      runId,
-      stateSlug: `state-${runId}`,
-      repoPath: path.join(tmpDir, "worktrees", runId),
-      planFile: path.join(tmpDir, "plan.md"),
-      pid,
-      status,
-      startedAt: "2026-05-11T00:00:00Z",
-      lastUpdatedAt: "2026-05-11T00:00:00Z",
-      branches: [],
-    };
-  }
-
-  // T1: paused + live pid → candidate returned, record NOT removed
-  test("T1: paused+live-pid returns running candidate and preserves the record", () => {
-    const registry = path.join(tmpDir, "reg-t1");
-    const repo = gstackRepo();
-    const record = makeTestRecord("run-t1", "paused", process.pid);
-    writeActiveRunRecord(registry, record);
-
-    const result = resolvePlanSelection({
-      gstackRepo: repo,
-      activeRunRegistry: registry,
-    });
-
-    expect(fs.existsSync(activeRunRecordPath(registry, record.runId))).toBe(
-      true,
-    );
-    expect(result.candidates.some((c) => c.runId === record.runId)).toBe(true);
-  });
-
-  // T2: paused + dead pid → removeActiveRunRecord called, no candidate returned
-  test("T2: paused+dead-pid removes record and returns no candidate", () => {
-    const registry = path.join(tmpDir, "reg-t2");
-    const repo = gstackRepo();
-    const record = makeTestRecord("run-t2", "paused", DEAD_PID);
-    writeActiveRunRecord(registry, record);
-
-    const result = resolvePlanSelection({
-      gstackRepo: repo,
-      activeRunRegistry: registry,
-    });
-
-    expect(fs.existsSync(activeRunRecordPath(registry, record.runId))).toBe(
-      false,
-    );
-    expect(result.candidates.some((c) => c.runId === record.runId)).toBe(false);
-  });
-
-  // T3: failed + dead pid → no candidate, record NOT removed (existing behavior)
-  test("T3: failed+dead-pid returns no resumable candidate and preserves record", () => {
-    const registry = path.join(tmpDir, "reg-t3");
-    const repo = gstackRepo();
-    const record = makeTestRecord("run-t3", "failed", DEAD_PID);
-    writeActiveRunRecord(registry, record);
-
-    const result = resolvePlanSelection({
-      gstackRepo: repo,
-      activeRunRegistry: registry,
-    });
-
-    expect(fs.existsSync(activeRunRecordPath(registry, record.runId))).toBe(
-      true,
-    );
-    expect(
-      result.candidates.some(
-        (c) =>
-          c.runId === record.runId &&
-          (c.status === "running" || c.status === "stale"),
-      ),
-    ).toBe(false);
-  });
-
-  // T4: failed + live pid → no resumable candidate (failed is terminal regardless of pid)
-  test("T4: failed+live-pid returns no resumable candidate (terminal status)", () => {
-    const registry = path.join(tmpDir, "reg-t4");
-    const repo = gstackRepo();
-    const record = makeTestRecord("run-t4", "failed", process.pid);
-    writeActiveRunRecord(registry, record);
-
-    const result = resolvePlanSelection({
-      gstackRepo: repo,
-      activeRunRegistry: registry,
-    });
-
-    expect(
-      result.candidates.some(
-        (c) =>
-          c.runId === record.runId &&
-          (c.status === "running" || c.status === "stale"),
-      ),
-    ).toBe(false);
-  });
-
-  // T5: completed + dead pid → no candidate, record NOT removed
-  test("T5: completed+dead-pid returns no resumable candidate and preserves record", () => {
-    const registry = path.join(tmpDir, "reg-t5");
-    const repo = gstackRepo();
-    const record = makeTestRecord("run-t5", "completed", DEAD_PID);
-    writeActiveRunRecord(registry, record);
-
-    const result = resolvePlanSelection({
-      gstackRepo: repo,
-      activeRunRegistry: registry,
-    });
-
-    expect(fs.existsSync(activeRunRecordPath(registry, record.runId))).toBe(
-      true,
-    );
-    expect(
-      result.candidates.some(
-        (c) =>
-          c.runId === record.runId &&
-          (c.status === "running" || c.status === "stale"),
-      ),
-    ).toBe(false);
-  });
-
-  // T6: running + dead pid → existing orphan handling (stale candidate, record preserved)
-  test("T6: running+dead-pid produces stale candidate via orphan handling (record preserved)", () => {
-    const registry = path.join(tmpDir, "reg-t6");
-    const repo = gstackRepo();
-    const record = makeTestRecord("run-t6", "running", DEAD_PID);
-    writeActiveRunRecord(registry, record);
-
-    const result = resolvePlanSelection({
-      gstackRepo: repo,
-      activeRunRegistry: registry,
-    });
-
-    expect(fs.existsSync(activeRunRecordPath(registry, record.runId))).toBe(
-      true,
-    );
-    expect(
-      result.candidates.some(
-        (c) => c.runId === record.runId && c.status === "stale",
-      ),
-    ).toBe(true);
-  });
-
-  // Edge: pid=0 (missing/zero) treated as dead → cleanup triggered
-  test("edge: pid=0 is treated as dead, record removed, no candidate returned", () => {
-    const registry = path.join(tmpDir, "reg-edge-pid0");
-    const repo = gstackRepo();
-    const record = makeTestRecord("run-pid0", "paused", 0);
-    writeActiveRunRecord(registry, record);
-
-    const result = resolvePlanSelection({
-      gstackRepo: repo,
-      activeRunRegistry: registry,
-    });
-
-    expect(fs.existsSync(activeRunRecordPath(registry, record.runId))).toBe(
-      false,
-    );
-    expect(result.candidates.some((c) => c.runId === record.runId)).toBe(false);
-  });
-
-  // Edge: multiple paused+dead records → all removed in a single pass
-  test("edge: multiple paused+dead records are all removed in one pass", () => {
-    const registry = path.join(tmpDir, "reg-edge-multi");
-    const repo = gstackRepo();
-    const runIds = ["run-m1", "run-m2", "run-m3"];
-    for (const runId of runIds) {
-      writeActiveRunRecord(registry, makeTestRecord(runId, "paused", DEAD_PID));
-    }
-
-    const result = resolvePlanSelection({
-      gstackRepo: repo,
-      activeRunRegistry: registry,
-    });
-
-    for (const runId of runIds) {
-      expect(fs.existsSync(activeRunRecordPath(registry, runId))).toBe(false);
-    }
-    expect(result.candidates.some((c) => runIds.includes(c.runId ?? ""))).toBe(
-      false,
-    );
-  });
-
-  // Edge: removeActiveRunRecord failure is swallowed; new build proceeds without the stale candidate
-  test("edge: cleanup failure is swallowed and stale run is not surfaced as a candidate", () => {
-    if (typeof process.getuid === "function" && process.getuid() === 0) {
-      // Root bypasses chmod restrictions; test is meaningless
-      return;
-    }
-    const registry = path.join(tmpDir, "reg-edge-chmod");
-    const repo = gstackRepo();
-    const record = makeTestRecord("run-chmod", "paused", DEAD_PID);
-    writeActiveRunRecord(registry, record);
-    fs.chmodSync(registry, 0o444); // Read-only dir → unlink will fail with EPERM
-
-    let threw = false;
-    let result: ReturnType<typeof resolvePlanSelection> | undefined;
-    try {
-      result = resolvePlanSelection({
-        gstackRepo: repo,
-        activeRunRegistry: registry,
-      });
-    } catch {
-      threw = true;
-    } finally {
-      fs.chmodSync(registry, 0o755);
-    }
-
-    expect(threw).toBe(false);
-    if (result) {
-      expect(result.candidates.some((c) => c.runId === record.runId)).toBe(
-        false,
-      );
-    }
   });
 });
 

@@ -101,8 +101,12 @@ import {
   type ParsedFeatureVerdict,
 } from "./feature-review";
 import { promptYesNo, buildBlockedFeatureMd } from "./feature-review-prompt";
-import { runPlanReview, reconcilePlanReview } from "./plan-reviewer";
-import { shipAndDeploy, shipOnly, landOnly } from "./ship";
+import {
+  runPlanReview,
+  reconcilePlanReview,
+  readPlanReviewRound,
+} from "./plan-reviewer";
+import { shipAndDeploy, shipOnly } from "./ship";
 import { runReleaseDaemon, retryReleaseQueueRecord } from "./release-daemon";
 import {
   defaultReleaseQueueDir,
@@ -2601,19 +2605,57 @@ export function buildKindInstructions(phase: Phase): string[] {
     REPO_BOUNDARY_INSTRUCTIONS[0],
     REPO_BOUNDARY_INSTRUCTIONS[1],
   ];
-  // Parser only ever emits "code" kind; other kinds were removed. Keep the
-  // default path so test fixtures that omit kind still work.
-  const kindInstructions = [
-    `Make all failing tests pass with minimal correct code. Do NOT change test assertions.`,
-    `Also complete every non-code deliverable in the phase description: if it says "run X and produce Y" or "record Z to <path>", actually execute that script/command and commit the output files. Writing the code that could produce Y is not the same as producing Y.`,
-    `If there are no existing failing tests, implement the work described above.`,
-    `If the project uses GitHub Actions, ensure your changes pass them.`,
-    `Commit your changes to the current branch with a clear conventional-commit message.`,
-    `Fail forward: if a test fails, fix it before returning. Only return when the code is done and all artifacts are committed.`,
-  ];
-  return [...kindInstructions, ...sharedTail].map(
-    (line, i) => `${i + 1}. ${line}`,
-  );
+  let kindInstructions: string[];
+  switch (phase.kind) {
+    case "writing":
+      kindInstructions = [
+        `Produce the written deliverable described in the phase. Quality bar: a reader unfamiliar with the project understands it after one read. No placeholder content.`,
+        `Commit the completed artifact to the file path(s) named in the phase body.`,
+        `Do NOT write or run tests — this is a writing phase, not a code phase.`,
+      ];
+      break;
+    case "experiment":
+      kindInstructions = [
+        `Execute the experiment as described. Run the named scripts/commands literally.`,
+        `Commit raw results to the named output path(s). Verify output files exist and are non-empty before committing.`,
+        `Do NOT summarize or interpret results in this step — that belongs in Review & QA.`,
+        `Do NOT write or run tests — this is an experiment phase, not a code phase.`,
+      ];
+      break;
+    case "research":
+      kindInstructions = [
+        `Produce the synthesis artifact described. Cite primary sources.`,
+        `Commit the artifact to the named output path(s). No speculation without explicitly labeling it as such.`,
+        `Do NOT write or run tests — this is a research phase, not a code phase.`,
+      ];
+      break;
+    case "manual":
+      kindInstructions = [
+        `This phase requires a human action outside the AI agent's scope. Ask the user to complete the action named in the phase description, then wait for their confirmation.`,
+        `Once the user confirms the action is done, commit a record of completion to the named path (if specified) and return.`,
+        `Do NOT attempt to automate the manual action — it is intentionally a human gate.`,
+      ];
+      break;
+    default: // "code"
+      kindInstructions = [
+        `Make all failing tests pass with minimal correct code. Do NOT change test assertions.`,
+        `Also complete every non-code deliverable in the phase description: if it says "run X and produce Y" or "record Z to <path>", actually execute that script/command and commit the output files. Writing the code that could produce Y is not the same as producing Y.`,
+        `If there are no existing failing tests, implement the work described above.`,
+        `If the project uses GitHub Actions, ensure your changes pass them.`,
+        `Commit your changes to the current branch with a clear conventional-commit message.`,
+        `Fail forward: if a test fails, fix it before returning. Only return when the code is done and all artifacts are committed.`,
+      ];
+      break;
+  }
+  const allLines =
+    phase.kind === "code"
+      ? [...kindInstructions, ...sharedTail]
+      : [
+          ...kindInstructions,
+          `Commit your changes to the current branch with a clear conventional-commit message.`,
+          ...sharedTail,
+        ];
+  return allLines.map((line, i) => `${i + 1}. ${line}`);
 }
 
 /**
@@ -2753,6 +2795,67 @@ function buildGeminiPromptBody(
   return sections.join("\n");
 }
 
+export function buildKindInstructions(phase: Phase): string[] {
+  const sharedTail = [
+    `Do NOT run /review, /qa, /ship, or any orchestration skill — those are downstream of you.`,
+    `Do NOT update the plan file's checkboxes — the orchestrator handles that.`,
+    `Reference existing code by file path — your --yolo file tools work, you don't need code inlined.`,
+    REPO_BOUNDARY_INSTRUCTIONS[0],
+    REPO_BOUNDARY_INSTRUCTIONS[1],
+  ];
+  let kindInstructions: string[];
+  switch (phase.kind) {
+    case "writing":
+      kindInstructions = [
+        `Produce the written deliverable described in the phase. Quality bar: a reader unfamiliar with the project understands it after one read. No placeholder content.`,
+        `Commit the completed artifact to the file path(s) named in the phase body.`,
+        `Do NOT write or run tests — this is a writing phase, not a code phase.`,
+      ];
+      break;
+    case "experiment":
+      kindInstructions = [
+        `Execute the experiment as described. Run the named scripts/commands literally.`,
+        `Commit raw results to the named output path(s). Verify output files exist and are non-empty before committing.`,
+        `Do NOT summarize or interpret results in this step — that belongs in Review & QA.`,
+        `Do NOT write or run tests — this is an experiment phase, not a code phase.`,
+      ];
+      break;
+    case "research":
+      kindInstructions = [
+        `Produce the synthesis artifact described. Cite primary sources.`,
+        `Commit the artifact to the named output path(s). No speculation without explicitly labeling it as such.`,
+        `Do NOT write or run tests — this is a research phase, not a code phase.`,
+      ];
+      break;
+    case "manual":
+      kindInstructions = [
+        `This phase requires a human action outside the AI agent's scope. Ask the user to complete the action named in the phase description, then wait for their confirmation.`,
+        `Once the user confirms the action is done, commit a record of completion to the named path (if specified) and return.`,
+        `Do NOT attempt to automate the manual action — it is intentionally a human gate.`,
+      ];
+      break;
+    default: // "code"
+      kindInstructions = [
+        `Make all failing tests pass with minimal correct code. Do NOT change test assertions.`,
+        `Also complete every non-code deliverable in the phase description: if it says "run X and produce Y" or "record Z to <path>", actually execute that script/command and commit the output files. Writing the code that could produce Y is not the same as producing Y.`,
+        `If there are no existing failing tests, implement the work described above.`,
+        `If the project uses GitHub Actions, ensure your changes pass them.`,
+        `Commit your changes to the current branch with a clear conventional-commit message.`,
+        `Fail forward: if a test fails, fix it before returning. Only return when the code is done and all artifacts are committed.`,
+      ];
+      break;
+  }
+  const allLines =
+    phase.kind === "code"
+      ? [...kindInstructions, ...sharedTail]
+      : [
+          ...kindInstructions,
+          `Commit your changes to the current branch with a clear conventional-commit message.`,
+          ...sharedTail,
+        ];
+  return allLines.map((line, i) => `${i + 1}. ${line}`);
+}
+
 /**
  * Build the review-gate context body that gets written to a file. Captures
  * which phase, what changed, and what to verify so each configured gate command
@@ -2801,7 +2904,9 @@ export function buildCodexReviewBody(
       : "",
     "## Your task",
     "",
-    "",
+    phase.kind !== "code"
+      ? `Review rubric: deliverable completeness and artifact correctness — not code quality or tests. Verify the artifact exists at the path named in the phase, is non-empty, and satisfies the acceptance criteria in the phase description.`
+      : "",
     `1. Run the slash command specified by the runner prompt on the current branch's working tree against its base.`,
     `2. If iteration > 1, this is a re-run after an earlier gate tried to fix findings — be especially thorough.`,
     `3. Use --yolo / workspace-write file tools to inspect the actual code; don't ask the orchestrator to inline anything.`,
@@ -2927,6 +3032,13 @@ async function verifyOriginPlanFeature(args: {
     };
   }
   return { ok: true, issueLogPath: outputFilePath };
+}
+
+export function extractCoverageTarget(phaseBody: string): number {
+  const m = phaseBody.match(
+    /\*\*Coverage target:\s*(?:>=|[≥>])\s*(\d+(?:\.\d+)?)%\*\*/i,
+  );
+  return m ? parseFloat(m[1]) : 80;
 }
 
 export function buildGeminiTestSpecPrompt(
@@ -6165,7 +6277,7 @@ async function main() {
   // function read from these references, so the rebinding has to be
   // visible to them.
   // eslint-disable-next-line prefer-const
-  let { features, phases, warnings } = parsePlan(content, {
+  let { features, phases, warnings, droppedPhasesCount } = parsePlan(content, {
     dualImpl: args.dualImpl,
   });
 
@@ -6190,13 +6302,18 @@ async function main() {
     for (const w of warnings) console.log(`  - ${w}`);
   }
 
-  if (args.printOnly) {
-    process.exit(0);
+  if (phases.length === 0) {
+    const hint =
+      droppedPhasesCount > 0
+        ? `\n${droppedPhasesCount} phase(s) found but none are executable.\n` +
+          `Phases need labeled markers (**Implementation** and **Review & QA** checkboxes) to be runnable.\n`
+        : "\nno executable phases found; nothing to do\n";
+    console.error(hint);
+    process.exit(2);
   }
 
-  if (phases.length === 0) {
-    console.error("\nno executable phases found; nothing to do");
-    process.exit(2);
+  if (args.printOnly) {
+    process.exit(0);
   }
 
   if (args.parallelPhases > 1 && !args.dryRun) {
@@ -6264,6 +6381,7 @@ async function main() {
   let state: BuildState | undefined;
   let currentBranchAtLaunch = "unknown";
   const startedAt = Date.now();
+  const FINALIZATION_REQUIRED = 13;
   let exitCode = 1;
 
   try {
@@ -6420,6 +6538,7 @@ async function main() {
           timeoutMs: BUILD_DEFAULTS.timeoutsMs.planReview,
           logDirPath: logDir(slug),
           cwd,
+          round: readPlanReviewRound(planReviewReportPath),
         });
         const outcome = await reconcilePlanReview(verdict, args.planFile, {
           planReviewReportPath,
@@ -7316,7 +7435,7 @@ async function main() {
         saveState(state, { noGbrain: args.noGbrain, log: console.warn });
         // When --skip-ship leaves features at origin_verified, exit 13
         // (FINALIZATION_REQUIRED) instead of 0 so the skill agent cannot infer
-        // "done" from the exit code — Step 3 (ship + archive) is mandatory.
+        // "done" from exit 0 — Step 3 (ship + archive) is mandatory.
         if (
           args.skipShip &&
           state.features?.some((f) => f.status === "origin_verified")
@@ -7352,7 +7471,9 @@ async function main() {
         } else {
           updateActiveRunFromState(
             state,
-            exitCode === 0 || exitCode === FINALIZATION_REQUIRED ? "paused" : "failed",
+            exitCode === 0 || exitCode === FINALIZATION_REQUIRED
+              ? "paused"
+              : "failed",
           );
         }
       } else if (launch.runId && launch.activeRunRegistry) {
@@ -7375,7 +7496,10 @@ async function main() {
       exitCode = 1;
     }
     logActivity({
-      event: exitCode === 0 || exitCode === FINALIZATION_REQUIRED ? "success" : "failed",
+      event:
+        exitCode === 0 || exitCode === FINALIZATION_REQUIRED
+          ? "success"
+          : "failed",
       slug,
       durationMs: Date.now() - startedAt,
       exitCode,
