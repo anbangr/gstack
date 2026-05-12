@@ -7358,6 +7358,43 @@ async function main() {
         }
       } while (exitCode === 0 && rerunAutonomousLoop);
 
+      if (exitCode === 0 && args.singleBranch) {
+        console.log(
+          args.releaseMode === "queued"
+            ? "\n▶ Plan complete. Running /ship and queueing PR for release daemon."
+            : "\n▶ Plan complete. Running /ship + /land-and-deploy.",
+        );
+        const planShipResult =
+          args.releaseMode === "queued"
+            ? await shipOnly({
+                cwd,
+                slug: `${slug}-plan`,
+                shipRole: args.roles.ship,
+              })
+            : await shipAndDeploy({
+                cwd,
+                slug: `${slug}-plan`,
+                shipRole: args.roles.ship,
+                landRole: args.roles.land,
+              });
+        if (planShipResult.exitCode !== 0 || planShipResult.timedOut) {
+          console.error(
+            `✗ plan-level ship failed (exit ${planShipResult.exitCode}, timed_out=${planShipResult.timedOut}); see ${planShipResult.logPath}`,
+          );
+          exitCode = 1;
+        } else {
+          const now = new Date().toISOString();
+          for (const f of state.features ?? []) {
+            if (f.status === "origin_verified") {
+              f.status = "committed";
+              f.completedAt = now;
+            }
+          }
+          state.completed = true;
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+        }
+      }
+
       if (exitCode === 0 && (args.skipShip || args.dryRun)) {
         console.log(
           `\n${args.dryRun ? "(dry-run) " : ""}all features done${args.skipShip ? " (ship skipped)" : ""}`,
@@ -7438,6 +7475,7 @@ async function main() {
       exitCode,
       dryRun: args.dryRun,
       skipShip: args.skipShip,
+      singleBranch: args.singleBranch,
     });
   }
 
