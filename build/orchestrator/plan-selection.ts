@@ -486,14 +486,16 @@ function activeRunOnlyCandidates(
   manifestRunIds: Set<string>,
 ): PlanCandidate[] {
   const registryDir = opts.activeRunRegistry ?? defaultActiveRunRegistryDir();
-  return readActiveRunRecords(registryDir)
-    .filter((record) => {
-      if (record.status === "paused" && !isPidAlive(record.pid)) {
-        removeActiveRunRecord(registryDir, record.runId);
-        return false;
-      }
-      return true;
-    })
+  const records = readActiveRunRecords(registryDir);
+  const cleaned: ActiveRunRecord[] = [];
+  for (const record of records) {
+    if (record.status === "paused" && !isPidAlive(record.pid)) {
+      removeActiveRunRecord(registryDir, record.runId);
+      continue;
+    }
+    cleaned.push(record);
+  }
+  return cleaned
     .filter((record) => !manifestRunIds.has(record.runId))
     .filter((record) => repoMatches(activeRunRepoPath(record), opts.projectRoot))
     .map(activeRunCandidate);

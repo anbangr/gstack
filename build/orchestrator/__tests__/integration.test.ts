@@ -1370,3 +1370,132 @@ test("exit-0 with --dry-run writes paused status to active-run registry (Feature
   expect(records[0].runId).toBe(runId);
   expect(records[0].status).toBe("paused");
 });
+
+test("T3 (Feature 4): non-zero non-13 exit writes 'failed' record to active-run registry", () => {
+  const failDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "gstack-exitfail-registry-"),
+  );
+  try {
+    // Minimal git repo so getCurrentBranch works inside the try block.
+    const repo = path.join(failDir, "repo");
+    fs.mkdirSync(repo);
+    expect(spawnSync("git", ["init", "-b", "main"], { cwd: repo }).status).toBe(
+      0,
+    );
+    expect(
+      spawnSync("git", ["config", "user.email", "test@example.com"], {
+        cwd: repo,
+      }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["config", "user.name", "Test User"], { cwd: repo })
+        .status,
+    ).toBe(0);
+    fs.writeFileSync(path.join(repo, "README.md"), "# test\n");
+    expect(spawnSync("git", ["add", "README.md"], { cwd: repo }).status).toBe(
+      0,
+    );
+    expect(
+      spawnSync("git", ["commit", "-m", "init"], { cwd: repo }).status,
+    ).toBe(0);
+
+    const planFile = path.join(failDir, "fail-plan.md");
+    fs.writeFileSync(
+      planFile,
+      `# Fail Plan
+
+## Feature 1: Ready
+
+### Phase 1.1: Done
+- [x] **Test Specification (Gemini Sub-agent)**: Existing tests.
+- [x] **Implementation (Gemini Sub-agent)**: Existing implementation.
+- [x] **Review & QA (Codex Sub-agent)**: Existing review.
+`,
+    );
+
+    const gstackHome = path.join(failDir, ".gstack");
+    const stateDir = path.join(gstackHome, "build-state");
+    const registryDir = path.join(stateDir, "active-runs");
+    fs.mkdirSync(registryDir, { recursive: true });
+
+    // Pre-write a state file with a MISMATCHED projectRoot to force
+    // validateResumeLaunch to fail (exitCode=2) inside the try block.
+    // With --run-id fail-run, slug = "build-fail-run".
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      path.join(stateDir, "build-fail-run.json"),
+      JSON.stringify(
+        {
+          planFile,
+          planBasename: "fail-plan",
+          slug: "build-fail-run",
+          branch: "main",
+          startedAt: now,
+          lastUpdatedAt: now,
+          launch: {
+            argv: [],
+            projectRoot: "/intentionally-wrong-path-that-does-not-match",
+            runId: "fail-run",
+            stateSlug: "build-fail-run",
+            dryRun: false,
+            skipShip: false,
+            skipFeatureReview: false,
+            launchedAt: now,
+            activeRunRegistry: registryDir,
+          },
+          currentPhaseIndex: 0,
+          currentFeatureIndex: 0,
+          phases: [],
+          features: [],
+          completed: false,
+          geminiModel: "gemini",
+          codexModel: "codex",
+          codexReviewModel: "codex-review",
+        },
+        null,
+        2,
+      ),
+    );
+
+    const cliPath = path.resolve(import.meta.dir, "../cli.ts");
+    const result = spawnSync(
+      "bun",
+      [
+        "run",
+        cliPath,
+        planFile,
+        "--project-root",
+        repo,
+        "--no-plan-review",
+        "--test-cmd",
+        "bun test",
+        "--no-gbrain",
+        "--run-id",
+        "fail-run",
+        "--active-run-registry",
+        registryDir,
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: failDir,
+          GSTACK_HOME: gstackHome,
+        },
+        encoding: "utf8",
+        timeout: 10_000,
+      },
+    );
+
+    // Exit must be non-zero and non-13 (validateResumeLaunch throws → exitCode=2).
+    expect(result.status).not.toBeNull();
+    expect(result.status).not.toBe(0);
+    expect(result.status).not.toBe(13);
+
+    const records = readActiveRunRecords(registryDir);
+    expect(records).toHaveLength(1);
+    expect(records[0].runId).toBe("fail-run");
+    expect(records[0].status).toBe("failed");
+  } finally {
+    fs.rmSync(failDir, { recursive: true, force: true });
+  }
+});

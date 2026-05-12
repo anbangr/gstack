@@ -35,11 +35,13 @@ If you've been seeing extra top-level skills (`/dublin-v1`, `/wellington`, etc.)
 - **`setup`** — added Conductor worktree guard before `ln -snf "$SOURCE_GSTACK_DIR" "$CLAUDE_GSTACK_LINK"`. Checks `[ -d "$CLAUDE_GSTACK_LINK" ] && [ ! -L "$CLAUDE_GSTACK_LINK" ]` for a real directory, then `cd ... && pwd -P` to compare against the source. If they differ, sets `_SKIP_CLAUDE_REGISTER=1`, prints a remediation message naming both paths, and exits the Claude registration branch without touching the global install.
 - **Paused active-run records with dead PIDs are now auto-cleaned.** `resolvePlanSelection` filters out paused active-run records whose process no longer exists, removes the stale record, and prevents phantom candidates from surfacing in `/build --resume`.
 - **`removeActiveRunRecord` swallows cleanup failures instead of throwing.** EPERM, EACCES, and other unlink errors during stale-record cleanup no longer crash the plan resolver. The build proceeds without surfacing the stale candidate.
+- **Stale running active-run candidates stay visible.** Running records with dead PIDs remain resumable as stale candidates instead of being silently dropped during paused-record cleanup.
 
 #### Added
 
 - **`test/setup-conductor-worktree.test.ts`** — 8 tests (27 expect calls) covering: guard placement in `setup` before `ln -snf`, `pwd -P` resolution against `$SOURCE_GSTACK_DIR`, the skip-branch's remediation message, BSD `ln -snf` reproducer (proves the bug shape exists), guard skips when dest is real-dir-elsewhere, guard allows ln when dest doesn't exist, guard allows ln when dest is an existing symlink (upgrade-in-place), guard allows ln when dest already resolves to source (self-rerun).
 - **Paused+dead-pid auto-cleanup coverage.** Six behavioral tests verify live-pid preservation, dead-pid removal, terminal-status protection, orphan handling, pid=0 cleanup, multi-record batch removal, and cleanup-failure swallowing.
+- **Exit-code active-run registry regression coverage.** Tests verify `--skip-ship` exit 13 writes `paused`, dry-run exit 0 writes `paused`, and non-zero non-13 exits write `failed`.
 
 #### For contributors
 

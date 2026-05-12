@@ -869,6 +869,122 @@ describe("plan resolver", () => {
       `gstack-build monitor --manifest ${manifestPath} --watch --supervise`,
     );
   });
+
+  // Feature 3 integration: stale-paused active-run record auto-cleanup
+  // T4: paused + dead pid — record must be removed, no candidate returned.
+  // (RED before Feature 3 is implemented: currently returns "selected" with stale status)
+  test("T4 (Feature 3): paused + dead pid — record removed, no candidate", () => {
+    const repo = gstackRepo();
+    const app = path.join(tmpDir, "app");
+    const activeRunRegistry = path.join(tmpDir, "active-runs-t4");
+    const plan = livingPlan(repo, "app-impl-plan-stale-paused-1.md");
+
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-stale-paused",
+      stateSlug: "build-run-stale-paused",
+      repoPath: path.join(tmpDir, "worktrees", "run-stale-paused"),
+      baseProjectRoot: app,
+      planFile: plan,
+      pid: 999999, // guaranteed dead: no real process will have this pid in test
+      status: "paused",
+      startedAt: "2026-05-11T00:00:00Z",
+      lastUpdatedAt: "2026-05-11T00:00:00Z",
+      branches: [],
+    });
+
+    const recordFile = activeRunRecordPath(
+      activeRunRegistry,
+      "run-stale-paused",
+    );
+    expect(fs.existsSync(recordFile)).toBe(true); // pre-condition: record written
+
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      projectRoot: app,
+      resumeOnly: true,
+      activeRunRegistry,
+    });
+
+    // After Feature 3: stale-paused record is cleaned up and no candidate returned.
+    expect(fs.existsSync(recordFile)).toBe(false);
+    expect(result.result).toBe("none");
+  });
+
+  // T5: paused + live pid — record must stay, candidate returned.
+  // (GREEN before and after Feature 3: live-paused records are not touched)
+  test("T5 (Feature 3): paused + live pid — record kept, candidate returned", () => {
+    const repo = gstackRepo();
+    const app = path.join(tmpDir, "app");
+    const activeRunRegistry = path.join(tmpDir, "active-runs-t5");
+    const plan = livingPlan(repo, "app-impl-plan-live-paused-1.md");
+
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-live-paused",
+      stateSlug: "build-run-live-paused",
+      repoPath: path.join(tmpDir, "worktrees", "run-live-paused"),
+      baseProjectRoot: app,
+      planFile: plan,
+      pid: process.pid, // guaranteed alive: current test process
+      status: "paused",
+      startedAt: "2026-05-11T00:00:00Z",
+      lastUpdatedAt: "2026-05-11T00:00:00Z",
+      branches: [],
+    });
+
+    const recordFile = activeRunRecordPath(
+      activeRunRegistry,
+      "run-live-paused",
+    );
+
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      projectRoot: app,
+      resumeOnly: true,
+      activeRunRegistry,
+    });
+
+    // Live-paused records are not cleaned up.
+    expect(fs.existsSync(recordFile)).toBe(true);
+    expect(result.result).toBe("selected");
+    expect(result.selected?.runId).toBe("run-live-paused");
+  });
+
+  test("T6 (Feature 3): running + dead pid remains a stale resume candidate", () => {
+    const repo = gstackRepo();
+    const app = path.join(tmpDir, "app");
+    const activeRunRegistry = path.join(tmpDir, "active-runs-t6");
+    const plan = livingPlan(repo, "app-impl-plan-running-dead-1.md");
+
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-running-dead",
+      stateSlug: "build-run-running-dead",
+      repoPath: path.join(tmpDir, "worktrees", "run-running-dead"),
+      baseProjectRoot: app,
+      planFile: plan,
+      pid: 999999,
+      status: "running",
+      startedAt: "2026-05-11T00:00:00Z",
+      lastUpdatedAt: "2026-05-11T00:00:00Z",
+      branches: [],
+    });
+
+    const recordFile = activeRunRecordPath(
+      activeRunRegistry,
+      "run-running-dead",
+    );
+
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      projectRoot: app,
+      resumeOnly: true,
+      activeRunRegistry,
+    });
+
+    expect(fs.existsSync(recordFile)).toBe(true);
+    expect(result.result).toBe("selected");
+    expect(result.selected?.runId).toBe("run-running-dead");
+    expect(result.selected?.status).toBe("stale");
+  });
 });
 
 // ====================================================================================
