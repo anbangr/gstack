@@ -2094,10 +2094,15 @@ function safeBranchPart(value: string): string {
   );
 }
 
-function ownedFeatureBranch(state: BuildState, feature: FeatureState): string {
+export function ownedFeatureBranch(
+  state: BuildState,
+  feature: FeatureState,
+  opts: { singleBranch?: boolean } = {},
+): string {
   const prefix = safeBranchPart(
     state.launch?.branchPrefix ?? state.planBasename,
   );
+  if (opts.singleBranch) return `feat/${prefix}`;
   return `feat/${prefix}-${featureSlug(feature)}`;
 }
 
@@ -2178,6 +2183,7 @@ export function ensureFeatureBranch(args: {
   feature: FeatureState;
   dryRun: boolean;
   noGbrain: boolean;
+  singleBranch?: boolean;
 }): boolean {
   if (args.feature.branch) {
     if (
@@ -2223,7 +2229,7 @@ export function ensureFeatureBranch(args: {
   const onBase = existing === base || existing === "";
   const createFeatureBranch = onBase || existing.startsWith("feat/");
   const branch = createFeatureBranch
-    ? ownedFeatureBranch(args.state, args.feature)
+    ? ownedFeatureBranch(args.state, args.feature, { singleBranch: args.singleBranch })
     : existing;
   args.feature.branch = branch;
   args.state.branch = branch;
@@ -6621,6 +6627,7 @@ async function main() {
               feature: featureState,
               dryRun: args.dryRun,
               noGbrain: args.noGbrain,
+              singleBranch: args.singleBranch,
             })
           ) {
             console.error(
