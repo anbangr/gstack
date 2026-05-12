@@ -24,6 +24,7 @@ import {
   archiveOriginPlan,
   buildOriginVerificationBody,
   ensureFeatureBranch,
+  ownedFeatureBranch,
   detectRemoteBaseRef,
   syncLandedBase,
   syncFeatureBranchWithBase,
@@ -32,6 +33,7 @@ import {
   markPhaseCommittedAfterManualRecovery,
   phaseTableStatus,
   phaseGateProjection,
+  featureGateProjection,
   reconcileVisiblePlanState,
   releaseDaemonLaunchCommand,
   renderLaunchdReleaseDaemonPlist,
@@ -294,6 +296,30 @@ describe("--skip-ship flag wiring", () => {
       ["plan.md", "--release-mode", "surprise"],
       "--release-mode expects queued or auto-land",
     );
+  });
+});
+
+describe("--single-branch flag wiring", () => {
+  it("parseArgs default -> singleBranch=false", () => {
+    const args = parseArgs(["plan.md"]);
+    expect(args.singleBranch).toBe(false);
+  });
+
+  it("parseArgs([plan, --single-branch]) sets singleBranch=true", () => {
+    const args = parseArgs(["plan.md", "--single-branch"]);
+    expect(args.singleBranch).toBe(true);
+  });
+
+  it("--single-branch is independent of --skip-ship", () => {
+    const args = parseArgs([
+      "plan.md",
+      "--single-branch",
+      "--release-mode",
+      "auto-land",
+    ]);
+    expect(args.singleBranch).toBe(true);
+    expect(args.skipShip).toBe(false);
+    expect(args.releaseMode).toBe("auto-land");
   });
 });
 
@@ -3224,8 +3250,9 @@ describe("reconcileVisiblePlanState", () => {
         origin_verification: { done: false, line: 4 },
       },
     });
-    // skipShip=true + committed → only feature_review checked
-    const state = makeState("committed", "committed");
+    // skipShip=true + origin_verified → only feature_review checked
+    // (committed always shows all gates; origin_verified respects skipShip)
+    const state = makeState("committed", "origin_verified");
 
     reconcileVisiblePlanState(planFile, [feature], [phase], state, {
       skipShip: true,
@@ -3921,5 +3948,98 @@ describe("buildKindInstructions — non-code phase prompts", () => {
       expect(joined).toContain("Do NOT run /review");
       expect(joined).toContain("Do NOT update the plan file");
     }
+  });
+});
+
+describe("featureGateProjection with singleBranch", () => {
+  it("suppresses ship_land and origin_verification for origin_verified when singleBranch", () => {
+    const result = featureGateProjection("origin_verified", { singleBranch: true });
+    expect(result).toEqual({ feature_review: true });
+  });
+
+  it("shows all gates for committed regardless of singleBranch", () => {
+    const result = featureGateProjection("committed", { singleBranch: true });
+    expect(result).toEqual({
+      feature_review: true,
+      ship_land: true,
+      origin_verification: true,
+    });
+  });
+});
+
+describe("ownedFeatureBranch", () => {
+  function makeStateForBranch(
+    overrides: { branchPrefix?: string; planBasename?: string } = {},
+  ): BuildState {
+    return {
+      planFile: "plan.md",
+      planBasename: overrides.planBasename ?? "my-plan",
+      slug: "test",
+      branch: "",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      lastUpdatedAt: "2026-01-01T00:00:00.000Z",
+      currentPhaseIndex: 0,
+      currentFeatureIndex: 0,
+      features: [],
+      phases: [],
+      completed: false,
+      geminiModel: "gemini",
+      codexModel: "codex",
+      codexReviewModel: "codex-review",
+      launch: overrides.branchPrefix
+        ? {
+            argv: ["plan.md"],
+            projectRoot: "/repo",
+            runId: "run-1",
+            branchPrefix: overrides.branchPrefix,
+            activeRunRegistry: "/tmp/ar",
+            dryRun: false,
+            skipShip: false,
+            skipFeatureReview: false,
+            launchedAt: "2026-01-01T00:00:00.000Z",
+            stateSlug: "test",
+          }
+        : undefined,
+    } as BuildState;
+  }
+
+  it("returns feat/<prefix>-<slug> by default (multi-branch)", () => {
+    const state = makeStateForBranch({ planBasename: "my-plan" });
+    const feature: FeatureState = {
+      index: 0,
+      number: "1",
+      name: "Auth",
+      phaseIndexes: [],
+      status: "running",
+    };
+    expect(ownedFeatureBranch(state, feature)).toBe("feat/my-plan-1-auth");
+  });
+
+  it("returns feat/<prefix> with no slug when singleBranch", () => {
+    const state = makeStateForBranch({ planBasename: "my-plan" });
+    const feature: FeatureState = {
+      index: 0,
+      number: "1",
+      name: "Auth",
+      phaseIndexes: [],
+      status: "running",
+    };
+    expect(ownedFeatureBranch(state, feature, { singleBranch: true })).toBe(
+      "feat/my-plan",
+    );
+  });
+
+  it("uses branchPrefix from state.launch when available", () => {
+    const state = makeStateForBranch({ branchPrefix: "my-prefix" });
+    const feature: FeatureState = {
+      index: 0,
+      number: "2",
+      name: "Billing",
+      phaseIndexes: [],
+      status: "running",
+    };
+    expect(ownedFeatureBranch(state, feature, { singleBranch: true })).toBe(
+      "feat/my-prefix",
+    );
   });
 });

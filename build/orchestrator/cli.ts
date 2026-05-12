@@ -193,6 +193,7 @@ let visiblePlanProjection: {
   phases: Phase[];
   skipShip?: boolean;
   dryRun?: boolean;
+  singleBranch?: boolean;
 } | null = null;
 
 function saveState(
@@ -211,6 +212,7 @@ function saveState(
         {
           skipShip: visiblePlanProjection.skipShip,
           dryRun: visiblePlanProjection.dryRun,
+          singleBranch: visiblePlanProjection.singleBranch,
         },
       );
     } catch (err) {
@@ -279,9 +281,9 @@ export function phaseGateProjection(
  * Given a feature's runtime status, return the set of feature gates that
  * should show as done in the plan file.
  */
-function featureGateProjection(
+export function featureGateProjection(
   status: FeatureStatus,
-  opts: { skipShip?: boolean } = {},
+  opts: { skipShip?: boolean; singleBranch?: boolean } = {},
 ): Partial<Record<FeatureGate, boolean>> {
   switch (status) {
     case "pending":
@@ -303,14 +305,19 @@ function featureGateProjection(
         ? { feature_review: true }
         : { feature_review: true, ship_land: true };
     case "origin_verified":
-    case "committed":
-      return opts.skipShip
+      return opts.skipShip || opts.singleBranch
         ? { feature_review: true }
         : {
             feature_review: true,
             ship_land: true,
             origin_verification: true,
           };
+    case "committed":
+      return {
+        feature_review: true,
+        ship_land: true,
+        origin_verification: true,
+      };
     default: {
       const _exhaustive: never = status;
       void _exhaustive;
@@ -352,7 +359,7 @@ function reconcileFeatureVisibleGates(
   planFile: string,
   feature: Feature,
   featureState: FeatureState,
-  opts: { skipShip?: boolean } = {},
+  opts: { skipShip?: boolean; singleBranch?: boolean } = {},
 ): number {
   if (!feature.gates) return 0;
   const desired = featureGateProjection(featureState.status, opts);
@@ -389,7 +396,7 @@ export function reconcileVisiblePlanState(
   features: Feature[],
   phases: Phase[],
   state: BuildState,
-  opts: { skipShip?: boolean; dryRun?: boolean } = {},
+  opts: { skipShip?: boolean; dryRun?: boolean; singleBranch?: boolean } = {},
 ): void {
   if (opts.dryRun) return;
   let changed = 0;
@@ -403,6 +410,7 @@ export function reconcileVisiblePlanState(
     if (!featureState) continue;
     changed += reconcileFeatureVisibleGates(planFile, feature, featureState, {
       skipShip: opts.skipShip,
+      singleBranch: opts.singleBranch,
     });
   }
   if (changed > 0) {
@@ -527,6 +535,8 @@ export interface Args {
   noResume: boolean;
   noGbrain: boolean;
   skipShip: boolean;
+  /** When true, all features share one feat/<prefix> branch; /ship + /land-and-deploy run once after all features complete. */
+  singleBranch: boolean;
   releaseMode: "queued" | "auto-land";
   maxCodexIter: number;
   testCmd?: string;
@@ -626,6 +636,7 @@ export function parseArgs(argv: string[]): Args {
     noResume: false,
     noGbrain: false,
     skipShip: false,
+    singleBranch: false,
     releaseMode: "queued",
     maxCodexIter: DEFAULT_MAX_CODEX_ITERATIONS,
     projectRoot: undefined,
@@ -677,6 +688,7 @@ export function parseArgs(argv: string[]): Args {
     else if (a === "--no-resume" || a === "--restart") args.noResume = true;
     else if (a === "--no-gbrain") args.noGbrain = true;
     else if (a === "--skip-ship") args.skipShip = true;
+    else if (a === "--single-branch") args.singleBranch = true;
     else if (a === "--release-mode") {
       const next = argv[++i];
       if (next !== "queued" && next !== "auto-land") {
@@ -1738,6 +1750,10 @@ Flags:
   --no-resume          Ignore existing state, start fresh.
   --no-gbrain          Skip gbrain mirror; local JSON only.
   --skip-ship          Skip per-feature /ship + /land-and-deploy steps.
+  --single-branch      All features share one feat/<prefix> branch. /ship +
+                       /land-and-deploy runs once after all features complete
+                       instead of after each feature. Auto-selected by the
+                       driver agent based on plan cohesion.
   --release-mode <m>   queued (default) runs /ship then queues PR for the
                        release daemon. auto-land preserves legacy /ship +
                        /land-and-deploy behavior.
@@ -2082,10 +2098,15 @@ function safeBranchPart(value: string): string {
   );
 }
 
-function ownedFeatureBranch(state: BuildState, feature: FeatureState): string {
+export function ownedFeatureBranch(
+  state: BuildState,
+  feature: FeatureState,
+  opts: { singleBranch?: boolean } = {},
+): string {
   const prefix = safeBranchPart(
     state.launch?.branchPrefix ?? state.planBasename,
   );
+  if (opts.singleBranch) return `feat/${prefix}`;
   return `feat/${prefix}-${featureSlug(feature)}`;
 }
 
@@ -2166,6 +2187,7 @@ export function ensureFeatureBranch(args: {
   feature: FeatureState;
   dryRun: boolean;
   noGbrain: boolean;
+  singleBranch?: boolean;
 }): boolean {
   if (args.feature.branch) {
     if (
@@ -2211,7 +2233,7 @@ export function ensureFeatureBranch(args: {
   const onBase = existing === base || existing === "";
   const createFeatureBranch = onBase || existing.startsWith("feat/");
   const branch = createFeatureBranch
-    ? ownedFeatureBranch(args.state, args.feature)
+    ? ownedFeatureBranch(args.state, args.feature, { singleBranch: args.singleBranch })
     : existing;
   args.feature.branch = branch;
   args.state.branch = branch;
@@ -6289,6 +6311,7 @@ async function main() {
     phases,
     skipShip: args.skipShip,
     dryRun: args.dryRun,
+    singleBranch: args.singleBranch,
   };
 
   console.log(`Plan: ${args.planFile}`);
@@ -6689,6 +6712,7 @@ async function main() {
               feature: featureState,
               dryRun: args.dryRun,
               noGbrain: args.noGbrain,
+              singleBranch: args.singleBranch,
             })
           ) {
             console.error(
