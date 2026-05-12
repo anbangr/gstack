@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
+import { readActiveRunRecords } from "../active-runs";
 
 const TDD_PLAN = `# Test Integration Plan
 
@@ -1227,4 +1228,145 @@ EOF
   } finally {
     fs.rmSync(criticalDir, { recursive: true, force: true });
   }
+});
+
+// ─── Feature 2 T1/T2: active-run registry exit-code → status ─────────────────
+
+test("exit-13 (FINALIZATION_REQUIRED) writes paused status to active-run registry (Feature 2 T1)", () => {
+  // This test FAILS on the old ternary (exitCode === 0 ? "paused" : "failed")
+  // because exit-13 would produce "failed" instead of "paused".
+  // It PASSES on the fixed ternary (exitCode === 0 || exitCode === 13 ? "paused" : "failed").
+  const t1Dir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-f2t1-registry-"));
+  try {
+    const repo = path.join(t1Dir, "repo");
+    const bare = path.join(t1Dir, "origin.git");
+    fs.mkdirSync(repo);
+    expect(spawnSync("git", ["init", "-b", "main"], { cwd: repo }).status).toBe(
+      0,
+    );
+    expect(
+      spawnSync("git", ["init", "--bare", "-b", "main", bare]).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["config", "user.email", "test@example.com"], {
+        cwd: repo,
+      }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["config", "user.name", "Test User"], { cwd: repo })
+        .status,
+    ).toBe(0);
+    fs.writeFileSync(path.join(repo, "README.md"), "# test\n");
+    expect(spawnSync("git", ["add", "README.md"], { cwd: repo }).status).toBe(
+      0,
+    );
+    expect(
+      spawnSync("git", ["commit", "-m", "init"], { cwd: repo }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["remote", "add", "origin", bare], { cwd: repo }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["push", "-u", "origin", "main"], { cwd: repo }).status,
+    ).toBe(0);
+
+    const t1PlanFile = path.join(t1Dir, "skip-ship-plan.md");
+    fs.writeFileSync(
+      t1PlanFile,
+      `# Feature 2 Exit-13 Registry Test Plan
+
+## Feature 1: Done
+
+### Phase 1.1: Implementation
+- [x] **Test Specification (Gemini Sub-agent)**: Existing tests.
+- [x] **Implementation (Gemini Sub-agent)**: Existing implementation.
+- [x] **Review & QA (Codex Sub-agent)**: Existing review.
+`,
+    );
+
+    const registryDir = path.join(t1Dir, "active-runs");
+    const runId = "f2t1-exit13-regression";
+    const cliPath = path.resolve(import.meta.dir, "../cli.ts");
+    const result = spawnSync(
+      "bun",
+      [
+        "run",
+        cliPath,
+        t1PlanFile,
+        "--project-root",
+        repo,
+        "--skip-ship",
+        "--no-plan-review",
+        "--test-cmd",
+        "bun test",
+        "--no-gbrain",
+        "--run-id",
+        runId,
+        "--active-run-registry",
+        registryDir,
+      ],
+      {
+        encoding: "utf8",
+        timeout: 30_000,
+        env: {
+          ...process.env,
+          HOME: t1Dir,
+          GSTACK_HOME: path.join(t1Dir, ".gstack"),
+        },
+      },
+    );
+
+    // exit-13 = FINALIZATION_REQUIRED: --skip-ship leaves features at origin_verified
+    expect(result.status).toBe(13);
+
+    // T1: registry must record "paused" after exit-13, not "failed".
+    const records = readActiveRunRecords(registryDir);
+    expect(records).toHaveLength(1);
+    expect(records[0].runId).toBe(runId);
+    expect(records[0].status).toBe("paused");
+  } finally {
+    fs.rmSync(t1Dir, { recursive: true, force: true });
+  }
+});
+
+test("exit-0 with --dry-run writes paused status to active-run registry (Feature 2 T2)", () => {
+  // Uses shared tmpDir/planFile from beforeAll (TDD plan with incomplete phases).
+  // --dry-run causes state.completed = false and exitCode = 0, so the else branch
+  // of the finally block runs with fallback "paused" (exitCode === 0 → "paused").
+  const cliPath = path.resolve(import.meta.dir, "../cli.ts");
+  const registryDir = path.join(tmpDir, "active-runs-f2t2");
+  const runId = "f2t2-dryrun-exit0";
+
+  const result = spawnSync(
+    "bun",
+    [
+      "run",
+      cliPath,
+      planFile,
+      "--dry-run",
+      "--test-cmd",
+      "bun test",
+      "--no-gbrain",
+      "--run-id",
+      runId,
+      "--active-run-registry",
+      registryDir,
+    ],
+    {
+      env: {
+        ...process.env,
+        HOME: tmpDir,
+        GSTACK_HOME: path.join(tmpDir, ".gstack"),
+      },
+      encoding: "utf8",
+      timeout: 30_000,
+    },
+  );
+
+  // T2: exit-0 (dry-run, !completed) → registry has "paused" status.
+  expect(result.status).toBe(0);
+  const records = readActiveRunRecords(registryDir);
+  expect(records).toHaveLength(1);
+  expect(records[0].runId).toBe(runId);
+  expect(records[0].status).toBe("paused");
 });
