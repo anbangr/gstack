@@ -732,6 +732,33 @@ kind's checkpoint structure. The orchestrator handles all kinds without special 
 
    If `gstack-build` exits with **code 1** (runtime error) or **code 2** (test failure): handle as usual (see Step M3).
 
+5.7. **Branch Strategy Decision**: Read the living plan file (path from `build-synthesis-output.md`). Reason holistically about the features: are they tightly coupled and form one coherent deliverable, or do they have independent shipping value?
+
+   Use `AskUserQuestion` with this format:
+   ```
+   D[N] — Branch strategy for this plan?
+   Analysis: <1-2 sentences of holistic reasoning>
+   Recommendation: A) single-branch
+
+   A) Single-branch — one `feat/<prefix>` branch for the whole plan, /ship +
+      /land-and-deploy once after all features are implemented, tested, and reviewed
+      ✅ One clean PR, one CI run, one merge
+      ❌ If a late feature breaks badly, rollback affects all prior work
+
+   B) Multi-branch — separate `feat/<prefix>-<feature>` branch per feature, /ship +
+      /land-and-deploy after each feature completes
+      ✅ Each feature is independently revertable
+      ❌ Multiple PRs, multiple CI runs, more merge noise
+   ```
+
+   Where [N] is a sequential decision number for this session.
+
+   If the user picks **A (single-branch)**: add `--single-branch` to `_FLAGS` before Step M2 launches `gstack-build`.
+
+   If the user picks **B (multi-branch)**: leave `_FLAGS` unchanged.
+
+   Make your recommendation holistically — reason about coupling, shared data models, independent shipping value, and plan coherence. No fixed thresholds.
+
 6. **Confirm with user**: Present the run list from the synthesis summary, then use `AskUserQuestion` to ask the user to confirm before launching the CLI. Show: manifest path, run count, each target repo, and each living plan path.
 
 ## CLI Monitoring Loop
