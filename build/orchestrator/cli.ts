@@ -102,7 +102,7 @@ import {
 } from "./feature-review";
 import { promptYesNo, buildBlockedFeatureMd } from "./feature-review-prompt";
 import { runPlanReview, reconcilePlanReview } from "./plan-reviewer";
-import { shipAndDeploy, shipOnly } from "./ship";
+import { shipAndDeploy, shipOnly, landOnly } from "./ship";
 import { runReleaseDaemon, retryReleaseQueueRecord } from "./release-daemon";
 import {
   defaultReleaseQueueDir,
@@ -7497,6 +7497,52 @@ export function findMergeCandidateBranches(
     }));
 }
 
+export function findOpenPRForBranch(
+  cwd: string,
+  branch: string,
+  ghBinary = "gh",
+): number | null {
+  const r = spawnSync(
+    ghBinary,
+    [
+      "pr",
+      "list",
+      "--state",
+      "open",
+      "--head",
+      branch,
+      "--json",
+      "number,baseRefName",
+    ],
+    { cwd, encoding: "utf8", timeout: 15_000 },
+  );
+  if (r.error || r.status !== 0) {
+    console.warn(
+      `  ⚠ gh pr list failed for ${branch} — falling back to ship+land`,
+    );
+    return null;
+  }
+  try {
+    const prs = JSON.parse(r.stdout || "[]") as Array<{
+      number: number;
+      baseRefName: string;
+    }>;
+    if (!Array.isArray(prs)) return null;
+    const baseRef = detectRemoteBaseRef(cwd).replace(/^origin\//, "");
+    const match = prs.find((pr) => pr.baseRefName === baseRef) ?? prs[0];
+    const num = match?.number ?? null;
+    return typeof num === "number" && num > 0 ? num : null;
+  } catch {
+    return null;
+  }
+}
+
+export function chooseMergePath(
+  openPRNumber: number | null,
+): "land-only" | "ship-and-deploy" {
+  return openPRNumber !== null ? "land-only" : "ship-and-deploy";
+}
+
 export function detectRemoteBaseRef(cwd: string): string {
   const originHead = spawnSync(
     "git",
@@ -7724,6 +7770,12 @@ async function processMergeBranch(args: {
   if (!checkoutMergeBranch(args.cwd, args.candidate)) return false;
 
   const branchSlug = branch.replace(/[^a-z0-9-]/gi, "-").toLowerCase();
+  const openPRNumber = findOpenPRForBranch(args.cwd, branch);
+  if (openPRNumber !== null) {
+    console.log(
+      `  ℹ found existing open PR #${openPRNumber} for ${branch} — will land directly after review`,
+    );
+  }
   let lastReviewReportPath: string | null = null;
   for (let iter = 1; iter <= args.maxReviewIterations; iter++) {
     const review = await runMergeReview({
@@ -7736,15 +7788,37 @@ async function processMergeBranch(args: {
     lastReviewReportPath = review.reportPath;
     if (review.ok) {
       console.log(`  ✓ review passed for ${branch}`);
-      const result = await shipAndDeploy({
-        cwd: args.cwd,
-        slug: `${args.slug}-${branchSlug}`,
-        shipRole: args.roles.ship,
-        landRole: args.roles.land,
-      });
+      let result: SubAgentResult;
+      if (openPRNumber !== null) {
+        const pushR = spawnSync("git", ["push", "origin", branch], {
+          cwd: args.cwd,
+          encoding: "utf8",
+          timeout: 60_000,
+        });
+        if (pushR.status !== 0) {
+          console.error(
+            `  ✗ git push failed for ${branch}: ${pushR.stderr || pushR.stdout}`,
+          );
+          return false;
+        }
+        result = await landOnly({
+          cwd: args.cwd,
+          slug: `${args.slug}-${branchSlug}`,
+          landRole: args.roles.land,
+        });
+      } else {
+        result = await shipAndDeploy({
+          cwd: args.cwd,
+          slug: `${args.slug}-${branchSlug}`,
+          shipRole: args.roles.ship,
+          landRole: args.roles.land,
+        });
+      }
       if (result.timedOut || result.exitCode !== 0) {
+        const deployLabel =
+          chooseMergePath(openPRNumber) === "land-only" ? "land" : "ship/land";
         console.error(
-          `  ✗ ship/land failed for ${branch} (exit ${result.exitCode})`,
+          `  ✗ ${deployLabel} failed for ${branch} (exit ${result.exitCode})`,
         );
         return false;
       }
