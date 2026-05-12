@@ -189,6 +189,7 @@ let visiblePlanProjection: {
   phases: Phase[];
   skipShip?: boolean;
   dryRun?: boolean;
+  singleBranch?: boolean;
 } | null = null;
 
 function saveState(
@@ -207,6 +208,7 @@ function saveState(
         {
           skipShip: visiblePlanProjection.skipShip,
           dryRun: visiblePlanProjection.dryRun,
+          singleBranch: visiblePlanProjection.singleBranch,
         },
       );
     } catch (err) {
@@ -275,9 +277,9 @@ export function phaseGateProjection(
  * Given a feature's runtime status, return the set of feature gates that
  * should show as done in the plan file.
  */
-function featureGateProjection(
+export function featureGateProjection(
   status: FeatureStatus,
-  opts: { skipShip?: boolean } = {},
+  opts: { skipShip?: boolean; singleBranch?: boolean } = {},
 ): Partial<Record<FeatureGate, boolean>> {
   switch (status) {
     case "pending":
@@ -299,14 +301,19 @@ function featureGateProjection(
         ? { feature_review: true }
         : { feature_review: true, ship_land: true };
     case "origin_verified":
-    case "committed":
-      return opts.skipShip
+      return opts.skipShip || opts.singleBranch
         ? { feature_review: true }
         : {
             feature_review: true,
             ship_land: true,
             origin_verification: true,
           };
+    case "committed":
+      return {
+        feature_review: true,
+        ship_land: true,
+        origin_verification: true,
+      };
     default: {
       const _exhaustive: never = status;
       void _exhaustive;
@@ -348,7 +355,7 @@ function reconcileFeatureVisibleGates(
   planFile: string,
   feature: Feature,
   featureState: FeatureState,
-  opts: { skipShip?: boolean } = {},
+  opts: { skipShip?: boolean; singleBranch?: boolean } = {},
 ): number {
   if (!feature.gates) return 0;
   const desired = featureGateProjection(featureState.status, opts);
@@ -385,7 +392,7 @@ export function reconcileVisiblePlanState(
   features: Feature[],
   phases: Phase[],
   state: BuildState,
-  opts: { skipShip?: boolean; dryRun?: boolean } = {},
+  opts: { skipShip?: boolean; dryRun?: boolean; singleBranch?: boolean } = {},
 ): void {
   if (opts.dryRun) return;
   let changed = 0;
@@ -399,6 +406,7 @@ export function reconcileVisiblePlanState(
     if (!featureState) continue;
     changed += reconcileFeatureVisibleGates(planFile, feature, featureState, {
       skipShip: opts.skipShip,
+      singleBranch: opts.singleBranch,
     });
   }
   if (changed > 0) {
@@ -6219,6 +6227,7 @@ async function main() {
     phases,
     skipShip: args.skipShip,
     dryRun: args.dryRun,
+    singleBranch: args.singleBranch,
   };
 
   console.log(`Plan: ${args.planFile}`);

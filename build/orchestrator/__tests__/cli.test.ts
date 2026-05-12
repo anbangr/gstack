@@ -31,6 +31,7 @@ import {
   markPhaseCommittedAfterManualRecovery,
   phaseTableStatus,
   phaseGateProjection,
+  featureGateProjection,
   reconcileVisiblePlanState,
   releaseDaemonLaunchCommand,
   renderLaunchdReleaseDaemonPlist,
@@ -3237,8 +3238,9 @@ describe("reconcileVisiblePlanState", () => {
         origin_verification: { done: false, line: 4 },
       },
     });
-    // skipShip=true + committed → only feature_review checked
-    const state = makeState("committed", "committed");
+    // skipShip=true + origin_verified → only feature_review checked
+    // (committed always shows all gates; origin_verified respects skipShip)
+    const state = makeState("committed", "origin_verified");
 
     reconcileVisiblePlanState(planFile, [feature], [phase], state, {
       skipShip: true,
@@ -3439,5 +3441,21 @@ describe("buildKindInstructions", () => {
         expect(typeof line).toBe("string");
       }
     }
+  });
+});
+
+describe("featureGateProjection with singleBranch", () => {
+  it("suppresses ship_land and origin_verification for origin_verified when singleBranch", () => {
+    const result = featureGateProjection("origin_verified", { singleBranch: true });
+    expect(result).toEqual({ feature_review: true });
+  });
+
+  it("shows all gates for committed regardless of singleBranch", () => {
+    const result = featureGateProjection("committed", { singleBranch: true });
+    expect(result).toEqual({
+      feature_review: true,
+      ship_land: true,
+      origin_verification: true,
+    });
   });
 });
