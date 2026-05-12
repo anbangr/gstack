@@ -6585,7 +6585,7 @@ async function main() {
       do {
         rerunAutonomousLoop = false;
         while (true) {
-          const skipUnshippedVerified = args.skipShip || args.dryRun;
+          const skipUnshippedVerified = args.skipShip || args.singleBranch || args.dryRun;
           const featureIndex = findNextFeatureIndex(state, {
             skipOriginVerified: skipUnshippedVerified,
           });
@@ -7034,7 +7034,7 @@ async function main() {
             saveState(state, { noGbrain: args.noGbrain, log: console.warn });
           }
 
-          if (!resumeAfterLanding && !args.skipShip && !args.dryRun) {
+          if (!resumeAfterLanding && !args.skipShip && !args.singleBranch && !args.dryRun) {
             const branchForShip = featureState.branch || state.branch;
             const baseSync = syncFeatureBranchWithBase(cwd, branchForShip);
             if (!baseSync.ok) {
@@ -7212,6 +7212,7 @@ async function main() {
           if (
             (resumeAfterLanding || featureState.status === "landed") &&
             !args.skipShip &&
+            !args.singleBranch &&
             !args.dryRun
           ) {
             const synced = syncLandedBase(cwd);
@@ -7250,7 +7251,7 @@ async function main() {
             originPlanFile: args.originPlan,
             cwd,
             roles: args.roles,
-            dryRun: args.dryRun || args.skipShip,
+            dryRun: args.dryRun || args.skipShip || args.singleBranch,
           });
           featureState.issueLogPath = originCheck.issueLogPath;
           if (!originCheck.ok) {
@@ -7294,7 +7295,9 @@ async function main() {
           }
 
           featureState.status =
-            args.skipShip || args.dryRun ? "origin_verified" : "committed";
+            args.skipShip || args.singleBranch || args.dryRun
+              ? "origin_verified"
+              : "committed";
           featureState.originVerificationAttempts = 0;
           featureState.error = undefined;
           featureState.originVerifiedAt = new Date().toISOString();
@@ -7318,7 +7321,7 @@ async function main() {
         if (exitCode === 0) {
           const remainingPhase = findNextPhaseIndex(state.phases);
           const remainingFeature = findNextFeatureIndex(state, {
-            skipOriginVerified: args.skipShip || args.dryRun,
+            skipOriginVerified: args.skipShip || args.singleBranch || args.dryRun,
           });
           if (remainingPhase !== -1 || remainingFeature !== -1) {
             console.error(
@@ -7444,19 +7447,58 @@ async function main() {
         }
       } while (exitCode === 0 && rerunAutonomousLoop);
 
+      if (exitCode === 0 && args.singleBranch) {
+        console.log(
+          args.releaseMode === "queued"
+            ? "\n▶ Plan complete. Running /ship and queueing PR for release daemon."
+            : "\n▶ Plan complete. Running /ship + /land-and-deploy.",
+        );
+        const planShipResult =
+          args.releaseMode === "queued"
+            ? await shipOnly({
+                cwd,
+                slug: `${slug}-plan`,
+                shipRole: args.roles.ship,
+              })
+            : await shipAndDeploy({
+                cwd,
+                slug: `${slug}-plan`,
+                shipRole: args.roles.ship,
+                landRole: args.roles.land,
+              });
+        if (planShipResult.exitCode !== 0 || planShipResult.timedOut) {
+          console.error(
+            `✗ plan-level ship failed (exit ${planShipResult.exitCode}, timed_out=${planShipResult.timedOut}); see ${planShipResult.logPath}`,
+          );
+          exitCode = 1;
+        } else {
+          const now = new Date().toISOString();
+          for (const f of state.features ?? []) {
+            if (f.status === "origin_verified") {
+              f.status = "committed";
+              f.completedAt = now;
+            }
+          }
+          state.completed = true;
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+        }
+      }
+
       if (exitCode === 0 && (args.skipShip || args.dryRun)) {
         console.log(
           `\n${args.dryRun ? "(dry-run) " : ""}all features done${args.skipShip ? " (ship skipped)" : ""}`,
         );
       }
       if (exitCode === 0) {
-        // In --release-mode queued, all features may reach release_queued status
-        // while the release daemon handles the actual landing asynchronously.
-        // state.completed = true means "the orchestrator's job is done" — not
-        // "all PRs have merged." The release daemon is responsible for landing
-        // queued PRs.
-        state.completed = !args.dryRun && !args.skipShip;
-        saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+        if (!args.singleBranch) {
+          // In --release-mode queued, all features may reach release_queued status
+          // while the release daemon handles the actual landing asynchronously.
+          // state.completed = true means "the orchestrator's job is done" — not
+          // "all PRs have merged." The release daemon is responsible for landing
+          // queued PRs.
+          state.completed = !args.dryRun && !args.skipShip;
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+        }
         // When --skip-ship leaves features at origin_verified, exit 13
         // (FINALIZATION_REQUIRED) instead of 0 so the skill agent cannot infer
         // "done" from exit 0 — Step 3 (ship + archive) is mandatory.
@@ -7529,6 +7571,7 @@ async function main() {
       exitCode,
       dryRun: args.dryRun,
       skipShip: args.skipShip,
+      singleBranch: args.singleBranch,
     });
   }
 
