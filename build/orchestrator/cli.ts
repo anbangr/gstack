@@ -2529,6 +2529,12 @@ export function sanitizeReviewFeedback(raw: string): string {
 export const BLOCKED_GITIGNORE_PATTERN = "BLOCKED*.md";
 
 /**
+ * Exit code used when --skip-ship leaves features at origin_verified.
+ * Step 3 (ship + archive) is still pending finalization.
+ */
+export const FINALIZATION_REQUIRED = 13;
+
+/**
  * Append the BLOCKED*.md gitignore pattern to a project's .gitignore
  * exactly once per project. Idempotent. Best-effort: write failures are
  * logged but not fatal — the BLOCKED.md write is the primary user-visible
