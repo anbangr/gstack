@@ -616,4 +616,23 @@ describe("parsePlan — PhaseKind from heading bracket annotation", () => {
     expect(phases[0].number).toBe("2.1");
     expect(phases[0].kind).toBe("writing");
   });
+
+  it("parser module loads without ReferenceError (no undefined-symbol crash at import time)", () => {
+    // If parser.ts references constants that don't exist at module scope
+    // (e.g. BODY_KIND_PATTERN / IMPL_LABELS_BY_KIND / REVIEW_LABELS_BY_KIND from a
+    // half-landed branch), the import itself throws a ReferenceError and every test in
+    // this file fails to load. Reaching this line means the import succeeded.
+    expect(typeof parsePlan).toBe("function");
+  });
+
+  it("does not throw when phase body contains an HTML-comment kind annotation", () => {
+    const md = `### Phase 1: Comment Kind Phase
+<!-- kind: writing -->
+- [ ] **Implementation**: do work
+- [ ] **Review**: check work
+`;
+    // If a broken if-block in finalize() references undefined BODY_KIND_PATTERN,
+    // this call would throw a ReferenceError. Asserting no throw pins that invariant.
+    expect(() => parsePlan(md)).not.toThrow();
+  });
 });
