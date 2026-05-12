@@ -2545,6 +2545,11 @@ describe("ensureFeatureBranch", () => {
   });
 
   it("uses branchPrefix for owned feature branches", () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-prefix-branch-"));
+    const repo = tmpDir;
+    expect(spawnSync("git", ["init", "-b", "main"], { cwd: repo }).status).toBe(
+      0,
+    );
     const slug = `test-prefix-${Date.now()}`;
     const feature: FeatureState = {
       index: 0,
@@ -2569,7 +2574,7 @@ describe("ensureFeatureBranch", () => {
 
     expect(
       ensureFeatureBranch({
-        cwd: process.cwd(),
+        cwd: repo,
         state,
         feature,
         dryRun: true,

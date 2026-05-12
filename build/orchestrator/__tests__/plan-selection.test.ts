@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { activeRunRecordPath, writeActiveRunRecord } from "../active-runs";
+import {
+  activeRunRecordPath,
+  readActiveRunRecords,
+  writeActiveRunRecord,
+} from "../active-runs";
 import {
   canonicalSourcePlanClaimPath,
   legacySourcePlanClaimPath,
@@ -396,15 +400,15 @@ describe("active-run registry edge cases — exit-13 fix (Feature 2)", () => {
       activeRunRegistry,
     });
 
-    // paused + dead pid → non-terminal but not live → status "stale"
-    // runHasIncompleteCandidate returns true for "stale" → candidate included → gate blocks
+    // paused + dead pid is auto-cleaned and no longer blocks new builds.
     const candidate = result.candidates.find(
       (c) => c.runId === "run-paused-dead",
     );
-    expect(candidate).toBeDefined();
-    expect(candidate?.status).toBe("stale");
-    expect(candidate?.live).toBe(false);
-    expect(result.result).not.toBe("none");
+    expect(candidate).toBeUndefined();
+    expect(result.result).toBe("none");
+    expect(
+      fs.existsSync(activeRunRecordPath(activeRunRegistry, "run-paused-dead")),
+    ).toBe(false);
   });
 
   // Edge case: failed record with dead pid → terminal (gate allows).
