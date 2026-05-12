@@ -33,10 +33,13 @@ If you've been seeing extra top-level skills (`/dublin-v1`, `/wellington`, etc.)
 #### Fixed
 
 - **`setup`** — added Conductor worktree guard before `ln -snf "$SOURCE_GSTACK_DIR" "$CLAUDE_GSTACK_LINK"`. Checks `[ -d "$CLAUDE_GSTACK_LINK" ] && [ ! -L "$CLAUDE_GSTACK_LINK" ]` for a real directory, then `cd ... && pwd -P` to compare against the source. If they differ, sets `_SKIP_CLAUDE_REGISTER=1`, prints a remediation message naming both paths, and exits the Claude registration branch without touching the global install.
+- **Paused active-run records with dead PIDs are now auto-cleaned.** `resolvePlanSelection` filters out paused active-run records whose process no longer exists, removes the stale record, and prevents phantom candidates from surfacing in `/build --resume`.
+- **`removeActiveRunRecord` swallows cleanup failures instead of throwing.** EPERM, EACCES, and other unlink errors during stale-record cleanup no longer crash the plan resolver. The build proceeds without surfacing the stale candidate.
 
 #### Added
 
 - **`test/setup-conductor-worktree.test.ts`** — 8 tests (27 expect calls) covering: guard placement in `setup` before `ln -snf`, `pwd -P` resolution against `$SOURCE_GSTACK_DIR`, the skip-branch's remediation message, BSD `ln -snf` reproducer (proves the bug shape exists), guard skips when dest is real-dir-elsewhere, guard allows ln when dest doesn't exist, guard allows ln when dest is an existing symlink (upgrade-in-place), guard allows ln when dest already resolves to source (self-rerun).
+- **Paused+dead-pid auto-cleanup coverage.** Six behavioral tests verify live-pid preservation, dead-pid removal, terminal-status protection, orphan handling, pid=0 cleanup, multi-record batch removal, and cleanup-failure swallowing.
 
 #### For contributors
 
@@ -221,7 +224,6 @@ This release came out of a contributor-wave triage pass that closed ~75 stale PR
 - **#1242** `careful/bin/check-careful.sh` uses `[[:space:]]` instead of `\s` in the safe-rm exception regex. macOS sed -E does not support `\s`, which silently broke the exception detection — `rm -rf node_modules` now correctly skips the warning gate on macOS, matching Linux behavior. Removes the `detectSafeRmWorks()` platform-conditional from `test/hook-scripts.test.ts` so both platforms are tested at the same bar. Contributed by @ToraDady.
 - **#1394** Codex skill `## Step 0: Check codex binary` renamed to `## Step 0.4: Check codex binary` so the header no longer collides with the new platform-detect prelude (also numbered Step 0). Affects both `codex/SKILL.md.tmpl` and the regenerated `codex/SKILL.md`. Contributed by @mvanhorn.
 - **#1393** `/make-pdf` MAKE-PDF SETUP block moves from after the Telemetry footer to right after the Preamble Bash, so `$P` is set before any subsequent step references it. The implementation switches from the `{{MAKE_PDF_SETUP}}` placeholder pattern to programmatic insertion via `generateMakePdfSetup` in `scripts/resolvers/preamble.ts`, gated on `ctx.skillName === 'make-pdf'`. New `make-pdf setup ordering` test in `test/gen-skill-docs.test.ts` asserts the SETUP block sits after the Preamble heading and before Plan Mode / Telemetry / workflow headings. Contributed by @jbetala7.
-
 ## [1.31.0.0] - 2026-05-09
 
 ## **AskUserQuestion stops getting silently buried in plan files.**
