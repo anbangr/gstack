@@ -754,7 +754,7 @@ You are the Execution Agent. The planning phase is over. Your job is to locate t
 
 **Always use the code-driven CLI.** Route all plans — even single-phase — to `gstack-build`. The LLM-driven loop stalls between phases even on 2-phase builds, and context compaction mid-build causes the agent to silently forget rules. Your role: locate plan → synthesize living plan → confirm with user → launch CLI → monitor.
 
-**Never use `ScheduleWakeup` for `/build` monitoring.** A scheduled host wakeup is not durable build supervision: the build can fail, block, or need recovery while the chat stays asleep until the user manually asks for status. After every launch, relaunch, resume, or manual recovery, the next action must be the foreground `gstack-build monitor --manifest ... --watch --supervise` command. Do not say "checking back", "back in N minutes", or end the turn while a manifest-backed run is still active. Do not create ad-hoc watcher scripts or run `sleep ... && tail ...` polling loops; all waiting and stale-lock recovery belongs to the CLI monitor.
+**Never use `ScheduleWakeup` for `/build` monitoring, Monitor tool task notifications, or any other passive notification mechanism.** These approaches share the same failure mode: if the build fails silently, the agent goes idle until the user intervenes. A scheduled host wakeup is not durable build supervision: the build can fail, block, or need recovery while the chat stays asleep until the user manually asks for status. After every launch, relaunch, resume, or manual recovery, the next action must be the foreground `gstack-build monitor --manifest ... --watch --supervise` command. Do not say "checking back", "back in N minutes", or end the turn while a manifest-backed run is still active. Do not create ad-hoc watcher scripts or run `sleep ... && tail ...` polling loops; all waiting and stale-lock recovery belongs to the CLI monitor. **If you are woken by a task notification about gstack-build progress (i.e., a `<task-notification>` block arrives), that means the monitor is running in background — that is wrong. Immediately run the foreground monitor command.**
 
 **Execution Modes**:
 - **Normal Mode**: Locate the source plan, synthesize a new living plan, create the first feature branch, then launch the CLI. (Default)
@@ -1574,7 +1574,7 @@ After this launch block finishes, the next tool call must be Bash running Step M
 
 ### Step M3: Foreground CLI Monitor
 
-Hard rule: `/build` polling is owned by the CLI monitor, not by host timer tools. Do not use `ScheduleWakeup`, delayed reminders, `sleep ... && tail ...`, ad-hoc watcher scripts, or "check back later" messages as a substitute for this command. After launch, keep this host turn alive by running the CLI-owned foreground monitor. If the command blocks for a long time, that is expected behavior:
+Hard rule: `/build` polling is owned by the CLI monitor, not by host timer tools. Do not use `ScheduleWakeup`, delayed reminders, `sleep ... && tail ...`, ad-hoc watcher scripts, or "check back later" messages as a substitute for this command. Also forbidden: running the monitor command with `run_in_background: true` and using Monitor tool events as a substitute. The monitor command MUST run as a blocking foreground Bash tool call. After launch, keep this host turn alive by running the CLI-owned foreground monitor. If the command blocks for a long time, that is expected behavior:
 
 ```bash
 set -o pipefail
@@ -1627,6 +1627,19 @@ If the host cannot invoke skills natively, report that limitation once and write
 - `MONITOR_AGENT_ESCALATION`: the CLI-owned supervisor already asked the configured `monitorAgent` to diagnose a blocking event. Read `sourceEvent`, `verdict`, `recommendedHostAction`, `suggestedCommands`, and `userChoices`. If `verdict` is `host_action_required`, perform the safe host action or inspection command. If `verdict` is `user_action_required`, ask the user to choose. Do not let the monitor agent edit, commit, kill processes, patch state JSON, or override deterministic monitor identity checks.
 - `MONITOR_REENTER`: the foreground watch reached `--max-wall-ms`; immediately re-run the same monitor command in the same host session. Do not use `ScheduleWakeup` here.
 - `MONITOR_ERROR`: stop and report the error. Historical manifests without `launchCommand` are invalid; regenerate or relaunch through Step M2.
+
+#### Ship Failure Recovery (RUN_FAILED after queued-mode ship)
+
+When the monitor emits `RUN_FAILED` with a message like "Feature N: ship succeeded but PR number could not be parsed", the feature's ship step failed after phases completed.
+
+To recover:
+1. Diagnose why /ship failed (check the log path in the error message).
+2. Fix the underlying issue (e.g., broken `gh` CLI auth, missing PR template, base sync conflict — see the `features[N].error` field in the state JSON).
+3. Edit the state JSON to clear the failure and reset the feature:
+   - File: `~/.gstack/build-state/<slug>.json` (logs remain under `~/.gstack/build-state/<slug>/`)
+   - Remove the top-level `failureReason` key.
+   - Set `features[N].status` to `"phases_done"` (where N is the 0-based feature index).
+4. Re-run the monitor: `gstack-build monitor --manifest ... --watch --supervise`
 
 ### Step M3.5: Skill Fault Investigator
 

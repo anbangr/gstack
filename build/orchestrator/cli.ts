@@ -6922,6 +6922,7 @@ async function main() {
                   "```",
                 ].join("\n"),
               );
+              state.failureReason = `Feature ${featureState.number}: ${featureState.error}`;
               saveState(state, { noGbrain: args.noGbrain, log: console.warn });
               console.error(`✗ ${featureState.error}; see ${conflictLogPath}`);
               exitCode = 1;
@@ -6958,6 +6959,7 @@ async function main() {
             if (result.exitCode !== 0 || result.timedOut) {
               featureState.status = "paused";
               featureState.error = `ship failed (exit ${result.exitCode}, timed_out=${result.timedOut}); see ${result.logPath}`;
+              state.failureReason = `Feature ${featureState.number}: ${featureState.error}`;
               saveState(state, { noGbrain: args.noGbrain, log: console.warn });
               console.error(`✗ ${featureState.error}`);
               exitCode = 1;
@@ -6975,6 +6977,7 @@ async function main() {
               if (!parsedShip.prNumber) {
                 featureState.status = "paused";
                 featureState.error = `ship succeeded but PR number could not be parsed; see ${result.logPath}`;
+                state.failureReason = `Feature ${featureState.number}: ${featureState.error}`;
                 saveState(state, {
                   noGbrain: args.noGbrain,
                   log: console.warn,
@@ -7008,6 +7011,7 @@ async function main() {
               if (!marked.ok) {
                 featureState.status = "paused";
                 featureState.error = `ship succeeded but PR #${record.prNumber} could not be marked queued: ${marked.error}`;
+                state.failureReason = `Feature ${featureState.number}: ${featureState.error}`;
                 saveState(state, {
                   noGbrain: args.noGbrain,
                   log: console.warn,
