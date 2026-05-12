@@ -845,6 +845,86 @@ describe("plan resolver", () => {
     expect(result.errors[0]).toContain("build-run-manifest.json");
   });
 
+  test("available source plan auto-selects when another source plan is live (no explicit path)", () => {
+    const repo = gstackRepo();
+    const activeRunRegistry = path.join(tmpDir, "active-runs");
+    const planA = sourcePlan(repo, "a-plan-1.md");
+    const planB = sourcePlan(repo, "b-plan-1.md");
+
+    writeJson(canonicalSourcePlanClaimPath(repo, planA), {
+      sourcePlanPath: planA,
+      pid: process.pid,
+      status: "claimed",
+    });
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-a",
+      stateSlug: "state-a",
+      repoPath: path.join(tmpDir, "worktrees", "run-a"),
+      planFile: planA,
+      pid: process.pid,
+      status: "running",
+      startedAt: "2026-05-09T00:00:00Z",
+      lastUpdatedAt: "2026-05-09T00:00:00Z",
+      branches: [],
+    });
+
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      activeRunRegistry,
+    });
+
+    expect(result.result).toBe("selected");
+    expect(result.selected?.path).toBe(planB);
+    expect(result.candidates.some((c) => c.path === planA)).toBe(true);
+  });
+
+  test("explicit available source plan starts without ambiguity while another run is active", () => {
+    const repo = gstackRepo();
+    const activeRunRegistry = path.join(tmpDir, "active-runs");
+    const planA = sourcePlan(repo, "a-plan-1.md");
+    const planB = sourcePlan(repo, "b-plan-1.md");
+
+    writeActiveRunRecord(activeRunRegistry, {
+      runId: "run-a",
+      stateSlug: "state-a",
+      repoPath: path.join(tmpDir, "worktrees", "run-a"),
+      planFile: planA,
+      pid: process.pid,
+      status: "running",
+      startedAt: "2026-05-09T00:00:00Z",
+      lastUpdatedAt: "2026-05-09T00:00:00Z",
+      branches: [],
+    });
+
+    const result = resolvePlanSelection({
+      gstackRepo: repo,
+      explicitPaths: [planB],
+      activeRunRegistry,
+    });
+
+    expect(result.result).toBe("selected");
+    expect(result.selected?.path).toBe(planB);
+  });
+
+  test("blocked plan plus two available plans returns ambiguous, not selected", () => {
+    const repo = gstackRepo();
+    const planA = sourcePlan(repo, "a-plan-1.md");
+    const planB = sourcePlan(repo, "b-plan-1.md");
+    const planC = sourcePlan(repo, "c-plan-1.md");
+
+    writeJson(canonicalSourcePlanClaimPath(repo, planA), {
+      sourcePlanPath: planA,
+      pid: process.pid,
+      status: "claimed",
+    });
+
+    const result = resolvePlanSelection({ gstackRepo: repo });
+
+    expect(result.result).toBe("ambiguous");
+    expect(result.candidates.map((c) => c.path)).toContain(planB);
+    expect(result.candidates.map((c) => c.path)).toContain(planC);
+  });
+
   test("human table includes commands and monitor commands", () => {
     const repo = gstackRepo();
     const app = path.join(tmpDir, "app");
