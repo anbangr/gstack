@@ -220,6 +220,19 @@ ensure_playwright_browser() {
   fi
 }
 
+# Guard: warn when running claude-only but other host installs exist
+if [ "$HOST" = "claude" ]; then
+  _WARN_HOSTS=()
+  [ -d "$HOME/.codex/skills/gstack" ] && _WARN_HOSTS+=("codex")
+  [ -d "$HOME/.kiro/skills/gstack" ] && _WARN_HOSTS+=("kiro")
+  [ -d "$HOME/.factory/skills/gstack" ] && _WARN_HOSTS+=("factory")
+  [ -d "$HOME/.config/opencode/skills/gstack" ] && _WARN_HOSTS+=("opencode")
+  if [ ${#_WARN_HOSTS[@]} -gt 0 ]; then
+    log "warning: existing installs for ${_WARN_HOSTS[*]} won't be updated."
+    log "         Run './setup --host auto' to update all installed agents."
+  fi
+fi
+
 # 1. Build browse binary if needed (smart rebuild: stale sources, package.json, lock)
 NEEDS_BUILD=0
 if [ ! -x "$BROWSE_BIN" ]; then
