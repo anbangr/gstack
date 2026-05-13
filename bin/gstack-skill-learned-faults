@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# gstack-skill-learned-faults — read-only display of learned fault patterns
+#
+# Usage:
+#   gstack-skill-learned-faults          # display patterns table
+#
+# Env overrides (for testing):
+#   GSTACK_HOME  — override ~/.gstack state directory
+set -uo pipefail
+
+GSTACK_HOME="${GSTACK_HOME:-$HOME/.gstack}"
+PATTERNS_FILE="$GSTACK_HOME/skill-faults/learned-patterns.json"
+
+# ─── Check for jq ───────────────────────────────────────────
+if ! command -v jq &> /dev/null; then
+  echo "Error: jq is required but not installed" >&2
+  exit 1
+fi
+
+# ─── Check for patterns file ────────────────────────────────
+if [ ! -f "$PATTERNS_FILE" ]; then
+  echo "No learned patterns yet. Patterns are proposed by the catch-all fault investigator"
+  echo "when a build fails with no matching static fault category."
+  exit 0
+fi
+
+# ─── Check if file is empty or contains empty array ────────
+FILE_CONTENT="$(cat "$PATTERNS_FILE" 2>/dev/null || echo '[]')"
+if [ "$FILE_CONTENT" = "[]" ] || [ -z "$FILE_CONTENT" ]; then
+  echo "No learned patterns yet. Patterns are proposed by the catch-all fault investigator"
+  echo "when a build fails with no matching static fault category."
+  exit 0
+fi
+
+# ─── Parse JSON and build table ──────────────────────────────
+echo "LEARNED FAULT PATTERNS  ($PATTERNS_FILE)"
+echo ""
+
+# Build table header
+printf "%-26s %-8s %4s  %-19s %-29s\n" "CATEGORY" "SEV" "HITS" "LEARNED" "SOURCE"
+printf "%s  %s  %s  %s  %s\n" "──────────────────────────────" "────────" "────" "───────────────────" "─────────────────────────────"
+
+# Process each pattern using jq directly
+jq -r '.[] | [.category, .severity, .hitCount, .learnedAt, .source] | @tsv' "$PATTERNS_FILE" 2>/dev/null | while IFS=$'\t' read -r category severity hit_count learned_at source; do
+  # Format CATEGORY (up to 26 chars, no ellipsis, just cut)
+  category_display="${category:0:26}"
+
+  # Format SEV (up to 8 chars)
+  sev_display="${severity:0:8}"
+
+  # Format HITS (right-aligned in 4-char field)
+  hits_padded=$(printf "%4d" "$hit_count")
+
+  # Format LEARNED as YYYY-MM-DD HH:MM (strip seconds and timezone from ISO 8601)
+  if [ -n "$learned_at" ]; then
+    # Extract just the date and hour:minute from ISO format (e.g., 2026-05-01T14:22:30Z)
+    learned_display="${learned_at:0:16}"
+  else
+    learned_display="                   "
+  fi
+
+  # Format SOURCE (truncate to 29 chars with … if longer)
+  if [ ${#source} -gt 29 ]; then
+    source_display="${source:0:26}…"
+  else
+    source_display="$source"
+  fi
+
+  printf "%-26s %-8s %4s  %-19s %-29s\n" "$category_display" "$sev_display" "$hits_padded" "$learned_display" "$source_display"
+done
+
+# ─── Get totals from jq ──────────────────────────────────────
+TOTAL_COUNT=$(jq 'length' "$PATTERNS_FILE" 2>/dev/null || echo 0)
+ACTIVE_COUNT=$(jq '[.[] | select(.hitCount > 0)] | length' "$PATTERNS_FILE" 2>/dev/null || echo 0)
+
+echo ""
+echo "$TOTAL_COUNT patterns total. $ACTIVE_COUNT active (hitCount > 0)."
+echo "Edit $PATTERNS_FILE directly to remove or update a pattern."
