@@ -41,6 +41,7 @@ import {
   runRoleTask,
   buildKindInstructions,
   extractCoverageTarget,
+  resolvePhaseBody,
   HELP_TEXT,
 } from "../cli";
 import type {
@@ -118,6 +119,33 @@ function expectParseArgsExit(argv: string[], message: string): void {
     console.error = originalError;
   }
 }
+
+describe("resolvePhaseBody", () => {
+  const base =
+    "/Users/anbang/Documents/Antigravity/agnt2-workspace/agnt2-paper";
+  const worktree =
+    "/Users/anbang/.gstack/build-worktrees/agnt2-paper/run-id-abc123";
+
+  it("replaces base project root with worktree path in body", () => {
+    const body = `Write files to ${base}/experiments/E8/e8-replay.json and commit from ${base}.`;
+    const result = resolvePhaseBody(body, base, worktree);
+    expect(result).toBe(
+      `Write files to ${worktree}/experiments/E8/e8-replay.json and commit from ${worktree}.`,
+    );
+  });
+
+  it("returns body unchanged when baseProjectRoot equals worktreePath", () => {
+    const body = `Write files to ${base}/experiments/E8/e8-replay.json`;
+    const result = resolvePhaseBody(body, base, base);
+    expect(result).toBe(body);
+  });
+
+  it("returns body unchanged when baseProjectRoot is undefined", () => {
+    const body = `Write files to ${base}/experiments/E8/e8-replay.json`;
+    const result = resolvePhaseBody(body, undefined, worktree);
+    expect(result).toBe(body);
+  });
+});
 
 describe("buildGeminiTestSpecPrompt", () => {
   const legacyPhase: Phase = { ...basePhase, testSpecCheckboxLine: -1 };
