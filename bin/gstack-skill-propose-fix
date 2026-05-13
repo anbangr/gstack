@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# gstack-skill-propose-fix — synthesize AI fix proposals from fault investigation reports
+#
+# Usage:
+#   gstack skill:propose-fix <CATEGORY>   — propose fix for one category
+#   gstack skill:propose-fix --all        — propose fixes for all categories with no proposal yet
+#
+# Env overrides (for testing):
+#   GSTACK_HOME                     — override ~/.gstack state directory
+#   GSTACK_FAULT_INVESTIGATOR_COMMAND — override AI command (e.g. set to "true" in tests)
+set -uo pipefail
+
+GSTACK_HOME="${GSTACK_HOME:-$HOME/.gstack}"
+FAULT_DIR="$GSTACK_HOME/skill-faults"
+PROPOSALS_DIR="$FAULT_DIR/fix-proposals"
+MAX_REPORTS=5
+
+usage() {
+  echo "Usage: gstack skill:propose-fix <CATEGORY>" >&2
+  echo "       gstack skill:propose-fix --all" >&2
+  exit 1
+}
+
+# Repo root — needed to inline build/SKILL.md.tmpl into the agent prompt
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+
+# AI command — use override for tests; otherwise detect from gstack-config
+_CMD="${GSTACK_FAULT_INVESTIGATOR_COMMAND:-}"
+if [ -z "$_CMD" ]; then
+  _PROVIDER=$(gstack-config get fault_investigator_provider 2>/dev/null || echo "claude")
+  case "$_PROVIDER" in
+    gemini) _CMD="gemini" ;;
+    kimi)   _CMD="kimi-code" ;;
+    *)      _CMD="claude" ;;
+  esac
+fi
+
+mkdir -p "$PROPOSALS_DIR"
+
+# ─── propose_for_category ────────────────────────────────────────────────────
+# Spawns a background AI agent to write a fix proposal for the given category.
+# Prints "Fix proposer spawned for <CATEGORY> → <output-path>" on success.
+# Prints an error to stderr and returns 1 if no reports are found.
+propose_for_category() {
+  local category="$1"
+
+  # Per-fault investigation reports: skill-fault-<runId>-<CATEGORY>.md
+  local reports
+  reports=$(find "$FAULT_DIR" -maxdepth 1 \
+    -name "skill-fault-*-${category}.md" 2>/dev/null \
+    | sort -r | head -"$MAX_REPORTS")
+
+  # Discovery report referenced by learned-patterns.json source field
+  local learned_json="$FAULT_DIR/learned-patterns.json"
+  if [ -f "$learned_json" ]; then
+    local src
+    src=$(jq -r --arg c "$category" \
+      '.[] | select(.category==$c) | .source // ""' \
+      "$learned_json" 2>/dev/null \
+      | sed 's|^investigator:||' | head -1)
+    if [ -n "$src" ] && [ -f "$FAULT_DIR/$src" ]; then
+      reports="$FAULT_DIR/$src"$'\n'"$reports"
+    fi
+  fi
+
+  if [ -z "$reports" ]; then
+    echo "No investigation reports found for category: $category" >&2
+    return 1
+  fi
+
+  # Output path
+  local ts
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  local out="$PROPOSALS_DIR/${category}-${ts}.md"
+
+  # Inline report contents (at most MAX_REPORTS)
+  local report_block=""
+  local count=0
+  while IFS= read -r rpt && [ "$count" -lt "$MAX_REPORTS" ]; do
+    [ -z "$rpt" ] && continue
+    report_block+="=== $(basename "$rpt") ==="$'\n'"$(cat "$rpt")"$'\n\n'
+    count=$((count + 1))
+  done <<< "$reports"
+
+  # Source file — inlined so the agent can reference exact line content
+  local skill_tmpl=""
+  if [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/build/SKILL.md.tmpl" ]; then
+    skill_tmpl=$(cat "$REPO_ROOT/build/SKILL.md.tmpl")
+  fi
+
+  # Learned fault metadata (if applicable)
+  local fault_meta=""
+  if [ -f "$learned_json" ]; then
+    fault_meta=$(jq -r --arg c "$category" \
+      '.[] | select(.category==$c) | "Description: " + .description + "\nHit count: " + (.hitCount|tostring)' \
+      "$learned_json" 2>/dev/null || true)
+  fi
+
+  local prompt
+  prompt="You are a fix proposer for the gstack build skill.
+
+Fault category: $category
+$fault_meta
+
+Investigation reports (most recent first, capped at $MAX_REPORTS):
+$report_block
+
+Source file — build/SKILL.md.tmpl:
+$skill_tmpl
+
+Risk tiering rubric:
+- SKILL.md.tmpl adds content only (new guard/check/step, additive only): LOW RISK — produce a diff block
+- SKILL.md.tmpl modifies or removes existing steps: HIGH RISK — advisory only
+- .ts adds a null check or constant, ≤10 lines: LOW RISK — produce a diff block
+- .ts touches algorithm logic, error handling, or sequencing: HIGH RISK — advisory only
+- Any change >20 lines or touching multiple call sites: HIGH RISK — advisory only
+
+Write a fix proposal to: $out
+
+Required file structure:
+  # Fix Proposal: $category
+  Generated: <ISO timestamp>
+  Evidence: <N> investigation reports
+    - <report filenames>
+  Fault type: static|learned
+
+  ## Root Cause Analysis
+  [Synthesized root cause across all reports — not a per-build narrative]
+
+  ## Recommended Fix
+
+  ### Summary
+  [One paragraph: what to change and why]
+
+  ### <path/to/file>  [LOW RISK — patch provided]
+  **What:** ...
+  **Why:** ...
+  \`\`\`diff
+  ...
+  \`\`\`
+
+  ### <path/to/file>  [HIGH RISK — advisory only]
+  **What:** ...
+  **Why:** ...
+  **To implement:** [prose — human writes the code]
+
+  ## Apply Instructions
+  1. Review each diff above
+  2. Apply low-risk patches: copy manually or git apply
+  3. Run bun test to verify
+  4. touch $out.applied when done
+
+IMPORTANT: ONLY read files and write the fix proposal to $out. Do NOT modify any source files."
+
+  $_CMD -p "$prompt" --tool Read --tool Write > /dev/null 2>&1 &
+  echo "Fix proposer spawned for $category → $out"
+}
+
+# ─── main ────────────────────────────────────────────────────────────────────
+if [ $# -eq 0 ]; then
+  usage
+fi
+
+if [ "$1" = "--all" ]; then
+  # Collect all categories from per-fault report filenames + learned-patterns.json
+  all_cats=""
+
+  while IFS= read -r f; do
+    cat=$(basename "$f" .md | grep -oE '[A-Z][A-Z0-9_]+$' 2>/dev/null || true)
+    [ -n "$cat" ] && all_cats="$all_cats"$'\n'"$cat"
+  done < <(find "$FAULT_DIR" -maxdepth 1 -name "skill-fault-*-*.md" 2>/dev/null || true)
+
+  if [ -f "$FAULT_DIR/learned-patterns.json" ]; then
+    all_cats="$all_cats"$'\n'"$(jq -r '.[].category' "$FAULT_DIR/learned-patterns.json" 2>/dev/null || true)"
+  fi
+
+  spawned=0
+  while IFS= read -r cat; do
+    [ -z "$cat" ] && continue
+    # Skip if a proposal already exists for this category
+    if find "$PROPOSALS_DIR" -maxdepth 1 -name "${cat}-*.md" 2>/dev/null | grep -q .; then
+      continue
+    fi
+    propose_for_category "$cat" && spawned=$((spawned + 1))
+  done < <(echo "$all_cats" | sort -u)
+
+  if [ "$spawned" -eq 0 ]; then
+    echo "No unfixed categories found."
+  else
+    echo "$spawned fix proposer(s) spawned in background."
+  fi
+else
+  propose_for_category "$1"
+fi
