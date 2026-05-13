@@ -523,6 +523,12 @@ After showing What's New, continue with whatever skill the user originally invok
 
 When invoked directly as `/gstack-upgrade` (not from a preamble):
 
+**First, run the Step 2 detection block** to determine `INSTALL_TYPE`, `INSTALL_DIR`, and (for fork-copy) `FORK_REPO`.
+
+**If `INSTALL_TYPE=fork-copy`:** run the complete fork-copy upgrade path from Step 4 above (all five phases through the Step 4.9 Gemini/Kimi copies). This runs regardless of whether upstream has a new version — the standalone action for fork-copy is always "pull upstream into fork, gen, test, copy to install, set up all hosts." After completing Step 4.9, proceed to Step 5 (write marker + clear cache) and Step 6 (show what's new).
+
+**For all other install types** (`global-git`, `local-git`, `vendored`, `vendored-global`), continue with the steps below:
+
 1. Force a fresh update check (bypass cache):
 ```bash
 ~/.claude/skills/gstack/bin/gstack-update-check --force 2>/dev/null || \
@@ -551,7 +557,7 @@ echo "PRIMARY=$PRIMARY_VER LOCAL=$LOCAL_VER"
 
 **If versions match:** tell the user "You're on the latest version (v{PRIMARY_VER}). Global and local vendored copy are both up to date."
 
-4. After vendored copy handling, always run the fork skill overlay and multi-host sync:
+4. After vendored copy handling, run the fork skill overlay and multi-host sync (applies to non-fork-copy installs only):
 
 ```bash
 _FORK_REPO=$("$INSTALL_DIR/bin/gstack-config" get fork_repo_path 2>/dev/null || echo "")
