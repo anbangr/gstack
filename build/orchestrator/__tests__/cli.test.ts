@@ -3910,7 +3910,7 @@ describe("buildKindInstructions — non-code phase prompts", () => {
   it("writing phase: prompt contains quality bar and no test instructions", () => {
     const lines = buildKindInstructions(makePhase("writing"));
     const joined = lines.join("\n");
-    expect(joined).toContain("Quality bar: a reader unfamiliar");
+    expect(joined).toContain("Quality bar: a reader with domain expertise");
     expect(joined).not.toContain("write failing tests");
     expect(joined).not.toContain("Make all failing tests pass");
   });
