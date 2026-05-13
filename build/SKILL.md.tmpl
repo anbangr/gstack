@@ -1087,6 +1087,7 @@ if [ -z "$_FAULT_INVESTIGATOR_PROVIDER" ]; then
 fi
 
 if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
+  _FAULT_ROWS=""
   _FAULT_LINES=$(grep '"event":"SKILL_FAULT_DETECTED"' "$BUILD_TMP_DIR/monitor-output.log" 2>/dev/null || grep "SKILL_FAULT_DETECTED" "$BUILD_TMP_DIR/monitor-output.log" 2>/dev/null || true)
   if [ -n "$_FAULT_LINES" ]; then
     _FAULT_SECONDARY_DIR=""

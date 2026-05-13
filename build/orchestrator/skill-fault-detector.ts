@@ -114,7 +114,7 @@ export function loadLearnedPatterns(): LearnedPattern[] {
       (entry): entry is LearnedPattern =>
         entry != null &&
         typeof entry.category === "string" &&
-        entry.category.trim() !== "" &&
+        entry.category.trim() !== "" && // FIXME: does not enforce UPPER_SNAKE_CASE; bash M3.6 Phase 2 does
         typeof entry.severity === "string" &&
         VALID_SEVERITIES.has(entry.severity) &&
         typeof entry.description === "string" &&
