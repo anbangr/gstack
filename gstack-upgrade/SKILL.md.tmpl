@@ -83,7 +83,13 @@ Continue with the current skill.
 ### Step 2: Detect install type
 
 ```bash
-if [ -d "$HOME/.claude/skills/gstack/.git" ]; then
+_FORK_PATH=$(~/.claude/skills/gstack/bin/gstack-config get fork_repo_path 2>/dev/null || echo "")
+if [ -n "$_FORK_PATH" ] && [ -d "$_FORK_PATH/.git" ]; then
+  INSTALL_TYPE="fork-copy"
+  INSTALL_DIR="$HOME/.claude/skills/gstack"
+  FORK_REPO="$_FORK_PATH"
+  echo "Install type: $INSTALL_TYPE | fork: $FORK_REPO | install: $INSTALL_DIR"
+elif [ -d "$HOME/.claude/skills/gstack/.git" ]; then
   INSTALL_TYPE="global-git"
   INSTALL_DIR="$HOME/.claude/skills/gstack"
 elif [ -d "$HOME/.gstack/repos/gstack/.git" ]; then
