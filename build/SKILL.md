@@ -1939,21 +1939,25 @@ if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
     _DISCOVERY_REPORT_NAME="skill-fault-discovery-${_LAST_RUN_ID}-$(date +%Y%m%d-%H%M%S).md"
     _DISCOVERY_PRIMARY="$_FAULT_PRIMARY_DIR/$_DISCOVERY_REPORT_NAME"
     _CATCHALL_PROMPT="A build just failed (runId: ${_LAST_RUN_ID}). No known fault category matched. Read the build state at ${_FAILED_STATE_FILE:-<state-file-unavailable>} and stdout log at ${_FAILED_STDOUT_LOG:-<stdout-unavailable>}. Write a detailed investigation: what failed, the root cause, the evidence. You MUST ONLY read files. Do NOT write code, run tests, or commit anything. Write your report to ${_DISCOVERY_PRIMARY}."
-    case "$_FAULT_INVESTIGATOR_PROVIDER" in
-      gemini)
-        gemini -p "$_CATCHALL_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" --yolo > "$_DISCOVERY_PRIMARY" 2>&1 &
-        ;;
-      kimi)
-        kimi --work-dir "$(pwd -P)" -p "$_CATCHALL_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" --yolo --print --final-message-only > "$_DISCOVERY_PRIMARY" 2>&1 &
-        ;;
-      claude)
-        claude --model "$_FAULT_INVESTIGATOR_MODEL" -p "$_CATCHALL_PROMPT" > "$_DISCOVERY_PRIMARY" 2>&1 &
-        ;;
-      codex)
-        _CATCHALL_REASONING=$(jq -r '.roles.faultInvestigator.reasoning // "high"' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
-        codex exec "$_CATCHALL_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" -s workspace-write -c "model_reasoning_effort=\"$_CATCHALL_REASONING\"" -C "$(pwd -P)" > "$_DISCOVERY_PRIMARY" 2>&1 &
-        ;;
-    esac
+    if [ -n "$GSTACK_FAULT_INVESTIGATOR_COMMAND" ]; then
+      (FAULT_PRIMARY="$_DISCOVERY_PRIMARY" FAULT_SECONDARY="" FAULT_EVENT="" FAULT_CATEGORY="catch-all" FAULT_RUN_ID="$_LAST_RUN_ID" FAULT_REPORT_NAME="$_DISCOVERY_REPORT_NAME" FAULT_INVESTIGATOR_MODEL="$_FAULT_INVESTIGATOR_MODEL" bash -lc "$GSTACK_FAULT_INVESTIGATOR_COMMAND") > "$_DISCOVERY_PRIMARY" 2>&1 &
+    else
+      case "$_FAULT_INVESTIGATOR_PROVIDER" in
+        gemini)
+          gemini -p "$_CATCHALL_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" --yolo > "$_DISCOVERY_PRIMARY" 2>&1 &
+          ;;
+        kimi)
+          kimi --work-dir "$(pwd -P)" -p "$_CATCHALL_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" --yolo --print --final-message-only > "$_DISCOVERY_PRIMARY" 2>&1 &
+          ;;
+        claude)
+          claude --model "$_FAULT_INVESTIGATOR_MODEL" -p "$_CATCHALL_PROMPT" > "$_DISCOVERY_PRIMARY" 2>&1 &
+          ;;
+        codex)
+          _CATCHALL_REASONING=$(jq -r '.roles.faultInvestigator.reasoning // "high"' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
+          codex exec "$_CATCHALL_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" -s workspace-write -c "model_reasoning_effort=\"$_CATCHALL_REASONING\"" -C "$(pwd -P)" > "$_DISCOVERY_PRIMARY" 2>&1 &
+          ;;
+      esac
+    fi
   fi
 fi
 { [ "$_MONITOR_EXIT" = "0" ] || [ "$_MONITOR_EXIT" = "13" ]; } && printf '\n⚠ MANDATORY: %s — proceed to Step 3 (Final Ship & Completion). Plans NOT archived. Branches may be unshipped. Do NOT stop here.\n' "$([ "$_MONITOR_EXIT" = "13" ] && echo "FINALIZATION_REQUIRED" || echo "ALL_RUNS_COMPLETE")"
@@ -2056,8 +2060,11 @@ for _DISC_REPORT in "$_FAULT_PRIMARY_DIR"/skill-fault-discovery-*.md; do
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '. + {source: $src, learnedAt: $ts, hitCount: 0}' 2>/dev/null) || { touch "${_DISC_REPORT}.pattern-extracted"; continue; }
   _LP_TMP="${_LEARNED_PATTERNS_FILE}.tmp.$$"
-  jq --argjson entry "$_LP_ENRICHED" '. + [$entry]' "$_LEARNED_PATTERNS_FILE" > "$_LP_TMP" 2>/dev/null && mv "$_LP_TMP" "$_LEARNED_PATTERNS_FILE" || rm -f "$_LP_TMP" 2>/dev/null
-  touch "${_DISC_REPORT}.pattern-extracted"
+  if jq --argjson entry "$_LP_ENRICHED" '. + [$entry]' "$_LEARNED_PATTERNS_FILE" > "$_LP_TMP" 2>/dev/null && mv "$_LP_TMP" "$_LEARNED_PATTERNS_FILE" 2>/dev/null; then
+    touch "${_DISC_REPORT}.pattern-extracted"
+  else
+    rm -f "$_LP_TMP" 2>/dev/null
+  fi
 done
 ```
 
