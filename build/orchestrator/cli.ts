@@ -2618,6 +2618,18 @@ export function validateLogPathInScope(
   return resolved;
 }
 
+export function resolvePhaseBody(
+  body: string,
+  baseProjectRoot: string | undefined,
+  worktreePath: string,
+): string {
+  if (!baseProjectRoot || baseProjectRoot === worktreePath) return body;
+  // Replace with trailing slash first to avoid partial matches on the bare path.
+  return body
+    .replaceAll(baseProjectRoot + "/", worktreePath + "/")
+    .replaceAll(baseProjectRoot, worktreePath);
+}
+
 /**
  * Returns numbered instruction lines for the implementation subagent, tailored
  * to the phase kind. These replace the one-size-fits-all TDD instructions for
