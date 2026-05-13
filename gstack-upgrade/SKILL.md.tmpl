@@ -134,6 +134,70 @@ version, then run setup. If a merge conflict appears, stop and tell the user the
 upgrade needs manual conflict resolution in `$INSTALL_DIR`; do not continue to
 migrations or cache clearing.
 
+**For fork-copy installs** (`INSTALL_TYPE=fork-copy`):
+
+**Phase 1 — Upstream pull (in fork)**
+```bash
+cd "$FORK_REPO"
+_UPSTREAM_REMOTE=""
+for _r in upstream github origin; do
+  _url=$(git remote get-url "$_r" 2>/dev/null || true)
+  echo "$_url" | grep -q "garrytan/gstack" && { _UPSTREAM_REMOTE="$_r"; break; }
+done
+if [ -n "$_UPSTREAM_REMOTE" ]; then
+  git fetch "$_UPSTREAM_REMOTE" main
+  if ! git merge --no-edit "$_UPSTREAM_REMOTE/main"; then
+    echo "ERROR: upstream merge conflict in $FORK_REPO. Resolve and rerun /gstack-upgrade."
+    exit 1
+  fi
+  echo "Merged $_UPSTREAM_REMOTE/main into fork."
+else
+  echo "WARNING: no upstream garrytan/gstack remote found. Skipping upstream pull."
+  echo "Add one with: git remote add upstream https://github.com/garrytan/gstack.git"
+fi
+```
+
+**Phase 2 — Fork integrations**
+```bash
+cd "$FORK_REPO"
+bun run gen:skill-docs --host all
+bun run skill:check
+```
+
+**Phase 3 — Integration tests (abort on failure)**
+```bash
+cd "$FORK_REPO"
+if ! bun test; then
+  echo "ERROR: bun test failed in $FORK_REPO. Fix tests before installing."
+  exit 1
+fi
+```
+
+**Phase 4 — Copy to install dir (strips .git)**
+```bash
+if [ -d "$INSTALL_DIR/.git" ]; then
+  echo "NOTE: Converting $INSTALL_DIR from git clone to plain copy."
+  echo "Fork git history stays in $FORK_REPO."
+fi
+mkdir -p "$INSTALL_DIR"
+rsync -a --delete --exclude '.git' "$FORK_REPO/" "$INSTALL_DIR/"
+echo "Copied fork → $INSTALL_DIR"
+```
+
+**Phase 5 — Explicit per-host setup from install dir**
+```bash
+cd "$INSTALL_DIR"
+./setup --host claude
+command -v codex    >/dev/null 2>&1 && ./setup --host codex
+command -v kiro-cli >/dev/null 2>&1 && ./setup --host kiro
+command -v droid    >/dev/null 2>&1 && ./setup --host factory
+command -v opencode >/dev/null 2>&1 && ./setup --host opencode
+```
+
+Tell the user which hosts were set up.
+
+Then continue to **Step 4.9** (Gemini and Kimi explicit copies). Skip Steps 4.5, 4.6, 4.8 — they do not apply to fork-copy installs (see skip annotations in those steps).
+
 **For git installs** (global-git, local-git):
 ```bash
 cd "$INSTALL_DIR"
