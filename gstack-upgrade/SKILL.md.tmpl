@@ -327,6 +327,8 @@ Tell user: "Sync failed — restored previous version at `$LOCAL_GSTACK`. Run `c
 
 ### Step 4.6: Regenerate and audit skill consistency
 
+**Skip for `fork-copy` installs** — `gen:skill-docs --host all` and `skill:check` already ran in the fork (Phase 2 of the fork-copy path) before the rsync copy. Jump to Step 4.75.
+
 After the upstream merge and any local vendored sync, verify that the shared
 generated portions of every skill still match the current repo. This matters for
 customized gstack forks: upstream often changes preambles, host path rewrites,
@@ -384,6 +386,8 @@ Migrations are idempotent bash scripts in `gstack-upgrade/migrations/`. Each is 
 for how to add new migrations.
 
 ### Step 4.8: Fork skill overlay
+
+**Skip for `fork-copy` installs** — the fork IS the source; all fork customizations are already in `$FORK_REPO` before the rsync copy. No overlay step needed. Jump to Step 4.9.
 
 After migrations, overlay any custom SKILL.md.tmpl files from the user's configured fork repo onto the installed gstack, then regenerate all hosts. This ensures fork-local skill changes (e.g., custom build orchestration, added steps) survive upstream merges.
 
@@ -452,7 +456,7 @@ echo "FORK_REPO: ${_FORK_REPO:-none}"
 
 After gen:skill-docs has run (either in Step 4.6 or re-run in Step 4.8), sync generated SKILL.md files to gemini and kimi skill directories. These are not registered gstack hosts and are not handled by `./setup` — they need explicit file copies.
 
-Note: Claude reads directly from `$INSTALL_DIR`. Codex's `~/.codex/skills/gstack/SKILL.md` is already symlinked to `$INSTALL_DIR/.agents/skills/gstack/SKILL.md` (set up by `./setup`), so it updates automatically when gen:skill-docs runs. Only gemini and kimi need explicit sync.
+Note: Claude is served from `$INSTALL_DIR` directly. For `fork-copy` installs, Codex is reinstalled via `./setup --host codex` (Phase 5 of the fork-copy path), so its per-skill dirs and `openai.yaml` files are already current before this step. For all other install types, Codex updates automatically via the `./setup --host auto` call above. Gemini and Kimi always need explicit file copies and are handled below.
 
 ```bash
 _SYNCED_ANY=0
