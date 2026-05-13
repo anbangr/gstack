@@ -16,7 +16,7 @@ import type {
   PhaseStatus,
   SkillFaultDetectedEvent,
 } from "./types";
-import { detectSkillFaults } from "./skill-fault-detector";
+import { detectSkillFaults, loadLearnedPatterns } from "./skill-fault-detector";
 
 export type MonitorEventName =
   | "RUN_RUNNING"
@@ -115,7 +115,10 @@ function nowIso(now: Date | undefined): string {
   return (now ?? new Date()).toISOString();
 }
 
-function event(args: Omit<MonitorEvent, "timestamp">, now?: Date): MonitorEvent {
+function event(
+  args: Omit<MonitorEvent, "timestamp">,
+  now?: Date,
+): MonitorEvent {
   return { timestamp: nowIso(now), ...args };
 }
 
@@ -148,7 +151,10 @@ function requireStringArray(
   return [...value] as string[];
 }
 
-function optionalString(obj: Record<string, unknown>, field: string): string | undefined {
+function optionalString(
+  obj: Record<string, unknown>,
+  field: string,
+): string | undefined {
   const value = obj[field];
   return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
@@ -245,7 +251,9 @@ function registryDirFromLaunchCommand(run: BuildRunManifestRun): string {
   return defaultActiveRunRegistryDir();
 }
 
-function normalizeRepoIdentity(repoPath: string | undefined): string | undefined {
+function normalizeRepoIdentity(
+  repoPath: string | undefined,
+): string | undefined {
   return repoPath ? path.resolve(repoPath) : undefined;
 }
 
@@ -260,7 +268,9 @@ function registryRunInfo(run: BuildRunManifestRun): {
   if (records.length === 0) return { ok: true, liveOwner: false };
   const expected = normalizeRepoIdentity(run.repoPath);
   const ok = records.every((record) => {
-    const actual = normalizeRepoIdentity(record.baseProjectRoot ?? record.repoPath);
+    const actual = normalizeRepoIdentity(
+      record.baseProjectRoot ?? record.repoPath,
+    );
     return actual === expected;
   });
   const liveOwner = records.some(
@@ -318,7 +328,9 @@ function readRunSnapshot(
   const pidAlive = pid != null && isPidAlive(pid);
   const registry = registryRunInfo(run);
   const registryOk = registry.ok;
-  const identityOk = state ? stateMatchesRun(state, run) && registryOk : registryOk;
+  const identityOk = state
+    ? stateMatchesRun(state, run) && registryOk
+    : registryOk;
   const committedCount = committedPhaseCount(state);
   const staleWindowMs = Math.max(3 * pollMs, 1_000);
   const contextSaveCountFile = path.join(
@@ -329,9 +341,10 @@ function readRunSnapshot(
   const lastUpdatedAtMs = state?.lastUpdatedAt
     ? Date.parse(state.lastUpdatedAt)
     : null;
-  const recentProcessActivity = [fileMtimeMs(run.pidFile), fileMtimeMs(run.stdoutLog)].some(
-    (mtime) => mtime != null && now.getTime() - mtime < staleWindowMs,
-  );
+  const recentProcessActivity = [
+    fileMtimeMs(run.pidFile),
+    fileMtimeMs(run.stdoutLog),
+  ].some((mtime) => mtime != null && now.getTime() - mtime < staleWindowMs);
   return {
     run,
     stateFile,
@@ -365,12 +378,16 @@ function writeClaimStatus(
   if (!manifest.gstackRepo) return;
   const sourcePlanPath = run.sourcePlanPath ?? run.originPlanPath;
   if (!sourcePlanPath) return;
-  if (path.dirname(path.resolve(sourcePlanPath)) !== path.join(manifest.gstackRepo, "inbox")) {
+  if (
+    path.dirname(path.resolve(sourcePlanPath)) !==
+    path.join(manifest.gstackRepo, "inbox")
+  ) {
     return;
   }
-  const claimPath = sourcePlanClaimPaths(manifest.gstackRepo, sourcePlanPath).find(
-    (candidatePath) => fs.existsSync(candidatePath),
-  );
+  const claimPath = sourcePlanClaimPaths(
+    manifest.gstackRepo,
+    sourcePlanPath,
+  ).find((candidatePath) => fs.existsSync(candidatePath));
   if (!claimPath) return;
   const claim = readJsonFile<Record<string, any>>(claimPath);
   if (!claim) return;
@@ -394,7 +411,11 @@ function writeClaimStatus(
   const anyFailed = runIds.some(
     (id: string) => claim.runStatuses?.[id]?.status === "failed",
   );
-  claim.status = allCompleted ? "completed" : allTerminal && anyFailed ? "failed" : "running";
+  claim.status = allCompleted
+    ? "completed"
+    : allTerminal && anyFailed
+      ? "failed"
+      : "running";
   claim.updatedAt = updatedAt;
   if (claim.status === "completed") {
     claim.completedAt = updatedAt;
@@ -414,13 +435,21 @@ function writeClaimStatus(
 }
 
 function cleanupCompletedWorktree(run: BuildRunManifestRun): void {
-  const ok = spawnSync("git", ["-C", run.worktreePath, "rev-parse", "--is-inside-work-tree"], {
-    encoding: "utf8",
-  });
+  const ok = spawnSync(
+    "git",
+    ["-C", run.worktreePath, "rev-parse", "--is-inside-work-tree"],
+    {
+      encoding: "utf8",
+    },
+  );
   if (ok.status !== 0) return;
-  const removed = spawnSync("git", ["-C", run.repoPath, "worktree", "remove", run.worktreePath], {
-    encoding: "utf8",
-  });
+  const removed = spawnSync(
+    "git",
+    ["-C", run.repoPath, "worktree", "remove", run.worktreePath],
+    {
+      encoding: "utf8",
+    },
+  );
   if (removed.status !== 0) {
     console.warn(
       `[monitor] worktree cleanup failed for completed run ${run.runId}: ${removed.stderr || removed.stdout}`,
@@ -431,7 +460,10 @@ function cleanupCompletedWorktree(run: BuildRunManifestRun): void {
 function spawnResume(run: BuildRunManifestRun): number {
   fs.mkdirSync(path.dirname(run.pidFile), { recursive: true });
   fs.mkdirSync(path.dirname(run.stdoutLog), { recursive: true });
-  if (path.isAbsolute(run.launchCommand[0]) && !fs.existsSync(run.launchCommand[0])) {
+  if (
+    path.isAbsolute(run.launchCommand[0]) &&
+    !fs.existsSync(run.launchCommand[0])
+  ) {
     throw new Error(`resume executable not found: ${run.launchCommand[0]}`);
   }
   const outFd = fs.openSync(run.stdoutLog, "a");
@@ -486,16 +518,20 @@ export function evaluateMonitorOnce(
     const snapshots = manifest.runs.map((run) =>
       readRunSnapshot(run, pollMs, now),
     );
+    const learnedPatterns = loadLearnedPatterns();
 
     for (const snapshot of snapshots) {
       try {
-        const faults = detectSkillFaults({
-          state: snapshot.state,
-          worktreePath: snapshot.run.worktreePath,
-          stdoutLogPath: snapshot.run.stdoutLog,
-          stateDir: snapshot.stateDir,
-          livingPlanPath: snapshot.run.livingPlanPath,
-        });
+        const faults = detectSkillFaults(
+          {
+            state: snapshot.state,
+            worktreePath: snapshot.run.worktreePath,
+            stdoutLogPath: snapshot.run.stdoutLog,
+            stateDir: snapshot.stateDir,
+            livingPlanPath: snapshot.run.livingPlanPath,
+          },
+          learnedPatterns,
+        );
         if (faults.length > 0) {
           skillFaultEvents.push({
             event: "SKILL_FAULT_DETECTED",
@@ -517,7 +553,12 @@ export function evaluateMonitorOnce(
           `state file is unreadable: ${snapshot.stateError}`,
           now,
         );
-        return { manifest, events: [...events, terminalEvent], skillFaultEvents, terminalEvent };
+        return {
+          manifest,
+          events: [...events, terminalEvent],
+          skillFaultEvents,
+          terminalEvent,
+        };
       }
       if (!snapshot.registryOk || (snapshot.state && !snapshot.identityOk)) {
         const terminalEvent = runEvent(
@@ -526,7 +567,12 @@ export function evaluateMonitorOnce(
           "run identity is ambiguous; refusing automatic recovery",
           now,
         );
-        return { manifest, events: [...events, terminalEvent], skillFaultEvents, terminalEvent };
+        return {
+          manifest,
+          events: [...events, terminalEvent],
+          skillFaultEvents,
+          terminalEvent,
+        };
       }
       if (
         snapshot.committedCount > snapshot.priorContextSaveCount &&
@@ -542,7 +588,12 @@ export function evaluateMonitorOnce(
             countFile: snapshot.contextSaveCountFile,
           },
         );
-        return { manifest, events: [...events, terminalEvent], skillFaultEvents, terminalEvent };
+        return {
+          manifest,
+          events: [...events, terminalEvent],
+          skillFaultEvents,
+          terminalEvent,
+        };
       }
       if (snapshot.failed) {
         writeClaimStatus(manifest, snapshot.run, "failed", now);
@@ -552,7 +603,12 @@ export function evaluateMonitorOnce(
           snapshot.state?.failureReason ?? "build run failed",
           now,
         );
-        return { manifest, events: [...events, terminalEvent], skillFaultEvents, terminalEvent };
+        return {
+          manifest,
+          events: [...events, terminalEvent],
+          skillFaultEvents,
+          terminalEvent,
+        };
       }
       if (snapshot.completed) {
         writeClaimStatus(manifest, snapshot.run, "completed", now);
@@ -583,7 +639,12 @@ export function evaluateMonitorOnce(
             "run process or active-run registry owner is alive but state is stale",
             now,
           );
-          return { manifest, events: [...events, terminalEvent], skillFaultEvents, terminalEvent };
+          return {
+            manifest,
+            events: [...events, terminalEvent],
+            skillFaultEvents,
+            terminalEvent,
+          };
         }
         if (!snapshot.state || !snapshot.identityOk) {
           const terminalEvent = runEvent(
@@ -592,7 +653,12 @@ export function evaluateMonitorOnce(
             "run is stale but identity could not be proven",
             now,
           );
-          return { manifest, events: [...events, terminalEvent], skillFaultEvents, terminalEvent };
+          return {
+            manifest,
+            events: [...events, terminalEvent],
+            skillFaultEvents,
+            terminalEvent,
+          };
         }
         const lockCleanup = cleanupDeadLock(snapshot.run.stateSlug);
         if (lockCleanup.status === "live") {
@@ -602,7 +668,12 @@ export function evaluateMonitorOnce(
             "run state is stale but its lock is still held by a live process",
             now,
           );
-          return { manifest, events: [...events, terminalEvent], skillFaultEvents, terminalEvent };
+          return {
+            manifest,
+            events: [...events, terminalEvent],
+            skillFaultEvents,
+            terminalEvent,
+          };
         }
         if (
           lockCleanup.status === "invalid" ||
@@ -614,7 +685,12 @@ export function evaluateMonitorOnce(
             `run state is stale but its lock cannot be safely verified (${lockCleanup.status})`,
             now,
           );
-          return { manifest, events: [...events, terminalEvent], skillFaultEvents, terminalEvent };
+          return {
+            manifest,
+            events: [...events, terminalEvent],
+            skillFaultEvents,
+            terminalEvent,
+          };
         }
         let resumedPid = 0;
         if (opts.spawnResume !== false) {
@@ -629,11 +705,18 @@ export function evaluateMonitorOnce(
           now,
           { resumeAttempted: true },
         );
-        return { manifest, events: [...events, terminalEvent], skillFaultEvents, terminalEvent };
+        return {
+          manifest,
+          events: [...events, terminalEvent],
+          skillFaultEvents,
+          terminalEvent,
+        };
       }
       events.push(
         runEvent(
-          snapshot.pidAlive || snapshot.registryPidAlive ? "RUN_RUNNING" : "RUN_STALE",
+          snapshot.pidAlive || snapshot.registryPidAlive
+            ? "RUN_RUNNING"
+            : "RUN_STALE",
           snapshot,
           snapshot.pidAlive || snapshot.registryPidAlive
             ? "run process is alive"
@@ -653,7 +736,12 @@ export function evaluateMonitorOnce(
       },
       now,
     );
-    return { manifest, events: [...events, terminalEvent], skillFaultEvents, terminalEvent };
+    return {
+      manifest,
+      events: [...events, terminalEvent],
+      skillFaultEvents,
+      terminalEvent,
+    };
   } catch (err) {
     const terminalEvent = event(
       {

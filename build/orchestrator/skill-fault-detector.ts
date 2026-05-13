@@ -33,6 +33,25 @@ export interface SkillFault {
   };
 }
 
+export type LearnedMatcherKind =
+  | "stdout_contains"
+  | "stdout_regex"
+  | "failureReason_contains"
+  | "failureReason_regex"
+  | "plan_contains"
+  | "plan_regex";
+
+export interface LearnedPattern {
+  category: string; // UPPER_SNAKE_CASE, unique key
+  severity: "CRITICAL" | "HIGH" | "MEDIUM";
+  description: string;
+  matcherKind: LearnedMatcherKind;
+  pattern: string; // literal string or JS regex string — never eval'd
+  source: string; // "investigator:<report-filename>"
+  learnedAt: string; // ISO 8601
+  hitCount: number; // incremented each time this pattern fires
+}
+
 const CHECKED_IMPLEMENTATION_RE =
   /^\s*-\s+\[[xX]\]\s+\*\*Implementation(?:\s+\([^*\n]*\))?\*\*/m;
 const CHECKED_REVIEW_QA_RE =
@@ -68,11 +87,130 @@ function dirExists(p: string): boolean {
   }
 }
 
+const LEARNED_PATTERNS_PATH = (): string => {
+  const home = process.env.GSTACK_HOME ?? path.join(os.homedir(), ".gstack");
+  return path.join(home, "skill-faults", "learned-patterns.json");
+};
+
+/**
+ * Load learned fault patterns from disk.
+ * Returns [] on missing file, malformed JSON, or any I/O error.
+ */
+export function loadLearnedPatterns(): LearnedPattern[] {
+  try {
+    const raw = fs.readFileSync(LEARNED_PATTERNS_PATH(), "utf8");
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (entry): entry is LearnedPattern =>
+        entry != null &&
+        typeof entry.category === "string" &&
+        entry.category.trim() !== "" &&
+        typeof entry.matcherKind === "string" &&
+        entry.matcherKind.trim() !== "" &&
+        typeof entry.pattern === "string" &&
+        entry.pattern.trim() !== "",
+    );
+  } catch {
+    return [];
+  }
+}
+
+function applyLearnedPattern(
+  lp: LearnedPattern,
+  input: DetectorInput,
+  planContent: string | null,
+  stdoutContent: string | null,
+): boolean {
+  try {
+    switch (lp.matcherKind) {
+      case "stdout_contains":
+        return stdoutContent?.includes(lp.pattern) ?? false;
+      case "stdout_regex":
+        return new RegExp(lp.pattern).test(stdoutContent ?? "");
+      case "failureReason_contains":
+        return (input.state?.failureReason ?? "").includes(lp.pattern);
+      case "failureReason_regex":
+        return new RegExp(lp.pattern).test(input.state?.failureReason ?? "");
+      case "plan_contains":
+        return planContent?.includes(lp.pattern) ?? false;
+      case "plan_regex":
+        return new RegExp(lp.pattern).test(planContent ?? "");
+      default:
+        return false;
+    }
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Detect faults using learned patterns loaded from disk.
+ * Never throws — bad inputs return [].
+ */
+export function detectLearnedFaults(
+  input: DetectorInput,
+  staticCategories: Set<string>,
+  patterns?: LearnedPattern[],
+): SkillFault[] {
+  if (!patterns || patterns.length === 0) return [];
+  try {
+    const planContent = readFileSafe(input.livingPlanPath);
+    const stdoutContent = readFileSafe(input.stdoutLogPath);
+    const faults: SkillFault[] = [];
+    for (const lp of patterns) {
+      if (staticCategories.has(lp.category)) continue;
+      if (applyLearnedPattern(lp, input, planContent, stdoutContent)) {
+        faults.push({
+          category: lp.category,
+          severity: lp.severity,
+          description: "[learned] " + lp.description,
+          sourceFiles: [],
+          evidence: {},
+        });
+      }
+    }
+    return faults;
+  } catch {
+    return [];
+  }
+}
+
+function persistHitCounts(learnedFaultCategories: string[]): void {
+  if (learnedFaultCategories.length === 0) return;
+  try {
+    const filePath = LEARNED_PATTERNS_PATH();
+    const raw = fs.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return;
+    for (const entry of parsed) {
+      if (
+        entry != null &&
+        typeof entry.category === "string" &&
+        learnedFaultCategories.includes(entry.category)
+      ) {
+        entry.hitCount =
+          (typeof entry.hitCount === "number" ? entry.hitCount : 0) + 1;
+      }
+    }
+    const tmpPath = `${filePath}.tmp.${process.pid}`;
+    fs.writeFileSync(tmpPath, JSON.stringify(parsed, null, 2) + "\n", {
+      mode: 0o600,
+    });
+    fs.renameSync(tmpPath, filePath);
+  } catch {
+    // Swallow all errors — must not block fault return.
+  }
+}
+
 /**
  * Detect skill faults from build state and run artifacts.
  * Never throws — bad inputs are handled gracefully.
  */
-export function detectSkillFaults(input: DetectorInput): SkillFault[] {
+export function detectSkillFaults(
+  input: DetectorInput,
+  learnedPatterns?: LearnedPattern[],
+): SkillFault[] {
   const faults: SkillFault[] = [];
   const state = input?.state ?? null;
 
@@ -269,6 +407,20 @@ export function detectSkillFaults(input: DetectorInput): SkillFault[] {
         sourceFiles: [input.stdoutLogPath],
         evidence: {},
       });
+    }
+
+    // ------------------------------------------------------------------
+    // LEARNED PATTERNS — dynamic patterns from learned-patterns.json
+    // ------------------------------------------------------------------
+    const staticCategories = new Set(faults.map((f) => f.category));
+    const learnedFaults = detectLearnedFaults(
+      input,
+      staticCategories,
+      learnedPatterns,
+    );
+    faults.push(...learnedFaults);
+    if (learnedFaults.length > 0) {
+      persistHitCounts(learnedFaults.map((f) => f.category));
     }
   } catch {
     // Outer safety net: never throw on bad input.
