@@ -9,8 +9,10 @@
 # or already a symlink. Safe to re-run.
 set -euo pipefail
 
-INSTALL_DIR="${HOME}/.claude/skills/gstack"
+[ -z "${HOME:-}" ] && { echo "  [v1.32.1.0] HOME is unset — skipping."; exit 0; }
 
+INSTALL_DIR="${HOME}/.claude/skills/gstack"
+[ -f "$INSTALL_DIR/setup" ] || INSTALL_DIR="${HOME}/.gstack/repos/gstack"
 [ -f "$INSTALL_DIR/setup" ] || { echo "  [v1.32.1.0] gstack not at expected path — skipping."; exit 0; }
 
 # Only run if at least one non-claude host install dir exists
