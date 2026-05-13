@@ -7447,7 +7447,7 @@ async function main() {
         }
       } while (exitCode === 0 && rerunAutonomousLoop);
 
-      if (exitCode === 0 && args.singleBranch) {
+      if (exitCode === 0 && args.singleBranch && !args.dryRun) {
         console.log(
           args.releaseMode === "queued"
             ? "\n▶ Plan complete. Running /ship and queueing PR for release daemon."

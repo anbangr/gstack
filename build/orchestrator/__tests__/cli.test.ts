@@ -321,6 +321,12 @@ describe("--single-branch flag wiring", () => {
     expect(args.skipShip).toBe(false);
     expect(args.releaseMode).toBe("auto-land");
   });
+
+  it("--single-branch with --dry-run leaves dryRun=true and singleBranch=true", () => {
+    const args = parseArgs(["plan.md", "--single-branch", "--dry-run"]);
+    expect(args.singleBranch).toBe(true);
+    expect(args.dryRun).toBe(true);
+  });
 });
 
 describe("release-daemon CLI", () => {
@@ -3502,6 +3508,11 @@ describe("buildKindInstructions", () => {
   });
 });
 
+describe("findOpenPRForBranch", () => {
+  let tmpBin: string;
+  let ghBin: string;
+});
+
 // ---------------------------------------------------------------------------
 // ship failure paths: state.failureReason is set at all 4 paused locations
 // ---------------------------------------------------------------------------
@@ -3949,11 +3960,17 @@ describe("buildKindInstructions — non-code phase prompts", () => {
       expect(joined).toContain("Do NOT update the plan file");
     }
   });
+
+  it("returns 'ship-and-deploy' when no open PR exists", () => {
+    expect(chooseMergePath(null)).toBe("ship-and-deploy");
+  });
 });
 
 describe("featureGateProjection with singleBranch", () => {
   it("suppresses ship_land and origin_verification for origin_verified when singleBranch", () => {
-    const result = featureGateProjection("origin_verified", { singleBranch: true });
+    const result = featureGateProjection("origin_verified", {
+      singleBranch: true,
+    });
     expect(result).toEqual({ feature_review: true });
   });
 
