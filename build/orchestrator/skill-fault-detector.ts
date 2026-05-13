@@ -101,13 +101,26 @@ export function loadLearnedPatterns(): LearnedPattern[] {
     const raw = fs.readFileSync(LEARNED_PATTERNS_PATH(), "utf8");
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
+    const VALID_MATCHER_KINDS = new Set<string>([
+      "stdout_contains",
+      "stdout_regex",
+      "failureReason_contains",
+      "failureReason_regex",
+      "plan_contains",
+      "plan_regex",
+    ]);
+    const VALID_SEVERITIES = new Set<string>(["CRITICAL", "HIGH", "MEDIUM"]);
     return parsed.filter(
       (entry): entry is LearnedPattern =>
         entry != null &&
         typeof entry.category === "string" &&
         entry.category.trim() !== "" &&
+        typeof entry.severity === "string" &&
+        VALID_SEVERITIES.has(entry.severity) &&
+        typeof entry.description === "string" &&
+        entry.description.trim() !== "" &&
         typeof entry.matcherKind === "string" &&
-        entry.matcherKind.trim() !== "" &&
+        VALID_MATCHER_KINDS.has(entry.matcherKind) &&
         typeof entry.pattern === "string" &&
         entry.pattern.trim() !== "",
     );
@@ -151,12 +164,12 @@ function applyLearnedPattern(
 export function detectLearnedFaults(
   input: DetectorInput,
   staticCategories: Set<string>,
-  patterns?: LearnedPattern[],
+  patterns: LearnedPattern[],
+  planContent: string | null,
+  stdoutContent: string | null,
 ): SkillFault[] {
   if (!patterns || patterns.length === 0) return [];
   try {
-    const planContent = readFileSafe(input.livingPlanPath);
-    const stdoutContent = readFileSafe(input.stdoutLogPath);
     const faults: SkillFault[] = [];
     for (const lp of patterns) {
       if (staticCategories.has(lp.category)) continue;
@@ -264,6 +277,7 @@ export function detectSkillFaults(
     // PREMATURE_COMPLETION — checked checkboxes for non-committed phases
     // ------------------------------------------------------------------
     const planContent = readFileSafe(input.livingPlanPath);
+    const stdoutContent = readFileSafe(input.stdoutLogPath);
     if (planContent && state && Array.isArray(state.phases)) {
       // Split into phase blocks
       const blocks = planContent.split(/(?=### Phase)/);
@@ -398,7 +412,6 @@ export function detectSkillFaults(
     // ------------------------------------------------------------------
     // FEATURE_VERIFIER_SCOPE
     // ------------------------------------------------------------------
-    const stdoutContent = readFileSafe(input.stdoutLogPath);
     if (stdoutContent && stdoutContent.includes("VERIFICATION: GAPS")) {
       faults.push({
         category: "FEATURE_VERIFIER_SCOPE",
@@ -416,7 +429,9 @@ export function detectSkillFaults(
     const learnedFaults = detectLearnedFaults(
       input,
       staticCategories,
-      learnedPatterns,
+      learnedPatterns ?? [],
+      planContent,
+      stdoutContent,
     );
     faults.push(...learnedFaults);
     if (learnedFaults.length > 0) {
