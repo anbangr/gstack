@@ -1982,7 +1982,7 @@ fi
 # ---------- Phase 1: spawn pattern miner for un-mined investigation reports ----------
 # An un-mined report: a .md file with no GSTACK_LEARNED_PATTERN block,
 # no GSTACK_NO_PATTERN_FOUND sentinel, and no .pattern-extracted marker.
-for _DISC_REPORT in "$_FAULT_PRIMARY_DIR"/skill-fault-discovery-*.md; do
+for _DISC_REPORT in $(find "$_FAULT_PRIMARY_DIR" -maxdepth 1 -name 'skill-fault-discovery-*.md' 2>/dev/null); do
   [ -f "$_DISC_REPORT" ] || continue
   [ -f "${_DISC_REPORT}.pattern-extracted" ] && continue
   grep -q "GSTACK_LEARNED_PATTERN" "$_DISC_REPORT" 2>/dev/null && continue
@@ -2015,7 +2015,7 @@ for _DISC_REPORT in "$_FAULT_PRIMARY_DIR"/skill-fault-discovery-*.md; do
 done
 
 # ---------- Phase 2: extract patterns from mined reports ----------
-for _DISC_REPORT in "$_FAULT_PRIMARY_DIR"/skill-fault-discovery-*.md; do
+for _DISC_REPORT in $(find "$_FAULT_PRIMARY_DIR" -maxdepth 1 -name 'skill-fault-discovery-*.md' 2>/dev/null); do
   [ -f "$_DISC_REPORT" ] || continue
   [ -f "${_DISC_REPORT}.pattern-extracted" ] && continue
 
