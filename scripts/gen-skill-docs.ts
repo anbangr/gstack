@@ -41,6 +41,39 @@ import type { HostConfig } from "./host-config";
 const ROOT = path.resolve(import.meta.dir, "..");
 const DRY_RUN = process.argv.includes("--dry-run");
 
+// Directories never copied into external host skill dirs — code, build artifacts, and VCS noise.
+// Match is case-insensitive to handle macOS HFS+/APFS (default case-insensitive filesystem).
+const EXCLUDED_SKILL_DIRS = new Set([
+  "dist",
+  "src",
+  "test",
+  "tests",
+  "bin",
+  "node_modules",
+  "orchestrator",
+  "__tests__",
+  ".git",
+]);
+
+// Copy only .md files from srcDir into destDir, recursively. Used when copying
+// skill subdirectories to external host skill dirs so non-doc content never leaks.
+function copyMdFilesOnly(srcDir: string, destDir: string): void {
+  fs.mkdirSync(destDir, { recursive: true });
+  for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      copyMdFilesOnly(
+        path.join(srcDir, entry.name),
+        path.join(destDir, entry.name),
+      );
+    } else if (entry.isFile() && entry.name.endsWith(".md")) {
+      fs.copyFileSync(
+        path.join(srcDir, entry.name),
+        path.join(destDir, entry.name),
+      );
+    }
+  }
+}
+
 // ─── Host Detection (config-driven) ─────────────────────────
 
 const HOST_ARG = process.argv.find((a) => a.startsWith("--host"));
@@ -662,17 +695,6 @@ for (const currentHost of hostsToRun) {
               force: true,
             });
           }
-          const CODE_DIRS = new Set([
-            "dist",
-            "src",
-            "test",
-            "tests",
-            "bin",
-            "node_modules",
-            "orchestrator",
-            "__tests__",
-            ".git",
-          ]);
           const entries = fs.readdirSync(srcDir, { withFileTypes: true });
           for (const entry of entries) {
             if (entry.name === "SKILL.md" || entry.name === "SKILL.md.tmpl")
@@ -682,8 +704,8 @@ for (const currentHost of hostsToRun) {
             const destPath = path.join(destDir, entry.name);
             if (entry.isDirectory()) {
               if (isRootSkill) continue; // Do not copy root dirs like .git, node_modules, bin
-              if (CODE_DIRS.has(entry.name)) continue; // Never copy code/build dirs to host skill dirs
-              fs.cpSync(srcPath, destPath, { recursive: true });
+              if (EXCLUDED_SKILL_DIRS.has(entry.name.toLowerCase())) continue; // Never copy code/build dirs to host skill dirs
+              copyMdFilesOnly(srcPath, destPath);
             } else if (entry.isFile() && entry.name.endsWith(".md")) {
               fs.copyFileSync(srcPath, destPath);
             }
