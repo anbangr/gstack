@@ -24,10 +24,14 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { spawnSync } from "child_process";
 import {
   detectSkillFaults,
+  detectLearnedFaults,
+  loadLearnedPatterns,
   type DetectorInput,
   type SkillFault,
+  type LearnedPattern,
 } from "../build/orchestrator/skill-fault-detector";
 import {
   DEFAULT_MAX_CODEX_ITERATIONS,
@@ -963,5 +967,639 @@ describe("analytics", () => {
       const content = fs.readFileSync(jsonlPath, "utf8").trim();
       expect(content).toBe("");
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Learned fault detection — helpers
+// ---------------------------------------------------------------------------
+
+function makeLearnedPattern(
+  overrides: Partial<LearnedPattern> = {},
+): LearnedPattern {
+  return {
+    category: "TEST_LEARNED_FAULT",
+    severity: "HIGH",
+    description: "A learned fault for testing.",
+    matcherKind: "stdout_contains",
+    pattern: "OOM killed",
+    source: "investigator:test-report.md",
+    learnedAt: "2026-01-01T00:00:00Z",
+    hitCount: 0,
+    ...overrides,
+  };
+}
+
+function runPhase2Script(dir: string): {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+} {
+  const script = `
+    set -e
+    FAULT_DIR="${dir}"
+    PATTERNS_FILE="$FAULT_DIR/learned-patterns.json"
+    ALLOWED_KINDS="stdout_contains stdout_regex failureReason_contains failureReason_regex plan_contains plan_regex"
+
+    # Initialize patterns file if missing
+    if [ ! -f "$PATTERNS_FILE" ]; then
+      echo "[]" > "$PATTERNS_FILE"
+    fi
+
+    # Phase 2: extract mined patterns
+    for REPORT_FILE in "$FAULT_DIR"/*.md; do
+      [ -f "$REPORT_FILE" ] || continue
+      MARKER="\${REPORT_FILE}.pattern-extracted"
+      [ -f "$MARKER" ] && continue
+
+      # Check for NO_PATTERN_FOUND sentinel
+      if grep -q "GSTACK_NO_PATTERN_FOUND" "$REPORT_FILE"; then
+        touch "$MARKER"
+        continue
+      fi
+
+      # Check for LEARNED_PATTERN block
+      if ! grep -q "GSTACK_LEARNED_PATTERN" "$REPORT_FILE"; then
+        continue
+      fi
+
+      # Extract JSON from the block
+      JSON=$(awk '/<!-- GSTACK_LEARNED_PATTERN/{found=1; next} found && /-->/{found=0; next} found{print}' "$REPORT_FILE")
+
+      # Validate JSON fields with jq
+      CATEGORY=$(echo "$JSON" | jq -r '.category // empty' 2>/dev/null) || { touch "$MARKER"; continue; }
+      MATCHER_KIND=$(echo "$JSON" | jq -r '.matcherKind // empty' 2>/dev/null) || { touch "$MARKER"; continue; }
+      PATTERN=$(echo "$JSON" | jq -r '.pattern // empty' 2>/dev/null) || { touch "$MARKER"; continue; }
+
+      [ -z "$CATEGORY" ] && { touch "$MARKER"; continue; }
+      [ -z "$MATCHER_KIND" ] && { touch "$MARKER"; continue; }
+      [ -z "$PATTERN" ] && { touch "$MARKER"; continue; }
+
+      # Validate UPPER_SNAKE_CASE category (no lowercase letters, must not start with digit)
+      case "$CATEGORY" in
+        *[a-z]*|[0-9]*) touch "$MARKER"; continue;;
+      esac
+
+      # Validate matcherKind
+      VALID=0
+      for KIND in $ALLOWED_KINDS; do
+        [ "$MATCHER_KIND" = "$KIND" ] && VALID=1 && break
+      done
+      [ "$VALID" = "0" ] && { touch "$MARKER"; continue; }
+
+      # Dedup: skip if category already exists
+      if jq -e --arg c "$CATEGORY" 'any(.[]; .category == $c)' "$PATTERNS_FILE" > /dev/null 2>&1; then
+        touch "$MARKER"
+        continue
+      fi
+
+      # Enrich with metadata
+      ENRICHED=$(echo "$JSON" | jq \
+        --arg src "investigator:$(basename "$REPORT_FILE")" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '. + {source: $src, learnedAt: $ts, hitCount: 0}')
+
+      # Atomic append
+      TMP="$PATTERNS_FILE.tmp.$$"
+      jq --argjson entry "$ENRICHED" '. + [$entry]' "$PATTERNS_FILE" > "$TMP"
+      mv "$TMP" "$PATTERNS_FILE"
+
+      touch "$MARKER"
+    done
+  `;
+  const result = spawnSync("bash", ["-c", script], { encoding: "utf8" });
+  return {
+    exitCode: result.status ?? 1,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+  };
+}
+
+function reportNeedsMining(reportPath: string): boolean {
+  const content = fs.readFileSync(reportPath, "utf8");
+  const markerExists = fs.existsSync(reportPath + ".pattern-extracted");
+  return (
+    !content.includes("GSTACK_LEARNED_PATTERN") &&
+    !content.includes("GSTACK_NO_PATTERN_FOUND") &&
+    !markerExists
+  );
+}
+
+// ---------------------------------------------------------------------------
+// detectLearnedFaults — direct calls
+// ---------------------------------------------------------------------------
+
+describe("detectLearnedFaults — direct calls", () => {
+  test("test 1: stdout_contains fires on literal match", () => {
+    const dir = makeTmpDir();
+    const input = makeInput(dir);
+    const pattern = makeLearnedPattern({
+      matcherKind: "stdout_contains",
+      pattern: "OOM killed",
+    });
+    const faults = detectLearnedFaults(
+      input,
+      new Set<string>(),
+      [pattern],
+      null,
+      "process OOM killed by kernel",
+    );
+    expect(faults).toHaveLength(1);
+    expect(faults[0].category).toBe(pattern.category);
+    expect(faults[0].description.startsWith("[learned] ")).toBe(true);
+  });
+
+  test("test 2: stdout_regex fires on regex match", () => {
+    const dir = makeTmpDir();
+    const input = makeInput(dir);
+    const pattern = makeLearnedPattern({
+      matcherKind: "stdout_regex",
+      pattern: "Error: \\w+ timed out",
+    });
+    const faults = detectLearnedFaults(
+      input,
+      new Set<string>(),
+      [pattern],
+      null,
+      "Error: agent timed out after 30s",
+    );
+    expect(faults).toHaveLength(1);
+  });
+
+  test("test 3: failureReason_contains fires", () => {
+    const dir = makeTmpDir();
+    const input = makeInput(dir, {
+      state: baseState({ failureReason: "Process OOM killed by kernel" }),
+    });
+    const pattern = makeLearnedPattern({
+      matcherKind: "failureReason_contains",
+      pattern: "OOM killed",
+    });
+    const faults = detectLearnedFaults(
+      input,
+      new Set<string>(),
+      [pattern],
+      null,
+      null,
+    );
+    expect(faults).toHaveLength(1);
+  });
+
+  test("test 4: failureReason_regex fires", () => {
+    const dir = makeTmpDir();
+    const input = makeInput(dir, {
+      state: baseState({ failureReason: "timeout after 60s" }),
+    });
+    const pattern = makeLearnedPattern({
+      matcherKind: "failureReason_regex",
+      pattern: "timeout after \\d+s",
+    });
+    const faults = detectLearnedFaults(
+      input,
+      new Set<string>(),
+      [pattern],
+      null,
+      null,
+    );
+    expect(faults).toHaveLength(1);
+  });
+
+  test("test 5: plan_contains fires", () => {
+    const dir = makeTmpDir();
+    const input = makeInput(dir);
+    const pattern = makeLearnedPattern({
+      matcherKind: "plan_contains",
+      pattern: "MISSING_FEATURE",
+    });
+    const faults = detectLearnedFaults(
+      input,
+      new Set<string>(),
+      [pattern],
+      "This plan is MISSING_FEATURE for the new API",
+      null,
+    );
+    expect(faults).toHaveLength(1);
+  });
+
+  test("test 6: plan_regex fires", () => {
+    const dir = makeTmpDir();
+    const input = makeInput(dir);
+    const pattern = makeLearnedPattern({
+      matcherKind: "plan_regex",
+      pattern: "Phase \\d+ skipped",
+    });
+    const faults = detectLearnedFaults(
+      input,
+      new Set<string>(),
+      [pattern],
+      "Phase 3 skipped due to dependency failure",
+      null,
+    );
+    expect(faults).toHaveLength(1);
+  });
+
+  test("test 7: category in staticCategories → skipped (dedup)", () => {
+    const dir = makeTmpDir();
+    const input = makeInput(dir);
+    const pattern = makeLearnedPattern({
+      category: "CODEX_CONVERGENCE",
+      matcherKind: "stdout_contains",
+      pattern: "some text",
+    });
+    const faults = detectLearnedFaults(
+      input,
+      new Set<string>(["CODEX_CONVERGENCE"]),
+      [pattern],
+      null,
+      "some text that matches",
+    );
+    expect(faults).toHaveLength(0);
+  });
+
+  test("test 8: invalid regex → no throw, empty result", () => {
+    const dir = makeTmpDir();
+    const input = makeInput(dir);
+    const pattern = makeLearnedPattern({
+      matcherKind: "stdout_regex",
+      pattern: "[invalid",
+    });
+    expect(() =>
+      detectLearnedFaults(
+        input,
+        new Set<string>(),
+        [pattern],
+        null,
+        "[invalid matches",
+      ),
+    ).not.toThrow();
+    const faults = detectLearnedFaults(
+      input,
+      new Set<string>(),
+      [pattern],
+      null,
+      "[invalid matches",
+    );
+    expect(faults).toHaveLength(0);
+  });
+
+  test("test 9: empty patterns list → empty result, no throw", () => {
+    const dir = makeTmpDir();
+    const input = makeInput(dir);
+    expect(() =>
+      detectLearnedFaults(input, new Set<string>(), [], null, "some stdout"),
+    ).not.toThrow();
+    const faults = detectLearnedFaults(
+      input,
+      new Set<string>(),
+      [],
+      null,
+      "some stdout",
+    );
+    expect(faults).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadLearnedPatterns
+// ---------------------------------------------------------------------------
+
+describe("loadLearnedPatterns", () => {
+  test("test 10: reads pattern from $GSTACK_HOME/skill-faults/learned-patterns.json", () => {
+    const tmpDir = makeTmpDir();
+    process.env.GSTACK_HOME = tmpDir;
+    const sfDir = path.join(tmpDir, "skill-faults");
+    fs.mkdirSync(sfDir, { recursive: true });
+    const validPattern: LearnedPattern = {
+      category: "CUSTOM_OOM_KILL",
+      severity: "HIGH",
+      description: "Process was OOM killed.",
+      matcherKind: "stdout_contains",
+      pattern: "OOM killed",
+      source: "investigator:test.md",
+      learnedAt: "2026-01-01T00:00:00Z",
+      hitCount: 0,
+    };
+    fs.writeFileSync(
+      path.join(sfDir, "learned-patterns.json"),
+      JSON.stringify([validPattern]),
+      "utf8",
+    );
+    const patterns = loadLearnedPatterns();
+    expect(patterns).toHaveLength(1);
+    expect(patterns[0].category).toBe("CUSTOM_OOM_KILL");
+    expect(patterns[0].matcherKind).toBe("stdout_contains");
+    expect(patterns[0].hitCount).toBe(0);
+  });
+
+  test("test 11: returns [] for missing file, no throw", () => {
+    const tmpDir = makeTmpDir();
+    process.env.GSTACK_HOME = tmpDir;
+    // No skill-faults/ dir created
+    expect(() => loadLearnedPatterns()).not.toThrow();
+    const patterns = loadLearnedPatterns();
+    expect(patterns).toHaveLength(0);
+  });
+
+  test("test 12: returns [] for malformed JSON, and filters invalid entries", () => {
+    const tmpDir = makeTmpDir();
+    process.env.GSTACK_HOME = tmpDir;
+    const sfDir = path.join(tmpDir, "skill-faults");
+    fs.mkdirSync(sfDir, { recursive: true });
+
+    // Malformed JSON — must not throw
+    fs.writeFileSync(
+      path.join(sfDir, "learned-patterns.json"),
+      "{not valid json",
+      "utf8",
+    );
+    expect(() => loadLearnedPatterns()).not.toThrow();
+    expect(loadLearnedPatterns()).toHaveLength(0);
+
+    // Now write 2 entries: one valid, one missing severity
+    const validEntry: LearnedPattern = {
+      category: "VALID_CATEGORY",
+      severity: "MEDIUM",
+      description: "A valid learned pattern.",
+      matcherKind: "failureReason_contains",
+      pattern: "crash",
+      source: "investigator:report.md",
+      learnedAt: "2026-01-01T00:00:00Z",
+      hitCount: 0,
+    };
+    const invalidEntry = {
+      category: "INVALID_NO_SEVERITY",
+      // missing severity
+      description: "Missing severity field.",
+      matcherKind: "stdout_contains",
+      pattern: "crash",
+      source: "investigator:report.md",
+      learnedAt: "2026-01-01T00:00:00Z",
+      hitCount: 0,
+    };
+    fs.writeFileSync(
+      path.join(sfDir, "learned-patterns.json"),
+      JSON.stringify([validEntry, invalidEntry]),
+      "utf8",
+    );
+    const patterns = loadLearnedPatterns();
+    expect(patterns).toHaveLength(1);
+    expect(patterns[0].category).toBe("VALID_CATEGORY");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectSkillFaults with learned patterns
+// ---------------------------------------------------------------------------
+
+describe("detectSkillFaults with learned patterns", () => {
+  test("test 13: integration — learned faults appear alongside static faults", () => {
+    const dir = makeTmpDir();
+    // Create a real worktree dir to trigger WORKTREE_LEAK
+    const worktreePath = path.join(dir, "leaked-worktree");
+    fs.mkdirSync(worktreePath);
+
+    // Write a stdout log that matches the learned pattern
+    const stdoutLog = path.join(dir, "run.log");
+    fs.writeFileSync(stdoutLog, "process OOM killed by kernel\n", "utf8");
+
+    const learnedPattern = makeLearnedPattern({
+      category: "CUSTOM_OOM_KILL",
+      matcherKind: "stdout_contains",
+      pattern: "OOM killed",
+    });
+
+    const input = makeInput(dir, {
+      state: baseState({ completed: true }),
+      worktreePath,
+      stdoutLogPath: stdoutLog,
+    });
+
+    const faults = detectSkillFaults(input, [learnedPattern]);
+    const categories = faults.map((f) => f.category);
+    expect(categories).toContain("WORKTREE_LEAK");
+    expect(categories).toContain("CUSTOM_OOM_KILL");
+  });
+
+  test("test 14: hitCount increments 0→1 after a learned fault fires", () => {
+    const tmpDir = makeTmpDir();
+    process.env.GSTACK_HOME = tmpDir;
+    const sfDir = path.join(tmpDir, "skill-faults");
+    fs.mkdirSync(sfDir, { recursive: true });
+
+    const patternsFile = path.join(sfDir, "learned-patterns.json");
+    const pattern: LearnedPattern = {
+      category: "CUSTOM_OOM_KILL",
+      severity: "HIGH",
+      description: "Process was OOM killed.",
+      matcherKind: "stdout_contains",
+      pattern: "OOM killed",
+      source: "investigator:test.md",
+      learnedAt: "2026-01-01T00:00:00Z",
+      hitCount: 0,
+    };
+    fs.writeFileSync(patternsFile, JSON.stringify([pattern]), "utf8");
+
+    // Write stdout log that matches
+    const dir = makeTmpDir();
+    const stdoutLog = path.join(dir, "run.log");
+    fs.writeFileSync(stdoutLog, "process OOM killed by kernel\n", "utf8");
+
+    const input = makeInput(dir, { stdoutLogPath: stdoutLog });
+    const faults = detectSkillFaults(input, [pattern]);
+
+    // Fault should have fired
+    expect(faults.map((f) => f.category)).toContain("CUSTOM_OOM_KILL");
+
+    // Read back and verify hitCount incremented
+    const updated = JSON.parse(fs.readFileSync(patternsFile, "utf8")) as Array<{
+      category: string;
+      hitCount: number;
+    }>;
+    const entry = updated.find((e) => e.category === "CUSTOM_OOM_KILL");
+    expect(entry).toBeDefined();
+    expect(entry!.hitCount).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M3.6 Phase 2 bash extraction
+// ---------------------------------------------------------------------------
+
+describe("M3.6 Phase 2 bash extraction", () => {
+  test("test 15: un-mined report (no pattern block, no sentinel, no marker) needs mining", () => {
+    const dir = makeTmpDir();
+    const reportPath = path.join(dir, "fault-report.md");
+    fs.writeFileSync(
+      reportPath,
+      "# Fault Report\n\nSomething went wrong but no pattern extracted yet.\n",
+      "utf8",
+    );
+    expect(reportNeedsMining(reportPath)).toBe(true);
+  });
+
+  test("test 16: GSTACK_NO_PATTERN_FOUND sentinel → marker written immediately", () => {
+    const dir = makeTmpDir();
+    const reportPath = path.join(dir, "fault-report.md");
+    fs.writeFileSync(
+      reportPath,
+      '# Fault Report\n\n<!-- GSTACK_NO_PATTERN_FOUND reason="not specific enough" -->\n',
+      "utf8",
+    );
+    const result = runPhase2Script(dir);
+    expect(result.exitCode).toBe(0);
+    expect(fs.existsSync(reportPath + ".pattern-extracted")).toBe(true);
+  });
+
+  test("test 17: valid GSTACK_LEARNED_PATTERN → JSON updated, marker written", () => {
+    const dir = makeTmpDir();
+    const reportPath = path.join(dir, "fault-report.md");
+    fs.writeFileSync(
+      reportPath,
+      [
+        "# Fault Report",
+        "",
+        "<!-- GSTACK_LEARNED_PATTERN",
+        JSON.stringify({
+          category: "TEST_OOM_KILL",
+          severity: "HIGH",
+          description: "Process was OOM killed.",
+          matcherKind: "stdout_contains",
+          pattern: "OOM killed",
+        }),
+        "-->",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const result = runPhase2Script(dir);
+    expect(result.exitCode).toBe(0);
+
+    // Marker file must exist
+    expect(fs.existsSync(reportPath + ".pattern-extracted")).toBe(true);
+
+    // learned-patterns.json must exist with the entry
+    const patternsFile = path.join(dir, "learned-patterns.json");
+    expect(fs.existsSync(patternsFile)).toBe(true);
+    const parsed = JSON.parse(fs.readFileSync(patternsFile, "utf8")) as Array<{
+      category: string;
+      source: string;
+      learnedAt: string;
+      hitCount: number;
+    }>;
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].category).toBe("TEST_OOM_KILL");
+    expect(typeof parsed[0].source).toBe("string");
+    expect(typeof parsed[0].learnedAt).toBe("string");
+    expect(parsed[0].hitCount).toBe(0);
+  });
+
+  test("test 18: report with .pattern-extracted marker → skipped, no entries added", () => {
+    const dir = makeTmpDir();
+    const reportPath = path.join(dir, "fault-report.md");
+    fs.writeFileSync(
+      reportPath,
+      [
+        "# Fault Report",
+        "",
+        "<!-- GSTACK_LEARNED_PATTERN",
+        JSON.stringify({
+          category: "TEST_OOM_KILL",
+          severity: "HIGH",
+          description: "Process was OOM killed.",
+          matcherKind: "stdout_contains",
+          pattern: "OOM killed",
+        }),
+        "-->",
+      ].join("\n"),
+      "utf8",
+    );
+    // Touch the marker file first so the report is already processed
+    fs.writeFileSync(reportPath + ".pattern-extracted", "", "utf8");
+
+    const result = runPhase2Script(dir);
+    expect(result.exitCode).toBe(0);
+
+    // The patterns file is initialized to [] by the script but no entries are added
+    const patternsFile = path.join(dir, "learned-patterns.json");
+    const content = fs.readFileSync(patternsFile, "utf8");
+    expect(JSON.parse(content)).toEqual([]);
+  });
+
+  test("test 19: malformed JSON in pattern block → marker written, JSON unchanged", () => {
+    const dir = makeTmpDir();
+    const reportPath = path.join(dir, "fault-report.md");
+    fs.writeFileSync(
+      reportPath,
+      [
+        "# Fault Report",
+        "",
+        "<!-- GSTACK_LEARNED_PATTERN",
+        "{not valid json}",
+        "-->",
+      ].join("\n"),
+      "utf8",
+    );
+
+    // Pre-create an empty patterns file
+    const patternsFile = path.join(dir, "learned-patterns.json");
+    fs.writeFileSync(patternsFile, "[]", "utf8");
+
+    const result = runPhase2Script(dir);
+    expect(result.exitCode).toBe(0);
+
+    // Marker must be written
+    expect(fs.existsSync(reportPath + ".pattern-extracted")).toBe(true);
+    // Patterns file must still be empty array
+    const content = fs.readFileSync(patternsFile, "utf8");
+    expect(JSON.parse(content)).toEqual([]);
+  });
+
+  test("test 20: duplicate category → marker written, no duplicate in JSON", () => {
+    const dir = makeTmpDir();
+    const reportPath = path.join(dir, "fault-report.md");
+    fs.writeFileSync(
+      reportPath,
+      [
+        "# Fault Report",
+        "",
+        "<!-- GSTACK_LEARNED_PATTERN",
+        JSON.stringify({
+          category: "TEST_OOM_KILL",
+          severity: "HIGH",
+          description: "Process was OOM killed.",
+          matcherKind: "stdout_contains",
+          pattern: "OOM killed",
+        }),
+        "-->",
+      ].join("\n"),
+      "utf8",
+    );
+
+    // Pre-create patterns file with an existing TEST_OOM_KILL entry
+    const patternsFile = path.join(dir, "learned-patterns.json");
+    const existingEntry: LearnedPattern = {
+      category: "TEST_OOM_KILL",
+      severity: "HIGH",
+      description: "Existing entry.",
+      matcherKind: "stdout_contains",
+      pattern: "OOM killed",
+      source: "investigator:old-report.md",
+      learnedAt: "2025-01-01T00:00:00Z",
+      hitCount: 3,
+    };
+    fs.writeFileSync(patternsFile, JSON.stringify([existingEntry]), "utf8");
+
+    const result = runPhase2Script(dir);
+    expect(result.exitCode).toBe(0);
+
+    // Marker must be written
+    expect(fs.existsSync(reportPath + ".pattern-extracted")).toBe(true);
+
+    // Only 1 entry (no duplicate)
+    const parsed = JSON.parse(fs.readFileSync(patternsFile, "utf8")) as Array<{
+      category: string;
+    }>;
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].category).toBe("TEST_OOM_KILL");
   });
 });
