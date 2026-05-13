@@ -4434,9 +4434,10 @@ async function runPhase(args: {
           logDir(state.slug),
           `phase-${phase.number}-gemini-${action.iteration}-input.md`,
         );
+        const resolvedPhase1 = { ...phase, body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd) };
         fs.writeFileSync(
           inputFilePath,
-          buildGeminiPromptBody(phase, state.planFile, state.branch),
+          buildGeminiPromptBody(resolvedPhase1, state.planFile, state.branch),
         );
         // Pre-create empty output file so a missing-file error is unambiguous.
         fs.writeFileSync(outputFilePath, "");
@@ -4534,10 +4535,11 @@ async function runPhase(args: {
           logDir(state.slug),
           `phase-${phase.number}-gemini-rerun-${action.iteration}-input.md`,
         );
+        const resolvedPhase2 = { ...phase, body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd) };
         fs.writeFileSync(
           inputFilePath,
           buildGeminiPromptBody(
-            phase,
+            resolvedPhase2,
             state.planFile,
             state.branch,
             reviewContent,
@@ -4632,10 +4634,11 @@ async function runPhase(args: {
         const geminiOutputPath =
           phaseState.gemini?.outputFilePath ?? geminiOutputPathFallback;
         const geminiOutputExists = fs.existsSync(geminiOutputPath);
+        const resolvedPhase3 = { ...phase, body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd) };
         fs.writeFileSync(
           inputFilePath,
           buildCodexReviewBody(
-            phase,
+            resolvedPhase3,
             state.planFile,
             state.branch,
             action.iteration,
@@ -4682,9 +4685,10 @@ async function runPhase(args: {
           logDir(state.slug),
           `phase-${phase.number}-gemini-testspec-${action.iteration}-output.md`,
         );
+        const resolvedPhase4 = { ...phase, body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd) };
         fs.writeFileSync(
           inputFilePath,
-          buildGeminiTestSpecPrompt(phase, state.planFile),
+          buildGeminiTestSpecPrompt(resolvedPhase4, state.planFile),
         );
         fs.writeFileSync(outputFilePath, "");
         result = await runRoleTask({
@@ -4984,10 +4988,11 @@ async function runPhase(args: {
             `phase-${phaseN}-dual-${candidate}-${it}-output.md`,
           );
 
+          const resolvedPhase5 = { ...phase, body: resolvePhaseBody(phase.body, args.baseProjectRoot, candidateState.worktreePath) };
           fs.writeFileSync(
             inputPath,
             buildDualImplPromptBody({
-              phase,
+              phase: resolvedPhase5,
               planFile: state.planFile,
               candidate,
               opponent,
@@ -5600,10 +5605,11 @@ async function runPhase(args: {
           logDir(state.slug),
           `phase-${phase.number}-judge-output.md`,
         );
+        const resolvedPhase6 = { ...phase, body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd) };
         fs.writeFileSync(
           inputPath,
           buildJudgePrompt({
-            phase,
+            phase: resolvedPhase6,
             candidates: {
               primary: {
                 label: candidateLabel("primary"),
