@@ -1070,12 +1070,26 @@ The `fault_investigator_model` is read from `configure.cm` and faults are writte
 _MONITOR_EXIT="${_MONITOR_EXIT:-0}"
 [ -f "$BUILD_TMP_DIR/monitor-exit-code" ] && _MONITOR_EXIT=$(cat "$BUILD_TMP_DIR/monitor-exit-code" 2>/dev/null || printf '0\n')
 
+_FAULT_PRIMARY_DIR="$HOME/.gstack/skill-faults"
+mkdir -p "$_FAULT_PRIMARY_DIR"
+_FAULT_INVESTIGATOR_MODEL=$($GSTACK_BIN/gstack-config get fault_investigator_model 2>/dev/null || true)
+[ -z "$_FAULT_INVESTIGATOR_MODEL" ] && _FAULT_INVESTIGATOR_MODEL=$(jq -r '.roles.faultInvestigator.model // empty' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
+[ -z "$_FAULT_INVESTIGATOR_MODEL" ] && _FAULT_INVESTIGATOR_MODEL="claude-sonnet-4-6"
+_FAULT_INVESTIGATOR_PROVIDER=$($GSTACK_BIN/gstack-config get fault_investigator_provider 2>/dev/null || true)
+[ -z "$_FAULT_INVESTIGATOR_PROVIDER" ] && _FAULT_INVESTIGATOR_PROVIDER=$(jq -r '.roles.faultInvestigator.provider // empty' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
+if [ -z "$_FAULT_INVESTIGATOR_PROVIDER" ]; then
+  case "$_FAULT_INVESTIGATOR_MODEL" in
+    gemini*) _FAULT_INVESTIGATOR_PROVIDER="gemini" ;;
+    kimi*) _FAULT_INVESTIGATOR_PROVIDER="kimi" ;;
+    gpt-*|o*) _FAULT_INVESTIGATOR_PROVIDER="codex" ;;
+    *) _FAULT_INVESTIGATOR_PROVIDER="claude" ;;
+  esac
+fi
+
 if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
   _FAULT_LINES=$(grep '"event":"SKILL_FAULT_DETECTED"' "$BUILD_TMP_DIR/monitor-output.log" 2>/dev/null || grep "SKILL_FAULT_DETECTED" "$BUILD_TMP_DIR/monitor-output.log" 2>/dev/null || true)
   if [ -n "$_FAULT_LINES" ]; then
-    _FAULT_PRIMARY_DIR="$HOME/.gstack/skill-faults"
     _FAULT_SECONDARY_DIR=""
-    mkdir -p "$_FAULT_PRIMARY_DIR"
     if _GSTACK_SKILL_TARGET=$(readlink "$HOME/.claude/skills/gstack" 2>/dev/null); then
       case "$_GSTACK_SKILL_TARGET" in
         /*) _GSTACK_SKILL_ABS="$_GSTACK_SKILL_TARGET" ;;
@@ -1083,20 +1097,6 @@ if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
       esac
       _FAULT_SECONDARY_DIR="$_GSTACK_SKILL_ABS/inbox/faults"
       mkdir -p "$_FAULT_SECONDARY_DIR"
-    fi
-
-    _FAULT_INVESTIGATOR_MODEL=$($GSTACK_BIN/gstack-config get fault_investigator_model 2>/dev/null || true)
-    [ -z "$_FAULT_INVESTIGATOR_MODEL" ] && _FAULT_INVESTIGATOR_MODEL=$(jq -r '.roles.faultInvestigator.model // empty' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
-    [ -z "$_FAULT_INVESTIGATOR_MODEL" ] && _FAULT_INVESTIGATOR_MODEL="claude-sonnet-4-6"
-    _FAULT_INVESTIGATOR_PROVIDER=$($GSTACK_BIN/gstack-config get fault_investigator_provider 2>/dev/null || true)
-    [ -z "$_FAULT_INVESTIGATOR_PROVIDER" ] && _FAULT_INVESTIGATOR_PROVIDER=$(jq -r '.roles.faultInvestigator.provider // empty' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
-    if [ -z "$_FAULT_INVESTIGATOR_PROVIDER" ]; then
-      case "$_FAULT_INVESTIGATOR_MODEL" in
-        gemini*) _FAULT_INVESTIGATOR_PROVIDER="gemini" ;;
-        kimi*) _FAULT_INVESTIGATOR_PROVIDER="kimi" ;;
-        gpt-*|o*) _FAULT_INVESTIGATOR_PROVIDER="codex" ;;
-        *) _FAULT_INVESTIGATOR_PROVIDER="claude" ;;
-      esac
     fi
 
     # Each SKILL_FAULT_DETECTED line is a JSON event:
@@ -1186,9 +1186,137 @@ if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
       fi
     done < <(printf '%s\n' "$_FAULT_ROWS")
   fi
+
+  # Catch-all: fire a purely investigative agent when build failed with no known fault category.
+  # Do NOT propose patterns here — that is the pattern miner's job in Step M3.6.
+  if [ "$_MONITOR_EXIT" = "20" ] && [ -z "$_FAULT_ROWS" ]; then
+    _LAST_RUN_ID=$(grep '"event":"RUN_FAILED"' "$BUILD_TMP_DIR/monitor-output.log" 2>/dev/null | jq -r '.runId // "unknown"' 2>/dev/null | tail -1)
+    [ -z "$_LAST_RUN_ID" ] && _LAST_RUN_ID="unknown"
+    _FAILED_STATE_FILE=$(grep '"event":"RUN_FAILED"' "$BUILD_TMP_DIR/monitor-output.log" 2>/dev/null | jq -r '.stateFile // empty' 2>/dev/null | tail -1)
+    _FAILED_STDOUT_LOG=$(grep '"event":"RUN_FAILED"' "$BUILD_TMP_DIR/monitor-output.log" 2>/dev/null | jq -r '.stdoutLog // empty' 2>/dev/null | tail -1)
+    _DISCOVERY_REPORT_NAME="skill-fault-discovery-${_LAST_RUN_ID}-$(date +%Y%m%d-%H%M%S).md"
+    _DISCOVERY_PRIMARY="$_FAULT_PRIMARY_DIR/$_DISCOVERY_REPORT_NAME"
+    _CATCHALL_PROMPT="A build just failed (runId: ${_LAST_RUN_ID}). No known fault category matched. Read the build state at ${_FAILED_STATE_FILE:-<state-file-unavailable>} and stdout log at ${_FAILED_STDOUT_LOG:-<stdout-unavailable>}. Write a detailed investigation: what failed, the root cause, the evidence. You MUST ONLY read files. Do NOT write code, run tests, or commit anything. Write your report to ${_DISCOVERY_PRIMARY}."
+    case "$_FAULT_INVESTIGATOR_PROVIDER" in
+      gemini)
+        gemini -p "$_CATCHALL_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" --yolo > "$_DISCOVERY_PRIMARY" 2>&1 &
+        ;;
+      kimi)
+        kimi --work-dir "$(pwd -P)" -p "$_CATCHALL_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" --yolo --print --final-message-only > "$_DISCOVERY_PRIMARY" 2>&1 &
+        ;;
+      claude)
+        claude --model "$_FAULT_INVESTIGATOR_MODEL" -p "$_CATCHALL_PROMPT" > "$_DISCOVERY_PRIMARY" 2>&1 &
+        ;;
+      codex)
+        _CATCHALL_REASONING=$(jq -r '.roles.faultInvestigator.reasoning // "high"' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
+        codex exec "$_CATCHALL_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" -s workspace-write -c "model_reasoning_effort=\"$_CATCHALL_REASONING\"" -C "$(pwd -P)" > "$_DISCOVERY_PRIMARY" 2>&1 &
+        ;;
+    esac
+  fi
 fi
 { [ "$_MONITOR_EXIT" = "0" ] || [ "$_MONITOR_EXIT" = "13" ]; } && printf '\n⚠ MANDATORY: %s — proceed to Step 3 (Final Ship & Completion). Plans NOT archived. Branches may be unshipped. Do NOT stop here.\n' "$([ "$_MONITOR_EXIT" = "13" ] && echo "FINALIZATION_REQUIRED" || echo "ALL_RUNS_COMPLETE")"
 exit "$_MONITOR_EXIT"
+```
+
+### Step M3.6: Extract Learned Patterns
+
+Run this step every build. Phase 1 queues pattern mining for new investigation reports; Phase 2 extracts already-mined patterns into the active registry.
+
+```bash
+_FAULT_PRIMARY_DIR="${_FAULT_PRIMARY_DIR:-$HOME/.gstack/skill-faults}"
+_LEARNED_PATTERNS_FILE="$_FAULT_PRIMARY_DIR/learned-patterns.json"
+_ALLOWED_MATCHER_KINDS="stdout_contains stdout_regex failureReason_contains failureReason_regex plan_contains plan_regex"
+
+# Initialize patterns file if it doesn't exist yet.
+if [ ! -f "$_LEARNED_PATTERNS_FILE" ]; then
+  mkdir -p "$_FAULT_PRIMARY_DIR"
+  echo "[]" > "$_LEARNED_PATTERNS_FILE"
+fi
+
+# ---------- Phase 1: spawn pattern miner for un-mined investigation reports ----------
+# An un-mined report: a .md file with no GSTACK_LEARNED_PATTERN block,
+# no GSTACK_NO_PATTERN_FOUND sentinel, and no .pattern-extracted marker.
+for _DISC_REPORT in "$_FAULT_PRIMARY_DIR"/skill-fault-discovery-*.md; do
+  [ -f "$_DISC_REPORT" ] || continue
+  [ -f "${_DISC_REPORT}.pattern-extracted" ] && continue
+  grep -q "GSTACK_LEARNED_PATTERN" "$_DISC_REPORT" 2>/dev/null && continue
+  grep -q "GSTACK_NO_PATTERN_FOUND" "$_DISC_REPORT" 2>/dev/null && continue
+
+  # Find matching stdout log and state file from the report name: skill-fault-discovery-<runId>-<ts>.md
+  _DISC_RUN_ID=$(basename "$_DISC_REPORT" | sed 's/skill-fault-discovery-//' | sed 's/-[0-9][0-9]*-[0-9][0-9]*\.md$//' 2>/dev/null || true)
+  _DISC_STDOUT_LOG=$(grep '"event":"RUN_FAILED"' "$BUILD_TMP_DIR/monitor-output.log" 2>/dev/null | jq -r --arg rid "$_DISC_RUN_ID" 'select(.runId == $rid) | .stdoutLog // empty' 2>/dev/null | tail -1)
+  _DISC_STATE_FILE=$(grep '"event":"RUN_FAILED"' "$BUILD_TMP_DIR/monitor-output.log" 2>/dev/null | jq -r --arg rid "$_DISC_RUN_ID" 'select(.runId == $rid) | .stateFile // empty' 2>/dev/null | tail -1)
+
+  _MINER_PROMPT="An investigation report exists at ${_DISC_REPORT}. Also available: stdout log at ${_DISC_STDOUT_LOG:-<unavailable>} and build state at ${_DISC_STATE_FILE:-<unavailable>}. Your job: determine if there is a reliable, specific string or regex pattern that would detect this failure class automatically in future builds. Reason from the evidence. Be conservative — only propose if confident. If you find a reliable pattern, append EXACTLY this block at the end of the report: <!-- GSTACK_LEARNED_PATTERN\n{\"category\": \"UPPER_SNAKE_CASE\", \"severity\": \"HIGH\", \"description\": \"One sentence describing the failure mode.\", \"matcherKind\": \"stdout_contains\", \"pattern\": \"exact string or regex\"}\n--> . If no reliable pattern can be derived, append: <!-- GSTACK_NO_PATTERN_FOUND reason=\"brief explanation\" --> . You MUST ONLY read files and append to the report. No other modifications. matcherKind must be one of: stdout_contains, stdout_regex, failureReason_contains, failureReason_regex, plan_contains, plan_regex."
+
+  _FAULT_INVESTIGATOR_MODEL="${_FAULT_INVESTIGATOR_MODEL:-claude-sonnet-4-6}"
+  _FAULT_INVESTIGATOR_PROVIDER="${_FAULT_INVESTIGATOR_PROVIDER:-claude}"
+  case "$_FAULT_INVESTIGATOR_PROVIDER" in
+    gemini)
+      gemini -p "$_MINER_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" --yolo >> "$_DISC_REPORT" 2>/dev/null &
+      ;;
+    kimi)
+      kimi --work-dir "$(pwd -P)" -p "$_MINER_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" --yolo --print --final-message-only >> "$_DISC_REPORT" 2>/dev/null &
+      ;;
+    claude)
+      claude --model "$_FAULT_INVESTIGATOR_MODEL" -p "$_MINER_PROMPT" >> "$_DISC_REPORT" 2>/dev/null &
+      ;;
+    codex)
+      _MINER_REASONING=$(jq -r '.roles.faultInvestigator.reasoning // "high"' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
+      codex exec "$_MINER_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" -s workspace-write -c "model_reasoning_effort=\"$_MINER_REASONING\"" -C "$(pwd -P)" >> "$_DISC_REPORT" 2>/dev/null &
+      ;;
+  esac
+done
+
+# ---------- Phase 2: extract patterns from mined reports ----------
+for _DISC_REPORT in "$_FAULT_PRIMARY_DIR"/skill-fault-discovery-*.md; do
+  [ -f "$_DISC_REPORT" ] || continue
+  [ -f "${_DISC_REPORT}.pattern-extracted" ] && continue
+
+  # GSTACK_NO_PATTERN_FOUND: just mark as processed.
+  if grep -q "GSTACK_NO_PATTERN_FOUND" "$_DISC_REPORT" 2>/dev/null; then
+    touch "${_DISC_REPORT}.pattern-extracted"
+    continue
+  fi
+
+  grep -q "GSTACK_LEARNED_PATTERN" "$_DISC_REPORT" 2>/dev/null || continue
+
+  # Extract JSON from the <!-- GSTACK_LEARNED_PATTERN ... --> block.
+  _LP_JSON=$(awk '/<!-- GSTACK_LEARNED_PATTERN/{found=1; next} found && /-->/{found=0; next} found{print}' "$_DISC_REPORT")
+
+  # Validate required fields with jq.
+  _LP_CATEGORY=$(printf '%s' "$_LP_JSON" | jq -r '.category // empty' 2>/dev/null) || { touch "${_DISC_REPORT}.pattern-extracted"; continue; }
+  _LP_MATCHER=$(printf '%s' "$_LP_JSON" | jq -r '.matcherKind // empty' 2>/dev/null) || { touch "${_DISC_REPORT}.pattern-extracted"; continue; }
+  _LP_PATTERN=$(printf '%s' "$_LP_JSON" | jq -r '.pattern // empty' 2>/dev/null) || { touch "${_DISC_REPORT}.pattern-extracted"; continue; }
+  [ -z "$_LP_CATEGORY" ] && { touch "${_DISC_REPORT}.pattern-extracted"; continue; }
+  [ -z "$_LP_MATCHER" ] && { touch "${_DISC_REPORT}.pattern-extracted"; continue; }
+  [ -z "$_LP_PATTERN" ] && { touch "${_DISC_REPORT}.pattern-extracted"; continue; }
+
+  # Validate category is UPPER_SNAKE_CASE (no lowercase letters, no leading digit).
+  case "$_LP_CATEGORY" in
+    *[a-z]*|[0-9]*) touch "${_DISC_REPORT}.pattern-extracted"; continue;;
+  esac
+
+  # Validate matcherKind is in the allowed set.
+  _LP_KIND_VALID=0
+  for _K in $_ALLOWED_MATCHER_KINDS; do [ "$_LP_MATCHER" = "$_K" ] && _LP_KIND_VALID=1 && break; done
+  [ "$_LP_KIND_VALID" = "0" ] && { touch "${_DISC_REPORT}.pattern-extracted"; continue; }
+
+  # Dedup: first writer wins — skip if category already registered.
+  if jq -e --arg c "$_LP_CATEGORY" 'any(.[]; .category == $c)' "$_LEARNED_PATTERNS_FILE" > /dev/null 2>&1; then
+    touch "${_DISC_REPORT}.pattern-extracted"
+    continue
+  fi
+
+  # Enrich with metadata and atomically append.
+  _LP_ENRICHED=$(printf '%s' "$_LP_JSON" | jq \
+    --arg src "investigator:$(basename "$_DISC_REPORT")" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '. + {source: $src, learnedAt: $ts, hitCount: 0}' 2>/dev/null) || { touch "${_DISC_REPORT}.pattern-extracted"; continue; }
+  _LP_TMP="${_LEARNED_PATTERNS_FILE}.tmp.$$"
+  jq --argjson entry "$_LP_ENRICHED" '. + [$entry]' "$_LEARNED_PATTERNS_FILE" > "$_LP_TMP" 2>/dev/null && mv "$_LP_TMP" "$_LEARNED_PATTERNS_FILE" || rm -f "$_LP_TMP" 2>/dev/null
+  touch "${_DISC_REPORT}.pattern-extracted"
+done
 ```
 
 **MANDATORY NEXT ACTION — read before continuing:**
