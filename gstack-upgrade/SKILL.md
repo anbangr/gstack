@@ -143,19 +143,19 @@ fi
 git fetch origin main
 if ! git merge --no-edit origin/main; then
   echo "ERROR: gstack upgrade merge has conflicts in $INSTALL_DIR"
-  echo "Resolve conflicts, run ./setup, then rerun /gstack-upgrade if needed."
+  echo "Resolve conflicts, run ./setup --host auto, then rerun /gstack-upgrade if needed."
   exit 1
 fi
 
 if echo "$STASH_OUTPUT" | grep -q "Saved working directory"; then
   if ! git stash pop; then
     echo "ERROR: stashed local changes conflicted after the upgrade merge."
-    echo "Resolve conflicts in $INSTALL_DIR, run ./setup, then rerun /gstack-upgrade if needed."
+    echo "Resolve conflicts in $INSTALL_DIR, run ./setup --host auto, then rerun /gstack-upgrade if needed."
     exit 1
   fi
 fi
 
-if ! ./setup; then
+if ! ./setup --host auto; then
   echo "ERROR: ./setup failed after merging upstream."
   exit 1
 fi
@@ -195,7 +195,7 @@ if ! git merge --no-edit origin/main; then
 fi
 
 mv "$TMP_DIR/gstack" "$INSTALL_DIR"
-if ! (cd "$INSTALL_DIR" && ./setup); then
+if ! (cd "$INSTALL_DIR" && ./setup --host auto); then
   rm -rf "$INSTALL_DIR"
   mv "$INSTALL_DIR.bak" "$INSTALL_DIR"
   echo "ERROR: ./setup failed — restored previous vendored copy."
@@ -241,7 +241,7 @@ Tell user: "Removed vendored copy at `$LOCAL_GSTACK` (team mode active — globa
 mv "$LOCAL_GSTACK" "$LOCAL_GSTACK.bak"
 cp -Rf "$INSTALL_DIR" "$LOCAL_GSTACK"
 rm -rf "$LOCAL_GSTACK/.git"
-cd "$LOCAL_GSTACK" && ./setup
+cd "$LOCAL_GSTACK" && ./setup --host auto
 rm -rf "$LOCAL_GSTACK.bak"
 ```
 Tell user: "Also updated vendored copy at `$LOCAL_GSTACK` — commit `.claude/skills/gstack/` when you're ready."
@@ -251,7 +251,7 @@ If `./setup` fails, restore from backup and warn the user:
 rm -rf "$LOCAL_GSTACK"
 mv "$LOCAL_GSTACK.bak" "$LOCAL_GSTACK"
 ```
-Tell user: "Sync failed — restored previous version at `$LOCAL_GSTACK`. Run `/gstack-upgrade` manually to retry."
+Tell user: "Sync failed — restored previous version at `$LOCAL_GSTACK`. Run `cd $INSTALL_DIR && ./setup --host auto`, then retry `/gstack-upgrade`."
 
 ### Step 4.6: Regenerate and audit skill consistency
 
