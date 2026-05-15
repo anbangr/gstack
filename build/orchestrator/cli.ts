@@ -6415,7 +6415,11 @@ export function buildReleaseDaemonDoctorReport(opts: {
   let recentLogLines: string[] = [];
   if (exists(errLog)) {
     try {
-      const all = readFile(errLog).split("\n");
+      // Cap the read at 16 KB so a runaway log doesn't make doctor OOM. The
+      // last 5 non-empty lines are all we need.
+      const raw = readFile(errLog);
+      const trimmed = raw.length > 16_384 ? raw.slice(-16_384) : raw;
+      const all = trimmed.split("\n");
       recentLogLines = all.slice(-5).filter((line) => line.length > 0);
     } catch {
       recentLogLines = [];

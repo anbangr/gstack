@@ -1,5 +1,35 @@
 # TODOS
 
+## Pre-existing test failures observed on feat/release-daemon-path-fix-and-doctor
+
+### P0: 9 unrelated tests fail before any of this branch's changes
+
+**What:** Running `bun test` on `main` produces these failures, none of which
+this branch touches: 5 timeouts in `test/global-discover.test.ts` (the discover
+CLI takes >5s on a populated `~/.gstack`); 2 staleness assertions in the
+v1.27.0.0 brain-rename test (refs to `gstack-brain-init` and `gbrain_sync_mode`
+still in source after the rename); 1 failure in
+`test/gstack-upgrade-skill.test.ts` (Step 4.8 fork overlay assertion); 1
+failure in `test/developer-profile.test.ts > derive nudges scope_appetite
+upward after expand choices`.
+
+**Why:** Pre-existing failures hide regressions from new work. Each `/ship` has
+to triage and skip them, which dilutes signal. The Step 5 triage classified
+them as pre-existing (none of their code paths overlap with this branch's
+diff), but they should not stay broken.
+
+**Pros:** Fixing them restores a green baseline. `/ship` runs become faster
+because triage isn't needed. Future regressions become visible immediately.
+
+**Cons:** 9 failures across 4 unrelated areas, likely 30-60 min of investigation
+each to find root cause.
+
+**Context:** Discovered by `/ship` triage on
+`feat/release-daemon-path-fix-and-doctor` at commit a0ce8797 (2026-05-16).
+Baseline-on-main `bun test` reproduces the same 9 failures, confirming they
+predate this branch. The global-discover timeouts may be data-volume related
+(this dev box has heavy `~/.gstack/projects/` content from real use).
+
 ## Migration telemetry (release-daemon-style notices)
 
 ### P3: Emit telemetry when migration scripts print user-facing banners
