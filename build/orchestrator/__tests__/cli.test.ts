@@ -43,6 +43,7 @@ import {
   renderReleaseDaemonDoctorReport,
   runRoleTask,
   buildKindInstructions,
+  chooseMergePath,
   extractCoverageTarget,
   resolvePhaseBody,
   HELP_TEXT,
