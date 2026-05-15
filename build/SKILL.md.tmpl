@@ -958,6 +958,17 @@ for i in $(seq 0 $((_RUN_COUNT - 1))); do
     "$BUILD_RUN_MANIFEST" > "$_MANIFEST_TMP"
   mv "$_MANIFEST_TMP" "$BUILD_RUN_MANIFEST"
 
+  # Lazy log rotation: agent-stdout.log can grow indefinitely across
+  # resumes. With the orchestrator now emitting RUN_HEARTBEAT lines
+  # every 30s, growth picks up ~120 lines/hour on top of normal output.
+  # If the existing log is over 50MB, truncate to the last 25MB. We
+  # write to a temp file and atomically rename so we don't race the
+  # outgoing `tee`. Failure is non-fatal — worst case the log is large.
+  if [ -f "$stdoutLog" ] && [ "$(wc -c < "$stdoutLog" 2>/dev/null || echo 0)" -gt 52428800 ]; then
+    tail -c 26214400 "$stdoutLog" > "$stdoutLog.rotate.tmp" 2>/dev/null &&
+      mv "$stdoutLog.rotate.tmp" "$stdoutLog" 2>/dev/null || true
+  fi
+
   (
     "${_LAUNCH_COMMAND[@]}" 2>&1 | tee "$stdoutLog"
     echo "$?" > "$_RUN_DIR/exit-code"
@@ -1044,7 +1055,7 @@ If the host cannot invoke skills natively, report that limitation once and write
 
 - `USER_ACTION_REQUIRED`: read the final JSON `message` plus the referenced `stdoutLog` and ask the user for the next action. Do not kill or resume manually unless the user chooses that path.
 - `RUN_FAILED`: report the failed run and preserve its worktree for debugging. Use the referenced `stateFile` and `stdoutLog` for the failure summary.
-- `MONITOR_AGENT_ESCALATION`: the CLI-owned supervisor already asked the configured `monitorAgent` to diagnose a blocking event. Read `sourceEvent`, `verdict`, `recommendedHostAction`, `suggestedCommands`, and `userChoices`. If `verdict` is `host_action_required`, perform the safe host action or inspection command. If `verdict` is `user_action_required`, ask the user to choose. Do not let the monitor agent edit, commit, kill processes, patch state JSON, or override deterministic monitor identity checks.
+- `MONITOR_AGENT_ESCALATION`: the CLI-owned supervisor already asked the configured `monitorAgent` to diagnose a blocking event. Read `sourceEvent`, `verdict`, `recommendedHostAction`, `suggestedCommands`, and `userChoices`. If `verdict` is `host_action_required`, perform the safe host action or inspection command. If `verdict` is `user_action_required`, ask the user to choose. If `verdict` is `no_action`, the supervisor sees nothing the host should do — print `summary` for visibility, then `sleep 60` in the same Bash step before re-running the monitor command. Do NOT re-enter immediately on `no_action`; that just burns supervisor calls while the child sub-agent does real work. If repeated `no_action` (or any verdict) escalations stack up, the orchestrator surfaces a `USER_ACTION_REQUIRED` event with a `loopGuard` field instead — handle that via the `USER_ACTION_REQUIRED` clause above. Do not let the monitor agent edit, commit, kill processes, patch state JSON, or override deterministic monitor identity checks.
 - `MONITOR_REENTER`: the foreground watch reached `--max-wall-ms`; immediately re-run the same monitor command in the same host session. Do not use `ScheduleWakeup` here.
 - `MONITOR_ERROR`: stop and report the error. Historical manifests without `launchCommand` are invalid; regenerate or relaunch through Step M2.
 

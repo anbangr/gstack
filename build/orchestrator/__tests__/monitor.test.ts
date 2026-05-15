@@ -370,6 +370,115 @@ describe("evaluateMonitorOnce", () => {
     expect(result.terminalEvent.message).toContain("active-run registry owner");
   });
 
+  it("emits RUN_RUNNING when state is stale but stdoutLog mtime is fresh (heartbeat keep-alive)", () => {
+    // Pins Fix 1 (heartbeat). The gstack-build CLI emits a periodic
+    // RUN_HEARTBEAT line to stdout while a long sub-agent call is in
+    // flight; the outer `tee "$stdoutLog"` keeps stdoutLog mtime
+    // current. recentProcessActivity should pick that up and the
+    // monitor should NOT escalate.
+    const data = manifest();
+    const run = data.runs[0];
+    const registryDir = path.join(tmpDir, "active-runs");
+    fs.mkdirSync(registryDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(registryDir, `${run.runId}.json`),
+      JSON.stringify({
+        runId: run.runId,
+        stateSlug: run.stateSlug,
+        repoPath: run.worktreePath,
+        baseProjectRoot: run.repoPath,
+        planFile: run.livingPlanPath,
+        pid: process.pid,
+        status: "running",
+        startedAt: "2026-05-08T00:00:00.000Z",
+        lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+        branches: [],
+      }),
+    );
+    writeState(run, {
+      lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+    });
+    // Fresh stdoutLog: written "now-1s" relative to the monitor's
+    // synthetic now-time below.
+    fs.mkdirSync(path.dirname(run.stdoutLog), { recursive: true });
+    fs.writeFileSync(run.stdoutLog, "anything\n");
+    const fresh = new Date("2026-05-08T00:03:59.000Z");
+    fs.utimesSync(run.stdoutLog, fresh, fresh);
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:04:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+
+    // Per-run terminal events live in result.events. The watch-loop's
+    // outer terminal is MONITOR_REENTER (or ALL_RUNS_COMPLETE) when no
+    // run-level escalation fired.
+    expect(result.terminalEvent.event).toBe("MONITOR_REENTER");
+    const runEvents = result.events.filter(
+      (e) => "runId" in e && e.runId === data.runs[0].runId,
+    );
+    expect(runEvents.length).toBeGreaterThan(0);
+    const last = runEvents[runEvents.length - 1];
+    expect(last.event).toBe("RUN_RUNNING");
+    expect(last.message).toContain("waiting for state update");
+    // Crucially, no USER_ACTION_REQUIRED in the event stream — the
+    // false-positive escalation is gone.
+    expect(
+      result.events.some((e) => e.event === "USER_ACTION_REQUIRED"),
+    ).toBe(false);
+  });
+
+  it("REGRESSION: still escalates USER_ACTION_REQUIRED when state, pidFile, AND stdoutLog are ALL stale (true-stuck detection preserved)", () => {
+    // Mandatory regression test: Fix 1 must remove the false-positive
+    // escalation without removing the true-positive ("orchestrator
+    // truly hung") escalation. If this test ever fails, the staleness
+    // path has been silently broken by a future refactor.
+    const data = manifest();
+    const run = data.runs[0];
+    const registryDir = path.join(tmpDir, "active-runs");
+    fs.mkdirSync(registryDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(registryDir, `${run.runId}.json`),
+      JSON.stringify({
+        runId: run.runId,
+        stateSlug: run.stateSlug,
+        repoPath: run.worktreePath,
+        baseProjectRoot: run.repoPath,
+        planFile: run.livingPlanPath,
+        pid: process.pid,
+        status: "running",
+        startedAt: "2026-05-08T00:00:00.000Z",
+        lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+        branches: [],
+      }),
+    );
+    writeState(run, {
+      lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+    });
+    // Write a stdoutLog and pidFile but stamp their mtimes well outside
+    // the 180s staleness window. recentProcessActivity must be false.
+    fs.mkdirSync(path.dirname(run.stdoutLog), { recursive: true });
+    fs.writeFileSync(run.stdoutLog, "anything\n");
+    fs.writeFileSync(run.pidFile, `${process.pid}\n`);
+    const stale = new Date("2026-05-07T23:55:00.000Z");
+    fs.utimesSync(run.stdoutLog, stale, stale);
+    fs.utimesSync(run.pidFile, stale, stale);
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:04:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+
+    expect(result.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
+    expect(result.terminalEvent.message).toContain(
+      "active-run registry owner",
+    );
+  });
+
   it("emits MONITOR_ERROR instead of crashing when the resume executable is missing", () => {
     const data = manifest({
       launchCommand: [path.join(tmpDir, "missing-gstack-build")],
