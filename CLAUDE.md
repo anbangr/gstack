@@ -60,6 +60,7 @@ variants to force all tests. Run `eval:select` to preview which tests would run.
 (in `test/helpers/touchfiles.ts`). CI runs only gate tests (`EVALS_TIER=gate`);
 periodic tests run weekly via cron or manually. Use `EVALS_TIER=gate` or
 `EVALS_TIER=periodic` to filter. When adding new E2E tests, classify them:
+
 1. Safety guardrail or deterministic functional test? -> `gate`
 2. Quality benchmark, Opus model test, or non-deterministic? -> `periodic`
 3. Requires external service (Codex, Gemini)? -> `periodic`
@@ -197,6 +198,7 @@ SKILL.md.tmpl files are **prompt templates read by Claude**, not bash scripts.
 Each bash code block runs in a separate shell — variables do not persist between blocks.
 
 Rules:
+
 - **Use natural language for logic and state.** Don't use shell variables to pass
   state between code blocks. Instead, tell Claude what to remember and reference
   it in prose (e.g., "the base branch detected in Step 0").
@@ -273,13 +275,13 @@ is load-bearing for scope isolation.
 
 **Sidebar security stack** (layered defense against prompt injection):
 
-| Layer | Module | Lives in |
-|-------|--------|----------|
-| L1-L3 | `content-security.ts` | both server and agent — datamarking, hidden element strip, ARIA regex, URL blocklist, envelope wrapping |
-| L4 | `security-classifier.ts` (TestSavantAI ONNX) | **sidebar-agent only** |
-| L4b | `security-classifier.ts` (Claude Haiku transcript) | **sidebar-agent only** |
-| L5 | `security.ts` (canary) | both — inject in compiled, check in agent |
-| L6 | `security.ts` (combineVerdict ensemble) | both |
+| Layer | Module                                             | Lives in                                                                                                |
+| ----- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| L1-L3 | `content-security.ts`                              | both server and agent — datamarking, hidden element strip, ARIA regex, URL blocklist, envelope wrapping |
+| L4    | `security-classifier.ts` (TestSavantAI ONNX)       | **sidebar-agent only**                                                                                  |
+| L4b   | `security-classifier.ts` (Claude Haiku transcript) | **sidebar-agent only**                                                                                  |
+| L5    | `security.ts` (canary)                             | both — inject in compiled, check in agent                                                               |
+| L6    | `security.ts` (combineVerdict ensemble)            | both                                                                                                    |
 
 **Critical constraint:** `security-classifier.ts` CANNOT be imported from the
 compiled browse binary. `@huggingface/transformers` v4 requires `onnxruntime-node`
@@ -289,6 +291,7 @@ for `server.ts`. See `~/.gstack/projects/garrytan-gstack/ceo-plans/2026-04-19-pr
 §"Pre-Impl Gate 1 Outcome" for full architectural decision.
 
 **Thresholds** (in `security.ts`):
+
 - `BLOCK: 0.85` — single-layer score that would cause BLOCK if cross-confirmed
 - `WARN: 0.75` — cross-confirm threshold. When L4 AND L4b both >= 0.75 → BLOCK
 - `LOG_ONLY: 0.40` — gates transcript classifier (skip Haiku when all layers < 0.40)
@@ -303,6 +306,7 @@ this is the Stack Overflow instruction-writing FP mitigation. Canary leak
 always BLOCKs (deterministic).
 
 **Env knobs:**
+
 - `GSTACK_SECURITY_OFF=1` — emergency kill switch. Classifier stays off even if
   warmed. Canary is still injected; just the ML scan is skipped.
 - `GSTACK_SECURITY_ENSEMBLE=deberta` — opt-in DeBERTa-v3 ensemble. Adds
@@ -324,8 +328,16 @@ working directory (gitignored). This means skill changes are **live immediately*
 great for rapid iteration, risky during big refactors where half-written skills
 could break other Claude Code sessions using gstack concurrently.
 
+**If you maintain a separate source clone** (e.g. this directory) AND the global
+install at `~/.claude/skills/gstack/`, the symlink path is not interchangeable
+with the rsync path — pick one. Use the symlink for rapid iteration in a single
+working tree; use the rsync deploy (see "Deploying to the active skill" below)
+when you want source and runtime to be separately reasoning-trackable. Mixing
+both produces the partial-deploy failure class.
+
 **Check once per session:** Run `ls -la .claude/skills/gstack` to see if it's a
 symlink or a real copy. If it's a symlink to your working directory, be aware that:
+
 - Template changes + `bun run gen:skill-docs` immediately affect all gstack invocations
 - Breaking changes to SKILL.md.tmpl files can break concurrent gstack sessions
 - During large refactors, remove the symlink (`rm .claude/skills/gstack`) so the
@@ -339,7 +351,8 @@ Names are either short (`qa`) or namespaced (`gstack-qa`), controlled by
 skip the interactive prompt.
 
 **Note:** Vendoring gstack into a project's repo is deprecated. Use global install
-+ `./setup --team` instead. See README.md for team mode instructions.
+
+- `./setup --team` instead. See README.md for team mode instructions.
 
 **For plan reviews:** When reviewing plans that modify skill templates or the
 gen-skill-docs pipeline, consider whether the changes should be tested in isolation
@@ -373,6 +386,7 @@ into separate commits before pushing. Each commit should be independently
 understandable and revertable.
 
 Examples of good bisection:
+
 - Rename/move separate from behavior changes
 - Test infrastructure (touchfiles, helpers) separate from test implementations
 - Template changes separate from generated file regeneration
@@ -422,12 +436,12 @@ Config: `slop-scan.config.json` at repo root (currently excludes `**/vendor/**`)
 
 ### Utilities in `browse/src/error-handling.ts`
 
-| Function | Use when | Behavior |
-|----------|----------|----------|
-| `safeUnlink(path)` | Normal file deletion | Ignores ENOENT, rethrows others |
-| `safeUnlinkQuiet(path)` | Shutdown/emergency cleanup | Swallows all errors |
-| `safeKill(pid, signal)` | Sending signals | Ignores ESRCH, rethrows others |
-| `isProcessAlive(pid)` | Boolean process checks | Returns true/false, never throws |
+| Function                | Use when                   | Behavior                         |
+| ----------------------- | -------------------------- | -------------------------------- |
+| `safeUnlink(path)`      | Normal file deletion       | Ignores ENOENT, rethrows others  |
+| `safeUnlinkQuiet(path)` | Shutdown/emergency cleanup | Swallows all errors              |
+| `safeKill(pid, signal)` | Sending signals            | Ignores ESRCH, rethrows others   |
+| `isProcessAlive(pid)`   | Boolean process checks     | Returns true/false, never throws |
 
 ### Score tracking
 
@@ -507,6 +521,7 @@ narrative. It belongs in PR descriptions and commit messages, not CHANGELOG.
 bumped VERSION from v1.5.0.0 → v1.5.1.0 → v1.6.0.0 during development and only the
 final v1.6.0.0 ships to main, the entry must read as if v1.5.1.0 never existed.
 Concretely, NEVER write:
+
 - "v1.5.1.0 had a bug that v1.6.0.0 fixes" — readers don't know about v1.5.1.0; it's
   a branch-internal artifact.
 - "The shipping headline of v1.5.1.0 was broken because..." — same reason. From main's
@@ -522,6 +537,7 @@ ownership"), document it as a property, not as a fix. The shipped system is what
 the user gets; the path to that system is invisible to them.
 
 **When to write the CHANGELOG entry:**
+
 - At `/ship` time (Step 13), not during development or mid-branch.
 - The entry covers ALL commits on this branch vs the base branch.
 - Never fold new work into an existing CHANGELOG entry from a prior version that
@@ -529,6 +545,7 @@ the user gets; the path to that system is invisible to them.
   bump to v0.10.1.0 with a new entry — don't edit the v0.10.0.0 entry.
 
 **Key questions before writing:**
+
 1. What branch am I on? What did THIS branch change?
 2. Is the base branch version already released? (If yes, bump and create new entry.)
 3. Does an existing entry on this branch already cover earlier work? (If yes, replace
@@ -541,10 +558,11 @@ features, bump to v0.13.9.0 with a new entry. Never jam your changes into an ent
 already landed on main. Your entry goes on top because your branch lands next.
 
 **After merging main, always check:**
+
 - Does CHANGELOG have your branch's own entry separate from main's entries?
 - Is VERSION higher than main's VERSION?
 - Is your entry the topmost entry in CHANGELOG (above main's latest)?
-If any answer is no, fix it before continuing.
+  If any answer is no, fix it before continuing.
 
 **After any CHANGELOG edit that moves, adds, or removes entries,** immediately run
 `grep "^## \[" CHANGELOG.md` to verify no duplicates and a sensible reverse-chronological
@@ -614,6 +632,7 @@ Structure for the top of every `## [X.Y.Z]` entry:
    the metrics to a real workflow shift. End with what to do.
 
 Voice rules for the release summary:
+
 - No em dashes (use commas, periods, "...").
 - No AI vocabulary (delve, robust, comprehensive, nuanced, fundamental, etc.) or
   banned phrases ("here's the kicker", "the bottom line", etc.).
@@ -623,6 +642,7 @@ Voice rules for the release summary:
 - Be direct about quality. "Well-designed" or "this is a mess." No dancing.
 
 Source material:
+
 - CHANGELOG previous entry for prior context.
 - Benchmark files or `/retro` output for headline numbers.
 - Recent commits (`git log <prev-version>..HEAD --oneline`) for what shipped.
@@ -648,6 +668,7 @@ above, plus:
 This repo (`anbangr/gstack`) is a personal fork of `garrytan/gstack`. The top-level `VERSION` file tracks the fork's release state relative to upstream. Bumping it creates divergence that makes `gstack-update-check` output confusing (`UPGRADE_AVAILABLE` with the local version higher than upstream).
 
 **The rule:**
+
 - Editing or building a custom skill (e.g. `build/SKILL.md.tmpl`)? Bump only the `version:` frontmatter field inside that skill file (e.g. `version: 1.19.0`). Do NOT touch `VERSION` or `package.json` version.
 - Merging upstream? Sync `VERSION` and `package.json` to upstream's version after the merge.
 - Only bump `VERSION` when merging or syncing with upstream, never for fork-local skill work.
@@ -656,14 +677,14 @@ This repo (`anbangr/gstack`) is a personal fork of `garrytan/gstack`. The top-le
 
 When estimating or discussing effort, always show both human-team and CC+gstack time:
 
-| Task type | Human team | CC+gstack | Compression |
-|-----------|-----------|-----------|-------------|
-| Boilerplate / scaffolding | 2 days | 15 min | ~100x |
-| Test writing | 1 day | 15 min | ~50x |
-| Feature implementation | 1 week | 30 min | ~30x |
-| Bug fix + regression test | 4 hours | 15 min | ~20x |
-| Architecture / design | 2 days | 4 hours | ~5x |
-| Research / exploration | 1 day | 3 hours | ~3x |
+| Task type                 | Human team | CC+gstack | Compression |
+| ------------------------- | ---------- | --------- | ----------- |
+| Boilerplate / scaffolding | 2 days     | 15 min    | ~100x       |
+| Test writing              | 1 day      | 15 min    | ~50x        |
+| Feature implementation    | 1 week     | 30 min    | ~30x        |
+| Bug fix + regression test | 4 hours    | 15 min    | ~20x        |
+| Architecture / design     | 2 days     | 4 hours   | ~5x         |
+| Research / exploration    | 1 day      | 3 hours   | ~3x         |
 
 Completeness is cheap. Don't recommend shortcuts when the complete implementation
 is a "lake" (achievable) not an "ocean" (multi-quarter migration). See the
@@ -696,6 +717,7 @@ a preamble text change affects agent behavior, a new helper changes timing, a
 regenerated SKILL.md shifts prompt context.
 
 **Required before attributing a failure to "pre-existing":**
+
 1. Run the same eval on main (or base branch) and show it fails there too
 2. If it passes on main but fails on the branch — it IS your change. Trace the blame.
 3. If you can't run on main, say "unverified — may or may not be related" and flag it
@@ -726,16 +748,23 @@ Instead, extract only the section the test actually needs:
 
 ```typescript
 // BAD — agent reads 1900 lines, burns tokens on irrelevant sections
-fs.copyFileSync(path.join(ROOT, 'ship', 'SKILL.md'), path.join(dir, 'ship-SKILL.md'));
+fs.copyFileSync(
+  path.join(ROOT, "ship", "SKILL.md"),
+  path.join(dir, "ship-SKILL.md"),
+);
 
 // GOOD — agent reads ~60 lines, finishes in 38s instead of timing out
-const full = fs.readFileSync(path.join(ROOT, 'ship', 'SKILL.md'), 'utf-8');
-const start = full.indexOf('## Review Readiness Dashboard');
-const end = full.indexOf('\n---\n', start);
-fs.writeFileSync(path.join(dir, 'ship-SKILL.md'), full.slice(start, end > start ? end : undefined));
+const full = fs.readFileSync(path.join(ROOT, "ship", "SKILL.md"), "utf-8");
+const start = full.indexOf("## Review Readiness Dashboard");
+const end = full.indexOf("\n---\n", start);
+fs.writeFileSync(
+  path.join(dir, "ship-SKILL.md"),
+  full.slice(start, end > start ? end : undefined),
+);
 ```
 
 Also when running targeted E2E tests to debug failures:
+
 - Run in **foreground** (`bun test ...`), not background with `&` and `tee`
 - Never `pkill` running eval processes and restart — you lose results and waste money
 - One clean run beats three killed-and-restarted runs
@@ -765,13 +794,31 @@ Repeat for each skill: `gstack-openclaw-ceo-review`, `gstack-openclaw-investigat
 
 ## Deploying to the active skill
 
-The active skill lives at `~/.claude/skills/gstack/`. After making changes:
+The active skill at `~/.claude/skills/gstack/` is a clean rsync of this source
+repo with no `.git` — by design. **Do not git-clone into it, do not edit it
+directly, do not commit there.** All changes happen here in the source repo.
 
-1. Push your branch
-2. Fetch and reset in the skill directory: `cd ~/.claude/skills/gstack && git fetch origin && git reset --hard origin/main`
-3. Rebuild: `cd ~/.claude/skills/gstack && bun run build`
+To deploy a change from source to active skill:
 
-Or copy the binaries directly:
+```bash
+rsync -a --delete --exclude '.git' \
+  /Users/anbang/Documents/Antigravity/claude-workspace/gstack/ \
+  ~/.claude/skills/gstack/
+```
+
+This is the same mechanism `/gstack-upgrade` uses. If you upgrade from upstream
+via `/gstack-upgrade`, that overwrites your local source changes — push your
+source branch first.
+
+**Why no `.git` in the runtime:** the runtime is downstream of source. A git
+repo there invites cross-editing, stash mess, partial deploys, and the
+"skill template references a CLI flag that the runtime CLI doesn't parse"
+failure class. Keeping it git-less makes those structurally impossible.
+`bin/gstack-update-check` warns at every skill start if `.git` appears in the
+runtime.
+
+For binaries only (rare — usually rsync covers them):
+
 - `cp browse/dist/browse ~/.claude/skills/gstack/browse/dist/browse`
 - `cp design/dist/design ~/.claude/skills/gstack/design/dist/design`
 
@@ -780,6 +827,7 @@ Or copy the binaries directly:
 When the user's request matches an available skill, invoke it via the Skill tool. When in doubt, invoke the skill.
 
 Key routing rules:
+
 - Product ideas/brainstorming → invoke /office-hours
 - Strategy/scope → invoke /plan-ceo-review
 - Architecture → invoke /plan-eng-review
@@ -794,6 +842,7 @@ Key routing rules:
 - Resume context → invoke /context-restore
 
 ## GBrain Search Guidance (configured by /sync-gbrain)
+
 <!-- gstack-gbrain-search-guidance:start -->
 
 GBrain is set up and synced on this machine. The agent should prefer gbrain
@@ -809,19 +858,21 @@ each have their own pin and their own indexed pages, so semantic results
 match the actual code on disk in this worktree.
 
 Two indexed corpora available via the `gbrain` CLI:
+
 - This worktree's code (auto-pinned via `.gbrain-source`).
 - `~/.gstack/` curated memory (registered as `gstack-brain-<user>` source via
   the existing federation pipeline).
 
 Prefer gbrain when:
+
 - "Where is X handled?" / semantic intent, no exact string yet:
-    `gbrain search "<terms>"` or `gbrain query "<question>"`
+  `gbrain search "<terms>"` or `gbrain query "<question>"`
 - "Where is symbol Y defined?" / symbol-based code questions:
-    `gbrain code-def <symbol>` or `gbrain code-refs <symbol>`
+  `gbrain code-def <symbol>` or `gbrain code-refs <symbol>`
 - "What calls Y?" / "What does Y depend on?":
-    `gbrain code-callers <symbol>` / `gbrain code-callees <symbol>`
+  `gbrain code-callers <symbol>` / `gbrain code-callees <symbol>`
 - "What did we decide last time?" / past plans, retros, learnings:
-    `gbrain search "<terms>" --source gstack-brain-<user>`
+  `gbrain search "<terms>" --source gstack-brain-<user>`
 
 Grep is still right for known exact strings, regex, multiline patterns, and
 file globs. Run `/sync-gbrain` after meaningful code changes; for ongoing

@@ -178,6 +178,13 @@ fi
 if [ -d "$INSTALL_DIR/.git" ]; then
   echo "NOTE: Converting $INSTALL_DIR from git clone to plain copy."
   echo "Fork git history stays in $FORK_REPO."
+  # rsync --exclude '.git' SKIPS .git on the source side, but that ALSO
+  # protects an existing .git on the destination from --delete. To actually
+  # convert a clone to a plain copy, we must remove the destination .git
+  # ourselves before the rsync. Without this, the install dir keeps its
+  # old origin remote and can be hand-edited as a git working tree —
+  # the exact failure class that caused the May-2026 drift.
+  rm -rf "$INSTALL_DIR/.git"
 fi
 mkdir -p "$INSTALL_DIR"
 rsync -a --delete --exclude '.git' "$FORK_REPO/" "$INSTALL_DIR/"

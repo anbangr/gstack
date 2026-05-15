@@ -10,6 +10,7 @@ set -uo pipefail
 
 GSTACK_HOME="${GSTACK_HOME:-$HOME/.gstack}"
 PATTERNS_FILE="$GSTACK_HOME/skill-faults/learned-patterns.json"
+PROPOSALS_DIR="$GSTACK_HOME/skill-faults/fix-proposals"
 
 # ─── Check for jq ───────────────────────────────────────────
 if ! command -v jq &> /dev/null; then
@@ -37,13 +38,23 @@ echo "LEARNED FAULT PATTERNS  ($PATTERNS_FILE)"
 echo ""
 
 # Build table header
-printf "%-26s %-8s %4s  %-19s %-29s\n" "CATEGORY" "SEV" "HITS" "LEARNED" "SOURCE"
-printf "%s  %s  %s  %s  %s\n" "──────────────────────────────" "────────" "────" "───────────────────" "─────────────────────────────"
+printf "%-26s %-8s %4s  %-8s %-19s %-29s\n" "CATEGORY" "SEV" "HITS" "FIX" "LEARNED" "SOURCE"
+printf "%s  %s  %s  %s  %s  %s\n" "──────────────────────────────" "────────" "────" "────────" "───────────────────" "─────────────────────────────"
 
 # Process each pattern using jq directly
 jq -r '.[] | [.category, .severity, .hitCount, .learnedAt, .source] | @tsv' "$PATTERNS_FILE" 2>/dev/null | while IFS=$'\t' read -r category severity hit_count learned_at source; do
   # Format CATEGORY (up to 26 chars, no ellipsis, just cut)
   category_display="${category:0:26}"
+
+  # Determine fix proposal status for this category
+  fix_status="—"
+  if [ -d "$PROPOSALS_DIR" ]; then
+    if find "$PROPOSALS_DIR" -maxdepth 1 -name "${category}-*.md.applied" 2>/dev/null | grep -q .; then
+      fix_status="applied"
+    elif find "$PROPOSALS_DIR" -maxdepth 1 -name "${category}-*.md" ! -name "*.applied" 2>/dev/null | grep -q .; then
+      fix_status="proposed"
+    fi
+  fi
 
   # Format SEV (up to 8 chars)
   sev_display="${severity:0:8}"
@@ -66,7 +77,7 @@ jq -r '.[] | [.category, .severity, .hitCount, .learnedAt, .source] | @tsv' "$PA
     source_display="$source"
   fi
 
-  printf "%-26s %-8s %4s  %-19s %-29s\n" "$category_display" "$sev_display" "$hits_padded" "$learned_display" "$source_display"
+  printf "%-26s %-8s %4s  %-8s %-19s %-29s\n" "$category_display" "$sev_display" "$hits_padded" "$fix_status" "$learned_display" "$source_display"
 done
 
 # ─── Get totals from jq ──────────────────────────────────────
@@ -76,3 +87,4 @@ ACTIVE_COUNT=$(jq '[.[] | select(.hitCount > 0)] | length' "$PATTERNS_FILE" 2>/d
 echo ""
 echo "$TOTAL_COUNT patterns total. $ACTIVE_COUNT active (hitCount > 0)."
 echo "Edit $PATTERNS_FILE directly to remove or update a pattern."
+echo "Run 'gstack skill:propose-fix --all' to generate fix proposals for unfixed categories."

@@ -20,6 +20,18 @@ SNOOZE_FILE="$STATE_DIR/update-snoozed"
 VERSION_FILE="$GSTACK_DIR/VERSION"
 REMOTE_URL="${GSTACK_REMOTE_URL:-https://raw.githubusercontent.com/garrytan/gstack/main/VERSION}"
 
+# ─── Structural guardrail: runtime should NOT be a git repo ────
+# The active skill is supposed to be a clean rsync downstream of source.
+# A .git directory there means someone git-cloned into it, which invites
+# partial deploys, stash mess, and skill-template-vs-CLI flag drift.
+# Informational only (stderr, exit 0); see CLAUDE.md → "Deploying to the
+# active skill".
+if [ -d "$HOME/.claude/skills/gstack/.git" ]; then
+  echo "WARNING: gstack runtime has .git — this should not be." >&2
+  echo "  The runtime is supposed to be a clean rsync downstream of source." >&2
+  echo "  See CLAUDE.md → 'Deploying to the active skill'." >&2
+fi
+
 # ─── Force flag (busts cache + snooze for standalone /gstack-upgrade) ──
 if [ "${1:-}" = "--force" ]; then
   rm -f "$CACHE_FILE"

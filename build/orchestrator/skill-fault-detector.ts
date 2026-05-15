@@ -308,23 +308,30 @@ export function detectSkillFaults(
 
     // ------------------------------------------------------------------
     // PLAN_SYNTHESIS_INVALID — missing Origin trace: or Acceptance:
+    // The synthesizer template (build/SKILL.md.tmpl:426-428) places these
+    // headers on `## Feature X:` blocks. Phases inherit from features.
     // ------------------------------------------------------------------
     if (planContent) {
-      const blocks = planContent.split(/(?=### Phase)/);
-      let phaseIdx = 0;
-      for (let i = 0; i < blocks.length; i++) {
-        const block = blocks[i];
-        if (!block.startsWith("### Phase")) continue;
-        phaseIdx++;
+      const blocks = planContent.split(/(?=^## )/m);
+      let featureIdx = 0;
+      for (const block of blocks) {
+        if (!/^## Feature\b/.test(block)) continue;
+        featureIdx++;
 
-        const hasOrigin = block.includes("Origin trace:");
-        const hasAcceptance = block.includes("Acceptance:");
+        // Only look at the feature's own header section — content before the
+        // first `### Phase` (or end of block). Otherwise an "Acceptance:" line
+        // inside a Test Spec table could be misread as the feature's Acceptance.
+        const phaseSplit = block.search(/^### /m);
+        const header = phaseSplit > 0 ? block.slice(0, phaseSplit) : block;
+
+        const hasOrigin = /^Origin trace:/m.test(header);
+        const hasAcceptance = /^Acceptance:/m.test(header);
 
         if (!hasOrigin || !hasAcceptance) {
           faults.push({
             category: "PLAN_SYNTHESIS_INVALID",
             severity: "CRITICAL",
-            description: `Phase block ${phaseIdx} is missing ${!hasOrigin && !hasAcceptance ? "Origin trace: and Acceptance:" : !hasOrigin ? "Origin trace:" : "Acceptance:"}.`,
+            description: `Feature block ${featureIdx} is missing ${!hasOrigin && !hasAcceptance ? "Origin trace: and Acceptance:" : !hasOrigin ? "Origin trace:" : "Acceptance:"}.`,
             sourceFiles: [input.livingPlanPath],
             evidence: {},
           });
