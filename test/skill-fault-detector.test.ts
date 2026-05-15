@@ -104,20 +104,28 @@ function baseState(overrides: Partial<BuildState> = {}): BuildState {
   };
 }
 
-/** Valid living plan content: all phase blocks have Origin trace: and Acceptance: */
+/**
+ * Valid living plan content: each `## Feature` block has Origin trace: and
+ * Acceptance: in its header (matching build/SKILL.md.tmpl:426-428).
+ */
 function validPlanContent(numPhases = 1): string {
   const phases = Array.from({ length: numPhases }, (_, i) =>
     [
       `### Phase ${i + 1}: Something`,
       "",
-      `Origin trace: Feature ${i + 1}`,
-      `Acceptance: tests pass`,
-      "",
       `- [ ] **Implementation**: implement it`,
       `- [ ] **Review & QA**: review it`,
     ].join("\n"),
   );
-  return `# Test Plan\n\n## Feature 1: Core\n\n${phases.join("\n\n")}`;
+  return [
+    "# Test Plan",
+    "",
+    "## Feature 1: Core",
+    "Origin trace: Source plan Week 1",
+    "Acceptance: tests pass",
+    "",
+    phases.join("\n\n"),
+  ].join("\n");
 }
 
 /** Write a living plan file and return its path. */
@@ -457,43 +465,7 @@ describe("PREMATURE_COMPLETION", () => {
 // ---------------------------------------------------------------------------
 
 describe("PLAN_SYNTHESIS_INVALID", () => {
-  test("detected when a phase block is missing Origin trace:", () => {
-    const dir = makeTmpDir();
-    const planMissingOrigin = [
-      "# Plan",
-      "",
-      "### Phase 1: Setup",
-      "",
-      "Acceptance: tests pass",
-      "",
-      "- [ ] **Implementation**: implement",
-    ].join("\n");
-    const planPath = writePlan(dir, planMissingOrigin);
-    const input = makeInput(dir, { livingPlanPath: planPath });
-    const faults = detectSkillFaults(input);
-    const fault = faults.find((f) => f.category === "PLAN_SYNTHESIS_INVALID");
-    expect(fault).toBeDefined();
-  });
-
-  test("detected when a phase block is missing Acceptance:", () => {
-    const dir = makeTmpDir();
-    const planMissingAcceptance = [
-      "# Plan",
-      "",
-      "### Phase 1: Setup",
-      "",
-      "Origin trace: Feature 1",
-      "",
-      "- [ ] **Implementation**: implement",
-    ].join("\n");
-    const planPath = writePlan(dir, planMissingAcceptance);
-    const input = makeInput(dir, { livingPlanPath: planPath });
-    const faults = detectSkillFaults(input);
-    const fault = faults.find((f) => f.category === "PLAN_SYNTHESIS_INVALID");
-    expect(fault).toBeDefined();
-  });
-
-  test("NOT detected when all phase blocks have both Origin trace: and Acceptance:", () => {
+  test("NOT detected when a valid feature has Origin trace: and Acceptance:", () => {
     const dir = makeTmpDir();
     const faults = detectSkillFaults(makeInput(dir));
     expect(
@@ -501,24 +473,26 @@ describe("PLAN_SYNTHESIS_INVALID", () => {
     ).toBeUndefined();
   });
 
-  test("detected for only the offending phase (multi-phase plan)", () => {
+  test("detected for only the offending feature (multi-feature plan)", () => {
     const dir = makeTmpDir();
     const planMixed = [
       "# Plan",
       "",
-      "### Phase 1: Good",
-      "",
-      "Origin trace: Feature 1",
+      "## Feature 1: Good",
+      "Origin trace: Source plan Week 1",
       "Acceptance: tests pass",
       "",
-      "- [ ] **Implementation**: implement phase 1",
+      "### Phase 1.1: Setup",
       "",
-      "### Phase 2: Bad",
+      "- [ ] **Implementation**: implement",
       "",
-      "Origin trace: Feature 2",
+      "## Feature 2: Bad",
+      "Origin trace: Source plan Week 2",
       // Missing Acceptance:
       "",
-      "- [ ] **Implementation**: implement phase 2",
+      "### Phase 2.1: Setup",
+      "",
+      "- [ ] **Implementation**: implement",
     ].join("\n");
     const planPath = writePlan(dir, planMixed);
     const input = makeInput(dir, { livingPlanPath: planPath });
@@ -526,7 +500,88 @@ describe("PLAN_SYNTHESIS_INVALID", () => {
     const synthesisInvalid = faults.filter(
       (f) => f.category === "PLAN_SYNTHESIS_INVALID",
     );
-    expect(synthesisInvalid.length).toBeGreaterThanOrEqual(1);
+    expect(synthesisInvalid.length).toBe(1);
+    expect(synthesisInvalid[0].description).toContain("Feature block 2");
+    expect(synthesisInvalid[0].description).toContain("Acceptance:");
+  });
+
+  test("NOT detected when feature has Origin trace/Acceptance even if phases do not", () => {
+    // Matches build/SKILL.md.tmpl:426-428 — Origin trace/Acceptance live on
+    // `## Feature X:`, not on every `### Phase`. Phases inherit from feature.
+    const dir = makeTmpDir();
+    const planFeatureLevel = [
+      "# Plan",
+      "",
+      "## Feature 1: Core",
+      "Origin trace: Source plan Week 1-2",
+      "Acceptance: tests pass and benchmarks meet target",
+      "",
+      "### Phase 1: Setup",
+      "",
+      "- [ ] **Implementation**: implement phase 1",
+      "",
+      "### Phase 2: Wiring",
+      "",
+      "- [ ] **Implementation**: implement phase 2",
+    ].join("\n");
+    const planPath = writePlan(dir, planFeatureLevel);
+    const input = makeInput(dir, { livingPlanPath: planPath });
+    const faults = detectSkillFaults(input);
+    expect(
+      faults.find((f) => f.category === "PLAN_SYNTHESIS_INVALID"),
+    ).toBeUndefined();
+  });
+
+  test("detected when a feature block is missing Origin trace:", () => {
+    const dir = makeTmpDir();
+    const plan = [
+      "# Plan",
+      "",
+      "## Feature 1: Core",
+      "Acceptance: tests pass",
+      "",
+      "### Phase 1: Setup",
+      "",
+      "- [ ] **Implementation**: implement",
+    ].join("\n");
+    const planPath = writePlan(dir, plan);
+    const input = makeInput(dir, { livingPlanPath: planPath });
+    const faults = detectSkillFaults(input);
+    const fault = faults.find((f) => f.category === "PLAN_SYNTHESIS_INVALID");
+    expect(fault).toBeDefined();
+    expect(fault?.description).toContain("Origin trace:");
+  });
+
+  test("detected when a feature block is missing Acceptance:", () => {
+    const dir = makeTmpDir();
+    const plan = [
+      "# Plan",
+      "",
+      "## Feature 1: Core",
+      "Origin trace: Source plan Week 1",
+      "",
+      "### Phase 1: Setup",
+      "",
+      "- [ ] **Implementation**: implement",
+    ].join("\n");
+    const planPath = writePlan(dir, plan);
+    const input = makeInput(dir, { livingPlanPath: planPath });
+    const faults = detectSkillFaults(input);
+    const fault = faults.find((f) => f.category === "PLAN_SYNTHESIS_INVALID");
+    expect(fault).toBeDefined();
+    expect(fault?.description).toContain("Acceptance:");
+  });
+
+  test("NOT detected when plan has no features and no phases (header-only)", () => {
+    // A plan that's only a stub (table of contents, prose) should not be flagged.
+    const dir = makeTmpDir();
+    const plan = ["# Plan", "", "## Overview", "", "TBD"].join("\n");
+    const planPath = writePlan(dir, plan);
+    const input = makeInput(dir, { livingPlanPath: planPath });
+    const faults = detectSkillFaults(input);
+    expect(
+      faults.find((f) => f.category === "PLAN_SYNTHESIS_INVALID"),
+    ).toBeUndefined();
   });
 });
 
