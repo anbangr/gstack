@@ -1,5 +1,43 @@
 # TODOS
 
+## Migration telemetry (release-daemon-style notices)
+
+### P3: Emit telemetry when migration scripts print user-facing banners
+
+**What:** A `gstack-migration-log` binary that migration scripts can call to
+emit a one-line event when a banner fires, and a follow-up event when state
+transitions back to healthy. Mirrors `gstack-telemetry-log` but for the
+migration sub-pipeline.
+
+**Why:** v1.39.1.0 introduced the first migration that asks the user to take
+an action (re-install/reload the release daemon). Without telemetry we have no
+visibility into whether the banner is effective. If 80% of users see the
+banner and never run the fix, the banner is failing — and we can't tell
+without data.
+
+**Pros:** Data-driven iteration on migration UX. Catches the case where a
+banner has fired N times without resolution (escalation candidate, or auto-fix
+candidate). Costs almost nothing per migration call once the binary exists.
+
+**Cons:** Telemetry plumbing into shell scripts. Privacy review (must respect
+the existing `telemetry: community|anonymous|off` config, identical to
+`gstack-telemetry-log`).
+
+**Context:** Today telemetry only logs skill invocations to
+`~/.gstack/analytics/skill-usage.jsonl`. Migrations write touchfiles
+(`~/.gstack/.migrations/v<x>.done`) but emit no analytics. A new binary at
+`bin/gstack-migration-log` would accept `--migration v1.39.1.0 --event
+banner_fired --variant queue-no-daemon` and append to
+`~/.gstack/analytics/migration-usage.jsonl` gated on the same telemetry
+config. A second event type (`state_resolved`) fires when a subsequent
+migration run detects the user has acted on the banner.
+
+**Depends on:** Existing telemetry config plumbing
+(`~/.claude/skills/gstack/bin/gstack-config get telemetry`). No new privacy
+surface beyond the existing skill telemetry.
+
+**Surfaced by:** Eng review of release-daemon path-fix plan, D7=A (2026-05-16).
+
 ## /sync-gbrain memory stage perf follow-up
 
 ### P2: Investigate `gbrain import` perf on large staging dirs

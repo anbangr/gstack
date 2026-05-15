@@ -36,8 +36,11 @@ import {
   featureGateProjection,
   reconcileVisiblePlanState,
   releaseDaemonLaunchCommand,
+  releaseDaemonDefaultPath,
   renderLaunchdReleaseDaemonPlist,
   renderSystemdReleaseDaemonService,
+  buildReleaseDaemonDoctorReport,
+  renderReleaseDaemonDoctorReport,
   runRoleTask,
   buildKindInstructions,
   extractCoverageTarget,
@@ -396,12 +399,217 @@ describe("release-daemon CLI", () => {
     );
     expect(plist).toContain("<string>--project-root</string>");
 
+    // The plist must bake in a PATH that finds homebrew + HOME so the daemon
+    // can spawn gh/git/bun from the user's tool installs.
+    expect(plist).toContain("<key>EnvironmentVariables</key>");
+    expect(plist).toContain("<key>PATH</key>");
+    expect(plist).toContain("/opt/homebrew/bin");
+    expect(plist).toContain("/usr/local/bin");
+    expect(plist).toContain("<key>HOME</key>");
+    // Belt-and-braces: it must NOT be just the launchd default PATH.
+    expect(plist).not.toMatch(
+      /<key>PATH<\/key>\s*<string>\/usr\/bin:\/bin:\/usr\/sbin:\/sbin<\/string>/,
+    );
+
     const service = renderSystemdReleaseDaemonService(
       command,
       "/Users/alice/project repo",
     );
     expect(service).toContain("WorkingDirectory=/Users/alice/project\\ repo");
     expect(service).toContain("--project-root /Users/alice/project\\ repo");
+    // Systemd unit must declare PATH in [Service] for the same reason.
+    expect(service).toContain('Environment="PATH=');
+    expect(service).toContain("/opt/homebrew/bin");
+  });
+
+  it("parses release-daemon doctor", () => {
+    const args = parseArgs(["release-daemon", "doctor"]);
+    expect(args.mode).toBe("release-daemon");
+    expect(args.releaseDaemonCommand).toBe("doctor");
+  });
+});
+
+describe("releaseDaemonDefaultPath", () => {
+  it("puts homebrew before system defaults", () => {
+    const parts = releaseDaemonDefaultPath({ PATH: "" }).split(":");
+    expect(parts.indexOf("/opt/homebrew/bin")).toBeLessThan(
+      parts.indexOf("/usr/bin"),
+    );
+    expect(parts.indexOf("/usr/local/bin")).toBeLessThan(
+      parts.indexOf("/usr/bin"),
+    );
+  });
+
+  it("merges inherited PATH after known prefixes", () => {
+    const result = releaseDaemonDefaultPath({
+      PATH: "/Users/me/.bun/bin:/usr/bin",
+    });
+    const parts = result.split(":");
+    expect(parts).toContain("/Users/me/.bun/bin");
+    expect(parts.indexOf("/opt/homebrew/bin")).toBeLessThan(
+      parts.indexOf("/Users/me/.bun/bin"),
+    );
+  });
+
+  it("deduplicates entries appearing in both known prefixes and inherited PATH", () => {
+    const result = releaseDaemonDefaultPath({
+      PATH: "/opt/homebrew/bin:/usr/bin",
+    });
+    const parts = result.split(":");
+    expect(parts.filter((p) => p === "/opt/homebrew/bin").length).toBe(1);
+    expect(parts.filter((p) => p === "/usr/bin").length).toBe(1);
+  });
+
+  it("handles undefined PATH gracefully", () => {
+    const result = releaseDaemonDefaultPath({ PATH: undefined });
+    expect(result).toContain("/opt/homebrew/bin");
+    expect(result).toContain("/usr/bin");
+  });
+});
+
+describe("releaseDaemonDoctor", () => {
+  it("reports DAEMON_NOT_INSTALLED when plist is absent", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "doctor-test-"));
+    try {
+      const report = buildReleaseDaemonDoctorReport({
+        platform: "darwin",
+        queueDir: path.join(tmp, "queue"),
+        home: tmp,
+        uid: 501,
+        spawn: () =>
+          ({
+            status: 1,
+            stdout: "",
+            stderr: "",
+            signal: null,
+            pid: 0,
+            output: [],
+          }) as any,
+        fileExists: () => false,
+        readFile: () => {
+          throw new Error("not called");
+        },
+        readQueueRecords: () => [],
+      });
+      expect(report.verdict).toBe("DAEMON_NOT_INSTALLED");
+      expect(report.plistExists).toBe(false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("reports HEALTHY when plist loaded, has env vars, tools resolve, queue clean", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "doctor-test-"));
+    try {
+      const plistPath = path.join(
+        tmp,
+        "Library",
+        "LaunchAgents",
+        "com.gstack.release-daemon.plist",
+      );
+      fs.mkdirSync(path.dirname(plistPath), { recursive: true });
+      fs.writeFileSync(plistPath, "<EnvironmentVariables>contents</...>");
+
+      const report = buildReleaseDaemonDoctorReport({
+        platform: "darwin",
+        queueDir: path.join(tmp, "queue"),
+        home: tmp,
+        uid: 501,
+        spawn: ((cmd: string, _args: string[]) => {
+          if (cmd === "launchctl") {
+            return {
+              status: 0,
+              stdout: "0\t0\tcom.gstack.release-daemon\n",
+              stderr: "",
+            };
+          }
+          if (cmd === "/usr/bin/which") {
+            return {
+              status: 0,
+              stdout: "/opt/homebrew/bin/tool\n",
+              stderr: "",
+            };
+          }
+          return { status: 1, stdout: "", stderr: "" };
+        }) as any,
+        readQueueRecords: () => [],
+      });
+      expect(report.verdict).toBe("HEALTHY");
+      expect(report.plistExists).toBe(true);
+      expect(report.plistHasEnvironmentVariables).toBe(true);
+      expect(report.loaded).toBe(true);
+      expect(report.tools.every((t) => t.resolved !== null)).toBe(true);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("reports STALE_PLIST_NEEDS_RELOAD when plist lacks EnvironmentVariables", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "doctor-test-"));
+    try {
+      const plistPath = path.join(
+        tmp,
+        "Library",
+        "LaunchAgents",
+        "com.gstack.release-daemon.plist",
+      );
+      fs.mkdirSync(path.dirname(plistPath), { recursive: true });
+      // No EnvironmentVariables in content — simulates a plist generated by
+      // a gstack version before v1.39.1.0.
+      fs.writeFileSync(
+        plistPath,
+        "<plist><dict><key>Label</key></dict></plist>",
+      );
+
+      const report = buildReleaseDaemonDoctorReport({
+        platform: "darwin",
+        queueDir: path.join(tmp, "queue"),
+        home: tmp,
+        uid: 501,
+        spawn: ((cmd: string) => {
+          if (cmd === "launchctl") {
+            return {
+              status: 0,
+              stdout: "0\t0\tcom.gstack.release-daemon\n",
+              stderr: "",
+            };
+          }
+          return { status: 0, stdout: "/opt/homebrew/bin/tool\n", stderr: "" };
+        }) as any,
+        readQueueRecords: () => [],
+      });
+      expect(report.verdict).toBe("STALE_PLIST_NEEDS_RELOAD");
+      expect(report.plistHasEnvironmentVariables).toBe(false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("renders a human-readable report", () => {
+    const rendered = renderReleaseDaemonDoctorReport({
+      platform: "darwin",
+      queueDir: "/tmp/queue",
+      queueDepth: 3,
+      queueByStatus: { queued: 2, blocked: 1 },
+      plistPath:
+        "/Users/me/Library/LaunchAgents/com.gstack.release-daemon.plist",
+      plistExists: true,
+      plistHasEnvironmentVariables: true,
+      loaded: true,
+      loadedPath: "/opt/homebrew/bin:/usr/bin",
+      tools: [
+        { name: "gh", resolved: "/opt/homebrew/bin/gh" },
+        { name: "git", resolved: "/opt/homebrew/bin/git" },
+        { name: "bun", resolved: null },
+      ],
+      recentLogLines: ["error: something failed"],
+      verdict: "TOOL_MISSING",
+    });
+    expect(rendered).toContain("Release daemon doctor");
+    expect(rendered).toContain("/opt/homebrew/bin/gh ✓");
+    expect(rendered).toContain("MISSING");
+    expect(rendered).toContain("Verdict: TOOL_MISSING");
+    expect(rendered).toContain("3 record(s)");
   });
 });
 
