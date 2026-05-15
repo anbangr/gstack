@@ -154,6 +154,13 @@ import {
 import { BUILD_DEFAULTS } from "./build-config";
 import { evaluateMonitorOnce, monitorExitCode } from "./monitor";
 import { buildMonitorAgentEscalation } from "./monitor-supervisor";
+import { startHeartbeat, type HeartbeatController } from "./heartbeat";
+import {
+  recordEscalation,
+  resetStreak,
+  shouldSurface,
+  streakSurfaceMessage,
+} from "./escalation-streak";
 import { renderPlanStatusTable, resolvePlanSelection } from "./plan-selection";
 
 const DEFAULT_MAX_ORIGIN_VERIFICATION_ITERATIONS =
@@ -5853,13 +5860,40 @@ function printMonitorEvent(evt: unknown): void {
   console.log(JSON.stringify(evt));
 }
 
+/**
+ * Resolve the stateSlug to use for streak persistence. Prefer the
+ * terminal event's stateSlug (per-run terminal); fall back to the first
+ * manifest run's stateSlug for watch-level terminals.
+ */
+function streakSlugFor(
+  evaluation: ReturnType<typeof evaluateMonitorOnce>,
+): string | null {
+  const terminal = evaluation.terminalEvent as { stateSlug?: string };
+  if (terminal.stateSlug) return terminal.stateSlug;
+  return evaluation.manifest?.runs?.[0]?.stateSlug ?? null;
+}
+
+/**
+ * Try to record this escalation against the streak counter and check
+ * whether it has tripped the surface threshold. If so, emit a
+ * USER_ACTION_REQUIRED event instead and signal the caller to return
+ * exit code 11 (USER_ACTION_REQUIRED) rather than 11
+ * (MONITOR_AGENT_ESCALATION).
+ *
+ * Returns:
+ *   "surfaced"   — printed USER_ACTION_REQUIRED, caller should exit with
+ *                  monitorExitCode("USER_ACTION_REQUIRED")
+ *   "escalated"  — printed MONITOR_AGENT_ESCALATION, caller should exit
+ *                  with monitorExitCode("MONITOR_AGENT_ESCALATION")
+ *   "none"       — no supervisor was invoked, fall through to normal path
+ */
 async function maybePrintMonitorAgentEscalation(
   args: Args,
   evaluation: ReturnType<typeof evaluateMonitorOnce>,
-): Promise<boolean> {
-  if (!args.monitorSupervise || !args.monitorManifest) return false;
+): Promise<"surfaced" | "escalated" | "none"> {
+  if (!args.monitorSupervise || !args.monitorManifest) return "none";
   if (evaluation.terminalEvent.event === "HOST_CONTEXT_SAVE_REQUIRED") {
-    return false;
+    return "none";
   }
   const escalation = await buildMonitorAgentEscalation({
     manifestPath: args.monitorManifest,
@@ -5867,9 +5901,57 @@ async function maybePrintMonitorAgentEscalation(
     role: args.roles.monitorAgent,
     runner: runConfiguredRoleTask,
   });
-  if (!escalation) return false;
+  if (!escalation) return "none";
+
+  const slug = streakSlugFor(evaluation);
+  if (slug) {
+    const verdict =
+      (escalation as { verdict?: string }).verdict ?? "unknown";
+    const streak = recordEscalation(slug, verdict);
+    if (shouldSurface(streak)) {
+      // Loop guard: suppress the escalation and surface a
+      // USER_ACTION_REQUIRED event with the streak history. Reset the
+      // streak so the user's next action starts fresh.
+      const surface = {
+        event: "USER_ACTION_REQUIRED",
+        timestamp: new Date().toISOString(),
+        runId: (escalation as { runId?: string }).runId,
+        repoSlug: (escalation as { repoSlug?: string }).repoSlug,
+        stateSlug: slug,
+        message: streakSurfaceMessage(streak),
+        pidFile: (escalation as { pidFile?: string }).pidFile,
+        stateFile: (escalation as { stateFile?: string }).stateFile,
+        stdoutLog: (escalation as { stdoutLog?: string }).stdoutLog,
+        loopGuard: {
+          count: streak.count,
+          firstSeenAt: streak.firstSeenAt,
+          recentVerdicts: streak.recentVerdicts,
+        },
+      };
+      printMonitorEvent(surface);
+      resetStreak(slug);
+      return "surfaced";
+    }
+  }
+
   printMonitorEvent(escalation);
-  return true;
+  return "escalated";
+}
+
+/**
+ * Reset the streak counter for a non-escalation terminal event. Safe to
+ * call when no streak exists.
+ */
+function resetStreakFor(
+  evaluation: ReturnType<typeof evaluateMonitorOnce>,
+): void {
+  const slug = streakSlugFor(evaluation);
+  if (!slug) return;
+  try {
+    resetStreak(slug);
+  } catch {
+    // Non-fatal; the streak file at worst grows stale until the next run.
+  }
 }
 
 async function runMonitorMode(args: Args): Promise<number> {
@@ -5887,9 +5969,16 @@ async function runMonitorMode(args: Args): Promise<number> {
       process.stdout.write(JSON.stringify(evt) + "\n");
     }
     for (const evt of evaluation.events) printMonitorEvent(evt);
-    if (await maybePrintMonitorAgentEscalation(args, evaluation)) {
+    const result = await maybePrintMonitorAgentEscalation(args, evaluation);
+    if (result === "surfaced") {
+      return monitorExitCode("USER_ACTION_REQUIRED");
+    }
+    if (result === "escalated") {
       return monitorExitCode("MONITOR_AGENT_ESCALATION");
     }
+    // Non-escalation terminal: reset the streak so the user's recovery
+    // path doesn't inherit a stale counter.
+    resetStreakFor(evaluation);
     return monitorExitCode(evaluation.terminalEvent.event);
   }
 
@@ -5905,6 +5994,8 @@ async function runMonitorMode(args: Args): Promise<number> {
       if (evt.event !== "MONITOR_REENTER") printMonitorEvent(evt);
     }
     if (evaluation.terminalEvent.event === "RUN_RESUMED") {
+      // Run came back to life — drop any in-flight escalation streak.
+      resetStreakFor(evaluation);
       await sleepMs(args.monitorPollMs);
       continue;
     }
@@ -5912,9 +6003,16 @@ async function runMonitorMode(args: Args): Promise<number> {
       if (!evaluation.events.some((evt) => evt === evaluation.terminalEvent)) {
         printMonitorEvent(evaluation.terminalEvent);
       }
-      if (await maybePrintMonitorAgentEscalation(args, evaluation)) {
+      const result = await maybePrintMonitorAgentEscalation(args, evaluation);
+      if (result === "surfaced") {
+        return monitorExitCode("USER_ACTION_REQUIRED");
+      }
+      if (result === "escalated") {
         return monitorExitCode("MONITOR_AGENT_ESCALATION");
       }
+      // Non-escalation terminal (RUN_FAILED, ALL_RUNS_COMPLETE, etc.):
+      // reset the streak.
+      resetStreakFor(evaluation);
       return monitorExitCode(evaluation.terminalEvent.event);
     }
     if (Date.now() - startedAt >= args.monitorMaxWallMs) {
@@ -6295,9 +6393,18 @@ async function main() {
   const startedAt = Date.now();
   const FINALIZATION_REQUIRED = 13;
   let exitCode = 1;
+  let heartbeat: HeartbeatController | null = null;
 
   try {
     ensureLogDir(slug);
+
+    // Periodic stdout heartbeat keeps stdoutLog mtime fresh during long
+    // sub-agent waits so the monitor's recentProcessActivity check (in
+    // monitor.ts) doesn't falsely escalate. See heartbeat.ts.
+    heartbeat = startHeartbeat({
+      runId: launch.runId ?? slug,
+      getPhase: () => state?.currentPhaseIndex,
+    });
 
     currentBranchAtLaunch = getCurrentBranch(projectRoot);
     writeProvisionalActiveRunRecord({
@@ -7414,6 +7521,17 @@ async function main() {
       }
     }
   } finally {
+    // Stop the stdout heartbeat first so we don't write any more lines
+    // while the active-run registry / lock cleanup runs.
+    if (heartbeat) {
+      try {
+        heartbeat.stop();
+      } catch {
+        // stop() is idempotent and swallows its own errors; this catch
+        // is belt-and-braces so an unexpected throw can't shadow the
+        // exit-code reporting below.
+      }
+    }
     let activeRunRegistryUpdateFailed = false;
     try {
       if (state?.launch?.runId && state.launch.activeRunRegistry) {
