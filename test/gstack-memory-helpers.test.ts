@@ -272,17 +272,36 @@ describe("withErrorContext", () => {
 
 describe("detectEngineTier", () => {
   let savedHome: string | undefined;
+  let savedGbrainHome: string | undefined;
+  let savedRealHome: string | undefined;
+  let savedPath: string | undefined;
   let testHome: string;
+  let testGbrainHome: string;
 
   beforeEach(() => {
     savedHome = process.env.GSTACK_HOME;
+    savedGbrainHome = process.env.GBRAIN_HOME;
+    savedRealHome = process.env.HOME;
+    savedPath = process.env.PATH;
     testHome = mkdtempSync(join(tmpdir(), "gstack-test-engine-"));
+    testGbrainHome = mkdtempSync(join(tmpdir(), "gstack-test-gbrain-"));
     process.env.GSTACK_HOME = testHome;
+    process.env.GBRAIN_HOME = testGbrainHome;
+    // Isolate HOME too — even though gbrainConfigPath() prefers GBRAIN_HOME
+    // when set, defense-in-depth against future code reading ~/.gbrain
+    // directly. See #1415 codex review finding #6.
+    process.env.HOME = testHome;
   });
 
   afterAll(() => {
     if (savedHome === undefined) delete process.env.GSTACK_HOME;
     else process.env.GSTACK_HOME = savedHome;
+    if (savedGbrainHome === undefined) delete process.env.GBRAIN_HOME;
+    else process.env.GBRAIN_HOME = savedGbrainHome;
+    if (savedRealHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedRealHome;
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
   });
 
   it("returns a valid EngineDetect shape (engine, detected_at, schema_version)", () => {
@@ -306,5 +325,20 @@ describe("detectEngineTier", () => {
     const first = detectEngineTier();
     const second = detectEngineTier();
     expect(second.detected_at).toBe(first.detected_at);
+  });
+
+  it("falls back to GBRAIN_HOME/config.json when gbrain doctor omits engine (schema_version:2 case)", () => {
+    // Regression test for #1415: gbrain >=0.25 doctor output dropped the
+    // top-level `engine` field. The detect path must fall back to config.json.
+    // We force the doctor call to fail (PATH stripped of gbrain) and write a
+    // synthetic config to GBRAIN_HOME so the fallback path is deterministic.
+    process.env.PATH = "/nonexistent-no-gbrain-here";
+    writeFileSync(
+      join(testGbrainHome, "config.json"),
+      JSON.stringify({ engine: "postgres", database_url: "postgresql://test/example" }),
+      "utf-8"
+    );
+    const result = detectEngineTier();
+    expect(result.engine).toBe("supabase");
   });
 });

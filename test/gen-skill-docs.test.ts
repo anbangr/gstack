@@ -2821,7 +2821,12 @@ describe("setup script validation", () => {
     expect(codexSection).toContain("create_codex_runtime_root");
     expect(codexSection).toContain("link_codex_skill_dirs");
     expect(codexSection).not.toContain("link_claude_skill_dirs");
+    // Reject both the legacy bare-symlink form and the Windows-portable _link_or_copy form
+    // when applied to the whole $GSTACK_DIR — Codex install must use link_codex_skill_dirs instead.
     expect(codexSection).not.toContain('ln -snf "$GSTACK_DIR" "$CODEX_GSTACK"');
+    expect(codexSection).not.toContain(
+      '_link_or_copy "$GSTACK_DIR" "$CODEX_GSTACK"',
+    );
   });
 
   test("Codex install prefers repo-local .agents/skills when setup runs from there", () => {
@@ -2871,8 +2876,9 @@ describe("setup script validation", () => {
     );
     const fnBody = setupContent.slice(fnStart, fnEnd);
     expect(fnBody).toContain('mkdir -p "$target"');
+    // v1.38.0.0 (upstream): routes through _link_or_copy helper for Windows fallback (cp on MSYS2/Git Bash).
     expect(fnBody).toContain(
-      'ln -snf "$gstack_dir/$dir_name/SKILL.md" "$target/SKILL.md"',
+      '_link_or_copy "$gstack_dir/$dir_name/SKILL.md" "$target/SKILL.md"',
     );
   });
 
@@ -3010,7 +3016,10 @@ describe("setup script validation", () => {
     expect(fnBody).toContain("design-checklist.md");
     expect(fnBody).toContain("greptile-triage.md");
     expect(fnBody).toContain("TODOS-format.md");
+    // Reject both linking forms when applied to the whole $gstack_dir — Codex install must
+    // expose only the individual runtime assets, not the entire repo.
     expect(fnBody).not.toContain('ln -snf "$gstack_dir" "$codex_gstack"');
+    expect(fnBody).not.toContain('_link_or_copy "$gstack_dir" "$codex_gstack"');
   });
 
   test("direct Codex installs are migrated out of ~/.codex/skills/gstack", () => {

@@ -78,7 +78,14 @@ describe("pickNextSlot (the heart of queue-aware allocation)", () => {
   });
 
   test("multi-collision — two PRs claim sequential slots", () => {
-    const r = pickNextSlot(base, [[1, 7, 0, 0], [1, 8, 0, 0]], "minor");
+    const r = pickNextSlot(
+      base,
+      [
+        [1, 7, 0, 0],
+        [1, 8, 0, 0],
+      ],
+      "minor",
+    );
     expect(fmtVersion(r.version)).toBe("1.9.0.0");
   });
 
@@ -90,7 +97,14 @@ describe("pickNextSlot (the heart of queue-aware allocation)", () => {
   });
 
   test("claims below base are ignored", () => {
-    const r = pickNextSlot(base, [[1, 5, 0, 0], [1, 6, 2, 0]], "patch");
+    const r = pickNextSlot(
+      base,
+      [
+        [1, 5, 0, 0],
+        [1, 6, 2, 0],
+      ],
+      "patch",
+    );
     expect(fmtVersion(r.version)).toBe("1.6.4.0");
     expect(r.reason).toMatch(/no collision/);
   });
@@ -108,7 +122,15 @@ describe("pickNextSlot (the heart of queue-aware allocation)", () => {
   });
 
   test("unsorted claims still resolve correctly", () => {
-    const r = pickNextSlot(base, [[1, 9, 0, 0], [1, 7, 0, 0], [1, 8, 0, 0]], "minor");
+    const r = pickNextSlot(
+      base,
+      [
+        [1, 9, 0, 0],
+        [1, 7, 0, 0],
+        [1, 8, 0, 0],
+      ],
+      "minor",
+    );
     expect(fmtVersion(r.version)).toBe("1.10.0.0");
   });
 });
@@ -119,7 +141,14 @@ describe("markActiveSiblings", () => {
 
   test("flags siblings that are ahead of base AND recent AND have no PR", () => {
     const siblings = [
-      { path: "/a", branch: "feat/alpha", version: "1.7.0.0", last_commit_ts: now - 60, has_open_pr: false, is_active: false },
+      {
+        path: "/a",
+        branch: "feat/alpha",
+        version: "1.7.0.0",
+        last_commit_ts: now - 60,
+        has_open_pr: false,
+        is_active: false,
+      },
     ];
     const r = markActiveSiblings(siblings, base);
     expect(r[0].is_active).toBe(true);
@@ -127,22 +156,50 @@ describe("markActiveSiblings", () => {
 
   test("does not flag siblings with open PRs (already in the queue)", () => {
     const siblings = [
-      { path: "/a", branch: "feat/alpha", version: "1.7.0.0", last_commit_ts: now - 60, has_open_pr: true, is_active: false },
+      {
+        path: "/a",
+        branch: "feat/alpha",
+        version: "1.7.0.0",
+        last_commit_ts: now - 60,
+        has_open_pr: true,
+        is_active: false,
+      },
     ];
     expect(markActiveSiblings(siblings, base)[0].is_active).toBe(false);
   });
 
   test("does not flag stale siblings (commit > 24h old)", () => {
     const siblings = [
-      { path: "/a", branch: "feat/alpha", version: "1.7.0.0", last_commit_ts: now - 25 * 3600, has_open_pr: false, is_active: false },
+      {
+        path: "/a",
+        branch: "feat/alpha",
+        version: "1.7.0.0",
+        last_commit_ts: now - 25 * 3600,
+        has_open_pr: false,
+        is_active: false,
+      },
     ];
     expect(markActiveSiblings(siblings, base)[0].is_active).toBe(false);
   });
 
   test("does not flag siblings at or below base", () => {
     const siblings = [
-      { path: "/a", branch: "feat/alpha", version: "1.6.3.0", last_commit_ts: now - 60, has_open_pr: false, is_active: false },
-      { path: "/b", branch: "feat/beta", version: "1.5.0.0", last_commit_ts: now - 60, has_open_pr: false, is_active: false },
+      {
+        path: "/a",
+        branch: "feat/alpha",
+        version: "1.6.3.0",
+        last_commit_ts: now - 60,
+        has_open_pr: false,
+        is_active: false,
+      },
+      {
+        path: "/b",
+        branch: "feat/beta",
+        version: "1.5.0.0",
+        last_commit_ts: now - 60,
+        has_open_pr: false,
+        is_active: false,
+      },
     ];
     const r = markActiveSiblings(siblings, base);
     expect(r[0].is_active).toBe(false);
@@ -153,6 +210,9 @@ describe("markActiveSiblings", () => {
 // Integration smoke — only runs if gh is available and authenticated. Confirms
 // the CLI executes end-to-end against real APIs without crashing.
 describe("integration (smoke)", () => {
+  // Bumps timeout to 30s — the test spawns a real `bun run` subprocess that
+  // does a `gh pr list` against the live GitHub API to inspect claimed slots.
+  // Network latency makes 5s tight on developer machines.
   test("CLI runs against real repo and emits parseable JSON", async () => {
     const proc = Bun.spawnSync([
       "bun",
@@ -178,5 +238,5 @@ describe("integration (smoke)", () => {
     expect(Array.isArray(parsed.claimed)).toBe(true);
     expect(parsed).toHaveProperty("siblings");
     expect(parsed.siblings).toEqual([]); // --workspace-root null disabled scanning
-  }, 15_000);
+  }, 30_000); // Headroom over the 4-5s wall time of the spawned process under load
 });

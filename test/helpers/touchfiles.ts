@@ -435,6 +435,18 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     "bin/gstack-gbrain-mcp-verify",
     "test/helpers/agent-sdk-runner.ts",
   ],
+  // v1.34.0.0 split-engine Path 4 + Step 4.5 Yes (local PGLite for code).
+  // Periodic-tier per codex #12 (AgentSDK harness is non-deterministic).
+  // Fires when the setup-gbrain template, install/verify/init helpers, or
+  // the agent-sdk-runner harness changes.
+  "setup-gbrain-path4-local-pglite": [
+    "setup-gbrain/SKILL.md.tmpl",
+    "bin/gstack-gbrain-mcp-verify",
+    "bin/gstack-gbrain-install",
+    "bin/gstack-gbrain-detect",
+    "lib/gbrain-local-status.ts",
+    "test/helpers/agent-sdk-runner.ts",
+  ],
 
   // AskUserQuestion format regression (RECOMMENDATION + Completeness: N/10)
   // Fires when either template OR the two preamble resolvers change.
@@ -1061,6 +1073,7 @@ export const E2E_TIERS: Record<string, "gate" | "periodic"> = {
   // model's behavior against a stub MCP server.
   "setup-gbrain-remote": "periodic",
   "setup-gbrain-bad-token": "periodic",
+  "setup-gbrain-path4-local-pglite": "periodic",
 
   // AskUserQuestion format regression — periodic (Opus 4.7 non-deterministic benchmark)
   "plan-ceo-review-format-mode": "periodic",
