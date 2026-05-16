@@ -538,7 +538,14 @@ function legacyDualImplError(): string {
 }
 
 export interface Args {
-  mode: "build" | "merge" | "monitor" | "release-daemon" | "plan-status";
+  mode:
+    | "build"
+    | "merge"
+    | "monitor"
+    | "release-daemon"
+    | "plan-status"
+    | "reconcile"
+    | "doctor";
   planFile: string;
   printOnly: boolean;
   dryRun: boolean;
@@ -634,6 +641,17 @@ export interface Args {
   planStatusResumeOnly: boolean;
   /** Specific run id to inspect for resume. */
   planStatusResumeRunId?: string;
+  /**
+   * `gstack-build reconcile` mode: opt-in to the artifact-derivation pass
+   * that recovers `phases[i].codexReview` from `phase-N-{review|qa}-K-output.md`
+   * files when the JSON field was nulled. Mirrors backfill-checkboxes.ts's
+   * `--from-artifacts` flag.
+   */
+  reconcileFromArtifacts: boolean;
+  /** Plan markdown file for reconcile/doctor modes (when not auto-detected). */
+  reconcilePlanFile?: string;
+  /** State JSON file for reconcile/doctor modes (when not auto-detected). */
+  reconcileStateFile?: string;
 }
 
 export function parseArgs(argv: string[]): Args {
@@ -694,6 +712,9 @@ export function parseArgs(argv: string[]): Args {
     planStatusAllInbox: false,
     planStatusResumeOnly: false,
     planStatusResumeRunId: undefined,
+    reconcileFromArtifacts: false,
+    reconcilePlanFile: undefined,
+    reconcileStateFile: undefined,
   };
   const positional: string[] = [];
   const roleFlags = buildRoleFlagMap();
@@ -761,6 +782,15 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.monitorManifest = path.resolve(next);
+    } else if (a === "--from-artifacts") {
+      args.reconcileFromArtifacts = true;
+    } else if (a === "--state") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--state requires a path to the build state JSON");
+        process.exit(2);
+      }
+      args.reconcileStateFile = path.resolve(next);
     } else if (a === "--once") args.monitorOnce = true;
     else if (a === "--watch") args.monitorWatch = true;
     else if (a === "--supervise") args.monitorSupervise = true;
@@ -862,7 +892,12 @@ export function parseArgs(argv: string[]): Args {
         console.error("--plan requires a value");
         process.exit(2);
       }
-      args.planStatusPlans.push(path.resolve(next));
+      const resolved = path.resolve(next);
+      // Accumulates for plan-status (multi-plan inspection); also kept as
+      // a single-value reference for reconcile/doctor which take exactly
+      // one plan. Dispatch reads whichever field its mode needs.
+      args.planStatusPlans.push(resolved);
+      args.reconcilePlanFile = resolved;
     } else if (a === "--base-project-root") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
@@ -1026,6 +1061,34 @@ export function parseArgs(argv: string[]): Args {
       console.error(`usage: gstack-build release-daemon ${command}`);
       process.exit(2);
     }
+  } else if (positional[0] === "reconcile") {
+    if (positional.length !== 1) {
+      console.error(
+        "usage: gstack-build reconcile [--from-artifacts] --plan <plan.md> --state <state.json>   (-h for help)",
+      );
+      process.exit(2);
+    }
+    args.mode = "reconcile";
+    if (!args.reconcilePlanFile || !args.reconcileStateFile) {
+      console.error(
+        "gstack-build reconcile requires --plan <plan.md> --state <state.json>",
+      );
+      process.exit(2);
+    }
+  } else if (positional[0] === "doctor") {
+    if (positional.length !== 1) {
+      console.error(
+        "usage: gstack-build doctor --plan <plan.md> --state <state.json>   (-h for help)",
+      );
+      process.exit(2);
+    }
+    args.mode = "doctor";
+    if (!args.reconcilePlanFile || !args.reconcileStateFile) {
+      console.error(
+        "gstack-build doctor requires --plan <plan.md> --state <state.json>",
+      );
+      process.exit(2);
+    }
   } else if (positional[0] === "monitor") {
     if (positional.length !== 1) {
       console.error(
@@ -1068,6 +1131,8 @@ export function parseArgs(argv: string[]): Args {
   }
   if (
     args.mode !== "plan-status" &&
+    args.mode !== "reconcile" &&
+    args.mode !== "doctor" &&
     (args.planStatusJson ||
       args.planStatusAll ||
       args.planStatusGstackRepo ||
@@ -1753,6 +1818,8 @@ Usage:
   gstack-build monitor --manifest <path> [--once|--watch] [--supervise] [--poll-ms 60000] [--max-wall-ms <ms>]
   gstack-build plan-status --gstack-repo <path> [--project-root <path>] [--json] [--all]
   gstack-build release-daemon <install|uninstall|status|run|retry|doctor> [flags]
+  gstack-build reconcile [--from-artifacts] --plan <plan.md> --state <state.json>
+  gstack-build doctor --plan <plan.md> --state <state.json>
 
 Modes:
   <plan-file>           Execute a living implementation plan.
@@ -1760,6 +1827,11 @@ Modes:
   monitor               Foreground monitor for /build manifest runs.
   plan-status           Read-only /build plan selection and resume status.
   release-daemon        Process queued build-created PRs one at a time.
+  reconcile             Flip living-plan checkboxes for committed phases and
+                        optionally (--from-artifacts) recover a nulled
+                        codexReview from on-disk review/qa artifacts.
+  doctor                Read-only audit: flag state/plan/artifact drift.
+                        Suggests the right reconcile invocation.
 
 Flags:
   --print-only         Parse and show phase table; exit.
@@ -6826,6 +6898,29 @@ function writeWorktreeLeakResolvedMarker(homeDir: string): void {
   );
 }
 
+/**
+ * `gstack-build reconcile [--from-artifacts] --plan <plan.md> --state <state.json>`
+ *
+ * Delegates to `runBackfill()` (the script-mode entry point of
+ * backfill-checkboxes.ts) so this subcommand and the one-shot CLI stay
+ * exactly one code path. Exit codes match the script: 0 on success,
+ * 1 when checkbox flip errors occurred during reconciliation.
+ */
+export async function runReconcileMode(args: Args): Promise<number> {
+  const { runBackfill } = await import("./backfill-checkboxes");
+  try {
+    const summary = runBackfill({
+      planFile: args.reconcilePlanFile!,
+      stateFile: args.reconcileStateFile!,
+      fromArtifacts: args.reconcileFromArtifacts,
+    });
+    return summary.errors > 0 ? 1 : 0;
+  } catch (err) {
+    console.error((err as Error).message);
+    return 1;
+  }
+}
+
 async function main() {
   const rawArgv = process.argv.slice(2);
   const args = parseArgs(rawArgv);
@@ -6856,6 +6951,11 @@ async function main() {
 
   if (args.mode === "release-daemon") {
     const exitCode = await runReleaseDaemonMode(args);
+    process.exit(exitCode);
+  }
+
+  if (args.mode === "reconcile") {
+    const exitCode = await runReconcileMode(args);
     process.exit(exitCode);
   }
 

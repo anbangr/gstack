@@ -1150,6 +1150,55 @@ describe("plan-status subcommand wiring", () => {
   });
 });
 
+describe("reconcile subcommand wiring", () => {
+  it("parseArgs([reconcile]) selects reconcile mode with both file paths and the artifact flag", () => {
+    const plan = path.join(os.tmpdir(), "living-plan.md");
+    const state = path.join(os.tmpdir(), "state.json");
+    const args = parseArgs([
+      "reconcile",
+      "--plan",
+      plan,
+      "--state",
+      state,
+      "--from-artifacts",
+    ]);
+    expect(args.mode).toBe("reconcile");
+    expect(args.reconcilePlanFile).toBe(path.resolve(plan));
+    expect(args.reconcileStateFile).toBe(path.resolve(state));
+    expect(args.reconcileFromArtifacts).toBe(true);
+  });
+
+  it("parseArgs([reconcile]) without --from-artifacts leaves the flag false (legacy checkbox-only mode)", () => {
+    const plan = path.join(os.tmpdir(), "plan.md");
+    const state = path.join(os.tmpdir(), "state.json");
+    const args = parseArgs(["reconcile", "--plan", plan, "--state", state]);
+    expect(args.mode).toBe("reconcile");
+    expect(args.reconcileFromArtifacts).toBe(false);
+  });
+
+  it("reconcile rejects invocation without --plan or --state", () => {
+    expectParseArgsExit(
+      ["reconcile", "--from-artifacts"],
+      "reconcile requires",
+    );
+    expectParseArgsExit(
+      ["reconcile", "--plan", "/tmp/p.md"],
+      "reconcile requires",
+    );
+  });
+
+  it("--help text documents reconcile + doctor", () => {
+    expect(HELP_TEXT).toContain(
+      "gstack-build reconcile [--from-artifacts] --plan <plan.md> --state <state.json>",
+    );
+    expect(HELP_TEXT).toContain(
+      "gstack-build doctor --plan <plan.md> --state <state.json>",
+    );
+    expect(HELP_TEXT).toContain("Flip living-plan checkboxes for committed");
+    expect(HELP_TEXT).toContain("Read-only audit");
+  });
+});
+
 describe("review gate planning", () => {
   it("skips reviewSecondary when its command is unset", () => {
     const roles = {
