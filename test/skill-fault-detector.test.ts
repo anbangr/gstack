@@ -20,7 +20,7 @@
  *   - Analytics appended to ${GSTACK_HOME}/analytics/skill-faults.jsonl
  */
 
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, afterEach } from "bun:test";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -38,10 +38,19 @@ import {
   DEFAULT_MAX_TEST_ITERATIONS,
 } from "../build/orchestrator/phase-runner";
 import type { BuildState, PhaseState } from "../build/orchestrator/types";
+import { useIsolatedGstackHome } from "./helpers/test-home";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// Isolate GSTACK_HOME for every test in this file. Without this, the 50+
+// detectSkillFaults() calls below would each append a line to the real
+// ~/.gstack/analytics/skill-faults.jsonl. Tests that need a specific
+// GSTACK_HOME value (e.g. the analytics-write tests) can still override
+// process.env.GSTACK_HOME in their body — the helper's afterEach restores
+// the prior value cleanly.
+useIsolatedGstackHome("skill-fault-detector-home-");
 
 const tmpDirs: string[] = [];
 
@@ -62,20 +71,6 @@ afterEach(() => {
     }
   }
   tmpDirs.length = 0;
-});
-
-let savedGstackHome: string | undefined;
-
-beforeEach(() => {
-  savedGstackHome = process.env.GSTACK_HOME;
-});
-
-afterEach(() => {
-  if (savedGstackHome !== undefined) {
-    process.env.GSTACK_HOME = savedGstackHome;
-  } else {
-    delete process.env.GSTACK_HOME;
-  }
 });
 
 /** Minimal valid PhaseState for a committed phase. */

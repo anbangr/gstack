@@ -19,6 +19,7 @@ import type { BuildRunManifest, BuildState } from "../types";
 let tmpDir: string;
 let stateDir: string;
 let oldStateDir: string | undefined;
+let oldGstackHome: string | undefined;
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-monitor-"));
@@ -26,15 +27,24 @@ beforeEach(() => {
   fs.mkdirSync(stateDir, { recursive: true });
   oldStateDir = process.env.GSTACK_BUILD_STATE_DIR;
   process.env.GSTACK_BUILD_STATE_DIR = stateDir;
+  // Isolate GSTACK_HOME — evaluateMonitorOnce triggers detectSkillFaults,
+  // which appends to ${GSTACK_HOME}/analytics/skill-faults.jsonl. Without
+  // this, each test run leaks fault entries into the developer's real ~/.gstack/.
+  oldGstackHome = process.env.GSTACK_HOME;
+  process.env.GSTACK_HOME = tmpDir;
 });
 
 afterEach(() => {
   if (oldStateDir) process.env.GSTACK_BUILD_STATE_DIR = oldStateDir;
   else delete process.env.GSTACK_BUILD_STATE_DIR;
+  if (oldGstackHome !== undefined) process.env.GSTACK_HOME = oldGstackHome;
+  else delete process.env.GSTACK_HOME;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-function manifest(overrides: Partial<BuildRunManifest["runs"][number]> = {}): BuildRunManifest {
+function manifest(
+  overrides: Partial<BuildRunManifest["runs"][number]> = {},
+): BuildRunManifest {
   const repoPath = path.join(tmpDir, "repo");
   const worktreePath = path.join(tmpDir, "worktree");
   const runId = overrides.runId ?? "run-a";
@@ -124,7 +134,10 @@ function writeState(
   return state;
 }
 
-function writeContextCount(run: BuildRunManifest["runs"][number], count: number): void {
+function writeContextCount(
+  run: BuildRunManifest["runs"][number],
+  count: number,
+): void {
   const dir = path.join(stateDir, run.stateSlug);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, ".host-context-save-count"), `${count}\n`);
@@ -247,7 +260,9 @@ describe("evaluateMonitorOnce", () => {
     });
 
     expect(result.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
-    expect(result.terminalEvent.message).toContain("lock is still held by a live process");
+    expect(result.terminalEvent.message).toContain(
+      "lock is still held by a live process",
+    );
     expect(fs.existsSync(liveLock)).toBe(true);
   });
 
@@ -425,9 +440,9 @@ describe("evaluateMonitorOnce", () => {
     expect(last.message).toContain("waiting for state update");
     // Crucially, no USER_ACTION_REQUIRED in the event stream — the
     // false-positive escalation is gone.
-    expect(
-      result.events.some((e) => e.event === "USER_ACTION_REQUIRED"),
-    ).toBe(false);
+    expect(result.events.some((e) => e.event === "USER_ACTION_REQUIRED")).toBe(
+      false,
+    );
   });
 
   it("REGRESSION: still escalates USER_ACTION_REQUIRED when state, pidFile, AND stdoutLog are ALL stale (true-stuck detection preserved)", () => {
@@ -474,9 +489,7 @@ describe("evaluateMonitorOnce", () => {
     });
 
     expect(result.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
-    expect(result.terminalEvent.message).toContain(
-      "active-run registry owner",
-    );
+    expect(result.terminalEvent.message).toContain("active-run registry owner");
   });
 
   it("emits MONITOR_ERROR instead of crashing when the resume executable is missing", () => {
@@ -496,7 +509,9 @@ describe("evaluateMonitorOnce", () => {
     });
 
     expect(result.terminalEvent.event).toBe("MONITOR_ERROR");
-    expect(result.terminalEvent.message).toContain("resume executable not found");
+    expect(result.terminalEvent.message).toContain(
+      "resume executable not found",
+    );
   });
 });
 
@@ -539,7 +554,9 @@ describe("monitor agent supervisor", () => {
     writeState(run, {
       phases: [{ index: 0, number: "1", name: "Phase", status: "committed" }],
     });
-    const evaluation = evaluateMonitorOnce({ manifestPath: writeManifest(data) });
+    const evaluation = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+    });
     expect(evaluation.terminalEvent.event).toBe("HOST_CONTEXT_SAVE_REQUIRED");
     expect(shouldInvokeMonitorAgent(evaluation.terminalEvent)).toBe(false);
 
@@ -581,7 +598,9 @@ describe("monitor agent supervisor", () => {
           summary: "tests failed after implementation",
           attempted: ["read monitor event", "read log tail"],
           recommendedHostAction: "inspect failing test and relaunch monitor",
-          suggestedCommands: [`gstack-build monitor --manifest ${manifestPath} --watch --supervise`],
+          suggestedCommands: [
+            `gstack-build monitor --manifest ${manifestPath} --watch --supervise`,
+          ],
           userChoices: [],
         };
         fs.writeFileSync(outputFilePath, JSON.stringify(body));
@@ -607,7 +626,10 @@ describe("monitor agent supervisor", () => {
   });
 
   it("invokes fake monitorAgent for USER_ACTION_REQUIRED and MONITOR_ERROR", async () => {
-    for (const eventName of ["USER_ACTION_REQUIRED", "MONITOR_ERROR"] as const) {
+    for (const eventName of [
+      "USER_ACTION_REQUIRED",
+      "MONITOR_ERROR",
+    ] as const) {
       const evaluation = {
         events: [
           {

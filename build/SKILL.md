@@ -2016,6 +2016,15 @@ fi
 # ---------- Phase 1: spawn pattern miner for un-mined investigation reports ----------
 # An un-mined report: a .md file with no GSTACK_LEARNED_PATTERN block,
 # no GSTACK_NO_PATTERN_FOUND sentinel, and no .pattern-extracted marker.
+#
+# SCOPE: Only process discovery reports (skill-fault-discovery-*.md), NOT
+# per-category reports (skill-fault-<runId>-<CATEGORY>.md). Rationale:
+# per-category reports already have known categories from the static detector;
+# mining them for patterns is redundant because the detector's static
+# categories shadow learned patterns (see
+# build/orchestrator/skill-fault-detector.ts:175). The miner's job is
+# extracting NEW failure classes (unknown failure → discovery report →
+# learned pattern).
 _MINER_PIDS=""
 for _DISC_REPORT in $(find "$_FAULT_PRIMARY_DIR" -maxdepth 1 -name 'skill-fault-discovery-*.md' 2>/dev/null); do
   [ -f "$_DISC_REPORT" ] || continue
