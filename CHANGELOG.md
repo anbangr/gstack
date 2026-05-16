@@ -1,5 +1,50 @@
 # Changelog
 
+## [1.39.1.0] - 2026-05-16
+
+**Release daemon finds `gh` under launchd. Upgrade tells you when it's broken.**
+
+The release daemon's launchd plist baked in `PATH=/usr/bin:/bin:/usr/sbin:/sbin` (launchd's default), which omits `/opt/homebrew/bin` on every Apple Silicon homebrew install. On those machines the daemon polled, spawned `gh pr list`, hit ENOENT, and marked every queued PR as `blocked: gh pr view failed`. The queue grew with nothing draining it. This release writes a hybrid PATH into the plist (homebrew prefixes + install-time `process.env.PATH` + system defaults, deduplicated) and adds a one-time upgrade banner that surfaces the broken state. Linux systemd units get the symmetric fix and a matching banner. A new `gstack-build release-daemon doctor` reports queue depth, daemon load state, PATH sanity, tool resolvability, and recent log lines in one command.
+
+### The numbers that matter
+
+Source: a real Apple Silicon homebrew machine running gstack v1.39.0.0 with 61 queued PRs, and `bun test build/orchestrator/__tests__/cli.test.ts build/orchestrator/__tests__/migration-v1.39.1.0.test.ts`.
+
+| Metric                                                          | Before                                                                             | After                            | Δ     |
+| --------------------------------------------------------------- | ---------------------------------------------------------------------------------- | -------------------------------- | ----- |
+| PRs in `blocked` status after daemon polls                      | 61                                                                                 | 0                                | -61   |
+| Time to diagnose a frozen queue                                 | ~20 min (compose `launchctl print` + log tail + `which gh` + queue status by hand) | <5 sec (`release-daemon doctor`) | ~240x |
+| `gh` resolvable from the loaded daemon's PATH                   | no                                                                                 | yes                              | flip  |
+| Migration auto-fires on `gstack-upgrade` when queue + no daemon | no                                                                                 | yes                              | new   |
+| New cli tests (PATH helper + doctor report)                     | 0                                                                                  | 9                                | +9    |
+| Migration test suite (per-scenario, mocked launchctl)           | 0                                                                                  | 6 darwin + 2 linux               | new   |
+
+`release-daemon doctor` returns HEALTHY in under a second on a clean install and surfaces the exact failure mode on a broken one (DAEMON_NOT_INSTALLED, DAEMON_NOT_LOADED, STALE_PLIST_NEEDS_RELOAD, TOOL_MISSING, QUEUE_HAS_BLOCKED_TASKS).
+
+### What this means for builders
+
+If your queue is frozen, run `gstack-build release-daemon doctor` first. If you've upgraded from <=1.39.0.0 with queued PRs, the next `gstack-upgrade` will show a banner with the exact reinstall + reload commands; the banner is one-time and per-state (separate touchfile for the install-needed case and the reload-needed case).
+
+### Itemized changes
+
+#### Fixed
+
+- Launchd plist now sets `EnvironmentVariables.PATH` and `HOME` so `gh`, `git`, `bun` resolve under launchd's daemon.
+- Systemd user unit now sets `Environment="PATH=..."` to a homebrew-aware PATH.
+
+#### Added
+
+- `gstack-build release-daemon doctor` reports queue depth (by status), daemon load state, plist PATH sanity, tool resolvability under the effective PATH, last 5 lines of `~/.gstack/release-daemon.err.log`, and a single-word verdict.
+- `gstack-upgrade` migration `v1.39.1.0.sh` prints a one-time banner when the release queue has records and either no daemon is installed, the daemon plist is unloaded, or the plist predates the PATH fix. Linux gets the symmetric notice.
+- `installReleaseDaemon` stdout now teaches both the first-install `launchctl load` command and the re-install `launchctl unload && launchctl load` pair (and the `daemon-reload && restart` equivalent on Linux).
+
+### For contributors
+
+- New migration test pattern: `build/orchestrator/__tests__/migration-v1.39.1.0.test.ts` isolates `HOME` and `GSTACK_HOME` per scenario and mocks `launchctl list` via a fake binary on PATH. Future migrations can follow this template.
+- `releaseDaemonDefaultPath(env)` accepts an optional env override for trivial unit-testing without monkey-patching `process.env`.
+- `buildReleaseDaemonDoctorReport(opts)` and `renderReleaseDaemonDoctorReport(report)` are exported; the report shape is also exported as `ReleaseDaemonDoctorReport` for downstream tooling.
+- Two-touchfile gating (`v1.39.1.0.queue-no-daemon.done` and `v1.39.1.0.stale-plist.done`) keeps the install-needed and reload-needed notices independent.
+
 ## [1.39.0.0] - 2026-05-14
 
 ## **`buildFetchHandler` ships. Embedders compose overlay routes on top of**

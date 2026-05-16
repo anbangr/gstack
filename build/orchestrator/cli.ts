@@ -605,7 +605,13 @@ export interface Args {
   /** Maximum foreground monitor wall time before MONITOR_REENTER. */
   monitorMaxWallMs: number;
   /** release-daemon subcommand. */
-  releaseDaemonCommand?: "install" | "uninstall" | "status" | "run" | "retry";
+  releaseDaemonCommand?:
+    | "install"
+    | "uninstall"
+    | "status"
+    | "run"
+    | "retry"
+    | "doctor";
   releaseDaemonOnce: boolean;
   releaseDaemonWatch: boolean;
   releaseDaemonPollMs: number;
@@ -970,10 +976,11 @@ export function parseArgs(argv: string[]): Args {
       command !== "uninstall" &&
       command !== "status" &&
       command !== "run" &&
-      command !== "retry"
+      command !== "retry" &&
+      command !== "doctor"
     ) {
       console.error(
-        "usage: gstack-build release-daemon <install|uninstall|status|run|retry> [flags]   (-h for help)",
+        "usage: gstack-build release-daemon <install|uninstall|status|run|retry|doctor> [flags]   (-h for help)",
       );
       process.exit(2);
     }
@@ -1742,7 +1749,7 @@ Usage:
   gstack-build merge [flags]
   gstack-build monitor --manifest <path> [--once|--watch] [--supervise] [--poll-ms 60000] [--max-wall-ms <ms>]
   gstack-build plan-status --gstack-repo <path> [--project-root <path>] [--json] [--all]
-  gstack-build release-daemon <install|uninstall|status|run|retry> [flags]
+  gstack-build release-daemon <install|uninstall|status|run|retry|doctor> [flags]
 
 Modes:
   <plan-file>           Execute a living implementation plan.
@@ -2240,7 +2247,9 @@ export function ensureFeatureBranch(args: {
   const onBase = existing === base || existing === "";
   const createFeatureBranch = onBase || existing.startsWith("feat/");
   const branch = createFeatureBranch
-    ? ownedFeatureBranch(args.state, args.feature, { singleBranch: args.singleBranch })
+    ? ownedFeatureBranch(args.state, args.feature, {
+        singleBranch: args.singleBranch,
+      })
     : existing;
   args.feature.branch = branch;
   args.state.branch = branch;
@@ -4441,7 +4450,10 @@ async function runPhase(args: {
           logDir(state.slug),
           `phase-${phase.number}-gemini-${action.iteration}-input.md`,
         );
-        const resolvedPhase1 = { ...phase, body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd) };
+        const resolvedPhase1 = {
+          ...phase,
+          body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd),
+        };
         fs.writeFileSync(
           inputFilePath,
           buildGeminiPromptBody(resolvedPhase1, state.planFile, state.branch),
@@ -4542,7 +4554,10 @@ async function runPhase(args: {
           logDir(state.slug),
           `phase-${phase.number}-gemini-rerun-${action.iteration}-input.md`,
         );
-        const resolvedPhase2 = { ...phase, body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd) };
+        const resolvedPhase2 = {
+          ...phase,
+          body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd),
+        };
         fs.writeFileSync(
           inputFilePath,
           buildGeminiPromptBody(
@@ -4641,7 +4656,10 @@ async function runPhase(args: {
         const geminiOutputPath =
           phaseState.gemini?.outputFilePath ?? geminiOutputPathFallback;
         const geminiOutputExists = fs.existsSync(geminiOutputPath);
-        const resolvedPhase3 = { ...phase, body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd) };
+        const resolvedPhase3 = {
+          ...phase,
+          body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd),
+        };
         fs.writeFileSync(
           inputFilePath,
           buildCodexReviewBody(
@@ -4692,7 +4710,10 @@ async function runPhase(args: {
           logDir(state.slug),
           `phase-${phase.number}-gemini-testspec-${action.iteration}-output.md`,
         );
-        const resolvedPhase4 = { ...phase, body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd) };
+        const resolvedPhase4 = {
+          ...phase,
+          body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd),
+        };
         fs.writeFileSync(
           inputFilePath,
           buildGeminiTestSpecPrompt(resolvedPhase4, state.planFile),
@@ -4995,7 +5016,14 @@ async function runPhase(args: {
             `phase-${phaseN}-dual-${candidate}-${it}-output.md`,
           );
 
-          const resolvedPhase5 = { ...phase, body: resolvePhaseBody(phase.body, args.baseProjectRoot, candidateState.worktreePath) };
+          const resolvedPhase5 = {
+            ...phase,
+            body: resolvePhaseBody(
+              phase.body,
+              args.baseProjectRoot,
+              candidateState.worktreePath,
+            ),
+          };
           fs.writeFileSync(
             inputPath,
             buildDualImplPromptBody({
@@ -5612,7 +5640,10 @@ async function runPhase(args: {
           logDir(state.slug),
           `phase-${phase.number}-judge-output.md`,
         );
-        const resolvedPhase6 = { ...phase, body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd) };
+        const resolvedPhase6 = {
+          ...phase,
+          body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd),
+        };
         fs.writeFileSync(
           inputPath,
           buildJudgePrompt({
@@ -5905,8 +5936,7 @@ async function maybePrintMonitorAgentEscalation(
 
   const slug = streakSlugFor(evaluation);
   if (slug) {
-    const verdict =
-      (escalation as { verdict?: string }).verdict ?? "unknown";
+    const verdict = (escalation as { verdict?: string }).verdict ?? "unknown";
     const streak = recordEscalation(slug, verdict);
     if (shouldSurface(streak)) {
       // Loop guard: suppress the escalation and surface a
@@ -6074,12 +6104,43 @@ export function releaseDaemonLaunchCommand(projectRoot: string): string[] {
   ];
 }
 
+// Launchd defaults to PATH=/usr/bin:/bin:/usr/sbin:/sbin which omits
+// /opt/homebrew/bin, so gh/bun/node lookups silently fail. Systemd user units
+// have a similarly minimal default. Strategy: prepend known-good prefixes,
+// merge install-time process.env.PATH so user-installed shims (~/.bun/bin,
+// asdf, ~/.cargo/bin) carry through, end with system defaults, deduplicate.
+export function releaseDaemonDefaultPath(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const home = os.homedir();
+  const known = [
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    path.join(home, ".local", "bin"),
+  ];
+  const inherited = (env.PATH ?? "").split(":").filter(Boolean);
+  const defaults = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const entry of [...known, ...inherited, ...defaults]) {
+    if (!seen.has(entry)) {
+      seen.add(entry);
+      merged.push(entry);
+    }
+  }
+  return merged.join(":");
+}
+
 export function renderLaunchdReleaseDaemonPlist(
   command: string[],
   projectRoot: string,
 ): string {
   const esc = (part: string) =>
     part.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const home = os.homedir();
+  const daemonPath = releaseDaemonDefaultPath();
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -6090,10 +6151,15 @@ export function renderLaunchdReleaseDaemonPlist(
 ${command.map((part) => `    <string>${esc(part)}</string>`).join("\n")}
   </array>
   <key>WorkingDirectory</key><string>${esc(projectRoot)}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>${esc(daemonPath)}</string>
+    <key>HOME</key><string>${esc(home)}</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${path.join(os.homedir(), ".gstack", "release-daemon.out.log")}</string>
-  <key>StandardErrorPath</key><string>${path.join(os.homedir(), ".gstack", "release-daemon.err.log")}</string>
+  <key>StandardOutPath</key><string>${path.join(home, ".gstack", "release-daemon.out.log")}</string>
+  <key>StandardErrorPath</key><string>${path.join(home, ".gstack", "release-daemon.err.log")}</string>
 </dict>
 </plist>
 `;
@@ -6107,12 +6173,14 @@ export function renderSystemdReleaseDaemonService(
   command: string[],
   projectRoot: string,
 ): string {
+  const daemonPath = releaseDaemonDefaultPath();
   return [
     "[Unit]",
     "Description=gstack release daemon",
     "",
     "[Service]",
     `WorkingDirectory=${systemdQuote(projectRoot)}`,
+    `Environment="PATH=${daemonPath}"`,
     `ExecStart=${command.map(systemdQuote).join(" ")}`,
     "Restart=always",
     "RestartSec=10",
@@ -6135,7 +6203,10 @@ function installReleaseDaemon(args: Args): number {
       renderLaunchdReleaseDaemonPlist(command, projectRoot),
     );
     console.log(`Installed launchd user agent: ${plist}`);
-    console.log(`Start with: launchctl load ${plist}`);
+    console.log(`If the daemon is not yet running:`);
+    console.log(`  launchctl load ${plist}`);
+    console.log(`If you are re-installing to pick up a plist update:`);
+    console.log(`  launchctl unload ${plist} && launchctl load ${plist}`);
     return 0;
   }
   if (process.platform === "linux") {
@@ -6147,8 +6218,11 @@ function installReleaseDaemon(args: Args): number {
       renderSystemdReleaseDaemonService(command, projectRoot),
     );
     console.log(`Installed systemd user service: ${service}`);
+    console.log(`If not yet running:`);
+    console.log(`  systemctl --user enable --now gstack-release-daemon`);
+    console.log(`Re-install (reload unit):`);
     console.log(
-      "Start with: systemctl --user enable --now gstack-release-daemon",
+      `  systemctl --user daemon-reload && systemctl --user restart gstack-release-daemon`,
     );
     return 0;
   }
@@ -6203,6 +6277,242 @@ function releaseDaemonStatus(args: Args): number {
   return queued.some((item) => item.status === "blocked") ? 1 : 0;
 }
 
+type DoctorVerdict =
+  | "HEALTHY"
+  | "DAEMON_NOT_INSTALLED"
+  | "DAEMON_NOT_LOADED"
+  | "STALE_PLIST_NEEDS_RELOAD"
+  | "TOOL_MISSING"
+  | "QUEUE_HAS_BLOCKED_TASKS";
+
+export interface ReleaseDaemonDoctorReport {
+  platform: NodeJS.Platform;
+  queueDir: string;
+  queueDepth: number;
+  queueByStatus: Record<string, number>;
+  plistPath: string | null;
+  plistExists: boolean;
+  plistHasEnvironmentVariables: boolean;
+  loaded: boolean | null;
+  loadedPath: string | null;
+  tools: { name: string; resolved: string | null }[];
+  recentLogLines: string[];
+  verdict: DoctorVerdict;
+}
+
+export function buildReleaseDaemonDoctorReport(opts: {
+  platform?: NodeJS.Platform;
+  queueDir: string;
+  home?: string;
+  uid?: number;
+  spawn?: typeof spawnSync;
+  fileExists?: (p: string) => boolean;
+  readFile?: (p: string) => string;
+  readQueueRecords?: typeof readReleaseQueueRecords;
+}): ReleaseDaemonDoctorReport {
+  const platform = opts.platform ?? process.platform;
+  const home = opts.home ?? os.homedir();
+  const uid = opts.uid ?? process.getuid?.() ?? 0;
+  const spawn = opts.spawn ?? spawnSync;
+  const exists = opts.fileExists ?? ((p: string) => fs.existsSync(p));
+  const readFile = opts.readFile ?? ((p: string) => fs.readFileSync(p, "utf8"));
+  const records = (opts.readQueueRecords ?? readReleaseQueueRecords)(
+    opts.queueDir,
+  );
+  const queueByStatus: Record<string, number> = {};
+  for (const r of records) {
+    queueByStatus[r.status] = (queueByStatus[r.status] ?? 0) + 1;
+  }
+
+  const plistPath =
+    platform === "darwin"
+      ? path.join(
+          home,
+          "Library",
+          "LaunchAgents",
+          "com.gstack.release-daemon.plist",
+        )
+      : platform === "linux"
+        ? path.join(
+            home,
+            ".config",
+            "systemd",
+            "user",
+            "gstack-release-daemon.service",
+          )
+        : null;
+  const plistExists = plistPath ? exists(plistPath) : false;
+  const plistHasEnvironmentVariables = (() => {
+    if (!plistExists || !plistPath) return false;
+    try {
+      const content = readFile(plistPath);
+      if (platform === "darwin")
+        return content.includes("EnvironmentVariables");
+      if (platform === "linux") return content.includes('Environment="PATH=');
+      return false;
+    } catch {
+      return false;
+    }
+  })();
+
+  let loaded: boolean | null = null;
+  let loadedPath: string | null = null;
+  if (platform === "darwin" && plistExists) {
+    const list = spawn("launchctl", ["list"], { encoding: "utf8" });
+    if (list.status === 0 && typeof list.stdout === "string") {
+      loaded = list.stdout.includes("com.gstack.release-daemon");
+    } else {
+      loaded = false;
+    }
+    if (loaded) {
+      const print = spawn(
+        "launchctl",
+        ["print", `gui/${uid}/com.gstack.release-daemon`],
+        { encoding: "utf8" },
+      );
+      if (print.status === 0 && typeof print.stdout === "string") {
+        const match = print.stdout.match(/^\s*PATH\s*=\s*(.+)$/m);
+        if (match) loadedPath = match[1].trim();
+      }
+    }
+  } else if (platform === "linux" && plistExists) {
+    const status = spawn(
+      "systemctl",
+      ["--user", "is-active", "gstack-release-daemon"],
+      { encoding: "utf8" },
+    );
+    loaded =
+      status.status === 0 &&
+      typeof status.stdout === "string" &&
+      status.stdout.trim() === "active";
+    const show = spawn(
+      "systemctl",
+      ["--user", "show", "-p", "Environment", "gstack-release-daemon"],
+      { encoding: "utf8" },
+    );
+    if (show.status === 0 && typeof show.stdout === "string") {
+      const match = show.stdout.match(/PATH=([^\s"]+)/);
+      if (match) loadedPath = match[1];
+    }
+  }
+
+  // Resolve tool paths under the daemon's effective PATH (loadedPath if known,
+  // otherwise the static default we'd bake into a fresh plist).
+  const effectivePath = loadedPath ?? releaseDaemonDefaultPath();
+  const tools = ["gh", "git", "bun"].map((name) => {
+    const which = spawn("/usr/bin/which", [name], {
+      encoding: "utf8",
+      env: { PATH: effectivePath, HOME: home },
+    });
+    const resolved =
+      which.status === 0 && typeof which.stdout === "string"
+        ? which.stdout.trim() || null
+        : null;
+    return { name, resolved };
+  });
+
+  const errLog = path.join(home, ".gstack", "release-daemon.err.log");
+  let recentLogLines: string[] = [];
+  if (exists(errLog)) {
+    try {
+      // Cap the read at 16 KB so a runaway log doesn't make doctor OOM. The
+      // last 5 non-empty lines are all we need.
+      const raw = readFile(errLog);
+      const trimmed = raw.length > 16_384 ? raw.slice(-16_384) : raw;
+      const all = trimmed.split("\n");
+      recentLogLines = all.slice(-5).filter((line) => line.length > 0);
+    } catch {
+      recentLogLines = [];
+    }
+  }
+
+  let verdict: DoctorVerdict = "HEALTHY";
+  if (!plistExists) {
+    verdict = "DAEMON_NOT_INSTALLED";
+  } else if (loaded === false) {
+    verdict = "DAEMON_NOT_LOADED";
+  } else if (!plistHasEnvironmentVariables) {
+    verdict = "STALE_PLIST_NEEDS_RELOAD";
+  } else if (tools.some((t) => t.resolved === null)) {
+    verdict = "TOOL_MISSING";
+  } else if ((queueByStatus["blocked"] ?? 0) > 0) {
+    verdict = "QUEUE_HAS_BLOCKED_TASKS";
+  }
+
+  return {
+    platform,
+    queueDir: opts.queueDir,
+    queueDepth: records.length,
+    queueByStatus,
+    plistPath,
+    plistExists,
+    plistHasEnvironmentVariables,
+    loaded,
+    loadedPath,
+    tools,
+    recentLogLines,
+    verdict,
+  };
+}
+
+export function renderReleaseDaemonDoctorReport(
+  report: ReleaseDaemonDoctorReport,
+): string {
+  const lines: string[] = [];
+  lines.push("Release daemon doctor");
+  lines.push("─────────────────────");
+  lines.push(`Platform:           ${report.platform}`);
+  lines.push(`Queue dir:          ${report.queueDir}`);
+  const statusBreakdown = Object.entries(report.queueByStatus)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([s, n]) => `${n} ${s}`)
+    .join(", ");
+  lines.push(
+    `Queue depth:        ${report.queueDepth} record(s)${statusBreakdown ? ` (${statusBreakdown})` : ""}`,
+  );
+  if (report.plistPath) {
+    lines.push(
+      `Plist/unit:         ${report.plistPath} (${report.plistExists ? "exists" : "MISSING"}${
+        report.plistExists
+          ? `, has PATH env: ${report.plistHasEnvironmentVariables ? "yes" : "NO"}`
+          : ""
+      })`,
+    );
+  } else {
+    lines.push(
+      "Plist/unit:         unsupported platform (use `release-daemon run --watch` manually)",
+    );
+  }
+  if (report.loaded !== null) {
+    lines.push(`Loaded:             ${report.loaded ? "yes" : "no"}`);
+  }
+  if (report.loadedPath) {
+    lines.push(`Loaded PATH:        ${report.loadedPath}`);
+  }
+  lines.push("Tool resolvability:");
+  for (const t of report.tools) {
+    lines.push(
+      `  ${t.name.padEnd(18)} ${t.resolved ? `${t.resolved} ✓` : "MISSING"}`,
+    );
+  }
+  if (report.recentLogLines.length > 0) {
+    lines.push(`Recent err log lines (last ${report.recentLogLines.length}):`);
+    for (const line of report.recentLogLines) {
+      lines.push(`  ${line}`);
+    }
+  }
+  lines.push(`Verdict: ${report.verdict}`);
+  return lines.join("\n");
+}
+
+function releaseDaemonDoctor(args: Args): number {
+  const report = buildReleaseDaemonDoctorReport({
+    queueDir: args.releaseQueueDir,
+  });
+  console.log(renderReleaseDaemonDoctorReport(report));
+  return report.verdict === "HEALTHY" ? 0 : 1;
+}
+
 async function runReleaseDaemonMode(args: Args): Promise<number> {
   switch (args.releaseDaemonCommand) {
     case "install":
@@ -6211,6 +6521,8 @@ async function runReleaseDaemonMode(args: Args): Promise<number> {
       return uninstallReleaseDaemon();
     case "status":
       return releaseDaemonStatus(args);
+    case "doctor":
+      return releaseDaemonDoctor(args);
     case "retry": {
       const record = retryReleaseQueueRecord(
         args.releaseDaemonRetryPr!,
@@ -6581,7 +6893,8 @@ async function main() {
       do {
         rerunAutonomousLoop = false;
         while (true) {
-          const skipUnshippedVerified = args.skipShip || args.singleBranch || args.dryRun;
+          const skipUnshippedVerified =
+            args.skipShip || args.singleBranch || args.dryRun;
           const featureIndex = findNextFeatureIndex(state, {
             skipOriginVerified: skipUnshippedVerified,
           });
@@ -7030,7 +7343,12 @@ async function main() {
             saveState(state, { noGbrain: args.noGbrain, log: console.warn });
           }
 
-          if (!resumeAfterLanding && !args.skipShip && !args.singleBranch && !args.dryRun) {
+          if (
+            !resumeAfterLanding &&
+            !args.skipShip &&
+            !args.singleBranch &&
+            !args.dryRun
+          ) {
             const branchForShip = featureState.branch || state.branch;
             const baseSync = syncFeatureBranchWithBase(cwd, branchForShip);
             if (!baseSync.ok) {
@@ -7317,7 +7635,8 @@ async function main() {
         if (exitCode === 0) {
           const remainingPhase = findNextPhaseIndex(state.phases);
           const remainingFeature = findNextFeatureIndex(state, {
-            skipOriginVerified: args.skipShip || args.singleBranch || args.dryRun,
+            skipOriginVerified:
+              args.skipShip || args.singleBranch || args.dryRun,
           });
           if (remainingPhase !== -1 || remainingFeature !== -1) {
             console.error(
