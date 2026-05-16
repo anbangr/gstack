@@ -2,7 +2,7 @@
 
 ## [1.39.1.0] - 2026-05-16
 
-**Release daemon finds `gh` under launchd. Upgrade tells you when it's broken. Plus upstream's blocking ExitPlanMode gate.**
+**Release daemon finds `gh` under launchd. Upgrade tells you when it's broken. Plus upstream's blocking ExitPlanMode gate. Plus reconcile + doctor for manual-ship state drift.**
 
 > **Note on this release.** Two v1.39.1.0 lines shipped in parallel — the fork
 > at `anbangr/gstack` (this release-daemon work, dated 2026-05-16) and upstream
@@ -102,6 +102,35 @@ When the model finishes a plan-\* review and is about to exit plan mode, it read
 
 - The implementation sequence is load-bearing: resolver → index → templates → preamble → `bun run gen:skill-docs` → tests. Adding the test before regeneration fails on missing gate; regenerating before the resolver edits produces no-op output. Bisectable commits should respect this order.
 - The codex gate is intentionally NOT terminal in `codex/SKILL.md`. Codex has three modes (review/challenge/consult) and only review mode writes to plan files. The gate's check-2 ("last heading is GSTACK REVIEW REPORT") short-circuits cleanly when no plan file is in context, so non-plan codex invocations are unaffected.
+
+### Build reconcile + doctor: recover state after a manual ship
+
+**`gstack-build reconcile` recovers nulled codexReview from on-disk artifacts. `gstack-build doctor` flags state/plan/artifact drift before it bites.**
+
+When a feature is shipped manually (`gh pr create + gh pr merge` to bypass a loop failure), gstack-build's per-checkbox plan rewriter never runs, so the living plan stays at `[ ]` even though the feature is merged. When a manual `jq` patch resets `state.phases[N].codexReview = null` during a workaround relaunch, the JSON state forgets a review that ran (the artifacts on disk still prove it did). This release adds two surfaces: `gstack-build reconcile [--from-artifacts]` to recover the JSON state from filesystem ground truth and flip the trailing checkboxes; `gstack-build doctor` to audit for the same drift before the user notices it and tell them which reconcile command to run.
+
+The reconcile path delegates to the existing `backfill-checkboxes.ts` script (refactored to a callable function shared with the new subcommand). The `--from-artifacts` flag scans for `phase-N-{review|qa|review-merged}-K-*.md` files in the per-slug log dir, populates `codexReview` with `iterations`, `outputLogPaths`, and `outputFilePaths`, marks the entry with `derivedFromArtifacts: true`, and does a best-effort regex parse of `GATE PASS / GATE FAIL / TIMEOUT` from the latest merged review file (last-occurrence wins, since reviewers quote prior verdicts before stating their own). Live data always wins over derived data: an already-populated codexReview is never clobbered.
+
+The doctor is read-only. It flags two P0 cases (status=committed + null codexReview + artifacts on disk, OR status=committed + unchecked plan rows) and two P1 cases (stale `state.planFile` path, orphan artifacts referencing missing phase numbers). Exit code 1 on any P0 finding, 0 otherwise. Every finding names the exact `gstack-build reconcile ...` invocation that fixes it.
+
+### What this means for builders
+
+If you've shipped manually and noticed your living-plan checkboxes never updated, run `gstack-build doctor --plan <plan.md> --state <state.json>`. It tells you exactly what's out of sync and what to run. If you're about to ship the next feature on a branch where earlier features were merged via manual workarounds, run `doctor` first to make sure state is clean.
+
+#### Added
+
+- `gstack-build reconcile [--from-artifacts] --plan <plan.md> --state <state.json>` — top-level subcommand wrapping the existing `backfill-checkboxes.ts` script. Same checkbox-flipping behavior as the script (committed phases get `[x]`), plus an opt-in `--from-artifacts` pass that reconstructs `phases[i].codexReview` from on-disk artifacts when the JSON field is null.
+- `gstack-build doctor --plan <plan.md> --state <state.json>` — read-only audit. Lists state/plan/artifact drift findings with severity (P0/P1) and a suggested fix command for each.
+- `backfill-checkboxes.ts --from-artifacts` — same artifact-reconcile pass, exposed as a flag on the one-shot script for users who already know the path.
+- `CodexReviewState.derivedFromArtifacts?: boolean` — new optional field marking reconstructed entries so future readers can distinguish them from live-observed entries.
+
+#### For contributors
+
+- New module `build/orchestrator/artifact-reconcile.ts` with pure functions: `findCodexReviewArtifacts(logDir, phaseNumber)`, `parseVerdictFromMerged(content)`, `reconcileCodexReviewFromArtifacts(state, logDir)`. Never writes; mutation lives in the CLI layer under the orchestrator's exclusive lock.
+- New module `build/orchestrator/build-doctor.ts` with `buildDoctorReport(args)` + `renderDoctorReport(report)` + `resolveLogDirForState(stateFile)`. Pure functions; the doctor never proposes auto-fixes — only diagnoses and names the right command.
+- `backfill-checkboxes.ts` body extracted into `runBackfill(args): BackfillSummary`; CLI entry gated by `import.meta.main`. The new `reconcile` subcommand and the standalone script share exactly one code path.
+- 16 new tests across `__tests__/backfill-checkboxes.test.ts` (5 new cases for `--from-artifacts`), `__tests__/build-doctor.test.ts` (7 new cases for pure-function paths + CLI subprocess), and `__tests__/cli.test.ts` (4 new wiring cases for the subcommand surface).
+- `--plan` flag is now dual-purpose: pushes onto `planStatusPlans` (for plan-status mode) AND sets `reconcilePlanFile` (for reconcile/doctor). The plan-status guard at the bottom of `parseArgs` excludes reconcile/doctor modes so a valid reconcile invocation doesn't trip "plan-status flags require: gstack-build plan-status".
 
 ## [1.39.0.0] - 2026-05-14
 
