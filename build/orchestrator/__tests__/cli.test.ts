@@ -66,24 +66,38 @@ import { DEFAULT_ROLE_CONFIGS } from "../role-config";
 
 let tmpDir: string | null = null;
 let tmpStateDir: string | null = null;
+let tmpGstackHome: string | null = null;
 let realStateDir: string | undefined;
+let realGstackHome: string | undefined;
 
 beforeEach(() => {
   realStateDir = process.env.GSTACK_BUILD_STATE_DIR;
   tmpStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-cli-state-"));
   process.env.GSTACK_BUILD_STATE_DIR = tmpStateDir;
+  // Isolate GSTACK_HOME too — evaluateMonitorOnce can trigger detectSkillFaults,
+  // which appends to ${GSTACK_HOME}/analytics/skill-faults.jsonl. Without this,
+  // each test run would leak fault entries into the developer's real ~/.gstack/.
+  realGstackHome = process.env.GSTACK_HOME;
+  tmpGstackHome = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-cli-home-"));
+  process.env.GSTACK_HOME = tmpGstackHome;
 });
 
 afterEach(() => {
   if (realStateDir) process.env.GSTACK_BUILD_STATE_DIR = realStateDir;
   else delete process.env.GSTACK_BUILD_STATE_DIR;
+  if (realGstackHome !== undefined) process.env.GSTACK_HOME = realGstackHome;
+  else delete process.env.GSTACK_HOME;
   if (tmpStateDir && fs.existsSync(tmpStateDir)) {
     fs.rmSync(tmpStateDir, { recursive: true, force: true });
+  }
+  if (tmpGstackHome && fs.existsSync(tmpGstackHome)) {
+    fs.rmSync(tmpGstackHome, { recursive: true, force: true });
   }
   if (tmpDir && fs.existsSync(tmpDir)) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
   tmpStateDir = null;
+  tmpGstackHome = null;
   tmpDir = null;
 });
 

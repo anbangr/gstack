@@ -28,6 +28,7 @@ import { DEFAULT_MAX_CODEX_ITERATIONS } from "../build/orchestrator/phase-runner
 let tmpDir: string;
 let stateDir: string;
 let oldStateDir: string | undefined;
+let oldGstackHome: string | undefined;
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-skill-fault-"));
@@ -35,11 +36,18 @@ beforeEach(() => {
   fs.mkdirSync(stateDir, { recursive: true });
   oldStateDir = process.env.GSTACK_BUILD_STATE_DIR;
   process.env.GSTACK_BUILD_STATE_DIR = stateDir;
+  // Isolate GSTACK_HOME too — evaluateMonitorOnce can trigger detectSkillFaults,
+  // which appends to ${GSTACK_HOME}/analytics/skill-faults.jsonl. Without this,
+  // each test run would leak fault entries into the developer's real ~/.gstack/.
+  oldGstackHome = process.env.GSTACK_HOME;
+  process.env.GSTACK_HOME = tmpDir;
 });
 
 afterEach(() => {
   if (oldStateDir) process.env.GSTACK_BUILD_STATE_DIR = oldStateDir;
   else delete process.env.GSTACK_BUILD_STATE_DIR;
+  if (oldGstackHome !== undefined) process.env.GSTACK_HOME = oldGstackHome;
+  else delete process.env.GSTACK_HOME;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
