@@ -1305,7 +1305,7 @@ describe("Retro plan completion section", () => {
 // --- Plan status footer in preamble ---
 
 describe("Plan status footer in preamble", () => {
-  test("preamble contains plan status footer", () => {
+  test("preamble contains plan status footer as neutral forward reference to EXIT PLAN MODE GATE", () => {
     // Read any skill that uses PREAMBLE
     const content = fs.readFileSync(
       path.join(ROOT, "office-hours", "SKILL.md"),
@@ -1313,9 +1313,11 @@ describe("Plan status footer in preamble", () => {
     );
     expect(content).toContain("Plan Status Footer");
     expect(content).toContain("GSTACK REVIEW REPORT");
-    expect(content).toContain("gstack-review-read");
     expect(content).toContain("ExitPlanMode");
-    expect(content).toContain("NO REVIEWS YET");
+    expect(content).toContain("EXIT PLAN MODE GATE");
+    // The preamble must NOT impose review-report rules on operational skills
+    // that have no review report. It's a forward reference, not enforcement.
+    expect(content).not.toContain("NO REVIEWS YET");
   });
 });
 
@@ -3966,5 +3968,47 @@ describe("LEARNINGS_SEARCH resolver: query parameter", () => {
         generateLearningsSearch(claudeCtx, [`query=${bad}`]),
       ).toThrow(/alphanumeric/);
     }
+  });
+});
+
+describe("EXIT PLAN MODE GATE placement", () => {
+  // Fresh skill list — do NOT reuse REVIEW_SKILLS upstream (3 entries, missing plan-devex).
+  const planSkills = [
+    "plan-eng-review",
+    "plan-ceo-review",
+    "plan-design-review",
+    "plan-devex-review",
+  ];
+
+  // Strip fenced code blocks before matching headings — PLAN_FILE_REVIEW_REPORT
+  // already contains `## GSTACK REVIEW REPORT` inside a markdown example fence,
+  // and the gate text itself shows `## GSTACK REVIEW REPORT` inside a fence too.
+  const stripFences = (md: string) => md.replace(/```[\s\S]*?```/g, "");
+
+  test("gate is the terminal ## heading in every plan-* review SKILL.md", () => {
+    for (const skill of planSkills) {
+      const md = fs.readFileSync(path.join(ROOT, skill, "SKILL.md"), "utf-8");
+      const stripped = stripFences(md);
+      const headings = [...stripped.matchAll(/^## .+$/gm)].map((m) => m[0]);
+      const lastH2 = headings.at(-1);
+      expect(
+        lastH2,
+        `${skill}/SKILL.md last ## heading (fences stripped)`,
+      ).toBe("## EXIT PLAN MODE GATE (BLOCKING)");
+      expect(md, `${skill}/SKILL.md gate body`).toContain(
+        "Failing this gate and calling ExitPlanMode anyway is a contract violation",
+      );
+    }
+  });
+
+  test("codex/SKILL.md contains gate (mid-file per D5; Step 2B/2C follow)", () => {
+    const codex = fs.readFileSync(
+      path.join(ROOT, "codex", "SKILL.md"),
+      "utf-8",
+    );
+    expect(codex).toContain("## EXIT PLAN MODE GATE (BLOCKING)");
+    expect(codex).toContain(
+      "Failing this gate and calling ExitPlanMode anyway is a contract violation",
+    );
   });
 });
