@@ -33,7 +33,8 @@ First, check if auto-upgrade is enabled:
 ```bash
 _AUTO=""
 [ "${GSTACK_AUTO_UPGRADE:-}" = "1" ] && _AUTO="true"
-[ -z "$_AUTO" ] && _AUTO=$(~/.claude/skills/gstack/bin/gstack-config get auto_upgrade 2>/dev/null || true)
+# Bootstrap read: $INSTALL_DIR not yet computed. Use known-location global path.
+[ -z "$_AUTO" ] && _AUTO=$("$HOME/.claude/skills/gstack/bin/gstack-config" get auto_upgrade 2>/dev/null || true)
 echo "AUTO_UPGRADE=$_AUTO"
 ```
 
@@ -81,7 +82,8 @@ Continue with the current skill.
 ### Step 2: Detect install type
 
 ```bash
-_FORK_PATH=$(~/.claude/skills/gstack/bin/gstack-config get fork_repo_path 2>/dev/null || echo "")
+# Bootstrap read: $INSTALL_DIR is computed BELOW. Use known-location global path.
+_FORK_PATH=$("$HOME/.claude/skills/gstack/bin/gstack-config" get fork_repo_path 2>/dev/null || echo "")
 if [ -n "$_FORK_PATH" ] && [ -d "$_FORK_PATH/.git" ]; then
   INSTALL_TYPE="fork-copy"
   INSTALL_DIR="$HOME/.claude/skills/gstack"
@@ -296,7 +298,7 @@ if [ -n "$_ROOT" ] && [ -d "$_ROOT/.claude/skills/gstack" ]; then
     LOCAL_GSTACK="$_ROOT/.claude/skills/gstack"
   fi
 fi
-_TEAM_MODE=$(~/.claude/skills/gstack/bin/gstack-config get team_mode 2>/dev/null || echo "false")
+_TEAM_MODE=$("$INSTALL_DIR/bin/gstack-config" get team_mode 2>/dev/null || echo "false")
 echo "LOCAL_GSTACK=$LOCAL_GSTACK"
 echo "TEAM_MODE=$_TEAM_MODE"
 ```
