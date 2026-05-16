@@ -6921,6 +6921,50 @@ export async function runReconcileMode(args: Args): Promise<number> {
   }
 }
 
+/**
+ * `gstack-build doctor --plan <plan.md> --state <state.json>`
+ *
+ * Read-only audit. Exit code:
+ *  - 0 if no findings or only P1 (housekeeping) findings.
+ *  - 1 if any P0 (silent-drift) finding present.
+ *  - 2 on argument or read errors.
+ */
+export async function runDoctorMode(args: Args): Promise<number> {
+  const { buildDoctorReport, renderDoctorReport, resolveLogDirForState } =
+    await import("./build-doctor");
+  const planFile = args.reconcilePlanFile!;
+  const stateFile = args.reconcileStateFile!;
+  let planContent: string;
+  try {
+    planContent = fs.readFileSync(planFile, "utf8");
+  } catch (err) {
+    console.error(
+      `doctor: failed to read plan file ${planFile}: ${(err as Error).message}`,
+    );
+    return 2;
+  }
+  let state: BuildState;
+  try {
+    const raw = fs.readFileSync(stateFile, "utf8");
+    state = JSON.parse(raw) as BuildState;
+  } catch (err) {
+    console.error(
+      `doctor: failed to read or parse state file ${stateFile}: ${(err as Error).message}`,
+    );
+    return 2;
+  }
+  const logDirPath = resolveLogDirForState(stateFile);
+  const report = buildDoctorReport({
+    planFile,
+    stateFile,
+    state,
+    planContent,
+    logDir: logDirPath,
+  });
+  process.stdout.write(renderDoctorReport(report));
+  return report.worstSeverity === "P0" ? 1 : 0;
+}
+
 async function main() {
   const rawArgv = process.argv.slice(2);
   const args = parseArgs(rawArgv);
@@ -6956,6 +7000,11 @@ async function main() {
 
   if (args.mode === "reconcile") {
     const exitCode = await runReconcileMode(args);
+    process.exit(exitCode);
+  }
+
+  if (args.mode === "doctor") {
+    const exitCode = await runDoctorMode(args);
     process.exit(exitCode);
   }
 
