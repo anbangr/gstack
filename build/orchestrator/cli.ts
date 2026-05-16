@@ -49,8 +49,11 @@ import {
 import {
   activeOwnedBranches,
   defaultActiveRunRegistryDir,
+  isPidAlive,
+  readActiveRunRecords,
   removeActiveRunRecord,
   writeActiveRunRecord,
+  type ActiveRunRecord,
   type ActiveRunStatus,
 } from "./active-runs";
 import {
@@ -6552,9 +6555,289 @@ async function runReleaseDaemonMode(args: Args): Promise<number> {
   }
 }
 
+// Default 30s timeout per git spawn during sweep. Protects against hangs on
+// network-filesystem mounts (NFS, SMB) where ~/.gstack might live for some
+// users. Conservative: a healthy `git worktree remove` finishes in <1s.
+const SWEEP_SPAWN_TIMEOUT_MS = 30_000;
+const SWEEP_SPAWN_MAX_BUFFER = 4 * 1024 * 1024; // 4MB plenty for git output
+
+interface WorktreeListEntry {
+  worktreePath: string;
+  repoPath: string; // the parent repo this worktree was created from
+}
+
+function listWorktreesFor(repoPath: string): WorktreeListEntry[] {
+  const result = spawnSync(
+    "git",
+    ["-C", repoPath, "worktree", "list", "--porcelain"],
+    {
+      encoding: "utf8",
+      timeout: SWEEP_SPAWN_TIMEOUT_MS,
+      maxBuffer: SWEEP_SPAWN_MAX_BUFFER,
+    },
+  );
+  if (result.status !== 0) return [];
+  const out: WorktreeListEntry[] = [];
+  for (const block of result.stdout.split("\n\n")) {
+    const wtLine = block.split("\n").find((l) => l.startsWith("worktree "));
+    if (!wtLine) continue;
+    const wtPath = wtLine.slice("worktree ".length).trim();
+    if (!wtPath) continue;
+    out.push({ worktreePath: wtPath, repoPath });
+  }
+  return out;
+}
+
+function pruneWorktrees(repoPath: string): void {
+  spawnSync("git", ["-C", repoPath, "worktree", "prune"], {
+    encoding: "utf8",
+    timeout: SWEEP_SPAWN_TIMEOUT_MS,
+    maxBuffer: SWEEP_SPAWN_MAX_BUFFER,
+  });
+}
+
+function removeWorktreeForceWithTimeout(
+  repoPath: string,
+  worktreePath: string,
+): { ok: boolean; stderr: string } {
+  const result = spawnSync(
+    "git",
+    ["-C", repoPath, "worktree", "remove", "--force", worktreePath],
+    {
+      encoding: "utf8",
+      timeout: SWEEP_SPAWN_TIMEOUT_MS,
+      maxBuffer: SWEEP_SPAWN_MAX_BUFFER,
+    },
+  );
+  return {
+    ok: result.status === 0,
+    stderr: result.stderr || result.stdout || "",
+  };
+}
+
+interface SweepStats {
+  shapeX: number; // dir + JSON, dead PID → both cleaned
+  shapeY: number; // no dir, JSON exists → JSON deleted
+  shapeZ: number; // dir on disk, no JSON → dir removed
+  skippedLive: number; // record has live PID, untouched
+  errors: number;
+}
+
+/**
+ * Sweep orphan worktrees and stale active-run JSON records at gstack-build
+ * startup. Handles three leak shapes documented in
+ * docs/superpowers/specs/2026-05-15-active-skill-clean-install-migration-design.md
+ * (and the follow-up sweep design):
+ *
+ *   Shape X: worktree dir exists, active-run JSON references it, PID is dead.
+ *   Shape Y: worktree dir is gone but active-run JSON still references it.
+ *   Shape Z: worktree dir exists but no active-run JSON owns it.
+ *
+ * Live builds (PID alive) are always skipped. Idempotent: a second call on a
+ * cleaned state is a no-op.
+ *
+ * Writes ~/.gstack/skill-faults/WORKTREE_LEAK.resolved on first non-empty run
+ * so future investigators can see WORKTREE_LEAK is systemically handled.
+ *
+ * All git spawns have a 30s timeout (SWEEP_SPAWN_TIMEOUT_MS) to prevent hangs
+ * on network-filesystem mounts.
+ */
+export function sweepOrphans(
+  registryDir: string,
+  opts: { homeDir?: string } = {},
+): SweepStats {
+  // os.homedir() caches at startup and ignores subsequent HOME env changes.
+  // Tests need to inject a temp dir, so accept an override here.
+  const homeDir = opts.homeDir ?? os.homedir();
+  const stats: SweepStats = {
+    shapeX: 0,
+    shapeY: 0,
+    shapeZ: 0,
+    skippedLive: 0,
+    errors: 0,
+  };
+
+  // 1. Read the active-runs registry (defensive on missing dir / malformed JSON).
+  let records: ActiveRunRecord[] = [];
+  try {
+    records = readActiveRunRecords(registryDir);
+  } catch (err) {
+    console.warn(
+      `[sweep] could not read active-runs registry at ${registryDir}: ${(err as Error).message}`,
+    );
+    return stats;
+  }
+
+  // 2. Build the "live" set: records whose PID is alive. We never touch these.
+  const liveByRunId = new Set<string>();
+  for (const r of records) {
+    if (isPidAlive(r.pid) && r.status === "running") {
+      liveByRunId.add(r.runId);
+      stats.skippedLive += 1;
+    }
+  }
+
+  // 3. Enumerate worktrees per unique repoPath in the registry.
+  const repoPaths = Array.from(
+    new Set(records.map((r) => r.repoPath).filter((p) => !!p)),
+  );
+  const allWorktrees = new Map<string, WorktreeListEntry>(); // worktreePath → entry
+  for (const repoPath of repoPaths) {
+    for (const entry of listWorktreesFor(repoPath)) {
+      allWorktrees.set(entry.worktreePath, entry);
+    }
+  }
+
+  // 4. Walk records and classify Shape X (and-or-Y).
+  for (const record of records) {
+    if (liveByRunId.has(record.runId)) {
+      // Live build — never touch its worktree. Drop it from the unclaimed
+      // pool so Shape Z (Step 5) can't mistake it for an orphan.
+      for (const [wtPath] of allWorktrees.entries()) {
+        if (path.basename(wtPath) === record.runId) {
+          allWorktrees.delete(wtPath);
+          break;
+        }
+      }
+      continue;
+    }
+    if (!record.repoPath) continue;
+
+    // Find the worktree dir matching this run. Build worktrees live at
+    // ~/.gstack/build-worktrees/<repoSlug>/<runId>, so we match by runId
+    // suffix in the worktree path.
+    let matchingWt: WorktreeListEntry | undefined;
+    for (const [wtPath, entry] of allWorktrees.entries()) {
+      if (path.basename(wtPath) === record.runId) {
+        matchingWt = entry;
+        break;
+      }
+    }
+
+    if (matchingWt && fs.existsSync(matchingWt.worktreePath)) {
+      // Shape X — both worktree and JSON present, PID dead.
+      const remove = removeWorktreeForceWithTimeout(
+        matchingWt.repoPath,
+        matchingWt.worktreePath,
+      );
+      if (!remove.ok) {
+        console.warn(
+          `[sweep] git worktree remove failed for ${matchingWt.worktreePath}: ${remove.stderr.trim()}`,
+        );
+        stats.errors += 1;
+        // Continue to delete the JSON anyway — record is stale regardless.
+      } else {
+        console.warn(
+          `[sweep] removed orphan worktree ${matchingWt.worktreePath} (runId=${record.runId})`,
+        );
+      }
+      try {
+        removeActiveRunRecord(registryDir, record.runId);
+        stats.shapeX += 1;
+      } catch (err) {
+        console.warn(
+          `[sweep] could not delete active-run record ${record.runId}: ${(err as Error).message}`,
+        );
+        stats.errors += 1;
+      }
+      allWorktrees.delete(matchingWt.worktreePath);
+    } else {
+      // Shape Y — JSON exists but worktree dir is gone (or git doesn't know
+      // about it). Delete the JSON and prune git's own state.
+      try {
+        removeActiveRunRecord(registryDir, record.runId);
+        console.warn(
+          `[sweep] pruned stale active-run record (no worktree on disk): ${record.runId}`,
+        );
+        stats.shapeY += 1;
+      } catch (err) {
+        console.warn(
+          `[sweep] could not delete active-run record ${record.runId}: ${(err as Error).message}`,
+        );
+        stats.errors += 1;
+      }
+    }
+  }
+
+  // 5. Walk remaining (unclaimed) worktrees that live under ~/.gstack/build-worktrees/.
+  // These are Shape Z: dir on disk, no matching active-run JSON.
+  const buildWorktreesRoot = path.join(homeDir, ".gstack", "build-worktrees");
+  for (const [wtPath, entry] of allWorktrees.entries()) {
+    if (!wtPath.startsWith(buildWorktreesRoot)) continue;
+    // The live-PID guard for Shape Z: liveByRunId is keyed on runId, but Shape Z
+    // by definition has no matching JSON. So no live process can claim this
+    // worktree via the registry. Safe to remove.
+    const remove = removeWorktreeForceWithTimeout(entry.repoPath, wtPath);
+    if (!remove.ok) {
+      console.warn(
+        `[sweep] git worktree remove failed for ${wtPath}: ${remove.stderr.trim()}`,
+      );
+      stats.errors += 1;
+      continue;
+    }
+    console.warn(
+      `[sweep] removed orphan worktree (no active-run record): ${wtPath}`,
+    );
+    stats.shapeZ += 1;
+  }
+
+  // 6. Final git worktree prune per repoPath to clean any registry stragglers.
+  for (const repoPath of repoPaths) {
+    pruneWorktrees(repoPath);
+  }
+
+  // 7. Write the resolution marker if we did anything this run.
+  const cleanedAnything = stats.shapeX + stats.shapeY + stats.shapeZ > 0;
+  if (cleanedAnything) {
+    try {
+      writeWorktreeLeakResolvedMarker(homeDir);
+    } catch (err) {
+      // Marker is best-effort; never let it break the sweep.
+      console.warn(
+        `[sweep] could not write WORKTREE_LEAK.resolved marker: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  return stats;
+}
+
+function writeWorktreeLeakResolvedMarker(homeDir: string): void {
+  const markerDir = path.join(homeDir, ".gstack", "skill-faults");
+  const markerPath = path.join(markerDir, "WORKTREE_LEAK.resolved");
+  if (fs.existsSync(markerPath)) return; // idempotent
+  fs.mkdirSync(markerDir, { recursive: true });
+  const commit = (() => {
+    try {
+      const r = spawnSync("git", ["rev-parse", "HEAD"], {
+        encoding: "utf8",
+        timeout: 5000,
+      });
+      return r.status === 0 ? r.stdout.trim().slice(0, 8) : "unknown";
+    } catch {
+      return "unknown";
+    }
+  })();
+  const ts = new Date().toISOString();
+  fs.writeFileSync(
+    markerPath,
+    `status:shipped-in-code commit:${commit} ts:${ts} notes:shipped in cli.ts sweepOrphans()\n`,
+    { mode: 0o644 },
+  );
+}
+
 async function main() {
   const rawArgv = process.argv.slice(2);
   const args = parseArgs(rawArgv);
+
+  // Sweep orphan worktrees + stale active-run records at startup. Always-on,
+  // idempotent, skips live builds. Catches the crash-mid-flight leak class
+  // that monitor.ts's on-success cleanup misses.
+  try {
+    sweepOrphans(args.activeRunRegistry);
+  } catch (err) {
+    console.warn(`[sweep] startup sweep failed: ${(err as Error).message}`);
+  }
 
   if (args.mode === "merge") {
     const exitCode = await runMergeMode(args);
