@@ -1,5 +1,61 @@
 # Changelog
 
+## [1.40.0.0] - 2026-05-16
+
+**Supervised gstack-build restarts stop nuking the active worktree. The startup sweep now reads ground truth from disk, not stale PIDs.**
+
+If you ran `gstack-build` under a supervisor (or any wrapper that relaunches the orchestrator process between phases), the startup sweep treated the previous orchestrator's PID as the only sign of life. Between phases the PID was dead, the active-run JSON still said `status: "running"`, and the sweep happily called `git worktree remove --force` on the still-active worktree. Users worked around it by moving worktrees outside `~/.gstack/build-worktrees/` and patching state files by hand. This release fixes the underlying signal: sweep now protects any active-run record whose worktree directory is on disk and whose heartbeat is fresh, regardless of PID.
+
+### What changed in one paragraph
+
+Active-run records now carry `worktreePath` directly instead of being inferred via runId-basename matching. The sweep's "is this build live?" decision protects a record when its worktree directory exists on disk and `lastUpdatedAt` is within the stale threshold (default 24h, override via `GSTACK_SWEEP_STALE_HOURS`). Records written by older versions are migrated on first read. The SIGINT/SIGTERM handler plus a new `process.on("exit")` listener now mark the active-run record `status: "paused"` before the orchestrator exits, so the on-disk state stops lying about liveness across restarts. The classify-then-dispatch refactor of `sweepOrphans` keeps the original Shape X/Y/Z behavior intact for genuinely abandoned records while adding the supervised-restart protection.
+
+### The numbers that matter
+
+Source: the new test suite under `build/orchestrator/__tests__/`. Run with `bun test ./build/orchestrator/__tests__/sweep-orphans.test.ts ./build/orchestrator/__tests__/exit-handler.test.ts ./build/orchestrator/__tests__/sweep-orphans-restart.test.ts`.
+
+| Metric | Before | After | Δ |
+| --- | --- | --- | --- |
+| Worktree survives sweep when PID dead and heartbeat fresh | no (destroyed) | yes (protected) | flip |
+| Active-run JSON survives sweep across between-phase restart | no | yes | flip |
+| Active-run JSON reflects `status: "paused"` after Ctrl-C / SIGTERM | no | yes | flip |
+| Stale-heartbeat reaper threshold (configurable) | hardcoded "any dead PID" | 24h default, env override | new |
+| Cross-machine clock-skew safety (future-timestamp clamp) | none | clamped to protect | new |
+| `sweepOrphans` tests | 9 | 16 (legacy preserved + 7 new) | +7 |
+| Exit-handler subprocess tests | 0 | 2 | new |
+| Supervised-restart integration tests | 0 | 2 | new |
+
+The supervised-restart integration tests fail pre-fix (`git worktree remove --force` runs against the live worktree) and pass post-fix.
+
+### What this means for builders
+
+Stop moving build worktrees outside `~/.gstack/build-worktrees/` to avoid the sweep. The fix preserves the convention while still cleaning up genuine leaks: a record whose heartbeat hasn't been updated in 24h with a dead PID gets reaped as before. Set `GSTACK_SWEEP_STALE_HOURS` if you want a tighter or looser reaper window. If your supervisor was patching `state.launch.projectRoot` or manifest paths to keep the worktree visible, you can drop those patches once you upgrade. New records carry `worktreePath` so the sweep no longer has to guess via runId-basename; pre-v1.40 records get rewritten on the next sweep cycle.
+
+### Itemized changes
+
+#### Fixed
+
+- `sweepOrphans` no longer destroys an active-run worktree when the recording orchestrator process has exited but the worktree directory is on disk with a fresh heartbeat. Previously the sweep matched records to worktrees by basename and called `git worktree remove --force` whenever the PID was dead, regardless of whether the worktree was the running build's home.
+- The SIGINT and SIGTERM handlers now call `updateActiveRunFromState(state, "paused")` before exit, so the active-run JSON reflects the dead PID rather than claiming `status: "running"` indefinitely.
+
+#### Added
+
+- `worktreePath` field on `ActiveRunRecord` (`build/orchestrator/active-runs.ts`). Optional for backward compatibility; the sweep migrates legacy records that match a worktree on disk by basename, after which the explicit field is the source of truth.
+- `process.on("exit")` listener in `gstack-build` that writes `status: "paused"` synchronously through the existing `writeActiveRunRecord` atomic-rename path. Catches normal exits that bypass SIGINT/SIGTERM.
+- `GSTACK_SWEEP_STALE_HOURS` env knob (default 24) controls the heartbeat-age threshold past which the sweep treats a dead-PID record as a genuine leak.
+- Cross-machine clock-skew clamp: records whose `lastUpdatedAt` is in the future (or within 60 seconds of now) are treated as protected, never reaped. Prevents an artifacts-sync record from another machine from triggering a destructive sweep on this one.
+- `protectedOnDisk` and `migrated` counters in `SweepStats` so callers can distinguish "sweep ran and found nothing destructive" from "sweep ran and found nothing at all."
+- 11 new sweep tests covering the protect-on-disk regression, clock-skew clamp, env-knob override, sub-60s freshness clamp, migration in both directions, supervised-restart end-to-end flow (with and without `worktreePath`), and repoPath normalization.
+
+#### Changed
+
+- `sweepOrphans` is now a small driver loop over a `classifyRecord` tagged union with named helpers (`reapShapeX`, `pruneRecord`, `migrateRecord`). Behavior preserved for the original Shape X/Y/Z paths; the new `protect-on-disk` and `migrate` verdicts add the supervised-restart and schema-migration paths.
+- `repoPath` dedup in the sweep now runs through the exported `normalizeRepoPath` so trailing-slash and `..`-segment variants collapse to a single canonical form. Eliminates a class of false Shape Y matches.
+
+#### For contributors
+
+- `normalizeRepoPath` is now exported from `build/orchestrator/active-runs.ts`.
+
 ## [1.39.1.0] - 2026-05-16
 
 **Release daemon finds `gh` under launchd. Upgrade tells you when it's broken. Plus upstream's blocking ExitPlanMode gate. Plus reconcile + doctor for manual-ship state drift.**
