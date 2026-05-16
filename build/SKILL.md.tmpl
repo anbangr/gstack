@@ -1140,6 +1140,7 @@ if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
     }
 
     _SEEN_FAULTS=""
+    _FAULT_PIDS=""
     while IFS=$'\t' read -r _FAULT_RUN_ID _FAULT_CATEGORY _FAULT_B64 _FAULT_EVENT_B64; do
       [ -z "$_FAULT_B64" ] && continue
       _FAULT_JSON=$(_decode_fault_b64 "$_FAULT_B64")
@@ -1170,6 +1171,7 @@ if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
 
       if [ -n "$GSTACK_FAULT_INVESTIGATOR_COMMAND" ]; then
         (FAULT_PRIMARY="$_FAULT_PRIMARY" FAULT_SECONDARY="$_FAULT_SECONDARY" FAULT_EVENT="$_FAULT_EVENT" FAULT_CATEGORY="$_FAULT_CATEGORY" FAULT_RUN_ID="$_FAULT_RUN_ID" FAULT_REPORT_NAME="$_FAULT_REPORT_NAME" FAULT_INVESTIGATOR_MODEL="$_FAULT_INVESTIGATOR_MODEL" bash -lc "$GSTACK_FAULT_INVESTIGATOR_COMMAND"; _FAULT_RC=$?; [ -n "$_FAULT_SECONDARY" ] && [ -s "$_FAULT_PRIMARY" ] && cp "$_FAULT_PRIMARY" "$_FAULT_SECONDARY" 2>/dev/null || true; exit "$_FAULT_RC") > "$_FAULT_PRIMARY" 2>&1 &
+        _FAULT_PIDS="$_FAULT_PIDS $!"
       else
         if [ -z "$_FAULT_INVESTIGATOR_PROVIDER" ] || [ -z "$_FAULT_INVESTIGATOR_MODEL" ]; then
           echo "unsupported fault investigator provider/model: $_FAULT_INVESTIGATOR_PROVIDER / $_FAULT_INVESTIGATOR_MODEL" >&2
@@ -1180,16 +1182,20 @@ if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
         case "$_FAULT_INVESTIGATOR_PROVIDER" in
           gemini)
             (FAULT_PRIMARY="$_FAULT_PRIMARY" FAULT_SECONDARY="$_FAULT_SECONDARY" FAULT_EVENT="$_FAULT_EVENT" FAULT_CATEGORY="$_FAULT_CATEGORY" FAULT_RUN_ID="$_FAULT_RUN_ID" FAULT_REPORT_NAME="$_FAULT_REPORT_NAME" FAULT_INVESTIGATOR_MODEL="$_FAULT_INVESTIGATOR_MODEL" gemini -p "$_INV_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" --yolo; [ -n "$_FAULT_SECONDARY" ] && [ -s "$_FAULT_PRIMARY" ] && cp "$_FAULT_PRIMARY" "$_FAULT_SECONDARY" 2>/dev/null || true) > "$_FAULT_PRIMARY" 2>&1 &
+            _FAULT_PIDS="$_FAULT_PIDS $!"
             ;;
           kimi)
             (FAULT_PRIMARY="$_FAULT_PRIMARY" FAULT_SECONDARY="$_FAULT_SECONDARY" FAULT_EVENT="$_FAULT_EVENT" FAULT_CATEGORY="$_FAULT_CATEGORY" FAULT_RUN_ID="$_FAULT_RUN_ID" FAULT_REPORT_NAME="$_FAULT_REPORT_NAME" FAULT_INVESTIGATOR_MODEL="$_FAULT_INVESTIGATOR_MODEL" kimi --work-dir "$(pwd -P)" -p "$_INV_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" --yolo --print --final-message-only; [ -n "$_FAULT_SECONDARY" ] && [ -s "$_FAULT_PRIMARY" ] && cp "$_FAULT_PRIMARY" "$_FAULT_SECONDARY" 2>/dev/null || true) > "$_FAULT_PRIMARY" 2>&1 &
+            _FAULT_PIDS="$_FAULT_PIDS $!"
             ;;
           claude)
             (FAULT_PRIMARY="$_FAULT_PRIMARY" FAULT_SECONDARY="$_FAULT_SECONDARY" FAULT_EVENT="$_FAULT_EVENT" FAULT_CATEGORY="$_FAULT_CATEGORY" FAULT_RUN_ID="$_FAULT_RUN_ID" FAULT_REPORT_NAME="$_FAULT_REPORT_NAME" FAULT_INVESTIGATOR_MODEL="$_FAULT_INVESTIGATOR_MODEL" claude --model "$_FAULT_INVESTIGATOR_MODEL" -p "$_INV_PROMPT"; [ -n "$_FAULT_SECONDARY" ] && [ -s "$_FAULT_PRIMARY" ] && cp "$_FAULT_PRIMARY" "$_FAULT_SECONDARY" 2>/dev/null || true) > "$_FAULT_PRIMARY" 2>&1 &
+            _FAULT_PIDS="$_FAULT_PIDS $!"
             ;;
           codex)
             _INV_REASONING=$(jq -r '.roles.faultInvestigator.reasoning // "high"' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
             (FAULT_PRIMARY="$_FAULT_PRIMARY" FAULT_SECONDARY="$_FAULT_SECONDARY" FAULT_EVENT="$_FAULT_EVENT" FAULT_CATEGORY="$_FAULT_CATEGORY" FAULT_RUN_ID="$_FAULT_RUN_ID" FAULT_REPORT_NAME="$_FAULT_REPORT_NAME" FAULT_INVESTIGATOR_MODEL="$_FAULT_INVESTIGATOR_MODEL" codex exec "$_INV_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" -s workspace-write -c "model_reasoning_effort=\"$_INV_REASONING\"" -C "$(pwd -P)"; [ -n "$_FAULT_SECONDARY" ] && [ -s "$_FAULT_PRIMARY" ] && cp "$_FAULT_PRIMARY" "$_FAULT_SECONDARY" 2>/dev/null || true) > "$_FAULT_PRIMARY" 2>&1 &
+            _FAULT_PIDS="$_FAULT_PIDS $!"
             ;;
           *)
             echo "unsupported fault investigator provider: $_FAULT_INVESTIGATOR_PROVIDER" >&2
@@ -1197,6 +1203,15 @@ if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
         esac
       fi
     done < <(printf '%s\n' "$_FAULT_ROWS")
+
+    # Wait for all backgrounded investigators so reports survive parent exit.
+    # Without this, the parent shell exits via `exit "$_MONITOR_EXIT"` before
+    # the investigator can write its report; the orphan dies on SIGHUP or its
+    # output is lost. Each investigator can take 30s-3min; that's acceptable
+    # latency to get reports on disk.
+    for _FP in $_FAULT_PIDS; do
+      wait "$_FP" 2>/dev/null || true
+    done
   fi
 
   # Catch-all: fire a purely investigative agent when build failed with no known fault category.
@@ -1209,25 +1224,34 @@ if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
     _DISCOVERY_REPORT_NAME="skill-fault-discovery-${_LAST_RUN_ID}-$(date +%Y%m%d-%H%M%S).md"
     _DISCOVERY_PRIMARY="$_FAULT_PRIMARY_DIR/$_DISCOVERY_REPORT_NAME"
     _CATCHALL_PROMPT="A build just failed (runId: ${_LAST_RUN_ID}). No known fault category matched. Read the build state at ${_FAILED_STATE_FILE:-<state-file-unavailable>} and stdout log at ${_FAILED_STDOUT_LOG:-<stdout-unavailable>}. Write a detailed investigation: what failed, the root cause, the evidence. You MUST ONLY read files. Do NOT write code, run tests, or commit anything. Write your report to ${_DISCOVERY_PRIMARY}."
+    _CATCHALL_PID=""
     if [ -n "$GSTACK_FAULT_INVESTIGATOR_COMMAND" ]; then
       (FAULT_PRIMARY="$_DISCOVERY_PRIMARY" FAULT_SECONDARY="" FAULT_EVENT="" FAULT_CATEGORY="catch-all" FAULT_RUN_ID="$_LAST_RUN_ID" FAULT_REPORT_NAME="$_DISCOVERY_REPORT_NAME" FAULT_INVESTIGATOR_MODEL="$_FAULT_INVESTIGATOR_MODEL" bash -lc "$GSTACK_FAULT_INVESTIGATOR_COMMAND") > "$_DISCOVERY_PRIMARY" 2>&1 &
+      _CATCHALL_PID=$!
     else
       case "$_FAULT_INVESTIGATOR_PROVIDER" in
         gemini)
           gemini -p "$_CATCHALL_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" --yolo > "$_DISCOVERY_PRIMARY" 2>&1 &
+          _CATCHALL_PID=$!
           ;;
         kimi)
           kimi --work-dir "$(pwd -P)" -p "$_CATCHALL_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" --yolo --print --final-message-only > "$_DISCOVERY_PRIMARY" 2>&1 &
+          _CATCHALL_PID=$!
           ;;
         claude)
           claude --model "$_FAULT_INVESTIGATOR_MODEL" -p "$_CATCHALL_PROMPT" > "$_DISCOVERY_PRIMARY" 2>&1 &
+          _CATCHALL_PID=$!
           ;;
         codex)
           _CATCHALL_REASONING=$(jq -r '.roles.faultInvestigator.reasoning // "high"' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
           codex exec "$_CATCHALL_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" -s workspace-write -c "model_reasoning_effort=\"$_CATCHALL_REASONING\"" -C "$(pwd -P)" > "$_DISCOVERY_PRIMARY" 2>&1 &
+          _CATCHALL_PID=$!
           ;;
       esac
     fi
+    # Same reason as per-category wait above: parent must wait or the
+    # discovery report file is lost when the build skill exits.
+    [ -n "$_CATCHALL_PID" ] && wait "$_CATCHALL_PID" 2>/dev/null || true
   fi
 fi
 { [ "$_MONITOR_EXIT" = "0" ] || [ "$_MONITOR_EXIT" = "13" ]; } && printf '\n⚠ MANDATORY: %s — proceed to Step 3 (Final Ship & Completion). Plans NOT archived. Branches may be unshipped. Do NOT stop here.\n' "$([ "$_MONITOR_EXIT" = "13" ] && echo "FINALIZATION_REQUIRED" || echo "ALL_RUNS_COMPLETE")"
@@ -1252,6 +1276,7 @@ fi
 # ---------- Phase 1: spawn pattern miner for un-mined investigation reports ----------
 # An un-mined report: a .md file with no GSTACK_LEARNED_PATTERN block,
 # no GSTACK_NO_PATTERN_FOUND sentinel, and no .pattern-extracted marker.
+_MINER_PIDS=""
 for _DISC_REPORT in $(find "$_FAULT_PRIMARY_DIR" -maxdepth 1 -name 'skill-fault-discovery-*.md' 2>/dev/null); do
   [ -f "$_DISC_REPORT" ] || continue
   [ -f "${_DISC_REPORT}.pattern-extracted" ] && continue
@@ -1270,18 +1295,29 @@ for _DISC_REPORT in $(find "$_FAULT_PRIMARY_DIR" -maxdepth 1 -name 'skill-fault-
   case "$_FAULT_INVESTIGATOR_PROVIDER" in
     gemini)
       gemini -p "$_MINER_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" --yolo >> "$_DISC_REPORT" 2>/dev/null &
+      _MINER_PIDS="$_MINER_PIDS $!"
       ;;
     kimi)
       kimi --work-dir "$(pwd -P)" -p "$_MINER_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" --yolo --print --final-message-only >> "$_DISC_REPORT" 2>/dev/null &
+      _MINER_PIDS="$_MINER_PIDS $!"
       ;;
     claude)
       claude --model "$_FAULT_INVESTIGATOR_MODEL" -p "$_MINER_PROMPT" >> "$_DISC_REPORT" 2>/dev/null &
+      _MINER_PIDS="$_MINER_PIDS $!"
       ;;
     codex)
       _MINER_REASONING=$(jq -r '.roles.faultInvestigator.reasoning // "high"' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
       codex exec "$_MINER_PROMPT" -m "$_FAULT_INVESTIGATOR_MODEL" -s workspace-write -c "model_reasoning_effort=\"$_MINER_REASONING\"" -C "$(pwd -P)" >> "$_DISC_REPORT" 2>/dev/null &
+      _MINER_PIDS="$_MINER_PIDS $!"
       ;;
   esac
+done
+
+# Wait for backgrounded miners so the pattern block is appended to the
+# report before Phase 2 reads it. Without the wait, Phase 2 below sees an
+# unfinished report and either re-spawns (duplicate work) or skips it.
+for _MP in $_MINER_PIDS; do
+  wait "$_MP" 2>/dev/null || true
 done
 
 # ---------- Phase 2: extract patterns from mined reports ----------
