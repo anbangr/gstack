@@ -50,6 +50,7 @@ import {
   activeOwnedBranches,
   defaultActiveRunRegistryDir,
   isPidAlive,
+  normalizeRepoPath,
   readActiveRunRecords,
   removeActiveRunRecord,
   writeActiveRunRecord,
@@ -466,6 +467,7 @@ function updateActiveRunFromState(
     runId: launch.runId,
     stateSlug: state.slug,
     repoPath: launch.projectRoot,
+    worktreePath: path.resolve(launch.projectRoot),
     ...(launch.baseProjectRoot && { baseProjectRoot: launch.baseProjectRoot }),
     planFile: state.planFile,
     ...(launch.branchPrefix && { branchPrefix: launch.branchPrefix }),
@@ -503,6 +505,7 @@ function writeProvisionalActiveRunRecord(args: {
     runId: launch.runId,
     stateSlug: launch.stateSlug ?? args.slug,
     repoPath: launch.projectRoot,
+    worktreePath: path.resolve(launch.projectRoot),
     ...(launch.baseProjectRoot && { baseProjectRoot: launch.baseProjectRoot }),
     planFile: args.planFile,
     ...(launch.branchPrefix && { branchPrefix: launch.branchPrefix }),
@@ -6688,25 +6691,207 @@ function removeWorktreeForceWithTimeout(
 }
 
 interface SweepStats {
-  shapeX: number; // dir + JSON, dead PID → both cleaned
+  shapeX: number; // dir + JSON, dead PID + stale heartbeat → both cleaned
   shapeY: number; // no dir, JSON exists → JSON deleted
   shapeZ: number; // dir on disk, no JSON → dir removed
   skippedLive: number; // record has live PID, untouched
+  protectedOnDisk: number; // record has dead PID but worktree on disk (fresh) — protected
+  migrated: number; // legacy record (no worktreePath) rewritten with discovered path
   errors: number;
+}
+
+// Default heartbeat-staleness threshold. A record's lastUpdatedAt must be older
+// than this for sweepOrphans to consider its worktree a genuine leak; below
+// the threshold, the worktree is protected from reaping even when the PID is
+// dead (supervised-restart case). Overridden by GSTACK_SWEEP_STALE_HOURS.
+const DEFAULT_SWEEP_STALE_HOURS = 24;
+
+// Below this lower bound, "now − lastUpdatedAt" is treated as live regardless
+// of the stale threshold, to absorb small clock drift across machines or
+// filesystem timestamp rounding.
+const SWEEP_FRESH_MIN_MS = 60_000;
+
+function staleThresholdMs(): number {
+  const raw = process.env.GSTACK_SWEEP_STALE_HOURS;
+  const hours = raw && /^\d+(\.\d+)?$/.test(raw) ? parseFloat(raw) : NaN;
+  const effective = Number.isFinite(hours) && hours > 0
+    ? hours
+    : DEFAULT_SWEEP_STALE_HOURS;
+  return effective * 3600 * 1000;
+}
+
+type ClassifyResult =
+  | { kind: "live" }
+  | { kind: "protect-on-disk"; worktreePath: string }
+  | { kind: "reap-shape-x"; worktree: WorktreeListEntry }
+  | { kind: "reap-shape-y" }
+  | { kind: "migrate"; discoveredPath: string };
+
+/**
+ * Decide what to do with a single active-run record.
+ *
+ * The central invariant: a record is "live" if its worktree directory exists
+ * on disk, NOT if its PID happens to match a running process. A
+ * supervisor-driven orchestrator legitimately exits between phases and
+ * relaunches under a new PID — its prior active-run JSON is stale-PID + still
+ * pointing at a worktree we must not touch.
+ *
+ * PID liveness is still used as a positive signal (skip on live PID), but its
+ * absence is no longer sufficient to destroy a worktree. The stale-heartbeat
+ * reaper handles genuinely abandoned records by checking lastUpdatedAt age.
+ */
+function classifyRecord(
+  record: ActiveRunRecord,
+  allWorktrees: Map<string, WorktreeListEntry>,
+  now: number,
+): ClassifyResult {
+  if (isPidAlive(record.pid) && record.status === "running") {
+    return { kind: "live" };
+  }
+
+  // Prefer the explicit worktreePath field. Records written before v1.40
+  // (when this field was added) don't have it; in that case fall back to
+  // basename-against-runId discovery to migrate the record on first read.
+  const explicitWt = record.worktreePath;
+  if (explicitWt) {
+    const onDisk = fs.existsSync(explicitWt);
+    if (onDisk) {
+      const age = now - new Date(record.lastUpdatedAt).getTime();
+      if (!Number.isFinite(age) || age < SWEEP_FRESH_MIN_MS) {
+        // Fresh heartbeat (or future-timestamp from cross-machine clock skew):
+        // treat as protected. We never destroy a worktree whose record was
+        // just updated.
+        return { kind: "protect-on-disk", worktreePath: explicitWt };
+      }
+      if (age <= staleThresholdMs()) {
+        // PID dead, dir on disk, but heartbeat within tolerance — assume
+        // supervised restart in progress, do not touch.
+        return { kind: "protect-on-disk", worktreePath: explicitWt };
+      }
+      // PID dead, dir on disk, heartbeat older than threshold: genuine leak.
+      // Try to match a registered git worktree entry; we still need its
+      // repoPath to drive `git worktree remove --force`.
+      const entry = allWorktrees.get(explicitWt);
+      if (entry) {
+        return { kind: "reap-shape-x", worktree: entry };
+      }
+      // Fall through — treat as shape Y (no matching git registration).
+      return { kind: "reap-shape-y" };
+    }
+    // Worktree path recorded but missing from disk: classic Shape Y.
+    return { kind: "reap-shape-y" };
+  }
+
+  // Legacy record: no worktreePath field. Try the basename heuristic ONLY
+  // to discover the path for migration. After discovery we rewrite the
+  // record, and subsequent passes use the explicit path above.
+  for (const [wtPath] of allWorktrees) {
+    if (path.basename(wtPath) === record.runId && fs.existsSync(wtPath)) {
+      return { kind: "migrate", discoveredPath: wtPath };
+    }
+  }
+  // No matching worktree on disk anywhere — genuine Shape Y for legacy
+  // record too.
+  return { kind: "reap-shape-y" };
+}
+
+function reapShapeX(
+  registryDir: string,
+  record: ActiveRunRecord,
+  worktree: WorktreeListEntry,
+  stats: SweepStats,
+): void {
+  const remove = removeWorktreeForceWithTimeout(
+    worktree.repoPath,
+    worktree.worktreePath,
+  );
+  if (!remove.ok) {
+    console.warn(
+      `[sweep] git worktree remove failed for ${worktree.worktreePath}: ${remove.stderr.trim()}`,
+    );
+    stats.errors += 1;
+    // Continue to delete the JSON anyway — record is stale regardless.
+  } else {
+    console.warn(
+      `[sweep] reaped stale worktree ${worktree.worktreePath} (runId=${record.runId}, lastUpdatedAt=${record.lastUpdatedAt})`,
+    );
+  }
+  try {
+    removeActiveRunRecord(registryDir, record.runId);
+    stats.shapeX += 1;
+  } catch (err) {
+    console.warn(
+      `[sweep] could not delete active-run record ${record.runId}: ${(err as Error).message}`,
+    );
+    stats.errors += 1;
+  }
+}
+
+function pruneRecord(
+  registryDir: string,
+  record: ActiveRunRecord,
+  stats: SweepStats,
+): void {
+  try {
+    removeActiveRunRecord(registryDir, record.runId);
+    console.warn(
+      `[sweep] pruned stale active-run record (no worktree on disk): ${record.runId}`,
+    );
+    stats.shapeY += 1;
+  } catch (err) {
+    console.warn(
+      `[sweep] could not delete active-run record ${record.runId}: ${(err as Error).message}`,
+    );
+    stats.errors += 1;
+  }
+}
+
+function migrateRecord(
+  registryDir: string,
+  record: ActiveRunRecord,
+  discoveredPath: string,
+  stats: SweepStats,
+): ActiveRunRecord {
+  const migrated: ActiveRunRecord = {
+    ...record,
+    worktreePath: discoveredPath,
+  };
+  try {
+    writeActiveRunRecord(registryDir, migrated);
+    stats.migrated += 1;
+    console.warn(
+      `[sweep] migrated legacy active-run record ${record.runId}: worktreePath=${discoveredPath}`,
+    );
+  } catch (err) {
+    console.warn(
+      `[sweep] could not migrate active-run record ${record.runId}: ${(err as Error).message}`,
+    );
+    stats.errors += 1;
+  }
+  return migrated;
 }
 
 /**
  * Sweep orphan worktrees and stale active-run JSON records at gstack-build
- * startup. Handles three leak shapes documented in
- * docs/superpowers/specs/2026-05-15-active-skill-clean-install-migration-design.md
- * (and the follow-up sweep design):
+ * startup. Handles three leak shapes plus a new "protected" case:
  *
- *   Shape X: worktree dir exists, active-run JSON references it, PID is dead.
+ *   Shape X: worktree dir exists, active-run JSON references it, PID is dead,
+ *            heartbeat older than GSTACK_SWEEP_STALE_HOURS (default 24h).
+ *            Both worktree and JSON cleaned.
  *   Shape Y: worktree dir is gone but active-run JSON still references it.
- *   Shape Z: worktree dir exists but no active-run JSON owns it.
+ *            JSON deleted.
+ *   Shape Z: worktree dir on disk under ~/.gstack/build-worktrees/ but no
+ *            active-run JSON owns it. Worktree removed.
+ *   Protect: worktree dir on disk + active-run JSON, fresh heartbeat (within
+ *            stale threshold). Untouched. This is the supervised-restart case:
+ *            orchestrator exited between phases, supervisor will relaunch.
  *
- * Live builds (PID alive) are always skipped. Idempotent: a second call on a
- * cleaned state is a no-op.
+ * Live builds (PID alive AND status=running) are always skipped. Idempotent:
+ * a second call on a cleaned state is a no-op.
+ *
+ * Legacy records (written before worktreePath was added to the schema) are
+ * migrated on first read when the runId-basename heuristic finds a matching
+ * directory on disk.
  *
  * Writes ~/.gstack/skill-faults/WORKTREE_LEAK.resolved on first non-empty run
  * so future investigators can see WORKTREE_LEAK is systemically handled.
@@ -6716,16 +6901,19 @@ interface SweepStats {
  */
 export function sweepOrphans(
   registryDir: string,
-  opts: { homeDir?: string } = {},
+  opts: { homeDir?: string; now?: number } = {},
 ): SweepStats {
   // os.homedir() caches at startup and ignores subsequent HOME env changes.
   // Tests need to inject a temp dir, so accept an override here.
   const homeDir = opts.homeDir ?? os.homedir();
+  const now = opts.now ?? Date.now();
   const stats: SweepStats = {
     shapeX: 0,
     shapeY: 0,
     shapeZ: 0,
     skippedLive: 0,
+    protectedOnDisk: 0,
+    migrated: 0,
     errors: 0,
   };
 
@@ -6740,18 +6928,15 @@ export function sweepOrphans(
     return stats;
   }
 
-  // 2. Build the "live" set: records whose PID is alive. We never touch these.
-  const liveByRunId = new Set<string>();
-  for (const r of records) {
-    if (isPidAlive(r.pid) && r.status === "running") {
-      liveByRunId.add(r.runId);
-      stats.skippedLive += 1;
-    }
-  }
-
-  // 3. Enumerate worktrees per unique repoPath in the registry.
+  // 2. Enumerate worktrees per unique normalized repoPath in the registry.
+  // Normalize so '/x/repo' and '/x/repo/' don't spawn `git worktree list`
+  // twice and don't produce mismatched paths downstream.
   const repoPaths = Array.from(
-    new Set(records.map((r) => r.repoPath).filter((p) => !!p)),
+    new Set(
+      records
+        .map((r) => normalizeRepoPath(r.repoPath))
+        .filter((p): p is string => !!p),
+    ),
   );
   const allWorktrees = new Map<string, WorktreeListEntry>(); // worktreePath → entry
   for (const repoPath of repoPaths) {
@@ -6760,85 +6945,65 @@ export function sweepOrphans(
     }
   }
 
-  // 4. Walk records and classify Shape X (and-or-Y).
-  for (const record of records) {
-    if (liveByRunId.has(record.runId)) {
-      // Live build — never touch its worktree. Drop it from the unclaimed
-      // pool so Shape Z (Step 5) can't mistake it for an orphan.
-      for (const [wtPath] of allWorktrees.entries()) {
-        if (path.basename(wtPath) === record.runId) {
-          allWorktrees.delete(wtPath);
-          break;
-        }
-      }
-      continue;
-    }
-    if (!record.repoPath) continue;
+  // 3. Classify and dispatch each record. Migration may rewrite a record
+  // in-place; the rewritten value gets re-classified in the same pass so
+  // the dispatch decision uses the freshly populated worktreePath.
+  const claimedWorktrees = new Set<string>(); // paths the loop touched
+  for (const original of records) {
+    let record = original;
 
-    // Find the worktree dir matching this run. Build worktrees live at
-    // ~/.gstack/build-worktrees/<repoSlug>/<runId>, so we match by runId
-    // suffix in the worktree path.
-    let matchingWt: WorktreeListEntry | undefined;
-    for (const [wtPath, entry] of allWorktrees.entries()) {
-      if (path.basename(wtPath) === record.runId) {
-        matchingWt = entry;
+    // Inner loop allows a single re-classification after migration without
+    // recursing — bounded at two iterations max.
+    for (let i = 0; i < 2; i += 1) {
+      const verdict = classifyRecord(record, allWorktrees, now);
+      if (verdict.kind === "live") {
+        stats.skippedLive += 1;
+        // Best-effort: mark the worktree as claimed so Shape Z below
+        // doesn't sweep it. With explicit worktreePath this is direct;
+        // fall back to basename for legacy records.
+        if (record.worktreePath) {
+          claimedWorktrees.add(record.worktreePath);
+        } else {
+          for (const [wtPath] of allWorktrees) {
+            if (path.basename(wtPath) === record.runId) {
+              claimedWorktrees.add(wtPath);
+              break;
+            }
+          }
+        }
         break;
       }
-    }
-
-    if (matchingWt && fs.existsSync(matchingWt.worktreePath)) {
-      // Shape X — both worktree and JSON present, PID dead.
-      const remove = removeWorktreeForceWithTimeout(
-        matchingWt.repoPath,
-        matchingWt.worktreePath,
+      if (verdict.kind === "protect-on-disk") {
+        stats.protectedOnDisk += 1;
+        claimedWorktrees.add(verdict.worktreePath);
+        break;
+      }
+      if (verdict.kind === "reap-shape-x") {
+        reapShapeX(registryDir, record, verdict.worktree, stats);
+        claimedWorktrees.add(verdict.worktree.worktreePath);
+        break;
+      }
+      if (verdict.kind === "reap-shape-y") {
+        pruneRecord(registryDir, record, stats);
+        break;
+      }
+      // verdict.kind === "migrate"
+      record = migrateRecord(
+        registryDir,
+        record,
+        verdict.discoveredPath,
+        stats,
       );
-      if (!remove.ok) {
-        console.warn(
-          `[sweep] git worktree remove failed for ${matchingWt.worktreePath}: ${remove.stderr.trim()}`,
-        );
-        stats.errors += 1;
-        // Continue to delete the JSON anyway — record is stale regardless.
-      } else {
-        console.warn(
-          `[sweep] removed orphan worktree ${matchingWt.worktreePath} (runId=${record.runId})`,
-        );
-      }
-      try {
-        removeActiveRunRecord(registryDir, record.runId);
-        stats.shapeX += 1;
-      } catch (err) {
-        console.warn(
-          `[sweep] could not delete active-run record ${record.runId}: ${(err as Error).message}`,
-        );
-        stats.errors += 1;
-      }
-      allWorktrees.delete(matchingWt.worktreePath);
-    } else {
-      // Shape Y — JSON exists but worktree dir is gone (or git doesn't know
-      // about it). Delete the JSON and prune git's own state.
-      try {
-        removeActiveRunRecord(registryDir, record.runId);
-        console.warn(
-          `[sweep] pruned stale active-run record (no worktree on disk): ${record.runId}`,
-        );
-        stats.shapeY += 1;
-      } catch (err) {
-        console.warn(
-          `[sweep] could not delete active-run record ${record.runId}: ${(err as Error).message}`,
-        );
-        stats.errors += 1;
-      }
+      // Loop again so the rewritten record gets a real classify decision.
     }
   }
 
-  // 5. Walk remaining (unclaimed) worktrees that live under ~/.gstack/build-worktrees/.
-  // These are Shape Z: dir on disk, no matching active-run JSON.
+  // 4. Walk remaining (unclaimed) worktrees under ~/.gstack/build-worktrees/.
+  // These are Shape Z: dir on disk, no active-run JSON owns them.
   const buildWorktreesRoot = path.join(homeDir, ".gstack", "build-worktrees");
   for (const [wtPath, entry] of allWorktrees.entries()) {
+    if (claimedWorktrees.has(wtPath)) continue;
     if (!wtPath.startsWith(buildWorktreesRoot)) continue;
-    // The live-PID guard for Shape Z: liveByRunId is keyed on runId, but Shape Z
-    // by definition has no matching JSON. So no live process can claim this
-    // worktree via the registry. Safe to remove.
     const remove = removeWorktreeForceWithTimeout(entry.repoPath, wtPath);
     if (!remove.ok) {
       console.warn(
@@ -6853,12 +7018,15 @@ export function sweepOrphans(
     stats.shapeZ += 1;
   }
 
-  // 6. Final git worktree prune per repoPath to clean any registry stragglers.
+  // 5. Final git worktree prune per repoPath to clean any registry stragglers.
   for (const repoPath of repoPaths) {
     pruneWorktrees(repoPath);
   }
 
-  // 7. Write the resolution marker if we did anything this run.
+  // 6. Write the resolution marker if we did anything destructive this run.
+  // Protected/migrated counts don't trigger the marker — that's intentional;
+  // the marker means "WORKTREE_LEAK was found and cleaned," not "the sweep
+  // ran." Pure-protect runs should look like no-ops to consumers.
   const cleanedAnything = stats.shapeX + stats.shapeY + stats.shapeZ > 0;
   if (cleanedAnything) {
     try {
@@ -7252,8 +7420,19 @@ async function main() {
         reconcileCommittedCheckboxes(args.planFile, phases, state);
       }
 
-      // SIGINT — release lock, save state, exit 130.
+      // SIGINT — release lock, save state, mark active-run paused, exit 130.
+      // Active-run JSON must reflect the dead PID so startup sweep on the next
+      // orchestrator invocation doesn't treat this run as live. The signal
+      // path covers Ctrl-C + SIGTERM; the process.on("exit") listener below
+      // covers normal exits. Neither path covers kill -9 / OOM / power loss.
       let interrupted = false;
+      const markActiveRunPaused = () => {
+        try {
+          if (state) updateActiveRunFromState(state, "paused");
+        } catch {
+          // Best-effort: never block exit on registry write failure.
+        }
+      };
       const onSignal = () => {
         if (interrupted) return;
         interrupted = true;
@@ -7263,11 +7442,19 @@ async function main() {
         } catch {
           // ignore
         }
+        markActiveRunPaused();
         releaseLock(slug);
         process.exit(130);
       };
       process.on("SIGINT", onSignal);
       process.on("SIGTERM", onSignal);
+      // process.on("exit") must run synchronously — no async APIs. Both
+      // saveState and writeActiveRunRecord use writeFileSync internally so
+      // they are safe to call here.
+      process.on("exit", () => {
+        if (interrupted) return; // already handled by onSignal
+        markActiveRunPaused();
+      });
 
       logActivity({
         event: "start",

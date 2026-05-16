@@ -99,6 +99,18 @@ describe("sweepOrphans", () => {
     }
   });
 
+  // Default lastUpdatedAt is deliberately stale (>24h in the past) so that
+  // legacy Shape X tests classify as reap. Tests exercising the protect-on-disk
+  // path (supervised restart / fresh heartbeat) pass a recent `lastUpdatedAt`
+  // explicitly via overrides.
+  function staleTimestamp(): string {
+    const d = new Date(Date.now() - 48 * 3600 * 1000); // 48h ago
+    return d.toISOString();
+  }
+  function freshTimestamp(): string {
+    return new Date().toISOString();
+  }
+
   function makeRecord(
     overrides: Partial<ActiveRunRecord> = {},
   ): ActiveRunRecord {
@@ -110,7 +122,7 @@ describe("sweepOrphans", () => {
       pid: 99999999, // dead PID by default
       status: "running",
       startedAt: "2026-05-16T00:00:00.000Z",
-      lastUpdatedAt: "2026-05-16T00:00:00.000Z",
+      lastUpdatedAt: staleTimestamp(),
       branches: ["feat/run-x"],
       ...overrides,
     };
@@ -122,9 +134,12 @@ describe("sweepOrphans", () => {
     return wtPath;
   }
 
-  it("Shape X — worktree + JSON, dead PID — both cleaned", () => {
+  it("Shape X — worktree + JSON + dead PID + stale heartbeat — both cleaned", () => {
     const wt = addWorktree("run-x");
-    writeActiveRunRecord(registryDir, makeRecord({ runId: "run-x" }));
+    writeActiveRunRecord(
+      registryDir,
+      makeRecord({ runId: "run-x", worktreePath: wt }),
+    );
 
     const stats = sweepOrphans(registryDir, { homeDir: fakeHome });
 
@@ -137,7 +152,10 @@ describe("sweepOrphans", () => {
     // Create worktree then remove it manually (simulating user rm -rf)
     const wt = addWorktree("run-y");
     fs.rmSync(wt, { recursive: true, force: true });
-    writeActiveRunRecord(registryDir, makeRecord({ runId: "run-y" }));
+    writeActiveRunRecord(
+      registryDir,
+      makeRecord({ runId: "run-y", worktreePath: wt }),
+    );
 
     const stats = sweepOrphans(registryDir, { homeDir: fakeHome });
 
@@ -152,12 +170,15 @@ describe("sweepOrphans", () => {
     // worktrees.
     const wtZ = addWorktree("run-z-orphan");
     // A separate record for a different runId, completed-and-cleaned scenario.
+    // worktreePath points at a nonexistent path so the record classifies as
+    // reap-shape-y, not protect.
     writeActiveRunRecord(
       registryDir,
       makeRecord({
         runId: "different-run",
         pid: 88888888, // also dead
         status: "completed",
+        worktreePath: path.join(buildWorktreesRoot, "different-run"),
       }),
     );
 
@@ -175,6 +196,7 @@ describe("sweepOrphans", () => {
       registryDir,
       makeRecord({
         runId: "run-live",
+        worktreePath: wt,
         pid: process.pid, // current process is alive
         status: "running",
       }),
@@ -215,7 +237,10 @@ describe("sweepOrphans", () => {
     );
     // Add a valid record alongside to verify the sweep keeps going.
     const wt = addWorktree("run-valid");
-    writeActiveRunRecord(registryDir, makeRecord({ runId: "run-valid" }));
+    writeActiveRunRecord(
+      registryDir,
+      makeRecord({ runId: "run-valid", worktreePath: wt }),
+    );
 
     // Should not throw. readActiveRunRecords gracefully skips malformed files.
     const stats = sweepOrphans(registryDir, { homeDir: fakeHome });
@@ -227,7 +252,10 @@ describe("sweepOrphans", () => {
 
   it("handles git worktree remove failure — logs warning, still cleans JSON", () => {
     const wt = addWorktree("run-locked");
-    writeActiveRunRecord(registryDir, makeRecord({ runId: "run-locked" }));
+    writeActiveRunRecord(
+      registryDir,
+      makeRecord({ runId: "run-locked", worktreePath: wt }),
+    );
     // Make the worktree read-only at the parent level to (try to) fail removal.
     // git worktree remove --force is robust to most things, so we simulate by
     // pointing the record at a non-existent repoPath, which fails listing but
@@ -252,7 +280,10 @@ describe("sweepOrphans", () => {
 
   it("is idempotent — second call on cleaned state is a no-op", () => {
     const wt = addWorktree("run-idem");
-    writeActiveRunRecord(registryDir, makeRecord({ runId: "run-idem" }));
+    writeActiveRunRecord(
+      registryDir,
+      makeRecord({ runId: "run-idem", worktreePath: wt }),
+    );
 
     const stats1 = sweepOrphans(registryDir, { homeDir: fakeHome });
     expect(stats1.shapeX).toBe(1);
@@ -267,7 +298,10 @@ describe("sweepOrphans", () => {
 
   it("writes WORKTREE_LEAK.resolved marker after first non-empty run", () => {
     const wt = addWorktree("run-marker");
-    writeActiveRunRecord(registryDir, makeRecord({ runId: "run-marker" }));
+    writeActiveRunRecord(
+      registryDir,
+      makeRecord({ runId: "run-marker", worktreePath: wt }),
+    );
     const markerPath = path.join(
       fakeHome,
       ".gstack",
@@ -289,5 +323,203 @@ describe("sweepOrphans", () => {
     sweepOrphans(registryDir, { homeDir: fakeHome });
     const mtimeAfter = fs.statSync(markerPath).mtimeMs;
     expect(mtimeAfter).toBe(mtimeBefore);
+  });
+
+  // -- protect-on-disk (the central regression for v1.40.0.0) --
+
+  it("REGRESSION: dead PID + worktree on disk + fresh heartbeat — does NOT reap (supervised restart)", () => {
+    // This is the exact bug from the original investigation: orchestrator
+    // exited between phases, supervisor relaunched, new sweep saw stale PID
+    // and destroyed the still-active worktree. With the fix, the worktree
+    // must survive untouched until the heartbeat goes stale.
+    const wt = addWorktree("run-restart");
+    writeActiveRunRecord(
+      registryDir,
+      makeRecord({
+        runId: "run-restart",
+        worktreePath: wt,
+        pid: 99999999, // dead — typical between-phase orchestrator
+        status: "running",
+        lastUpdatedAt: freshTimestamp(),
+      }),
+    );
+
+    const stats = sweepOrphans(registryDir, { homeDir: fakeHome });
+
+    expect(stats.shapeX).toBe(0);
+    expect(stats.shapeY).toBe(0);
+    expect(stats.shapeZ).toBe(0);
+    expect(stats.protectedOnDisk).toBe(1);
+    expect(fs.existsSync(wt)).toBe(true);
+    expect(readActiveRunRecords(registryDir).map((r) => r.runId)).toEqual([
+      "run-restart",
+    ]);
+    // No marker write — a pure-protect run is not a "leak resolved" event.
+    const markerPath = path.join(
+      fakeHome,
+      ".gstack",
+      "skill-faults",
+      "WORKTREE_LEAK.resolved",
+    );
+    expect(fs.existsSync(markerPath)).toBe(false);
+  });
+
+  it("clock skew clamp: lastUpdatedAt in the future — treats as protect, not reap", () => {
+    // Cross-machine sync (e.g., gbrain artifacts sync) can land records whose
+    // lastUpdatedAt is ahead of this machine's clock. The reaper must not
+    // misclassify these as stale-with-bogus-negative-age.
+    const wt = addWorktree("run-future");
+    const futureTimestamp = new Date(Date.now() + 3600 * 1000).toISOString();
+    writeActiveRunRecord(
+      registryDir,
+      makeRecord({
+        runId: "run-future",
+        worktreePath: wt,
+        lastUpdatedAt: futureTimestamp,
+      }),
+    );
+
+    const stats = sweepOrphans(registryDir, { homeDir: fakeHome });
+
+    expect(stats.shapeX).toBe(0);
+    expect(stats.protectedOnDisk).toBe(1);
+    expect(fs.existsSync(wt)).toBe(true);
+  });
+
+  it("GSTACK_SWEEP_STALE_HOURS env override — record aged past override reaps", () => {
+    // With override=0.1h (=360s), a record aged 600s is past threshold and reaps.
+    const wt = addWorktree("run-env");
+    writeActiveRunRecord(
+      registryDir,
+      makeRecord({
+        runId: "run-env",
+        worktreePath: wt,
+        lastUpdatedAt: new Date(Date.now() - 600 * 1000).toISOString(),
+      }),
+    );
+
+    const originalEnv = process.env.GSTACK_SWEEP_STALE_HOURS;
+    process.env.GSTACK_SWEEP_STALE_HOURS = "0.1";
+    try {
+      const stats = sweepOrphans(registryDir, { homeDir: fakeHome });
+      expect(stats.shapeX).toBe(1);
+      expect(fs.existsSync(wt)).toBe(false);
+    } finally {
+      if (originalEnv === undefined) {
+        delete process.env.GSTACK_SWEEP_STALE_HOURS;
+      } else {
+        process.env.GSTACK_SWEEP_STALE_HOURS = originalEnv;
+      }
+    }
+  });
+
+  it("sub-60s freshness clamp: record updated 5s ago — always protected", () => {
+    // Even with a tiny GSTACK_SWEEP_STALE_HOURS override, very fresh records
+    // are protected. Prevents racing the heartbeat-writer.
+    const wt = addWorktree("run-fresh");
+    writeActiveRunRecord(
+      registryDir,
+      makeRecord({
+        runId: "run-fresh",
+        worktreePath: wt,
+        lastUpdatedAt: new Date(Date.now() - 5 * 1000).toISOString(),
+      }),
+    );
+
+    const originalEnv = process.env.GSTACK_SWEEP_STALE_HOURS;
+    process.env.GSTACK_SWEEP_STALE_HOURS = "0.001"; // 3.6s
+    try {
+      const stats = sweepOrphans(registryDir, { homeDir: fakeHome });
+      expect(stats.protectedOnDisk).toBe(1);
+      expect(stats.shapeX).toBe(0);
+      expect(fs.existsSync(wt)).toBe(true);
+    } finally {
+      if (originalEnv === undefined) {
+        delete process.env.GSTACK_SWEEP_STALE_HOURS;
+      } else {
+        process.env.GSTACK_SWEEP_STALE_HOURS = originalEnv;
+      }
+    }
+  });
+
+  // -- migration on read (legacy records without worktreePath) --
+
+  it("migrates legacy record (no worktreePath) when basename matches and dir exists", () => {
+    const wt = addWorktree("run-legacy");
+    const legacy = makeRecord({
+      runId: "run-legacy",
+      lastUpdatedAt: freshTimestamp(),
+    });
+    // Strip worktreePath to simulate a pre-v1.40 record.
+    delete (legacy as Partial<ActiveRunRecord>).worktreePath;
+    writeActiveRunRecord(registryDir, legacy);
+
+    const stats = sweepOrphans(registryDir, { homeDir: fakeHome });
+
+    // Migration discovers the worktree, rewrites the record, then the second
+    // classify in the same pass treats it as protect-on-disk (fresh heartbeat).
+    expect(stats.migrated).toBe(1);
+    expect(stats.protectedOnDisk).toBe(1);
+    expect(stats.shapeX).toBe(0);
+    expect(fs.existsSync(wt)).toBe(true);
+
+    const records = readActiveRunRecords(registryDir);
+    expect(records).toHaveLength(1);
+    expect(records[0].worktreePath).toBe(wt);
+
+    // Second sweep: record now has worktreePath, no migration needed.
+    const stats2 = sweepOrphans(registryDir, { homeDir: fakeHome });
+    expect(stats2.migrated).toBe(0);
+    expect(stats2.protectedOnDisk).toBe(1);
+  });
+
+  it("legacy record with no matching worktree on disk anywhere — Shape Y", () => {
+    // Legacy record exists, but no worktree dir matches the runId by basename
+    // anywhere in the registry's repoPaths. Sweep treats as genuine Shape Y.
+    const legacy = makeRecord({ runId: "run-orphan-legacy" });
+    delete (legacy as Partial<ActiveRunRecord>).worktreePath;
+    writeActiveRunRecord(registryDir, legacy);
+
+    const stats = sweepOrphans(registryDir, { homeDir: fakeHome });
+
+    expect(stats.shapeY).toBe(1);
+    expect(stats.migrated).toBe(0);
+    expect(readActiveRunRecords(registryDir).map((r) => r.runId)).toEqual([]);
+  });
+
+  // -- repoPath normalization --
+
+  it("repoPath dedup: trailing slash form collapses to single git worktree list call", () => {
+    // Two records pointing at the same repo via slightly different path forms
+    // (with and without trailing slash). Sweep must normalize both to the
+    // same canonical form and not produce ghost classifications.
+    const wt1 = addWorktree("run-norm-a");
+    const wt2 = addWorktree("run-norm-b");
+    writeActiveRunRecord(
+      registryDir,
+      makeRecord({
+        runId: "run-norm-a",
+        repoPath: parentRepo, // canonical
+        worktreePath: wt1,
+        lastUpdatedAt: freshTimestamp(),
+      }),
+    );
+    writeActiveRunRecord(
+      registryDir,
+      makeRecord({
+        runId: "run-norm-b",
+        repoPath: parentRepo + "/", // same repo, trailing slash
+        worktreePath: wt2,
+        lastUpdatedAt: freshTimestamp(),
+      }),
+    );
+
+    const stats = sweepOrphans(registryDir, { homeDir: fakeHome });
+
+    // Both records protected; no spurious Shape Y from trailing-slash mismatch.
+    expect(stats.protectedOnDisk).toBe(2);
+    expect(stats.shapeY).toBe(0);
+    expect(fs.existsSync(wt1)).toBe(true);
+    expect(fs.existsSync(wt2)).toBe(true);
   });
 });
