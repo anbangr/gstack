@@ -8,6 +8,10 @@ export interface ActiveRunRecord {
   runId: string;
   stateSlug: string;
   repoPath: string;
+  // Absolute path to the worktree directory this run is executing in.
+  // Optional for backward compatibility with records written before this
+  // field existed. sweepOrphans migrates legacy records on first read.
+  worktreePath?: string;
   baseProjectRoot?: string;
   planFile: string;
   branchPrefix?: string;
@@ -110,7 +114,9 @@ export function readActiveRunRecords(registryDir: string): ActiveRunRecord[] {
   return records;
 }
 
-function normalizeRepoPath(repoPath: string | undefined): string | undefined {
+export function normalizeRepoPath(
+  repoPath: string | undefined,
+): string | undefined {
   return repoPath ? path.resolve(repoPath) : undefined;
 }
 
