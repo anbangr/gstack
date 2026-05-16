@@ -219,3 +219,251 @@ describe("backfill-checkboxes script", () => {
     expect(r.stderr).toMatch(/Usage:/);
   });
 });
+
+/**
+ * --from-artifacts mode: recover codexReview from on-disk artifacts when
+ * the JSON field was nulled (e.g. by a manual jq reset during workaround
+ * relaunch). The artifacts are the ground truth; the JSON field is the
+ * cached view. This pass reads ground truth back into the JSON.
+ */
+function runWithArtifacts(planFile: string, stateFile: string) {
+  return spawnSync(
+    "bun",
+    ["run", SCRIPT, planFile, stateFile, "--from-artifacts"],
+    { encoding: "utf8" },
+  );
+}
+
+/**
+ * Lay out a per-slug log dir next to the state.json. The CLI falls back
+ * to the sibling-of-state-file path when the global ~/.gstack path
+ * doesn't exist — this lets us test without touching $HOME.
+ */
+function plantArtifacts(
+  stateFile: string,
+  phaseNumber: string,
+  opts: {
+    reviewIters?: number[];
+    qaIters?: number[];
+    mergedVerdicts?: Record<number, string>;
+  },
+): string {
+  const slugDir = path.join(
+    path.dirname(stateFile),
+    path.basename(stateFile, ".json"),
+  );
+  fs.mkdirSync(slugDir, { recursive: true });
+  for (const k of opts.reviewIters ?? []) {
+    fs.writeFileSync(
+      path.join(slugDir, `phase-${phaseNumber}-review-${k}-output.md`),
+      `# Codex Review iteration ${k} for phase ${phaseNumber}\n`,
+    );
+  }
+  for (const k of opts.qaIters ?? []) {
+    fs.writeFileSync(
+      path.join(slugDir, `phase-${phaseNumber}-qa-${k}-output.md`),
+      `# Codex QA iteration ${k} for phase ${phaseNumber}\n`,
+    );
+  }
+  for (const [kStr, body] of Object.entries(opts.mergedVerdicts ?? {})) {
+    const k = parseInt(kStr, 10);
+    fs.writeFileSync(
+      path.join(slugDir, `phase-${phaseNumber}-review-merged-${k}.md`),
+      body,
+    );
+  }
+  return slugDir;
+}
+
+describe("backfill-checkboxes --from-artifacts", () => {
+  let cleanup: (() => void) | undefined;
+  afterEach(() => {
+    cleanup?.();
+    cleanup = undefined;
+  });
+
+  it("derives codexReview from on-disk artifacts when state.codexReview is null", () => {
+    // Phase 1 is committed with codexReview=null (the F2 investigation
+    // signature). Plant a review + qa artifact pair on disk. After
+    // --from-artifacts, state.phases[0].codexReview must be populated
+    // with derivedFromArtifacts=true and the review-row checkbox must
+    // flip in the plan.
+    const f = setupFixture({
+      stateOverride: {
+        phases: [
+          {
+            index: 0,
+            number: "1",
+            name: "Foo",
+            status: "committed",
+            codexReview: null,
+          },
+        ],
+      },
+    });
+    cleanup = f.cleanup;
+    plantArtifacts(f.stateFile, "1", {
+      reviewIters: [1],
+      qaIters: [1],
+      mergedVerdicts: { 1: "Decision: GATE PASS\n" },
+    });
+
+    const r = runWithArtifacts(f.planFile, f.stateFile);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toMatch(/Phase 1.*codexReview derived/);
+    expect(r.stdout).toMatch(/1 codexReview field\(s\) derived from artifacts/);
+
+    const afterState = JSON.parse(fs.readFileSync(f.stateFile, "utf8"));
+    expect(afterState.phases[0].codexReview).toBeDefined();
+    expect(afterState.phases[0].codexReview.derivedFromArtifacts).toBe(true);
+    expect(afterState.phases[0].codexReview.iterations).toBe(1);
+    expect(afterState.phases[0].codexReview.finalVerdict).toBe("GATE PASS");
+    expect(afterState.phases[0].codexReview.outputFilePaths).toHaveLength(2); // review + qa
+
+    const afterPlan = fs.readFileSync(f.planFile, "utf8");
+    expect(afterPlan).toContain("- [x] **Implementation**: do");
+    expect(afterPlan).toContain("- [x] **Review**: rev");
+  });
+
+  it("does NOT clobber a populated codexReview (live data wins over derived data)", () => {
+    // Phase 1 already has codexReview from a real loop run. Even if
+    // artifacts also exist on disk, we must not overwrite the live data.
+    const livePopulatedReview = {
+      iterations: 3,
+      finalVerdict: "GATE FAIL" as const,
+      outputLogPaths: ["/live/log-1.md", "/live/log-2.md", "/live/log-3.md"],
+      outputFilePaths: ["/live/out-1.md", "/live/out-2.md", "/live/out-3.md"],
+    };
+    const f = setupFixture({
+      stateOverride: {
+        phases: [
+          {
+            index: 0,
+            number: "1",
+            name: "Foo",
+            status: "committed",
+            codexReview: livePopulatedReview,
+          },
+        ],
+      },
+    });
+    cleanup = f.cleanup;
+    plantArtifacts(f.stateFile, "1", {
+      reviewIters: [1],
+      mergedVerdicts: { 1: "GATE PASS\n" },
+    });
+
+    const r = runWithArtifacts(f.planFile, f.stateFile);
+    expect(r.status).toBe(0);
+    expect(r.stdout).not.toMatch(/codexReview derived/);
+
+    const afterState = JSON.parse(fs.readFileSync(f.stateFile, "utf8"));
+    // Untouched: every field matches the live record.
+    expect(afterState.phases[0].codexReview.iterations).toBe(3);
+    expect(afterState.phases[0].codexReview.finalVerdict).toBe("GATE FAIL");
+    expect(afterState.phases[0].codexReview.outputFilePaths).toHaveLength(3);
+    expect(
+      afterState.phases[0].codexReview.derivedFromArtifacts,
+    ).toBeUndefined();
+  });
+
+  it("no-ops cleanly when codexReview is null but no artifacts exist on disk", () => {
+    // The F1 investigation signature: legitimate codexReview=null
+    // (the loop bailed at coverage gate before review). No artifacts on
+    // disk → leave it alone.
+    const f = setupFixture({
+      stateOverride: {
+        phases: [
+          {
+            index: 0,
+            number: "1",
+            name: "Foo",
+            status: "committed",
+            codexReview: null,
+          },
+        ],
+      },
+    });
+    cleanup = f.cleanup;
+    // Deliberately do NOT plant artifacts.
+
+    const r = runWithArtifacts(f.planFile, f.stateFile);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toMatch(/0 codexReview field\(s\) derived from artifacts/);
+
+    const afterState = JSON.parse(fs.readFileSync(f.stateFile, "utf8"));
+    expect(afterState.phases[0].codexReview).toBeNull();
+  });
+
+  it("picks the LAST verdict in merged-K.md (reviewers quote prior verdicts before stating their own)", () => {
+    // The realistic case: a reviewer writes "Last run was GATE FAIL,
+    // this run is GATE PASS" and we must take the latter.
+    const f = setupFixture({
+      stateOverride: {
+        phases: [
+          {
+            index: 0,
+            number: "1",
+            name: "Foo",
+            status: "committed",
+            codexReview: null,
+          },
+        ],
+      },
+    });
+    cleanup = f.cleanup;
+    plantArtifacts(f.stateFile, "1", {
+      reviewIters: [1],
+      mergedVerdicts: {
+        1: [
+          "## Codex Review Merged",
+          "",
+          "Quoting last iteration: that ended in GATE FAIL.",
+          "Now: this iteration's verdict is GATE PASS.",
+          "",
+        ].join("\n"),
+      },
+    });
+
+    const r = runWithArtifacts(f.planFile, f.stateFile);
+    expect(r.status).toBe(0);
+
+    const afterState = JSON.parse(fs.readFileSync(f.stateFile, "utf8"));
+    expect(afterState.phases[0].codexReview.finalVerdict).toBe("GATE PASS");
+  });
+
+  it("sets derivedFromArtifacts=true even when no recognizable verdict appears (presence-of-review-work is the signal)", () => {
+    // The merged file exists but has no GATE PASS/FAIL/TIMEOUT line.
+    // We still know the review work ran. finalVerdict stays undefined,
+    // but the flag is the load-bearing signal.
+    const f = setupFixture({
+      stateOverride: {
+        phases: [
+          {
+            index: 0,
+            number: "1",
+            name: "Foo",
+            status: "committed",
+            codexReview: null,
+          },
+        ],
+      },
+    });
+    cleanup = f.cleanup;
+    plantArtifacts(f.stateFile, "1", {
+      reviewIters: [1],
+      mergedVerdicts: {
+        1: "## Merged review\n\nNo verdict line in this file.\n",
+      },
+    });
+
+    const r = runWithArtifacts(f.planFile, f.stateFile);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toMatch(/Phase 1.*verdict-unknown/);
+
+    const afterState = JSON.parse(fs.readFileSync(f.stateFile, "utf8"));
+    expect(afterState.phases[0].codexReview.derivedFromArtifacts).toBe(true);
+    expect(afterState.phases[0].codexReview.finalVerdict).toBeUndefined();
+    expect(afterState.phases[0].codexReview.iterations).toBe(1);
+  });
+});
