@@ -434,7 +434,7 @@ function writeClaimStatus(
   fs.renameSync(tmpPath, claimPath);
 }
 
-function cleanupCompletedWorktree(run: BuildRunManifestRun): void {
+export function cleanupCompletedWorktree(run: BuildRunManifestRun): void {
   const ok = spawnSync(
     "git",
     ["-C", run.worktreePath, "rev-parse", "--is-inside-work-tree"],
