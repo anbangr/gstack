@@ -233,6 +233,21 @@ export interface CodexReviewState {
   outputFilePaths?: string[];
   /** Number of Gemini re-runs triggered by review feedback (RUN_GEMINI_FROM_REVIEW). */
   geminiReRunCount?: number;
+  /**
+   * Set when this entry was reconstructed from on-disk artifacts via
+   * `gstack-build reconcile --from-artifacts` or
+   * `backfill-checkboxes.ts --from-artifacts` (because the JSON state field
+   * was nulled out, e.g. by a manual jq edit during workaround relaunch).
+   *
+   * When true: `iterations`, `outputLogPaths`, `outputFilePaths` are derived
+   * from filesystem scan, and `finalVerdict` is best-effort regex-parsed
+   * from the latest `phase-N-review-merged-K.md` (may be undefined when
+   * no recognizable verdict appears in the file). Readers that need the
+   * exact set of fields the live loop would have written should treat
+   * `derivedFromArtifacts === true` as "trust the existence of review work,
+   * but not the verdict precision."
+   */
+  derivedFromArtifacts?: boolean;
 }
 
 export interface PhaseState {
