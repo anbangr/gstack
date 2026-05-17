@@ -1931,3 +1931,39 @@ Explicitly deferred from the v1.28.0.0 /plan-eng-review. Ship now; revisit when 
 **Effort:** S for approach 1 (already done in `cli.ts`), M for approach 2 (human: ~1 day / CC: ~30 min), L for approach 3.
 **Priority:** P2
 **Blocked by:** Design decision on which approach to pursue.
+
+## Add `## Test framework` plan-file override block
+
+### P3: Project-level persistence for the test-framework choice
+
+**What:** Extend the build orchestrator's plan-file parser to recognise a
+`## Test framework` markdown block whose body is a single Framework token
+(`vitest` | `jest` | `playwright` | `bun` | `pytest` | `go` | `cargo`). When
+present, that token feeds `resolveTestFramework` and `resolveTestCmd` as if
+the user had passed `--test-framework <token>` on every invocation.
+
+**Why:** Today the only override surface is the `--test-framework` CLI flag
+(shipped in v1.40.1.0). Users with a confused autodetect (e.g., monorepos
+where the orchestrator picks the wrong language) have to remember the flag
+on every `gstack-build` invocation. A plan-file block lets the override
+live with the plan that defines the project, so any future build of that
+plan inherits the right framework without per-invocation memory.
+
+**Pros:** Project-level persistence. Override is reviewable in the plan's
+PR. Removes a class of "I forgot the flag" failures during long
+supervised runs. CC effort: ~30 min (parser + 2 tests + CHANGELOG).
+
+**Cons:** Adds a parser slice that must stay in sync with the
+`isKnownFramework` whitelist; if Framework gains a new member, two places
+update. Plan-file parsers in gstack are historically fragile.
+
+**Context:** Surfaced during /plan-eng-review of the v1.40.1.0 test-runner
+detection fix (D3-B in that review). The CLI flag was chosen as the
+universal escape hatch for the immediate need; the plan-file block was
+explicitly deferred to here. Build the plan-file block if a user actually
+asks for it; until then, the CLI flag plus the new autodetect cover the
+known failure modes.
+
+**Depends on / blocked by:** v1.40.1.0 (the `--test-framework` flag and
+`Framework` type union must exist before the plan-file block has anything
+to feed). Already shipped.
