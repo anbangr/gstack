@@ -57,6 +57,116 @@ const CHECKED_IMPLEMENTATION_RE =
 const CHECKED_REVIEW_QA_RE =
   /^\s*-\s+\[[xX]\]\s+\*\*Review & QA(?:\s+\([^*\n]*\))?\*\*/m;
 
+/**
+ * Synthesis-complete sentinel. The planSynthesizer writes this as the last
+ * action of producing a living plan, after passing its own structural
+ * self-check. The shell wrapper around the synthesizer dispatch appends the
+ * sentinel as a safety net when the validator passes but no sentinel is
+ * present (see build/SKILL.md.tmpl Step 5).
+ *
+ * Detector gate: if a living plan exists but the sentinel is absent, treat as
+ * "synthesis-in-progress" — emit no PLAN_SYNTHESIS_INVALID faults. Without
+ * this gate the detector races the synthesizer and fires false positives on
+ * partial files (observed 2026-05-17 in 2/3 drain-faults investigations).
+ */
+const SYNTHESIS_COMPLETE_SENTINEL = "<!-- gstack-synthesis-complete";
+
+/**
+ * Parsed shape of a `## Feature N:` block in a living plan.
+ *
+ * Single source of truth for "what is a feature block" — consumed by the
+ * detector's PLAN_SYNTHESIS_INVALID branch AND by the standalone validator
+ * CLI at `build/orchestrator/validate-living-plan.ts`. Drift between the two
+ * is structurally impossible because they share this parse.
+ */
+export interface FeatureBlock {
+  /** Parsed integer from "## Feature N:". */
+  number: number;
+  /** Text after the colon, trimmed. */
+  name: string;
+  /**
+   * From the heading line to (exclusive) whichever comes first: the next
+   * `### Phase` heading OR the next `## ` heading. The structural fields
+   * (`Origin trace:`, `Acceptance:`) must appear line-anchored in here.
+   */
+  header: string;
+  /** Everything from the header cut to the next `## ` (or end of input). */
+  body: string;
+  /** `^Origin trace:` matched line-anchored within `header`. */
+  hasOriginTrace: boolean;
+  /** `^Acceptance:` matched line-anchored within `header`. */
+  hasAcceptance: boolean;
+}
+
+/**
+ * Heading-anchored feature-block extractor.
+ *
+ * Rules (all anchored, none use bare substring matching):
+ *   1. Split on lines starting with `## `.
+ *   2. Keep only sections whose first line matches `^## Feature (\d+):`
+ *      — i.e. the exact feature-section format. A `## Features overview`
+ *      summary list (one feature per line) does NOT match and is excluded.
+ *   3. `header` = heading line through (exclusive) the first of:
+ *        - the next `^### Phase` heading
+ *        - the next `^## ` H2 heading
+ *      `body` = remainder of the section up to the next `^## ` cut.
+ *   4. `hasOriginTrace` / `hasAcceptance` are line-anchored regexes against
+ *      `header` only. Run-on prose like `Origin trace: ... . Acceptance: ...`
+ *      on a single line yields `hasAcceptance=false` because there is no
+ *      line that STARTS with `Acceptance:`.
+ *
+ * Exported for use from `validate-living-plan.ts` and from the detector
+ * branch below.
+ */
+const FEATURE_HEADING_RE = /^## Feature (\d+):\s*(.*)$/;
+
+export function extractFeatureBlocks(planContent: string): FeatureBlock[] {
+  if (!planContent) return [];
+
+  const sections = planContent.split(/(?=^## )/m);
+  const blocks: FeatureBlock[] = [];
+
+  for (const section of sections) {
+    const newlineIdx = section.indexOf("\n");
+    const headingLine =
+      newlineIdx >= 0 ? section.slice(0, newlineIdx) : section;
+    const headingMatch = FEATURE_HEADING_RE.exec(headingLine);
+    if (!headingMatch) continue;
+
+    const number = parseInt(headingMatch[1], 10);
+    const name = headingMatch[2].trim();
+
+    // Find header end: first `^### Phase` OR first `^## ` AFTER the heading.
+    // Search starts after the heading line so the heading itself isn't a cut.
+    const afterHeading = section.slice(newlineIdx >= 0 ? newlineIdx + 1 : 0);
+    const phaseCut = afterHeading.search(/^### Phase/m);
+    const h2Cut = afterHeading.search(/^## /m);
+
+    let cuts = [phaseCut, h2Cut].filter((c) => c >= 0);
+    const cut = cuts.length ? Math.min(...cuts) : -1;
+
+    const header =
+      cut >= 0
+        ? headingLine + "\n" + afterHeading.slice(0, cut)
+        : headingLine + "\n" + afterHeading;
+    const body = cut >= 0 ? afterHeading.slice(cut) : "";
+
+    const hasOriginTrace = /^Origin trace:/m.test(header);
+    const hasAcceptance = /^Acceptance:/m.test(header);
+
+    blocks.push({
+      number,
+      name,
+      header,
+      body,
+      hasOriginTrace,
+      hasAcceptance,
+    });
+  }
+
+  return blocks;
+}
+
 function appendAnalytics(faults: SkillFault[]): void {
   const home = process.env.GSTACK_HOME ?? path.join(os.homedir(), ".gstack");
   const analyticsDir = path.join(home, "analytics");
@@ -332,30 +442,27 @@ export function detectSkillFaults(
 
     // ------------------------------------------------------------------
     // PLAN_SYNTHESIS_INVALID — missing Origin trace: or Acceptance:
-    // The synthesizer template (build/SKILL.md.tmpl:426-428) places these
-    // headers on `## Feature X:` blocks. Phases inherit from features.
+    // The synthesizer template (build/SKILL.md.tmpl Step 5) places these
+    // headers on `## Feature N:` blocks.
+    //
+    // Gate: only run this check when the synthesis-complete sentinel is
+    // present. Plans still being written by the synthesizer subagent will
+    // not yet have the sentinel — emit nothing rather than racing the write
+    // and reporting transient false positives.
     // ------------------------------------------------------------------
-    if (planContent) {
-      const blocks = planContent.split(/(?=^## )/m);
-      let featureIdx = 0;
-      for (const block of blocks) {
-        if (!/^## Feature\b/.test(block)) continue;
-        featureIdx++;
-
-        // Only look at the feature's own header section — content before the
-        // first `### Phase` (or end of block). Otherwise an "Acceptance:" line
-        // inside a Test Spec table could be misread as the feature's Acceptance.
-        const phaseSplit = block.search(/^### /m);
-        const header = phaseSplit > 0 ? block.slice(0, phaseSplit) : block;
-
-        const hasOrigin = /^Origin trace:/m.test(header);
-        const hasAcceptance = /^Acceptance:/m.test(header);
-
-        if (!hasOrigin || !hasAcceptance) {
+    if (planContent && planContent.includes(SYNTHESIS_COMPLETE_SENTINEL)) {
+      for (const block of extractFeatureBlocks(planContent)) {
+        if (!block.hasOriginTrace || !block.hasAcceptance) {
+          const missing =
+            !block.hasOriginTrace && !block.hasAcceptance
+              ? "Origin trace: and Acceptance:"
+              : !block.hasOriginTrace
+                ? "Origin trace:"
+                : "Acceptance:";
           faults.push({
             category: "PLAN_SYNTHESIS_INVALID",
             severity: "CRITICAL",
-            description: `Feature block ${featureIdx} is missing ${!hasOrigin && !hasAcceptance ? "Origin trace: and Acceptance:" : !hasOrigin ? "Origin trace:" : "Acceptance:"}.`,
+            description: `Feature block ${block.number} is missing ${missing}.`,
             sourceFiles: [input.livingPlanPath],
             evidence: {},
           });
