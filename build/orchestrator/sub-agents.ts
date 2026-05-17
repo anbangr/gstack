@@ -19,7 +19,7 @@
  *   - --yolo on Gemini for autonomous file edits
  */
 
-import { execFile } from "node:child_process";
+import { execFile } from "./child-registry";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { logDir, ensureLogDir } from "./state";

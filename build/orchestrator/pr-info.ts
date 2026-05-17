@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./child-registry";
 
 /**
  * Look up the most recent merged PR for a given head branch. Used by the

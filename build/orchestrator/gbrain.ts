@@ -16,7 +16,7 @@
  * gbrain wraps every page in frontmatter that we have to strip on read.
  */
 
-import { spawnSync } from 'node:child_process';
+import { spawnSync } from './child-registry';
 
 const GBRAIN_BIN = process.env.GBRAIN_BIN || 'gbrain';
 const PUT_TIMEOUT_MS = 15_000;

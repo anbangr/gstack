@@ -28,7 +28,7 @@
  *   130 user interrupt (SIGINT)
  */
 
-import { spawnSync } from "node:child_process";
+import { installSignalHandlers, spawnSync } from "./child-registry";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7186,6 +7186,14 @@ export async function runDoctorMode(args: Args): Promise<number> {
 }
 
 async function main() {
+  // Install SIGTERM/SIGINT/SIGHUP handlers before spawning anything so the
+  // first sub-process to outlive a survivable signal still gets reaped.
+  // SIGKILL itself can't be intercepted — the kernel terminates without
+  // userspace cleanup — but the common `kill` (SIGTERM), Ctrl-C (SIGINT),
+  // and terminal-disconnect (SIGHUP) paths are all clean now.
+  // See orchestrator/README.md "Child process management".
+  installSignalHandlers();
+
   const rawArgv = process.argv.slice(2);
   const args = parseArgs(rawArgv);
 
