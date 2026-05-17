@@ -276,6 +276,27 @@ export function detectSkillFaults(
     // ------------------------------------------------------------------
     // PREMATURE_COMPLETION — checked checkboxes for non-committed phases
     // ------------------------------------------------------------------
+    // The orchestrator legitimately ticks Implementation/Review checkboxes
+    // at intermediate non-terminal states (tests_green, codex_running,
+    // review_clean, etc.) BEFORE the phase reaches "committed". Firing the
+    // detector on those is a false-positive class observed in the wild
+    // (agnt2-prototype-bisectiongame-settlement, 2026-05-16: 78 fires for
+    // one healthy Phase 2.1 progressing through tests_green → codex_running
+    // → committed). The detector should only fire when the phase is stuck
+    // in a TERMINAL-FAILED state: failed, blocked, or has explicit error
+    // baggage. tests_green/codex_running/etc are healthy transitions.
+    //
+    // Allowed in-flight states (do NOT fire even with checkboxes ticked):
+    //   pending, test_spec_running, test_spec_done, tests_red,
+    //   gemini_running, dual_impl_*, impl_done, test_fix_running,
+    //   tests_green, codex_running, review_clean
+    // States that DO fire (genuine premature-completion signal):
+    //   failed, blocked, paused
+    const PREMATURE_COMPLETION_FIRING_STATUSES = new Set([
+      "failed",
+      "blocked",
+      "paused",
+    ]);
     const planContent = readFileSafe(input.livingPlanPath);
     const stdoutContent = readFileSafe(input.stdoutLogPath);
     if (planContent && state && Array.isArray(state.phases)) {
@@ -290,6 +311,9 @@ export function detectSkillFaults(
         phaseIdx++;
         if (!phaseState) continue;
         if (phaseState.status === "committed") continue;
+        if (!PREMATURE_COMPLETION_FIRING_STATUSES.has(phaseState.status)) {
+          continue;
+        }
 
         const hasCheckedImpl = CHECKED_IMPLEMENTATION_RE.test(block);
         const hasCheckedReview = CHECKED_REVIEW_QA_RE.test(block);
