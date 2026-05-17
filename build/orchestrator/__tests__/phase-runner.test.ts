@@ -1919,3 +1919,61 @@ coverage: 87.50%
     expect(next.coverageResult).toBeUndefined();
   });
 });
+
+// ----------------------------------------------------------------------
+// Audit-only phase transitions
+// ----------------------------------------------------------------------
+//
+// The auditOnly flag is consumed by cli.ts's hygiene check, not by
+// phase-runner.ts itself. From applyResult's perspective, an audit-only
+// phase that ran cleanly looks identical to a normal phase that produced
+// a commit: exitCode 0, no hygiene error in stdout. The point of these
+// tests is to PIN that the existing state-transition path still works
+// (impl_done → RUN_CODEX_REVIEW) when an audit-only phase produces no
+// commit, AND to regression-test that non-audit phases still fail closed
+// when hygiene returns exitCode 1.
+
+describe("audit-only phase transitions", () => {
+  it("audit-only: applyResult on exit 0 → status impl_done (no commit needed)", () => {
+    // Simulates cli.ts having passed requireNewCommit=false to hygiene, so
+    // hygiene returned the unmodified success result (exit 0, summary stdout).
+    const initial = basePhase({ status: "pending" });
+    const action = decideNextAction(initial);
+    const next = applyResult(initial, action as any, {
+      ...geminiSuccess(),
+      stdout: "audit clean — all 7 checklist items pass",
+    });
+    expect(next.status).toBe("impl_done");
+    expect(next.gemini?.exitCode).toBe(0);
+  });
+
+  it("audit-only: decideNextAction(impl_done, testSpecDone=true) → RUN_CODEX_REVIEW", () => {
+    // After applyResult sets impl_done, the orchestrator dispatches review.
+    // This pins the no-test-spec audit phase happy path.
+    const action = decideNextAction(basePhase({ status: "impl_done" }), 5, {
+      testSpecDone: true,
+    } as any);
+    expect(action.type).toBe("RUN_CODEX_REVIEW");
+  });
+
+  it("regression: non-audit-only phase still fails when hygiene returns exit 1", () => {
+    // Pins behavior for normal (non-audit) phases: a primary-impl that
+    // produces no commit must still terminate the phase as FAILED.
+    const initial = basePhase({ status: "pending" });
+    const action = decideNextAction(initial);
+    const next = applyResult(initial, action as any, {
+      ...geminiFailure(),
+      logPath: "/tmp/phase-1-primary-impl-1-hygiene.log",
+      stdout: [
+        "# Post-agent hygiene failure",
+        "",
+        "primary implementor did not create a new commit",
+        "",
+        "GATE FAIL",
+        "",
+      ].join("\n"),
+    });
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/did not create a new commit/);
+  });
+});

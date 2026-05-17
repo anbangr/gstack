@@ -2027,6 +2027,69 @@ describe("post-agent hygiene helpers", () => {
       "changed workspace root status",
     );
   });
+
+  // ------------------------------------------------------------------
+  // Audit-only phase hygiene (no commit required)
+  // ------------------------------------------------------------------
+
+  it("audit-only: requireNewCommit=false passes on a clean, unchanged tree", () => {
+    const before = captureGitSnapshot(tmpDir!);
+    // Agent did nothing — no commit, no dirty files. This is the audit-clean case.
+    const verdict = validatePostAgentHygiene({
+      cwd: tmpDir!,
+      before,
+      requireNewCommit: false,
+      label: "primary implementor",
+    });
+    expect(verdict).toEqual({ ok: true, errors: [] });
+  });
+
+  it("audit-only: requireNewCommit=false still fails on a dirty tree", () => {
+    const before = captureGitSnapshot(tmpDir!);
+    // Agent left an untracked file — must still fail hygiene.
+    fs.writeFileSync(path.join(tmpDir!, "scratch.txt"), "leftover\n");
+    const verdict = validatePostAgentHygiene({
+      cwd: tmpDir!,
+      before,
+      requireNewCommit: false,
+      label: "primary implementor",
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.errors.join("\n")).toMatch(/left the working tree dirty/);
+    expect(verdict.errors.join("\n")).toMatch(/\?\? scratch\.txt/);
+  });
+
+  it("guardrail: requireNewCommit=true still fails on a clean, unchanged tree", () => {
+    // Pins behavior for test-fixer (cli.ts ~4971) and merge-fixer (cli.ts ~9135)
+    // call sites that intentionally stay strict — a no-commit there means the
+    // agent failed at its job.
+    const before = captureGitSnapshot(tmpDir!);
+    const verdict = validatePostAgentHygiene({
+      cwd: tmpDir!,
+      before,
+      requireNewCommit: true,
+      label: "test fixer",
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.errors.join("\n")).toMatch(/did not create a new commit/);
+  });
+
+  it("audit-only: passes when the audit found problems and DID produce a commit", () => {
+    // An audit-only phase that found a problem and fixed it in place. The
+    // "no commit" assertion is moot because HEAD moved; the dirty-tree check
+    // still applies and passes because the agent committed cleanly.
+    const before = captureGitSnapshot(tmpDir!);
+    fs.writeFileSync(path.join(tmpDir!, "fix.txt"), "audit fix\n");
+    git(["add", "."], tmpDir!);
+    git(["commit", "-m", "fix(audit): correct missing thing"], tmpDir!);
+    const verdict = validatePostAgentHygiene({
+      cwd: tmpDir!,
+      before,
+      requireNewCommit: false,
+      label: "primary implementor",
+    });
+    expect(verdict).toEqual({ ok: true, errors: [] });
+  });
 });
 
 describe("plan storage helpers", () => {

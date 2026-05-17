@@ -1427,3 +1427,63 @@ test("T3 (Feature 4): non-zero non-13 exit writes 'failed' record to active-run 
     fs.rmSync(failDir, { recursive: true, force: true });
   }
 });
+
+test("dry-run audit-only plan parses the annotation and completes without RUN_FAILED", () => {
+  const auditDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-audit-only-"));
+  try {
+    const auditPlanFile = path.join(auditDir, "audit-plan.md");
+    fs.writeFileSync(
+      auditPlanFile,
+      `# Audit-Only Integration Plan
+
+## Feature 1: Submission readiness
+
+### Phase 1.1: Author-readiness audit
+<!-- audit-only -->
+This phase verifies that a previously-built artifact still passes. If the
+audit finds nothing to fix, the agent produces no commit and the orchestrator
+must not fail the phase on the "must commit" hygiene check.
+
+- [ ] **Implementation (Gemini Sub-agent)**: Run pre-submission audit checklist.
+- [ ] **Review & QA (Codex Sub-agent)**: Confirm all items green.
+`,
+    );
+    const cliPath = path.resolve(import.meta.dir, "../cli.ts");
+    const result = spawnSync(
+      "bun",
+      [
+        "run",
+        cliPath,
+        auditPlanFile,
+        "--dry-run",
+        "--test-cmd",
+        "bun test",
+        "--no-gbrain",
+        "--no-resume",
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: auditDir,
+          GSTACK_HOME: path.join(auditDir, ".gstack-audit"),
+        },
+        encoding: "utf8",
+        timeout: 30_000,
+      },
+    );
+
+    const out = result.stdout + result.stderr;
+
+    expect(result.status).toBe(0);
+    expect(out).toContain("Phase 1.1");
+    // Dry-run must walk through the orchestrator's happy path actions.
+    expect(out).toContain("RUN_GEMINI");
+    expect(out).toContain("RUN_CODEX_REVIEW");
+    // Must NOT surface a hygiene failure: dry-run skips real hygiene, but the
+    // annotation should not cause any parser warnings or unexpected RUN_FAILED.
+    expect(out).not.toMatch(/RUN_FAILED/);
+    expect(out).not.toMatch(/did not create a new commit/);
+  } finally {
+    fs.rmSync(auditDir, { recursive: true, force: true });
+  }
+});

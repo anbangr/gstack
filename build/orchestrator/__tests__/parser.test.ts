@@ -577,3 +577,82 @@ describe("parsePlan — phase kinds", () => {
     expect(warnings).toHaveLength(7);
   });
 });
+
+describe("parsePlan — audit-only annotation", () => {
+  it("sets phase.auditOnly = true when <!-- audit-only --> appears in body", () => {
+    const md = `### Phase 1: Author-readiness audit
+<!-- audit-only -->
+- [ ] **Implementation**: run the audit checklist
+- [ ] **Review**: confirm all items green
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases).toHaveLength(1);
+    expect(phases[0].auditOnly).toBe(true);
+  });
+
+  it("defaults phase.auditOnly = false when annotation is absent", () => {
+    const md = `### Phase 1: Normal phase
+- [ ] **Implementation**: write code
+- [ ] **Review**: review code
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases).toHaveLength(1);
+    expect(phases[0].auditOnly).toBe(false);
+  });
+
+  it("ignores <!-- audit-only --> inside a fenced code block", () => {
+    // Plan documentation showing the syntax must not trip the flag.
+    const md = `### Phase 1: Documentation phase
+This phase shows how to use the annotation:
+
+\`\`\`markdown
+<!-- audit-only -->
+\`\`\`
+
+- [ ] **Implementation**: document it
+- [ ] **Review**: review the docs
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases[0].auditOnly).toBe(false);
+  });
+
+  it("combines <!-- audit-only --> with <!-- kind: writing --> on the same phase", () => {
+    const md = `### Phase 1: Post-submission readiness check
+<!-- kind: writing -->
+<!-- audit-only -->
+- [ ] **Draft**: verify submission package
+- [ ] **Review**: confirm package valid
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases[0].kind).toBe("writing");
+    expect(phases[0].auditOnly).toBe(true);
+  });
+
+  it("matches case-insensitively and accepts whitespace variants", () => {
+    const md = `### Phase 1: Variant audit
+<!--audit-only-->
+- [ ] **Implementation**: run audit
+- [ ] **Review**: review
+
+### Phase 2: Spaces variant
+<!--   audit-only   -->
+- [ ] **Implementation**: run audit
+- [ ] **Review**: review
+
+### Phase 3: Mixed case
+<!-- AUDIT-ONLY -->
+- [ ] **Implementation**: run audit
+- [ ] **Review**: review
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases).toHaveLength(3);
+    expect(phases[0].auditOnly).toBe(true);
+    expect(phases[1].auditOnly).toBe(true);
+    expect(phases[2].auditOnly).toBe(true);
+  });
+});
