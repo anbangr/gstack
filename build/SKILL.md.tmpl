@@ -557,6 +557,13 @@ phase number and the colon: `### Phase N [kind]: Name`.
      - [ ] **Verify Completion (review roles)**: After the human confirms the action is done,
        verify the expected post-action state. Gate passes when confirmation is recorded.
 
+   **Orchestrator behavior for `[manual]`:** Runs a single primary-impl call (no test spec,
+   no verify-red, no tests, no Codex review). The agent prepares whatever it can — runbook,
+   staged files, a script the human will run — and commits a note describing remaining
+   human work. If the human work is already complete on the branch, the agent commits a
+   one-line acknowledgement and the phase advances. You do not need `--mark-phase-committed`
+   for normal `[manual]` flow.
+
 **Mixed plans:** A plan may contain both `code` and non-code phases. Each phase uses its own
 kind's checkpoint structure. The orchestrator handles all kinds without special config.
 
@@ -609,6 +616,12 @@ phase number and the colon: `### Phase N [kind]: Name`.
        file exactly what the human still needs to do.
      - [ ] **Verify Completion (review roles)**: After the human confirms the action is done,
        verify the expected post-action state. Gate passes when confirmation is recorded.
+
+   **Orchestrator behavior for `[manual]`:** Runs a single primary-impl call (no test spec,
+   no verify-red, no tests, no Codex review). The agent prepares whatever it can and commits
+   a note describing remaining human work; if the work is already complete, it commits a
+   one-line acknowledgement and the phase advances. You do not need `--mark-phase-committed`
+   for normal `[manual]` flow.
 
 **Mixed plans:** A plan may contain both `code` and non-code phases. Each phase uses its own
 kind's checkpoint structure. The orchestrator handles all kinds without special config.
@@ -776,7 +789,7 @@ This check is skipped when `--dry-run` or `--skip-ship` is active.
 
 ### Manual Recovery and Submodule Boundaries
 
-If a phase was manually repaired after a hygiene failure, use `gstack-build <plan> --mark-phase-committed <phase>` to mark that phase committed without rerunning Test Specification, Implementation, Green tests, or Review/QA. This is for build-state recovery only; do not use `--reset-phase` when the phase artifacts are already valid.
+If a `[code]` phase was manually repaired after a hygiene failure, use `gstack-build <plan> --mark-phase-committed <phase>` to mark that phase committed without rerunning Test Specification, Implementation, Green tests, or Review/QA. This is for build-state recovery on code phases only — for `[manual]` / `[writing]` / `[experiment]` / `[research]` phases the orchestrator already handles the happy path with a single primary-impl call, so the recovery flag is rarely needed there. Do not use `--reset-phase` when the phase artifacts are already valid.
 
 Mutable-agent recovery is parent-repo first. If an agent reports files inside a git submodule, the CLI fails closed by default and preserves the worktree. Only after verifying the submodule commit is intended, rerun with `--allow-submodule-recovery <submodule-path>`; the CLI stages only the submodule gitlink in the parent repo, not submodule-internal files. Do not edit target-repo cache history or dependency submodules as part of build-skill recovery unless the plan explicitly scopes that target repo work.
 
