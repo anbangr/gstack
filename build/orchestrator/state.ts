@@ -13,15 +13,22 @@
  * the gbrain page. Local JSON file path: `~/.gstack/build-state/<slug>.json`.
  */
 
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
-import type { BuildLaunchOptions, BuildState, Feature, FeatureState, Phase, PhaseState } from './types';
-import type { RoleConfigs } from './role-config';
-import { migrateLegacyModels } from './role-config';
-import { isGbrainAvailable, gbrainPut, gbrainGet } from './gbrain';
-import { isPhaseComplete } from './parser';
-import { isPidAlive } from './active-runs';
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+import type {
+  BuildLaunchOptions,
+  BuildState,
+  Feature,
+  FeatureState,
+  Phase,
+  PhaseState,
+} from "./types";
+import type { RoleConfigs } from "./role-config";
+import { migrateLegacyModels } from "./role-config";
+import { isGbrainAvailable, gbrainPut, gbrainGet } from "./gbrain";
+import { isPhaseComplete } from "./parser";
+import { isPidAlive } from "./active-runs";
 
 export interface PersistOptions {
   /** Skip gbrain entirely. Useful for tests and the --no-gbrain CLI flag. */
@@ -31,12 +38,12 @@ export interface PersistOptions {
 }
 
 export type DeadLockCleanupStatus =
-  | 'missing'
-  | 'removed'
-  | 'live'
-  | 'invalid'
-  | 'unreadable'
-  | 'race_lost';
+  | "missing"
+  | "removed"
+  | "live"
+  | "invalid"
+  | "unreadable"
+  | "race_lost";
 
 export interface DeadLockCleanupResult {
   status: DeadLockCleanupStatus;
@@ -49,12 +56,12 @@ function stateDir(): string {
   if (process.env.GSTACK_BUILD_STATE_DIR) {
     return path.resolve(process.env.GSTACK_BUILD_STATE_DIR);
   }
-  return path.join(os.homedir(), '.gstack', 'build-state');
+  return path.join(os.homedir(), ".gstack", "build-state");
 }
 
 export function deriveSlug(planFile: string): string {
   const base = path.basename(planFile);
-  const noExt = base.replace(/\.md$/i, '');
+  const noExt = base.replace(/\.md$/i, "");
   return `build-${noExt}`;
 }
 
@@ -62,8 +69,8 @@ export function deriveRunSlug(runId: string): string {
   const safe =
     runId
       .trim()
-      .replace(/[^a-zA-Z0-9._-]+/g, '-')
-      .replace(/^-+|-+$/g, '') || 'run';
+      .replace(/[^a-zA-Z0-9._-]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "run";
   return `build-${safe}`;
 }
 
@@ -89,23 +96,26 @@ function ensureStateDir(): void {
 
 function migrateState(state: BuildState): BuildState {
   state.phases = state.phases.map((ph) =>
-    (ph.status as string) === 'gemini_done'
-      ? { ...ph, status: 'impl_done' }
-      : (ph.status as string) === 'done'
-      ? { ...ph, status: 'committed' }
-      : ph
+    (ph.status as string) === "gemini_done"
+      ? { ...ph, status: "impl_done" }
+      : (ph.status as string) === "done"
+        ? { ...ph, status: "committed" }
+        : ph,
   );
   state.roleConfigs = migrateLegacyModels(state);
   if (!state.features) {
-    state.features = [{
-      index: 0,
-      number: '1',
-      name: 'Full plan',
-      phaseIndexes: state.phases.map((ph) => ph.index),
-      status: state.completed ? 'committed' : 'pending',
-      ...(state.completed ? { completedAt: state.lastUpdatedAt } : {}),
-    }];
-    state.currentFeatureIndex = state.features[0].status === 'committed' ? -1 : 0;
+    state.features = [
+      {
+        index: 0,
+        number: "1",
+        name: "Full plan",
+        phaseIndexes: state.phases.map((ph) => ph.index),
+        status: state.completed ? "committed" : "pending",
+        ...(state.completed ? { completedAt: state.lastUpdatedAt } : {}),
+      },
+    ];
+    state.currentFeatureIndex =
+      state.features[0].status === "committed" ? -1 : 0;
   }
   return state;
 }
@@ -131,7 +141,7 @@ export function freshState(args: {
   roleConfigs?: RoleConfigs;
 }): BuildState {
   const slug = deriveStateSlug(args.planFile, args.runId ?? args.launch?.runId);
-  const planBasename = path.basename(args.planFile).replace(/\.md$/i, '');
+  const planBasename = path.basename(args.planFile).replace(/\.md$/i, "");
   const now = new Date().toISOString();
   const phaseStates: PhaseState[] = args.phases.map((p) => ({
     index: p.index,
@@ -142,39 +152,51 @@ export function freshState(args: {
     // - impl checked only                         → impl_done (resume at Codex review)
     // - review checked only (user manually)       → committed (trust them; legacy compat)
     // - neither / testSpec unchecked              → pending (run from scratch)
-    status:
-      isPhaseComplete(p)
-        ? 'committed'
-        : p.implementationDone && !p.reviewDone
-        ? 'impl_done'
+    status: isPhaseComplete(p)
+      ? "committed"
+      : p.implementationDone && !p.reviewDone
+        ? "impl_done"
         : !p.implementationDone && p.reviewDone
-        ? 'committed'
-        : 'pending',
+          ? "committed"
+          : "pending",
+    // Cache the parsed kind so state-only consumers (fault detectors,
+    // drain-faults, future tooling) can read kind without re-parsing the plan.
+    // Fallback to "code" preserves behavior for test fixtures that build a
+    // Phase by hand without setting kind explicitly.
+    kind: p.kind ?? "code",
   }));
-  const providedFeatures = args.features?.filter((f) => f.phaseIndexes.length > 0);
+  const providedFeatures = args.features?.filter(
+    (f) => f.phaseIndexes.length > 0,
+  );
   const sourceFeatures =
     providedFeatures && providedFeatures.length > 0
       ? providedFeatures
       : phaseStates.length > 0
-      ? [{
-          index: 0,
-          number: '1',
-          name: 'Full plan',
-          body: '',
-          phaseIndexes: phaseStates.map((p) => p.index),
-        }]
-      : [];
+        ? [
+            {
+              index: 0,
+              number: "1",
+              name: "Full plan",
+              body: "",
+              phaseIndexes: phaseStates.map((p) => p.index),
+            },
+          ]
+        : [];
   const featureStates: FeatureState[] = sourceFeatures.map((f) => {
-    const done = f.phaseIndexes.every((idx) => phaseStates[idx]?.status === 'committed');
+    const done = f.phaseIndexes.every(
+      (idx) => phaseStates[idx]?.status === "committed",
+    );
     return {
       index: f.index,
       number: f.number,
       name: f.name,
       phaseIndexes: [...f.phaseIndexes],
-      status: done ? 'phases_done' : 'pending',
+      status: done ? "phases_done" : "pending",
     };
   });
-  const currentFeatureIndex = featureStates.findIndex((s) => s.status !== 'committed');
+  const currentFeatureIndex = featureStates.findIndex(
+    (s) => s.status !== "committed",
+  );
   return {
     planFile: args.planFile,
     planBasename,
@@ -183,7 +205,10 @@ export function freshState(args: {
     startedAt: now,
     lastUpdatedAt: now,
     ...(args.launch && { launch: args.launch }),
-    currentPhaseIndex: Math.max(0, phaseStates.findIndex((s) => s.status !== 'committed')),
+    currentPhaseIndex: Math.max(
+      0,
+      phaseStates.findIndex((s) => s.status !== "committed"),
+    ),
     currentFeatureIndex,
     features: featureStates,
     phases: phaseStates,
@@ -196,6 +221,40 @@ export function freshState(args: {
 }
 
 /**
+ * Hydrate `PhaseState.kind` from the parsed plan when the loaded state was
+ * written before kind was persisted (every phase has `kind: null` or
+ * `undefined`). Non-destructive: existing kind values on the state are never
+ * overwritten — user-set values win, plan re-parses do not.
+ *
+ * Index-safe: iterates `min(state.phases.length, phases.length)`. If the plan
+ * has been edited mid-build to add or remove phases, length-mismatched extras
+ * are left untouched.
+ *
+ * No-op when no parsed plan is available (e.g., gbrain-restore path before
+ * parsePlan has run) — caller can pass an empty array or `undefined` and the
+ * state is returned intact.
+ *
+ * Pair this with cli.ts's resume path: after `loadState` succeeds and the
+ * plan is parsed, call `backfillKindFromPlan(state, phases)` and the next
+ * `saveState` writes the populated kind to disk.
+ */
+export function backfillKindFromPlan(
+  state: BuildState,
+  phases: Phase[] | undefined,
+): BuildState {
+  if (!phases || phases.length === 0) return state;
+  const limit = Math.min(state.phases.length, phases.length);
+  for (let i = 0; i < limit; i++) {
+    const ps = state.phases[i];
+    const p = phases[i];
+    if (ps && p && p.kind && !ps.kind) {
+      ps.kind = p.kind;
+    }
+  }
+  return state;
+}
+
+/**
  * Load state for a plan. Strategy:
  *   1. Try local JSON (fast, always-on, source of truth).
  *   2. If JSON missing AND gbrain available, try gbrain (resume on a
@@ -205,16 +264,19 @@ export function freshState(args: {
  * Throws on JSON parse error (corrupt local state is a hard stop —
  * user inspects or deletes to start fresh).
  */
-export function loadState(slug: string, opts: PersistOptions = {}): BuildState | null {
+export function loadState(
+  slug: string,
+  opts: PersistOptions = {},
+): BuildState | null {
   const p = statePath(slug);
   if (fs.existsSync(p)) {
-    const raw = fs.readFileSync(p, 'utf8');
+    const raw = fs.readFileSync(p, "utf8");
     let parsed: BuildState;
     try {
       parsed = JSON.parse(raw) as BuildState;
     } catch (err) {
       throw new Error(
-        `state file at ${p} is corrupt (${(err as Error).message}). Inspect or delete to start fresh.`
+        `state file at ${p} is corrupt (${(err as Error).message}). Inspect or delete to start fresh.`,
       );
     }
     return migrateState(parsed);
@@ -233,7 +295,9 @@ export function loadState(slug: string, opts: PersistOptions = {}): BuildState |
     opts.log?.(`resumed state from gbrain page "${slug}"`);
     return parsed;
   } catch {
-    opts.log?.(`gbrain page "${slug}" exists but isn't valid state JSON; ignoring`);
+    opts.log?.(
+      `gbrain page "${slug}" exists but isn't valid state JSON; ignoring`,
+    );
     return null;
   }
 }
@@ -248,7 +312,7 @@ export function saveState(state: BuildState, opts: PersistOptions = {}): void {
   state.lastUpdatedAt = new Date().toISOString();
   const finalPath = statePath(state.slug);
   const tmpPath = `${finalPath}.tmp.${process.pid}`;
-  const serialized = JSON.stringify(state, null, 2) + '\n';
+  const serialized = JSON.stringify(state, null, 2) + "\n";
   fs.writeFileSync(tmpPath, serialized, { mode: 0o600 });
   fs.renameSync(tmpPath, finalPath);
 
@@ -257,18 +321,20 @@ export function saveState(state: BuildState, opts: PersistOptions = {}): void {
   if (!isGbrainAvailable()) return;
   const ok = gbrainPut(state.slug, serialized);
   if (!ok) {
-    opts.log?.(`warning: gbrain put for "${state.slug}" failed; local JSON is canonical`);
+    opts.log?.(
+      `warning: gbrain put for "${state.slug}" failed; local JSON is canonical`,
+    );
   }
 }
 
 function createLockFile(p: string): boolean {
   try {
-    const fd = fs.openSync(p, 'wx');
+    const fd = fs.openSync(p, "wx");
     fs.writeSync(fd, `${process.pid}\n${new Date().toISOString()}\n`);
     fs.closeSync(fd);
     return true;
   } catch (err: any) {
-    if (err.code === 'EEXIST') return false;
+    if (err.code === "EEXIST") return false;
     throw err;
   }
 }
@@ -277,31 +343,31 @@ export function cleanupDeadLock(slug: string): DeadLockCleanupResult {
   const p = lockPath(slug);
   let raw: string;
   try {
-    raw = fs.readFileSync(p, 'utf8');
+    raw = fs.readFileSync(p, "utf8");
   } catch (err: any) {
-    if (err.code === 'ENOENT') {
-      return { status: 'missing', lockFile: p };
+    if (err.code === "ENOENT") {
+      return { status: "missing", lockFile: p };
     }
-    return { status: 'unreadable', lockFile: p, error: err.message };
+    return { status: "unreadable", lockFile: p, error: err.message };
   }
 
-  const firstLine = raw.split(/\r?\n/)[0]?.trim() ?? '';
+  const firstLine = raw.split(/\r?\n/)[0]?.trim() ?? "";
   if (!/^[1-9]\d*$/.test(firstLine)) {
-    return { status: 'invalid', lockFile: p };
+    return { status: "invalid", lockFile: p };
   }
   const pid = Number(firstLine);
   if (isPidAlive(pid)) {
-    return { status: 'live', lockFile: p, pid };
+    return { status: "live", lockFile: p, pid };
   }
 
   try {
     fs.unlinkSync(p);
-    return { status: 'removed', lockFile: p, pid };
+    return { status: "removed", lockFile: p, pid };
   } catch (err: any) {
-    if (err.code === 'ENOENT') {
-      return { status: 'race_lost', lockFile: p, pid };
+    if (err.code === "ENOENT") {
+      return { status: "race_lost", lockFile: p, pid };
     }
-    return { status: 'unreadable', lockFile: p, pid, error: err.message };
+    return { status: "unreadable", lockFile: p, pid, error: err.message };
   }
 }
 
@@ -319,7 +385,7 @@ export function acquireLock(slug: string): boolean {
   if (createLockFile(p)) return true;
 
   const cleanup = cleanupDeadLock(slug);
-  if (cleanup.status !== 'removed' && cleanup.status !== 'race_lost') {
+  if (cleanup.status !== "removed" && cleanup.status !== "race_lost") {
     return false;
   }
   return createLockFile(p);
@@ -330,7 +396,7 @@ export function releaseLock(slug: string): void {
   try {
     fs.unlinkSync(p);
   } catch (err: any) {
-    if (err.code !== 'ENOENT') throw err;
+    if (err.code !== "ENOENT") throw err;
   }
 }
 
@@ -342,7 +408,7 @@ export function readLockInfo(slug: string): string | null {
   const p = lockPath(slug);
   if (!fs.existsSync(p)) return null;
   try {
-    return fs.readFileSync(p, 'utf8').trim();
+    return fs.readFileSync(p, "utf8").trim();
   } catch {
     return null;
   }
