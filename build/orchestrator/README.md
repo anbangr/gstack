@@ -415,6 +415,65 @@ The orchestrator stops at any of these and writes the failure reason into the st
 
 Exit codes: `0` clean run, `1` phase failed, `2` bad args, `3` lock contention, `130` SIGINT.
 
+## Mark a feature as already-shipped
+
+When a feature was merged outside the orchestrator's normal pipeline (manual
+ship from another lane, parallel merge, recovery after a killed orchestrator),
+the orchestrator's anti-tamper detector will treat any partial hand-edit to
+state as a `manual JSON state patch that bypassed ship+land+verify` and reset
+the feature to `phases_done`, trying to re-ship it. The supported way out:
+
+```bash
+gstack-build mark-shipped --plan <plan.md> --feature <number> [--pr <num>] [--merge-sha <sha>]
+```
+
+This writes the canonical terminal-state shape the detector trusts —
+`status=committed`, `completedAt`, `shippedAt`, `prNumber`, `mergeSha` — in one
+atomic local + gbrain write. Safety guards before any write:
+
+1. Refuses if any live orchestrator owns the same plan (stop it first).
+2. Auto-resolves `--pr` via `gh pr list --state merged --head <branch>` when
+   omitted. If multiple PRs match, the most-recently-merged wins.
+3. Verifies the PR is genuinely `MERGED` via `gh pr view`. Single source of
+   truth for `mergeSha` (`mergeCommit.oid`).
+4. If `--merge-sha` was passed, errors out on mismatch — catches operator
+   typos before any write.
+5. No-op + clean success message when the feature is already terminal.
+
+Does NOT touch `currentFeatureIndex` — that stays the orchestrator's
+responsibility. `findNextFeatureIndex()` will skip the feature naturally on
+the next launch because `isFeatureTerminal()` now returns true.
+
+Exit codes for mark-shipped: `0` success or no-op, `2` bad args / missing
+state / feature not found, `3` active orchestrator refused, `4` PR not
+merged, `5` `--merge-sha` mismatch.
+
+## Child process management
+
+Every spawn the orchestrator makes routes through `child-registry.ts`, a thin
+wrapper around `node:child_process` that:
+
+- Spawns each child detached (its own process group), so
+  `process.kill(-pid, signal)` reaches the whole subtree.
+- Tracks live pids in an in-memory registry.
+- Installs `SIGTERM` / `SIGINT` / `SIGHUP` handlers at orchestrator startup.
+  On any of those signals: SIGTERM every live group, wait up to 2 seconds,
+  SIGKILL survivors, then exit.
+
+`__tests__/no-bare-spawn.test.ts` is a static invariant: any new file under
+`build/orchestrator/` that imports from `node:child_process` directly fails CI.
+All `spawn`/`spawnSync`/`execFile` imports must go through
+`./child-registry` instead.
+
+**SIGKILL caveat.** `kill -9 <orchestrator-pid>` cannot be intercepted —
+the kernel terminates the process without running userspace cleanup, so
+in-flight children are reparented to init and outlive the orchestrator. This
+is standard POSIX behavior. The pre-fix polis-mesh incident hit this when the
+operator escalated straight to `kill -9` and `gbrain put` subprocesses
+survived. The fix handles the survivable signals (the common `kill`/SIGTERM,
+Ctrl-C/SIGINT, terminal-disconnect/SIGHUP) cleanly. For SIGKILL recovery,
+follow up with `pkill -9 gbrain` (or whichever subagent is still alive).
+
 ## Architecture
 
 ```
@@ -430,6 +489,9 @@ release-lock.ts remote git ref lock, heartbeat refresh, stale-owner handling
 release-daemon.ts FIFO queued release worker, scratch checkout, drift repair
 gbrain.ts       gbrain CLI wrapper (best-effort, never throws)
 ship.ts         configurable /ship + /land-and-deploy delegation
+mark-shipped.ts operator escape hatch — write canonical terminal state shape
+pr-info.ts      gh pr lookup helpers (findMergedPRForBranch, readMergedPRInfo)
+child-registry.ts drop-in spawn wrappers + signal handlers (reap detached children)
 types.ts        Phase, PhaseState, BuildState
 ```
 

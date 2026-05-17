@@ -1806,11 +1806,19 @@ When the monitor emits `RUN_FAILED` with a message like "Feature N: ship succeed
 To recover:
 1. Diagnose why /ship failed (check the log path in the error message).
 2. Fix the underlying issue (e.g., broken `gh` CLI auth, missing PR template, base sync conflict — see the `features[N].error` field in the state JSON).
-3. Edit the state JSON to clear the failure and reset the feature:
-   - File: `~/.gstack/build-state/<slug>.json` (logs remain under `~/.gstack/build-state/<slug>/`)
-   - Remove the top-level `failureReason` key.
-   - Set `features[N].status` to `"phases_done"` (where N is the 0-based feature index).
+3. Reset the feature so the monitor will retry. **Two paths:**
+   - **If the PR did NOT actually merge** (ship failed before push): edit the state JSON to clear the failure and reset the feature.
+     - File: `~/.gstack/build-state/<slug>.json` (logs remain under `~/.gstack/build-state/<slug>/`)
+     - Remove the top-level `failureReason` key.
+     - Set `features[N].status` to `"phases_done"` (where N is the 0-based feature index).
+   - **If the PR DID merge** (ship pushed, PR landed, but the monitor couldn't parse the PR number — or the feature was merged out of band from another lane): use the supported escape hatch instead of hand-editing state. It writes the canonical terminal shape atomically and survives the orchestrator's anti-tamper detector:
+     ```
+     gstack-build mark-shipped --plan <plan.md> --feature <number> [--pr <num>] [--merge-sha <sha>]
+     ```
+     See `build/orchestrator/README.md` § "Mark a feature as already-shipped" for the full guard list.
 4. Re-run the monitor: `gstack-build monitor --manifest ... --watch --supervise`
+
+**Why mark-shipped exists.** Partial JSON hand-edits (e.g. setting `prNumber` without `completedAt`) trip the detector at `cli.ts:7697`, which resets the feature to `phases_done` and tries to re-ship it — the exact failure mode of the polis-mesh incident on 2026-05-17. The `mark-shipped` subcommand writes the full canonical shape (`status=committed` + `completedAt` + `shippedAt` + `prNumber` + `mergeSha`) in one atomic gbrain put, so the detector treats it as a genuine pipeline completion.
 
 ### Step M3.5: Skill Fault Investigator
 
