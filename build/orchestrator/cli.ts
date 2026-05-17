@@ -3620,6 +3620,10 @@ function applyMutableAgentHygiene(opts: {
       `  ⚠ cleaned generated cache changes before ${opts.label} hygiene: ${preCleaned.join(", ")}`,
     );
   }
+  // Skip recovery when requireNewCommit is false. Audit-only phases bypass
+  // recovery intentionally: there's no commit to recover because none was
+  // expected. Recovery exists for sandboxed agents that wrote files but
+  // couldn't commit; an audit phase that found nothing to fix is not that.
   const recovery = opts.requireNewCommit
     ? recoverMutableAgentCommit({
         cwd: opts.cwd,
@@ -4579,7 +4583,12 @@ async function runPhase(args: {
         label: "primary implementor",
         outputFilePath,
         requireNonEmptyOutput: true,
-        requireNewCommit: true,
+        // Audit-only phases (annotated with `<!-- audit-only -->`) are gates
+        // that may legitimately produce zero source changes — skip the
+        // "must commit" assertion. The dirty-tree check still applies.
+        // Test-fixer and merge-fixer call sites elsewhere intentionally stay
+        // `true`: for those agents, "no commit" means they failed at their job.
+        requireNewCommit: !phase.auditOnly,
         allowSubmoduleRecovery: args.allowSubmoduleRecovery,
         parentWorkspace,
       });
@@ -4687,7 +4696,11 @@ async function runPhase(args: {
         label: "primary implementor rerun",
         outputFilePath,
         requireNonEmptyOutput: true,
-        requireNewCommit: true,
+        // Audit-only phases (annotated with `<!-- audit-only -->`) may also
+        // re-run cleanly after reviewer feedback without producing a commit
+        // if the audit verdict stands. Reviewer can still GATE FAIL on the
+        // summary if more is expected.
+        requireNewCommit: !phase.auditOnly,
         allowSubmoduleRecovery: args.allowSubmoduleRecovery,
         parentWorkspace,
       });
