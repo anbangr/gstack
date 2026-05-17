@@ -1081,6 +1081,13 @@ The `fault_investigator_model` is read from `configure.cm` and faults are writte
 _MONITOR_EXIT="${_MONITOR_EXIT:-0}"
 [ -f "$BUILD_TMP_DIR/monitor-exit-code" ] && _MONITOR_EXIT=$(cat "$BUILD_TMP_DIR/monitor-exit-code" 2>/dev/null || printf '0\n')
 
+# Drain any backlog from a previous skill-session crash or interrupted
+# MONITOR_REENTER cycle. The CLI does the same dedup-by-glob the bash below
+# does, so if the bash dispatch fires first on this run, drain is a no-op.
+# If a previous skill session died before reaching Step M3.5, drain catches
+# up here. Failures are non-fatal — the in-skill dispatch below still runs.
+"$_GSTACK_BUILD_CLI" drain-faults --manifest "$BUILD_RUN_MANIFEST" 2>&1 | tee -a "$BUILD_TMP_DIR/drain-faults.log" || true
+
 _FAULT_PRIMARY_DIR="$HOME/.gstack/skill-faults"
 mkdir -p "$_FAULT_PRIMARY_DIR"
 _FAULT_INVESTIGATOR_MODEL=$($GSTACK_BIN/gstack-config get fault_investigator_model 2>/dev/null || true)
