@@ -1689,7 +1689,10 @@ describe("critical-verdict-state-persistence-loop (Bug D1, Feature 4)", () => {
     // Simulate what cli.ts does on critical_exit (fixed behavior):
     // set state.planReview with sentinel before saveState + process.exit(3).
     const state = minimalBuildState();
-    state.planReview = { ...criticalVerdict, status: "critical_exit_pending" } as any;
+    state.planReview = {
+      ...criticalVerdict,
+      status: "critical_exit_pending",
+    } as any;
     saveState(state, { noGbrain: true });
 
     const loaded = loadState(state.slug, { noGbrain: true });
@@ -1831,7 +1834,8 @@ bun test v1.3.12
 coverage: 87.50%
 `;
 
-  const phaseBodyWithTarget = "## Phase\n\n**Coverage target: ≥80%**\n\nSome body text.";
+  const phaseBodyWithTarget =
+    "## Phase\n\n**Coverage target: ≥80%**\n\nSome body text.";
   const phaseBodyNoTarget = "## Phase\n\nNo coverage target line here.";
 
   function testsGreenResult(stdout: string): SubAgentResult {
@@ -1849,10 +1853,15 @@ coverage: 87.50%
   it("coverageResult.actual is set when stdout contains coverage data", () => {
     const state = basePhase({ status: "impl_done" });
     const action: Action = { type: "RUN_TESTS", phaseIndex: 0, iteration: 1 };
-    const next = applyResult(state, action, testsGreenResult(bunCoverageStdout), {
-      phaseBody: phaseBodyWithTarget,
-      testCmd: "bun test",
-    });
+    const next = applyResult(
+      state,
+      action,
+      testsGreenResult(bunCoverageStdout),
+      {
+        phaseBody: phaseBodyWithTarget,
+        testCmd: "bun test",
+      },
+    );
     expect(next.status).toBe("tests_green");
     expect(next.coverageResult).toBeDefined();
     expect(next.coverageResult!.actual).toBe(87.5);
@@ -1861,10 +1870,15 @@ coverage: 87.50%
   it("coverageResult.target defaults to 80 when no coverage target line in phase body", () => {
     const state = basePhase({ status: "impl_done" });
     const action: Action = { type: "RUN_TESTS", phaseIndex: 0, iteration: 1 };
-    const next = applyResult(state, action, testsGreenResult(bunCoverageStdout), {
-      phaseBody: phaseBodyNoTarget,
-      testCmd: "bun test",
-    });
+    const next = applyResult(
+      state,
+      action,
+      testsGreenResult(bunCoverageStdout),
+      {
+        phaseBody: phaseBodyNoTarget,
+        testCmd: "bun test",
+      },
+    );
     expect(next.coverageResult).toBeDefined();
     expect(next.coverageResult!.target).toBe(80);
   });
@@ -1873,10 +1887,15 @@ coverage: 87.50%
     const lowCoverageStdout = "coverage: 60.00%";
     const state = basePhase({ status: "impl_done" });
     const action: Action = { type: "RUN_TESTS", phaseIndex: 0, iteration: 1 };
-    const next = applyResult(state, action, testsGreenResult(lowCoverageStdout), {
-      phaseBody: phaseBodyWithTarget,
-      testCmd: "bun test",
-    });
+    const next = applyResult(
+      state,
+      action,
+      testsGreenResult(lowCoverageStdout),
+      {
+        phaseBody: phaseBodyWithTarget,
+        testCmd: "bun test",
+      },
+    );
     expect(next.status).toBe("tests_green");
     expect(next.coverageResult!.actual).toBe(60);
     expect(next.coverageResult!.target).toBe(80);
@@ -1895,7 +1914,11 @@ coverage: 87.50%
   it("coverageResult is not set when phaseBody is not provided (no extra)", () => {
     const state = basePhase({ status: "impl_done" });
     const action: Action = { type: "RUN_TESTS", phaseIndex: 0, iteration: 1 };
-    const next = applyResult(state, action, testsGreenResult(bunCoverageStdout));
+    const next = applyResult(
+      state,
+      action,
+      testsGreenResult(bunCoverageStdout),
+    );
     expect(next.coverageResult).toBeUndefined();
   });
 
@@ -1917,5 +1940,127 @@ coverage: 87.50%
     });
     expect(next.status).toBe("test_fix_running");
     expect(next.coverageResult).toBeUndefined();
+  });
+});
+
+describe("non-code phase kinds skip test-spec / tests pipeline", () => {
+  // Base phase shared across all non-code kind tests. testSpecCheckboxLine=-1
+  // because non-code phase templates do not have a Test Specification
+  // checkbox — parser sets testSpecDone=true via the no-checkbox compat path.
+  const baseNonCode: Omit<Phase, "kind"> = {
+    index: 0,
+    number: "1",
+    name: "Non-code phase",
+    body: "deliverable description",
+    testSpecDone: true,
+    testSpecCheckboxLine: -1,
+    implementationDone: false,
+    implementationCheckboxLine: 4,
+    reviewDone: false,
+    reviewCheckboxLine: 5,
+    dualImpl: false,
+  };
+
+  function pendingState(): PhaseState {
+    return {
+      index: 0,
+      number: "1",
+      name: "Non-code phase",
+      status: "pending" as any,
+    };
+  }
+
+  function implDoneState(): PhaseState {
+    return {
+      index: 0,
+      number: "1",
+      name: "Non-code phase",
+      status: "impl_done" as any,
+    };
+  }
+
+  it('pending + kind="manual" → RUN_GEMINI (no RUN_GEMINI_TEST_SPEC)', () => {
+    const phase: Phase = { ...baseNonCode, kind: "manual" };
+    const action = decideNextAction(pendingState(), 5, phase);
+    expect(action.type).toBe("RUN_GEMINI");
+  });
+
+  it('pending + kind="writing" → RUN_GEMINI', () => {
+    const phase: Phase = { ...baseNonCode, kind: "writing" };
+    const action = decideNextAction(pendingState(), 5, phase);
+    expect(action.type).toBe("RUN_GEMINI");
+  });
+
+  it('pending + kind="experiment" → RUN_GEMINI', () => {
+    const phase: Phase = { ...baseNonCode, kind: "experiment" };
+    const action = decideNextAction(pendingState(), 5, phase);
+    expect(action.type).toBe("RUN_GEMINI");
+  });
+
+  it('pending + kind="research" → RUN_GEMINI', () => {
+    const phase: Phase = { ...baseNonCode, kind: "research" };
+    const action = decideNextAction(pendingState(), 5, phase);
+    expect(action.type).toBe("RUN_GEMINI");
+  });
+
+  // Regression guard: code phases STILL go through test-spec pipeline.
+  it('pending + kind="code" + testSpecDone=false → RUN_GEMINI_TEST_SPEC (regression guard)', () => {
+    const codePhase: Phase = {
+      ...baseNonCode,
+      kind: "code",
+      testSpecDone: false,
+      testSpecCheckboxLine: 3,
+    };
+    const action = decideNextAction(pendingState(), 5, codePhase);
+    expect(action.type).toBe("RUN_GEMINI_TEST_SPEC");
+  });
+
+  // E3 regression guard: code phase + dualImpl + prewritten testspec → VERIFY_RED.
+  it('pending + kind="code" + dualImpl=true + prewritten testspec → VERIFY_RED (regression guard)', () => {
+    const dualCode: Phase = {
+      ...baseNonCode,
+      kind: "code",
+      testSpecDone: true,
+      testSpecCheckboxLine: 10, // real prewritten testspec, not the legacy -1 sentinel
+      dualImpl: true,
+    };
+    const action = decideNextAction(pendingState(), 5, dualCode);
+    expect(action.type).toBe("VERIFY_RED");
+  });
+
+  it('impl_done + kind="manual" → MARK_COMPLETE (decision 1B: skip Codex review)', () => {
+    const phase: Phase = { ...baseNonCode, kind: "manual" };
+    const action = decideNextAction(implDoneState(), 5, phase);
+    expect(action.type).toBe("MARK_COMPLETE");
+  });
+
+  it('impl_done + kind="writing" → RUN_CODEX_REVIEW (deliverable-completeness rubric)', () => {
+    const phase: Phase = { ...baseNonCode, kind: "writing" };
+    const action = decideNextAction(implDoneState(), 5, phase);
+    expect(action.type).toBe("RUN_CODEX_REVIEW");
+  });
+
+  it('impl_done + kind="experiment" → RUN_CODEX_REVIEW', () => {
+    const phase: Phase = { ...baseNonCode, kind: "experiment" };
+    const action = decideNextAction(implDoneState(), 5, phase);
+    expect(action.type).toBe("RUN_CODEX_REVIEW");
+  });
+
+  it('impl_done + kind="research" → RUN_CODEX_REVIEW', () => {
+    const phase: Phase = { ...baseNonCode, kind: "research" };
+    const action = decideNextAction(implDoneState(), 5, phase);
+    expect(action.type).toBe("RUN_CODEX_REVIEW");
+  });
+
+  // Regression guard: code phases at impl_done with testSpecDone=false → RUN_TESTS.
+  it('impl_done + kind="code" + testSpecDone=false → RUN_TESTS (regression guard)', () => {
+    const codePhase: Phase = {
+      ...baseNonCode,
+      kind: "code",
+      testSpecDone: false,
+      testSpecCheckboxLine: 3,
+    };
+    const action = decideNextAction(implDoneState(), 5, codePhase);
+    expect(action.type).toBe("RUN_TESTS");
   });
 });
