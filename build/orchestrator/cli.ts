@@ -78,6 +78,10 @@ import {
   runConfiguredRoleTask,
   runRoleTask as runGeminiRoleTask,
   detectTestCmd,
+  detectTestFramework,
+  frameworkToRunner,
+  isKnownFramework,
+  type Framework,
   runTests,
   runCodexImpl,
   runCodexReview,
@@ -560,6 +564,8 @@ export interface Args {
   releaseMode: "queued" | "auto-land";
   maxCodexIter: number;
   testCmd?: string;
+  /** Test framework override (vitest|jest|playwright|bun|pytest|go|cargo). When set, beats detectTestCmd autodetect at every call site. */
+  testFramework?: Framework;
   projectRoot?: string;
   /** When true, every phase implements via configured primary/secondary tournament with configured judge. */
   dualImpl: boolean;
@@ -655,6 +661,31 @@ export interface Args {
   reconcilePlanFile?: string;
   /** State JSON file for reconcile/doctor modes (when not auto-detected). */
   reconcileStateFile?: string;
+}
+
+/**
+ * Resolve the test command for a given cwd, honoring the priority:
+ *   --test-cmd (verbatim string) > --test-framework (canonical runner) > detectTestCmd
+ *
+ * Use this at every red-verify / dual-impl call site so the user can override
+ * a misdetection without editing the codebase.
+ */
+export function resolveTestCmd(args: Args, cwd: string): string | null {
+  if (args.testCmd) return args.testCmd;
+  if (args.testFramework) return frameworkToRunner(args.testFramework, cwd);
+  return detectTestCmd(cwd);
+}
+
+/**
+ * Resolve the framework name for prompt-hint purposes. Mirror of resolveTestCmd
+ * but returns just the framework label (vitest|jest|…) or null.
+ */
+export function resolveTestFramework(
+  args: Args,
+  cwd: string,
+): Framework | null {
+  if (args.testFramework) return args.testFramework;
+  return detectTestFramework(cwd);
 }
 
 export function parseArgs(argv: string[]): Args {
@@ -875,6 +906,20 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.testCmd = next;
+    } else if (a === "--test-framework") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--test-framework requires a value");
+        process.exit(2);
+      }
+      if (!isKnownFramework(next)) {
+        console.error(
+          `--test-framework: unknown value '${next}'. ` +
+            `Known: vitest, jest, playwright, bun, pytest, go, cargo`,
+        );
+        process.exit(2);
+      }
+      args.testFramework = next;
     } else if (a === "--project-root") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
@@ -3043,6 +3088,7 @@ export function extractCoverageTarget(phaseBody: string): number {
 export function buildGeminiTestSpecPrompt(
   phase: Phase,
   planFile: string,
+  framework: Framework | null = null,
 ): string {
   const hasTestSpec = phase.testSpecCheckboxLine !== -1;
 
@@ -3073,6 +3119,23 @@ export function buildGeminiTestSpecPrompt(
         `7. Write your output summary to the output file path (provided in shell prompt).`,
       ];
 
+  // When the CLI has detected the project's test framework, prepend it as a
+  // hint. Gemini's existing repo-inspection step is still authoritative — this
+  // just removes the case where the runner the CLI picked and the framework
+  // the LLM guessed disagree silently.
+  const frameworkHint =
+    framework !== null
+      ? [
+          `## Detected test framework`,
+          ``,
+          `The CLI inspected this project and identified the test framework as` +
+            ` \`${framework}\`. Use its assertion conventions and file-naming` +
+            ` patterns. If the repo's actual setup differs, follow the repo's` +
+            ` conventions and note the discrepancy in your output summary.`,
+          ``,
+        ]
+      : [];
+
   return [
     `# Phase ${phase.number}: ${phase.name} — Test Specification`,
     ``,
@@ -3082,6 +3145,7 @@ export function buildGeminiTestSpecPrompt(
     ``,
     phase.body.trim(),
     ``,
+    ...frameworkHint,
     `## Instructions`,
     ``,
     ...specInstructions,
@@ -4794,7 +4858,11 @@ async function runPhase(args: {
         };
         fs.writeFileSync(
           inputFilePath,
-          buildGeminiTestSpecPrompt(resolvedPhase4, state.planFile),
+          buildGeminiTestSpecPrompt(
+            resolvedPhase4,
+            state.planFile,
+            resolveTestFramework(args, cwd),
+          ),
         );
         fs.writeFileSync(outputFilePath, "");
         result = await runRoleTask({
@@ -4823,7 +4891,7 @@ async function runPhase(args: {
           stdout: "[dry-run] tests would fail (Red)",
         });
       } else {
-        const testCmd = args.testCmd ?? detectTestCmd(cwd);
+        const testCmd = resolveTestCmd(args, cwd);
         if (!testCmd) {
           console.warn(
             "  ⚠ no test command detected; assuming Red for VERIFY_RED",
@@ -4858,7 +4926,7 @@ async function runPhase(args: {
           stdout: "[dry-run] tests would pass (Green)",
         });
       } else {
-        effectiveTestCmd = args.testCmd ?? detectTestCmd(cwd);
+        effectiveTestCmd = resolveTestCmd(args, cwd);
         if (!effectiveTestCmd) {
           // No test cmd: skip test verification, treat as green.
           console.warn(
@@ -5078,7 +5146,7 @@ async function runPhase(args: {
         const phaseN = phase.number;
         const it = action.iteration;
 
-        const dualTestCmd = args.testCmd ?? detectTestCmd(cwd);
+        const dualTestCmd = resolveTestCmd(args, cwd);
 
         const runCandidate = async (candidate: DualImplCandidateKey) => {
           const opponent: DualImplCandidateKey =
@@ -5458,7 +5526,7 @@ async function runPhase(args: {
           );
           // Re-run tests inline since cached results are stale.
           // Reuse the existing testCmd detection below.
-          const testCmd = args.testCmd ?? detectTestCmd(cwd);
+          const testCmd = resolveTestCmd(args, cwd);
           if (!testCmd) {
             console.warn(
               "  ⚠ no test command detected for dual-tests; assuming both green",
@@ -5524,7 +5592,7 @@ async function runPhase(args: {
           };
         }
       } else {
-        const testCmd = args.testCmd ?? detectTestCmd(cwd);
+        const testCmd = resolveTestCmd(args, cwd);
         if (!testCmd) {
           // No test cmd: assume both green so judge runs.
           console.warn(
