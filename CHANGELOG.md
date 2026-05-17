@@ -1,5 +1,61 @@
 # Changelog
 
+## [1.40.1.0] - 2026-05-17
+
+**The red-verify gate stops running pytest on TypeScript tests. Test-framework autodetect now picks vitest, jest, or pytest from the right signal.**
+
+If your project has a vitest config plus a stray pytest.ini, gstack-build's autonomous build used to hit pytest, fail to parse `*.test.ts` files, blow three fix attempts, and exit with `Gemini could not produce failing tests after 3 attempts (GSTACK_BUILD_RED_MAX_ITER)`. Same shape for any TypeScript project where `scripts.test` was empty and a Python signal happened to coexist. This release rewrites the test-runner detection to put framework-config files (vitest.config.ts, jest.config.js, playwright.config.ts, setup.cfg with `[tool:pytest]`) first, then `scripts.test`, then build-system markers, with a bounded source-file tie-break for genuinely mixed-language repos. A new `--test-framework` CLI flag overrides autodetect when you know what you want.
+
+### What changed in one paragraph
+
+`detectTestCmd` is now a thin wrapper over a new `inspectProject(cwd)` helper that returns both the runner command and the framework name. The 5 call sites in `cli.ts` route through a new `resolveTestCmd(args, cwd)` so a single override knob (`--test-framework vitest|jest|playwright|bun|pytest|go|cargo`) wins at every red-verify, dual-impl, and verify-tests site. The Gemini testspec prompt at `buildGeminiTestSpecPrompt` now includes a one-paragraph `## Detected test framework` hint when the framework is known, so the LLM and the CLI agree on assertion-library expectations. For mixed-language repos where the cwd has both a `package.json` and a `pyproject.toml` (or `go.mod`), a depth-4 file walk with a 250ms time budget and a 50-per-language cap counts test files to break the tie.
+
+### The numbers that matter
+
+Source: `bun test ./build/orchestrator/__tests__/sub-agents.test.ts` after this change.
+
+| Metric | Before | After | Δ |
+| --- | --- | --- | --- |
+| `inspectProject` returns vitest for vitest.config.ts + pytest.ini | no (returned pytest) | yes | flip |
+| Framework-config files (vitest, jest, playwright, setup.cfg) explicitly detected | partial | yes | new |
+| `--test-framework` CLI override | not present | shipped | new |
+| Source-file tie-break for mixed-language repos | not present | shipped | new |
+| Clock-budget abort for pathological filesystems | not present | 250ms hard cap | new |
+| Sub-agents tests (legacy + new) | 105 | 145 | +40 |
+| Mandatory regression test (vitest.config.ts beats pytest.ini) | 0 | 1, ★★★ | new |
+
+The mandatory regression test fails on the pre-fix `detectTestCmd` (returns `"pytest"`) and passes on the post-fix `inspectProject` (returns `"vitest"`).
+
+### What this means for builders
+
+If you've been getting `GSTACK_BUILD_RED_MAX_ITER` on a TypeScript project, this release fixes the most likely cause. If you have a non-standard setup that still confuses autodetect, run `gstack-build --test-framework vitest <plan>` to force the framework. If you have a monorepo that mixes languages, the orchestrator will now use the majority-language signal at the cwd it's launched from. The old `--test-cmd` flag still wins at the top of the priority chain when you need to pass an exact command.
+
+### Itemized changes
+
+#### Fixed
+
+- The red-verify gate no longer picks `pytest` for a TypeScript project that has a stray `pytest.ini` and no `scripts.test`. Framework-config files (`vitest.config.{ts,js,mjs}`, `jest.config.{ts,js,cjs,mjs}`, `playwright.config.{ts,js}`, `setup.cfg [tool:pytest]`) now win the first-match round over generic build-system markers.
+- The legacy basename-first detection that mapped `<pkgmgr> test` regardless of the actual framework is gone. The new mapper uses the framework name when one is known and falls back to the package manager only when no framework config exists.
+
+#### Added
+
+- `inspectProject(cwd, opts?)` in `build/orchestrator/sub-agents.ts` is the single source of truth for runner + framework decisions. Both `detectTestCmd` and the new `detectTestFramework` are thin wrappers over it.
+- `--test-framework <name>` CLI flag with values `vitest | jest | playwright | bun | pytest | go | cargo`. Validates at parse time (unknown values exit 2). Beats autodetect at every call site.
+- `countTestFiles(cwd, budgetMs, now)` helper: bounded directory walk (depth 4, cap 50 files per language, ignores `node_modules/`, `.git/`, `dist/`, `build/`, `__pycache__/`, `vendor/`, `vendored/`, `.worktrees/`, `coverage/`, `target/`). Aborts cleanly on time-budget overrun. Used by the new tie-break.
+- `## Detected test framework` paragraph in `buildGeminiTestSpecPrompt` when the framework is known, so the testspec LLM and the runner agree on assertion conventions.
+- `Framework` type union exported from `sub-agents.ts` (`vitest|jest|playwright|bun|pytest|go|cargo`).
+- 40 new sub-agents tests covering: framework-config detection per file form (11 tests), scripts.test framework inference (4 tests), wrapper-script graceful degrade (1 test), countTestFiles bounded walk and ignore-dirs (4 tests), tie-break majority-wins (3 tests), single-language fallthrough (4 tests), prompt-hint rendering (3 tests), and the mandatory regression (1 test). Plus 10 unit tests for new helpers.
+
+#### Changed
+
+- `detectTestCmd` is now a one-line wrapper around `inspectProject(cwd).runner`. API surface unchanged for the 5 existing call sites; behavior changes where the detection differs.
+- `resolveTestCmd(args, cwd)` and `resolveTestFramework(args, cwd)` are the new public entry points in `cli.ts` for sites that need the override priority. They consult `--test-cmd`, then `--test-framework`, then autodetect.
+
+#### For contributors
+
+- TODOS.md gains a P3 entry for the future `## Test framework` plan-file override block. Shipped behavior is the CLI flag; the plan-file block is deferred until users actually ask for it.
+- Plan-eng-review of this change: 9 decisions resolved (D1-D9), 0 critical gaps, 1 mandatory regression test. See `~/.claude/plans/this-issue-replicated-ladybug.md`.
+
 ## [1.40.0.0] - 2026-05-16
 
 **Supervised gstack-build restarts stop nuking the active worktree. The startup sweep now reads ground truth from disk, not stale PIDs.**
