@@ -317,7 +317,15 @@ describe("TEST_FIXER_LOOP", () => {
 // ---------------------------------------------------------------------------
 
 describe("PREMATURE_COMPLETION", () => {
-  test("detected when plan has [x] **Implementation** for non-committed phase", () => {
+  // The detector was tightened in v1.40.2.0+ to only fire on terminal-failed
+  // states (failed/blocked/paused). Intermediate states like tests_green,
+  // codex_running, and review_clean are legitimate mid-phase transitions
+  // where the orchestrator has correctly ticked Implementation checkboxes
+  // before reaching `committed`. The previous behavior caused 78
+  // false-positive fires for one healthy Phase 2.1 in the agnt2-prototype
+  // run on 2026-05-16. See drain-faults plan T5 + skill-fault-detector.ts
+  // PREMATURE_COMPLETION_FIRING_STATUSES for the firing-status set.
+  test("detected when plan has [x] **Implementation** for failed phase", () => {
     const dir = makeTmpDir();
     const planWithChecked = [
       "# Plan",
@@ -331,20 +339,20 @@ describe("PREMATURE_COMPLETION", () => {
       "- [ ] **Review & QA**: not done",
     ].join("\n");
     const planPath = writePlan(dir, planWithChecked);
-    const nonCommittedPhase: PhaseState = {
+    const failedPhase: PhaseState = {
       ...committedPhase(0),
-      status: "tests_green", // not 'committed'
+      status: "failed",
     };
     const input = makeInput(dir, {
       livingPlanPath: planPath,
-      state: baseState({ phases: [nonCommittedPhase] }),
+      state: baseState({ phases: [failedPhase] }),
     });
     const faults = detectSkillFaults(input);
     const fault = faults.find((f) => f.category === "PREMATURE_COMPLETION");
     expect(fault).toBeDefined();
   });
 
-  test("detected when plan has [x] **Review & QA** for non-committed phase", () => {
+  test("detected when plan has [x] **Review & QA** for blocked phase", () => {
     const dir = makeTmpDir();
     const planWithChecked = [
       "# Plan",
@@ -358,20 +366,20 @@ describe("PREMATURE_COMPLETION", () => {
       "- [x] **Review & QA**: done",
     ].join("\n");
     const planPath = writePlan(dir, planWithChecked);
-    const nonCommittedPhase: PhaseState = {
+    const blockedPhase: PhaseState = {
       ...committedPhase(0),
-      status: "review_clean",
+      status: "blocked",
     };
     const input = makeInput(dir, {
       livingPlanPath: planPath,
-      state: baseState({ phases: [nonCommittedPhase] }),
+      state: baseState({ phases: [blockedPhase] }),
     });
     const faults = detectSkillFaults(input);
     const fault = faults.find((f) => f.category === "PREMATURE_COMPLETION");
     expect(fault).toBeDefined();
   });
 
-  test("detected with role-qualified Implementation and Review & QA labels", () => {
+  test("detected with role-qualified labels on paused phase", () => {
     const dir = makeTmpDir();
     const planWithQualifiedLabels = [
       "# Plan",
@@ -385,17 +393,104 @@ describe("PREMATURE_COMPLETION", () => {
       "- [x] **Review & QA (Codex Sub-agent)**: done",
     ].join("\n");
     const planPath = writePlan(dir, planWithQualifiedLabels);
-    const nonCommittedPhase: PhaseState = {
+    const pausedPhase: PhaseState = {
+      ...committedPhase(0),
+      status: "paused",
+    };
+    const input = makeInput(dir, {
+      livingPlanPath: planPath,
+      state: baseState({ phases: [pausedPhase] }),
+    });
+    const faults = detectSkillFaults(input);
+    const fault = faults.find((f) => f.category === "PREMATURE_COMPLETION");
+    expect(fault).toBeDefined();
+  });
+
+  // Regression tests for the agnt2-prototype-bisectiongame-settlement
+  // false-positive class (2026-05-16). The detector previously fired during
+  // healthy tests_green / codex_running / review_clean transitions.
+  test("NOT detected for tests_green (healthy intermediate state — regression)", () => {
+    const dir = makeTmpDir();
+    const plan = [
+      "# Plan",
+      "",
+      "### Phase 1: Setup",
+      "",
+      "Origin trace: Feature 1",
+      "Acceptance: tests pass",
+      "",
+      "- [x] **Implementation**: done",
+      "- [ ] **Review & QA**: not done",
+    ].join("\n");
+    const planPath = writePlan(dir, plan);
+    const testsGreenPhase: PhaseState = {
       ...committedPhase(0),
       status: "tests_green",
     };
     const input = makeInput(dir, {
       livingPlanPath: planPath,
-      state: baseState({ phases: [nonCommittedPhase] }),
+      state: baseState({ phases: [testsGreenPhase] }),
     });
     const faults = detectSkillFaults(input);
-    const fault = faults.find((f) => f.category === "PREMATURE_COMPLETION");
-    expect(fault).toBeDefined();
+    expect(
+      faults.find((f) => f.category === "PREMATURE_COMPLETION"),
+    ).toBeUndefined();
+  });
+
+  test("NOT detected for codex_running (healthy intermediate state — regression)", () => {
+    const dir = makeTmpDir();
+    const plan = [
+      "# Plan",
+      "",
+      "### Phase 1: Setup",
+      "",
+      "Origin trace: Feature 1",
+      "Acceptance: tests pass",
+      "",
+      "- [x] **Implementation**: done",
+      "- [ ] **Review & QA**: not done",
+    ].join("\n");
+    const planPath = writePlan(dir, plan);
+    const codexRunningPhase: PhaseState = {
+      ...committedPhase(0),
+      status: "codex_running",
+    };
+    const input = makeInput(dir, {
+      livingPlanPath: planPath,
+      state: baseState({ phases: [codexRunningPhase] }),
+    });
+    const faults = detectSkillFaults(input);
+    expect(
+      faults.find((f) => f.category === "PREMATURE_COMPLETION"),
+    ).toBeUndefined();
+  });
+
+  test("NOT detected for review_clean (healthy intermediate state — regression)", () => {
+    const dir = makeTmpDir();
+    const plan = [
+      "# Plan",
+      "",
+      "### Phase 1: Setup",
+      "",
+      "Origin trace: Feature 1",
+      "Acceptance: tests pass",
+      "",
+      "- [x] **Implementation**: done",
+      "- [x] **Review & QA**: done",
+    ].join("\n");
+    const planPath = writePlan(dir, plan);
+    const reviewCleanPhase: PhaseState = {
+      ...committedPhase(0),
+      status: "review_clean",
+    };
+    const input = makeInput(dir, {
+      livingPlanPath: planPath,
+      state: baseState({ phases: [reviewCleanPhase] }),
+    });
+    const faults = detectSkillFaults(input);
+    expect(
+      faults.find((f) => f.category === "PREMATURE_COMPLETION"),
+    ).toBeUndefined();
   });
 
   test("NOT detected for checked checkboxes whose bold labels only share the gate prefix", () => {
@@ -412,13 +507,16 @@ describe("PREMATURE_COMPLETION", () => {
       "- [x] **Review & QA notes**: document reviewer feedback",
     ].join("\n");
     const planPath = writePlan(dir, planWithSimilarLabels);
-    const nonCommittedPhase: PhaseState = {
+    // Use a firing status (failed) so this test isolates the label-prefix
+    // logic — without it, the test would also pass because tests_green
+    // is silenced by the firing-status gate.
+    const failedPhase: PhaseState = {
       ...committedPhase(0),
-      status: "tests_green",
+      status: "failed",
     };
     const input = makeInput(dir, {
       livingPlanPath: planPath,
-      state: baseState({ phases: [nonCommittedPhase] }),
+      state: baseState({ phases: [failedPhase] }),
     });
     const faults = detectSkillFaults(input);
     expect(
