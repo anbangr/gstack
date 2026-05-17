@@ -161,6 +161,11 @@ import {
 } from "./role-config";
 import { BUILD_DEFAULTS } from "./build-config";
 import { evaluateMonitorOnce, monitorExitCode } from "./monitor";
+import {
+  drainFaults,
+  drainFaultsFromMonitor,
+  type DrainFaultsResult,
+} from "./drain-faults";
 import { buildMonitorAgentEscalation } from "./monitor-supervisor";
 import { startHeartbeat, type HeartbeatController } from "./heartbeat";
 import {
@@ -552,7 +557,8 @@ export interface Args {
     | "release-daemon"
     | "plan-status"
     | "reconcile"
-    | "doctor";
+    | "doctor"
+    | "drain-faults";
   planFile: string;
   printOnly: boolean;
   dryRun: boolean;
@@ -661,6 +667,16 @@ export interface Args {
   reconcilePlanFile?: string;
   /** State JSON file for reconcile/doctor modes (when not auto-detected). */
   reconcileStateFile?: string;
+  /**
+   * BUILD_TMP_DIR alternative input for `drain-faults` mode. Accepted as
+   * `--build-tmp-dir <path>`; mutually exclusive with `--manifest`. Either
+   * works because drain only needs the directory holding monitor-output.log.
+   */
+  drainFaultsBuildTmpDir?: string;
+  /** Enable catch-all discovery investigator in drain-faults mode. */
+  drainFaultsCatchAll?: boolean;
+  /** Per-investigator timeout in ms for drain-faults mode. Default 10min. */
+  drainFaultsInvestigatorTimeoutMs?: number;
 }
 
 /**
@@ -749,6 +765,9 @@ export function parseArgs(argv: string[]): Args {
     reconcileFromArtifacts: false,
     reconcilePlanFile: undefined,
     reconcileStateFile: undefined,
+    drainFaultsBuildTmpDir: undefined,
+    drainFaultsCatchAll: false,
+    drainFaultsInvestigatorTimeoutMs: undefined,
   };
   const positional: string[] = [];
   const roleFlags = buildRoleFlagMap();
@@ -818,6 +837,25 @@ export function parseArgs(argv: string[]): Args {
       args.monitorManifest = path.resolve(next);
     } else if (a === "--from-artifacts") {
       args.reconcileFromArtifacts = true;
+    } else if (a === "--build-tmp-dir") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--build-tmp-dir requires a path");
+        process.exit(2);
+      }
+      args.drainFaultsBuildTmpDir = path.resolve(next);
+    } else if (a === "--catch-all") {
+      args.drainFaultsCatchAll = true;
+    } else if (a === "--investigator-timeout-ms") {
+      const next = argv[++i];
+      const n = Number(next);
+      if (!Number.isInteger(n) || n < 1000) {
+        console.error(
+          `--investigator-timeout-ms expects an integer >= 1000, got: ${next}`,
+        );
+        process.exit(2);
+      }
+      args.drainFaultsInvestigatorTimeoutMs = n;
     } else if (a === "--state") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
@@ -1134,6 +1172,26 @@ export function parseArgs(argv: string[]): Args {
     if (!args.reconcilePlanFile || !args.reconcileStateFile) {
       console.error(
         "gstack-build doctor requires --plan <plan.md> --state <state.json>",
+      );
+      process.exit(2);
+    }
+  } else if (positional[0] === "drain-faults") {
+    if (positional.length !== 1) {
+      console.error(
+        "usage: gstack-build drain-faults --manifest <path> | --build-tmp-dir <path>   [--dry-run] [--catch-all] [--investigator-timeout-ms <N>]   (-h for help)",
+      );
+      process.exit(2);
+    }
+    args.mode = "drain-faults";
+    if (!args.monitorManifest && !args.drainFaultsBuildTmpDir) {
+      console.error(
+        "gstack-build drain-faults requires --manifest <path> OR --build-tmp-dir <path>",
+      );
+      process.exit(2);
+    }
+    if (args.monitorManifest && args.drainFaultsBuildTmpDir) {
+      console.error(
+        "gstack-build drain-faults: provide only one of --manifest or --build-tmp-dir",
       );
       process.exit(2);
     }
@@ -6130,6 +6188,33 @@ function resetStreakFor(
   }
 }
 
+/**
+ * `gstack-build drain-faults` subcommand. Recovers stranded fault investigations
+ * from a build's monitor-output.log. Idempotent: re-running on the same log is
+ * a no-op once all faults have reports on disk.
+ *
+ * Accepts EITHER `--manifest <path>` (the build-run-manifest.json, same as the
+ * monitor uses) OR `--build-tmp-dir <path>` (the directory holding
+ * monitor-output.log directly). The two-form input is for ergonomics: ad-hoc
+ * recovery from a stranded log doesn't always have the manifest handy.
+ *
+ * Exit codes:
+ *   0 - all dispatched investigators succeeded (or nothing to drain)
+ *   1 - at least one investigator failed (timeout or non-zero exit)
+ *   2 - usage error (caught in parseArgs; this function should not hit it)
+ */
+async function runDrainFaultsMode(args: Args): Promise<number> {
+  const result: DrainFaultsResult = await drainFaults({
+    manifestPath: args.monitorManifest,
+    buildTmpDir: args.drainFaultsBuildTmpDir,
+    dryRun: args.dryRun,
+    catchAll: args.drainFaultsCatchAll,
+    investigatorTimeoutMs: args.drainFaultsInvestigatorTimeoutMs,
+  });
+  process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+  return result.reportsFailed > 0 ? 1 : 0;
+}
+
 async function runMonitorMode(args: Args): Promise<number> {
   if (!args.monitorManifest) {
     console.error("gstack-build monitor requires --manifest <path>");
@@ -6155,6 +6240,14 @@ async function runMonitorMode(args: Args): Promise<number> {
     // Non-escalation terminal: reset the streak so the user's recovery
     // path doesn't inherit a stale counter.
     resetStreakFor(evaluation);
+    // Belt-and-suspenders: drain any stranded faults from monitor-output.log
+    // before exit. Per eng-review 1A — even if the host skill agent never
+    // reaches Step M3.5, the monitor itself triggers investigations.
+    // Failures here are intentionally swallowed so monitor exit code is
+    // not perturbed by an investigator hang.
+    if (args.monitorManifest) {
+      await drainFaultsFromMonitor(args.monitorManifest);
+    }
     return monitorExitCode(evaluation.terminalEvent.event);
   }
 
@@ -6189,6 +6282,10 @@ async function runMonitorMode(args: Args): Promise<number> {
       // Non-escalation terminal (RUN_FAILED, ALL_RUNS_COMPLETE, etc.):
       // reset the streak.
       resetStreakFor(evaluation);
+      // Belt-and-suspenders drain on terminal exit (eng-review 1A).
+      if (args.monitorManifest) {
+        await drainFaultsFromMonitor(args.monitorManifest);
+      }
       return monitorExitCode(evaluation.terminalEvent.event);
     }
     if (Date.now() - startedAt >= args.monitorMaxWallMs) {
@@ -6782,9 +6879,8 @@ const SWEEP_FRESH_MIN_MS = 60_000;
 function staleThresholdMs(): number {
   const raw = process.env.GSTACK_SWEEP_STALE_HOURS;
   const hours = raw && /^\d+(\.\d+)?$/.test(raw) ? parseFloat(raw) : NaN;
-  const effective = Number.isFinite(hours) && hours > 0
-    ? hours
-    : DEFAULT_SWEEP_STALE_HOURS;
+  const effective =
+    Number.isFinite(hours) && hours > 0 ? hours : DEFAULT_SWEEP_STALE_HOURS;
   return effective * 3600 * 1000;
 }
 
@@ -7241,6 +7337,11 @@ async function main() {
 
   if (args.mode === "doctor") {
     const exitCode = await runDoctorMode(args);
+    process.exit(exitCode);
+  }
+
+  if (args.mode === "drain-faults") {
+    const exitCode = await runDrainFaultsMode(args);
     process.exit(exitCode);
   }
 
