@@ -42,6 +42,14 @@ const HEADING_KIND_PATTERN = /\[(code|writing|experiment|research|manual)\]/i;
 const BODY_KIND_PATTERN =
   /<!--\s*kind:\s*(code|writing|experiment|research|manual)\s*-->/i;
 
+/** Audit-only annotation: HTML comment anywhere in phase body. When present,
+ *  the orchestrator's post-impl hygiene check skips the "must create a new
+ *  commit" assertion — the phase is treated as a gate that may legitimately
+ *  produce zero source changes (e.g. pre-submission audits, license/metadata
+ *  checks that already pass). The "must leave tree clean" assertion still
+ *  applies, and reviews/QA still run on the existing HEAD. */
+const AUDIT_ONLY_PATTERN = /<!--\s*audit-only\s*-->/i;
+
 /** Implementation checkbox regex keyed by phase kind. */
 const IMPL_LABELS_BY_KIND: Record<PhaseKind, RegExp> = {
   code: /^\s*-\s+\[([ xX])\]\s+\*\*Implementation\b/,
@@ -205,7 +213,7 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
         reviewCheckboxLine: p.reviewCheckboxLine,
         kind: p.kind ?? "code",
         dualImpl: !!opts.dualImpl,
-        kind: p.kind ?? "code",
+        auditOnly: !!p.auditOnly,
         ...(p.gates && Object.keys(p.gates).length > 0
           ? { gates: p.gates }
           : {}),
@@ -305,6 +313,13 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
     if (!currentPhase.kind && BODY_KIND_PATTERN.test(line)) {
       const km = line.match(BODY_KIND_PATTERN);
       if (km) currentPhase.kind = parseKind(km[1], currentPhase.number ?? "?", warnings);
+    }
+
+    // Detect <!-- audit-only --> annotation. The FENCE handler above already
+    // skips matches inside ``` blocks, so documentation showing the syntax
+    // never trips this flag.
+    if (!currentPhase.auditOnly && AUDIT_ONLY_PATTERN.test(line)) {
+      currentPhase.auditOnly = true;
     }
 
     const testSpecMatch = line.match(TESTSPEC_CHECKBOX);

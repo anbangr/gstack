@@ -145,6 +145,12 @@ export interface Phase {
   /** Kind of phase — determines which checkpoint labels and subagent prompts apply.
    *  Optional so test fixtures that omit it still type-check under strict mode. */
   kind?: PhaseKind;
+  /** True when the phase is a gate that may legitimately produce zero source
+   *  changes (e.g. pre-submission audits, license/metadata checks that already pass).
+   *  Parsed from `<!-- audit-only -->` in the phase body. Defaults to false.
+   *  When true, the post-impl hygiene check skips the "must commit" assertion;
+   *  the "must leave tree clean" assertion still applies. */
+  auditOnly?: boolean;
   /** Parsed gate state for per-phase checkboxes (test_spec, verify_red, implementation, green_tests, review_qa). */
   gates?: Partial<Record<PhaseGate, PlanGateState>>;
 }
