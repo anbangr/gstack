@@ -332,6 +332,14 @@ export interface FeatureState {
   shippedAt?: string;
   /** PR number set at queue time; required for release_queued to be trusted as terminal. */
   prNumber?: number;
+  /**
+   * Merge commit SHA on the base branch (origin/main). Hard-to-fake evidence
+   * the feature actually landed: must match a real commit. Set by the real
+   * release pipeline when ship lands the PR, and by the operator-facing
+   * `gstack-build mark-shipped` escape hatch. Optional for back-compat with
+   * older state files that pre-date the field.
+   */
+  mergeSha?: string;
   landedAt?: string;
   originVerifiedAt?: string;
   completedAt?: string;
