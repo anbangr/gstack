@@ -1,4 +1,4 @@
-import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { spawnSync, type SpawnSyncReturns } from "./child-registry";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";

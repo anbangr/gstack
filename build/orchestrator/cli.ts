@@ -28,7 +28,7 @@
  *   130 user interrupt (SIGINT)
  */
 
-import { spawnSync } from "node:child_process";
+import { installSignalHandlers, spawnSync } from "./child-registry";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -166,6 +166,7 @@ import {
   drainFaultsFromMonitor,
   type DrainFaultsResult,
 } from "./drain-faults";
+import { runMarkShipped } from "./mark-shipped";
 import { buildMonitorAgentEscalation } from "./monitor-supervisor";
 import { startHeartbeat, type HeartbeatController } from "./heartbeat";
 import {
@@ -558,7 +559,8 @@ export interface Args {
     | "plan-status"
     | "reconcile"
     | "doctor"
-    | "drain-faults";
+    | "drain-faults"
+    | "mark-shipped";
   planFile: string;
   printOnly: boolean;
   dryRun: boolean;
@@ -677,6 +679,12 @@ export interface Args {
   drainFaultsCatchAll?: boolean;
   /** Per-investigator timeout in ms for drain-faults mode. Default 10min. */
   drainFaultsInvestigatorTimeoutMs?: number;
+  /** Feature number to mark shipped (mark-shipped mode). */
+  markShippedFeature?: string;
+  /** PR number override for mark-shipped (otherwise auto-resolved). */
+  markShippedPr?: number;
+  /** Merge SHA override for mark-shipped (otherwise read from gh pr view). */
+  markShippedMergeSha?: string;
 }
 
 /**
@@ -768,6 +776,9 @@ export function parseArgs(argv: string[]): Args {
     drainFaultsBuildTmpDir: undefined,
     drainFaultsCatchAll: false,
     drainFaultsInvestigatorTimeoutMs: undefined,
+    markShippedFeature: undefined,
+    markShippedPr: undefined,
+    markShippedMergeSha: undefined,
   };
   const positional: string[] = [];
   const roleFlags = buildRoleFlagMap();
@@ -1036,6 +1047,28 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.maxCodexIter = n;
+    } else if (a === "--feature") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--feature requires a feature number");
+        process.exit(2);
+      }
+      args.markShippedFeature = next;
+    } else if (a === "--pr") {
+      const next = argv[++i];
+      const n = Number(next);
+      if (!Number.isInteger(n) || n <= 0) {
+        console.error(`--pr expects a positive integer, got: ${next}`);
+        process.exit(2);
+      }
+      args.markShippedPr = n;
+    } else if (a === "--merge-sha") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--merge-sha requires a sha");
+        process.exit(2);
+      }
+      args.markShippedMergeSha = next;
     } else if (a === "--help" || a === "-h") {
       printHelp();
       process.exit(0);
@@ -1214,6 +1247,23 @@ export function parseArgs(argv: string[]): Args {
       process.exit(2);
     }
     if (!args.monitorOnce && !args.monitorWatch) args.monitorOnce = true;
+  } else if (positional[0] === "mark-shipped") {
+    if (positional.length !== 1) {
+      console.error(
+        "usage: gstack-build mark-shipped --plan <plan.md> --feature <num> [--pr <num>] [--merge-sha <sha>]   (-h for help)",
+      );
+      process.exit(2);
+    }
+    args.mode = "mark-shipped";
+    if (!args.reconcilePlanFile) {
+      console.error("gstack-build mark-shipped requires --plan <plan.md>");
+      process.exit(2);
+    }
+    args.planFile = args.reconcilePlanFile;
+    if (!args.markShippedFeature) {
+      console.error("gstack-build mark-shipped requires --feature <number>");
+      process.exit(2);
+    }
   } else if (positional.length === 1) {
     args.planFile = path.resolve(positional[0]);
     if (
@@ -7298,6 +7348,14 @@ export async function runDoctorMode(args: Args): Promise<number> {
 }
 
 async function main() {
+  // Install SIGTERM/SIGINT/SIGHUP handlers before spawning anything so the
+  // first sub-process to outlive a survivable signal still gets reaped.
+  // SIGKILL itself can't be intercepted — the kernel terminates without
+  // userspace cleanup — but the common `kill` (SIGTERM), Ctrl-C (SIGINT),
+  // and terminal-disconnect (SIGHUP) paths are all clean now.
+  // See orchestrator/README.md "Child process management".
+  installSignalHandlers();
+
   const rawArgv = process.argv.slice(2);
   const args = parseArgs(rawArgv);
 
@@ -7343,6 +7401,19 @@ async function main() {
   if (args.mode === "drain-faults") {
     const exitCode = await runDrainFaultsMode(args);
     process.exit(exitCode);
+  }
+
+  if (args.mode === "mark-shipped") {
+    const result = await runMarkShipped({
+      planFile: args.planFile,
+      feature: args.markShippedFeature!,
+      pr: args.markShippedPr,
+      mergeSha: args.markShippedMergeSha,
+      noGbrain: args.noGbrain,
+      activeRunRegistry: args.activeRunRegistry,
+      runId: args.runId,
+    });
+    process.exit(result.exitCode);
   }
 
   if (
