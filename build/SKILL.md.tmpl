@@ -613,6 +613,27 @@ phase number and the colon: `### Phase N [kind]: Name`.
 **Mixed plans:** A plan may contain both `code` and non-code phases. Each phase uses its own
 kind's checkpoint structure. The orchestrator handles all kinds without special config.
 
+**`<!-- audit-only -->` — gates that may legitimately produce no commit:** When a phase is a
+gate that runs a check rather than producing a deliverable — pre-submission audits, license
+verification, metadata sanity checks, lint passes that already pass, polish passes that
+confirm a prior phase converged — annotate the phase body with `<!-- audit-only -->`. The
+orchestrator's post-impl hygiene check skips the "must commit" assertion, so an agent that
+correctly finds nothing to fix can return cleanly. The "tree must be clean" check still
+applies — if the agent leaves uncommitted changes, the phase fails. Audit-only is orthogonal
+to phase kind: you can combine `<!-- audit-only -->` with `<!-- kind: writing -->` for a
+post-submission readiness pass on a paper, or use it alone on a `code` phase that audits a
+prior commit.
+
+     ### Phase 5.1: Pre-submission audit
+     <!-- audit-only -->
+     [Phase description: run the checklist, fix anything that fails, return when all green.]
+
+     - [ ] **Implementation (primary-impl role)**: Run the audit. If anything fails, fix it
+       in place and commit. If everything passes, return a non-empty audit summary and DO
+       NOT create an empty/no-op commit just to satisfy the hygiene check.
+     - [ ] **Review (review roles)**: Verify the audit summary lists every checklist item
+       with a pass/fail verdict and that no item is missing.
+
    Living plan filenames MUST be unique and must never use date-only names. Use:
    `<repoSlug>-impl-plan-<sourceSlug>-<YYYYMMDD-HHMMSS>-<hash>.md`.
 
