@@ -40,6 +40,7 @@ import {
   loadState,
   saveState as persistBuildState,
   backfillKindFromPlan,
+  mergeReparsedPhases,
   acquireLock,
   releaseLock,
   readLockInfo,
@@ -8542,6 +8543,44 @@ async function main() {
           // kind to disk so state-only consumers (fault detectors,
           // drain-faults) can read kind without re-parsing.
           backfillKindFromPlan(state, phases);
+          // Detect state/plan phase-array disagreement and repair by
+          // re-aligning state.phases to the parser's view by `number`.
+          // Triggered by:
+          //   1. State files written by pre-fix gstack versions where
+          //      FEATURE_NEEDS_PHASES mis-merged review phases (see
+          //      `mergeReparsedPhases` in state.ts).
+          //   2. A user hand-editing the plan markdown between runs in a
+          //      way that adds / renames phases.
+          // Repair preserves PhaseState identity for unchanged phase numbers
+          // (status, gemini output paths, codexReview records all survive).
+          // Orphaned state entries (numbers no longer in the plan) are
+          // dropped with a warning. A length match alone is insufficient —
+          // the original bug produced equal-length arrays with mis-aligned
+          // contents.
+          const stateNeedsRepair =
+            state.phases.length !== phases.length ||
+            state.phases.some(
+              (ps, i) => phases[i] && ps.number !== phases[i].number,
+            );
+          if (stateNeedsRepair) {
+            console.warn(
+              `[plan] state.phases disagrees with the parsed plan ` +
+                `(state has ${state.phases.length} phase(s), plan has ${phases.length}). ` +
+                `Re-aligning state to the plan by phase number.`,
+            );
+            const repair = mergeReparsedPhases(state, { phases, features });
+            if (repair.added.length > 0) {
+              console.warn(
+                `[plan] added ${repair.added.length} phase(s) from plan: ${repair.added.join(", ")}`,
+              );
+            }
+            if (repair.orphaned.length > 0) {
+              console.warn(
+                `[plan] dropped ${repair.orphaned.length} runtime state entry(s) for phases no longer in the plan: ${repair.orphaned.join(", ")}`,
+              );
+            }
+            saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+          }
           if (
             JSON.stringify(loaded.roleConfigs) !== JSON.stringify(args.roles)
           ) {
@@ -9051,26 +9090,23 @@ async function main() {
                 break;
               }
               if (out.action === "phases_added") {
-                // Re-parse the plan and merge new phases into BuildState.
-                // The plan-mutator appended under the current feature; new
-                // entries land at the end of the phases array (parser walks
-                // top-to-bottom).
+                // Re-parse the plan and merge new phases into BuildState by
+                // matching on `number`. `appendFeaturePhases` splices new
+                // review phases under the named feature (NOT at end-of-file),
+                // so the previous tail-slice merge ("phases land at the end")
+                // mis-aligned every PhaseState downstream of the insertion
+                // point and duplicated the actually-last phase. See
+                // `__tests__/phases-added-merge.test.ts` for the deterministic
+                // repro of the previous failure mode.
                 const newContent = fs.readFileSync(args.planFile, "utf8");
                 const reparsed = parsePlan(newContent, {
                   dualImpl: args.dualImpl,
                 });
-                const oldPhaseCount = phases.length;
-                const addedPhases = reparsed.phases.slice(oldPhaseCount);
-                for (const np of addedPhases) {
-                  state.phases.push({
-                    index: np.index,
-                    number: np.number,
-                    name: np.name,
-                    status: "pending",
-                  });
-                  if (np.featureIndex === featureDef.index) {
-                    featureState.phaseIndexes.push(np.index);
-                  }
+                const mergeReport = mergeReparsedPhases(state, reparsed);
+                if (mergeReport.orphaned.length > 0) {
+                  console.warn(
+                    `[plan] warning: dropped runtime state for phases no longer in the plan: ${mergeReport.orphaned.join(", ")}`,
+                  );
                 }
                 // Replace outer-scope arrays so subsequent iterations see
                 // the new shape.
@@ -9081,30 +9117,13 @@ async function main() {
                   visiblePlanProjection.phases = phases;
                   visiblePlanProjection.features = features;
                 }
-                // The featureDef reference is now stale (parser produced a
-                // new object). Rebind so the next loop iteration sees the
-                // up-to-date phaseIndexes array.
-                const refreshed = features[featureDef.index];
-                if (refreshed) {
-                  // featureDef is `const` in scope above so we cannot
-                  // reassign — but its mutable fields (phaseIndexes) are
-                  // updated in-place above. Verify identity holds.
-                  if (
-                    refreshed.phaseIndexes.length <
-                    featureState.phaseIndexes.length
-                  ) {
-                    // Defensive: parser may strip phases that lost their
-                    // checkboxes. Trust the parser's view in that case.
-                    featureState.phaseIndexes = [...refreshed.phaseIndexes];
-                  }
-                }
                 featureState.status = "running";
                 saveState(state, {
                   noGbrain: args.noGbrain,
                   log: console.warn,
                 });
                 console.log(
-                  `  → Plan amended with ${addedPhases.length} new phase(s); re-running phase loop.`,
+                  `  → Plan amended with ${mergeReport.added.length} new phase(s) [${mergeReport.added.join(", ")}]; re-running phase loop.`,
                 );
                 reviewLoopAction = "phases_added";
                 break;

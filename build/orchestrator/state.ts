@@ -254,6 +254,104 @@ export function backfillKindFromPlan(
   return state;
 }
 
+export interface MergeReparsedPhasesReport {
+  /** New PhaseState entries added by this merge, keyed by phase number. */
+  added: string[];
+  /**
+   * Phase numbers that existed in state.phases before the merge but are no
+   * longer present in the reparsed plan. The current production flow never
+   * removes phases (FEATURE_NEEDS_PHASES only adds), but callers should log
+   * these so a future regression doesn't silently drop runtime state.
+   */
+  orphaned: string[];
+}
+
+/**
+ * Re-align `state.phases` and `state.features[i].phaseIndexes` to the parser's
+ * view after the plan markdown is mutated mid-run (today: only by
+ * `appendFeaturePhases` on the FEATURE_NEEDS_PHASES path).
+ *
+ * The previous implementation in cli.ts assumed new phases append to the END
+ * of `reparsed.phases` (`slice(oldPhaseCount)`). That assumption breaks the
+ * moment `appendFeaturePhases` inserts under a non-last feature: the new phase
+ * lands mid-array and the parser shifts every downstream index. The slice
+ * then captures the wrong tail, leaving `state.phases[k].number` stale for
+ * every k >= insertion point AND pushing a duplicate of the actually-last
+ * phase. See `__tests__/phases-added-merge.test.ts` for the deterministic
+ * repro of the previous failure.
+ *
+ * Strategy: rebuild `state.phases` in parser order, by `number`. For each
+ * `reparsed.phases[i]`:
+ *   - if a PhaseState with that number already exists, reuse it and rewrite
+ *     its `.index` to `i` (preserving status, codexReview, gemini outputs,
+ *     committedAt, etc.);
+ *   - otherwise, create a fresh `pending` PhaseState at index `i`.
+ *
+ * Then sync `state.features[f].phaseIndexes` from `reparsed.features[f]`
+ * (preserving FeatureState.status and other in-flight fields).
+ *
+ * In-place: mutates `state.phases` and `state.features[*].phaseIndexes`.
+ * Returns a diff report so callers can log meaningfully.
+ */
+export function mergeReparsedPhases(
+  state: BuildState,
+  reparsed: { phases: Phase[]; features: Feature[] },
+): MergeReparsedPhasesReport {
+  const stateByNumber = new Map<string, PhaseState>();
+  for (const ps of state.phases) {
+    stateByNumber.set(ps.number, ps);
+  }
+
+  const added: string[] = [];
+  const seenNumbers = new Set<string>();
+  const nextPhases: PhaseState[] = [];
+
+  for (let i = 0; i < reparsed.phases.length; i++) {
+    const p = reparsed.phases[i];
+    seenNumbers.add(p.number);
+    const existing = stateByNumber.get(p.number);
+    if (existing) {
+      existing.index = i;
+      existing.name = p.name;
+      if (p.kind && !existing.kind) existing.kind = p.kind;
+      nextPhases.push(existing);
+    } else {
+      nextPhases.push({
+        index: i,
+        number: p.number,
+        name: p.name,
+        status: "pending",
+        kind: p.kind ?? "code",
+      });
+      added.push(p.number);
+    }
+  }
+
+  const orphaned: string[] = [];
+  for (const ps of state.phases) {
+    if (!seenNumbers.has(ps.number)) orphaned.push(ps.number);
+  }
+
+  state.phases = nextPhases;
+
+  // Sync per-feature phaseIndexes from the parser. The parser is the
+  // source of truth for "which phases belong to which feature." Preserve
+  // the FeatureState object identity (status, branch, prNumber, etc.).
+  for (
+    let f = 0;
+    f < state.features.length && f < reparsed.features.length;
+    f++
+  ) {
+    const featureState = state.features[f];
+    const parsedFeature = reparsed.features[f];
+    if (featureState && parsedFeature) {
+      featureState.phaseIndexes = [...parsedFeature.phaseIndexes];
+    }
+  }
+
+  return { added, orphaned };
+}
+
 /**
  * Load state for a plan. Strategy:
  *   1. Try local JSON (fast, always-on, source of truth).
