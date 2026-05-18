@@ -20,14 +20,16 @@
       "model": "kimi-code/kimi-for-coding",
       "reasoning": "high",
       "backupProvider": "gemini",
-      "backupModel": "gemini-3.1-pro-preview"
+      "backupModel": "gemini-3.1-pro-preview",
+      "retryOnTimeout": false
     },
     "testFixer": {
       "provider": "kimi",
       "model": "kimi-code/kimi-for-coding",
       "reasoning": "high",
       "backupProvider": "gemini",
-      "backupModel": "gemini-3.1-pro-preview"
+      "backupModel": "gemini-3.1-pro-preview",
+      "retryOnTimeout": false
     },
     "secondaryImpl": {
       "provider": "codex",
@@ -77,7 +79,8 @@
       "reasoning": "high",
       "command": "/ship",
       "backupProvider": "gemini",
-      "backupModel": "gemini-3.1-pro-preview"
+      "backupModel": "gemini-3.1-pro-preview",
+      "retryOnTimeout": false
     },
     "land": {
       "provider": "kimi",
@@ -85,7 +88,8 @@
       "reasoning": "high",
       "command": "/land-and-deploy",
       "backupProvider": "gemini",
-      "backupModel": "gemini-3.1-pro-preview"
+      "backupModel": "gemini-3.1-pro-preview",
+      "retryOnTimeout": false
     },
     "featureVerifier": {
       "provider": "claude",
