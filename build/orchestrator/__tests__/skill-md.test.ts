@@ -536,7 +536,7 @@ test("build skill docs describe manual recovery and submodule fail-closed bounda
     expect(content).toContain("fails closed by default");
     expect(content).toContain("stages only the submodule gitlink");
     expect(content).toContain(
-      "do not use `--reset-phase` when the phase artifacts are already valid",
+      "Do not use `--reset-phase` when the phase artifacts are already valid",
     );
   }
 });
