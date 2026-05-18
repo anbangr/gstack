@@ -1461,6 +1461,76 @@ process.stdout.write(match[1]);
   });
 });
 
+describe("runShip (kimi empty-output hard error)", () => {
+  it("returns non-zero exit when kimi exits 0 but writes nothing to the staged output", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-ship-empty-"));
+    const slug = `kimi-ship-empty-${process.pid}-${Date.now()}`;
+    const oldKimiBin = process.env.KIMI_BIN;
+    try {
+      // Fake kimi: exits 0, prints a fake output-file path, but never writes
+      // to that file. Reproduces mode B from the investigation: Kimi's
+      // `--print --final-message-only` returned the file path as if it
+      // wrote the file, but the inner /ship slash command silently skipped
+      // writing. Pre-fix this propagates as "ship succeeded" to cli.ts.
+      const fakeKimi = path.join(tmpDir, "kimi");
+      fs.writeFileSync(
+        fakeKimi,
+        `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const prompt = args[args.indexOf("-p") + 1] || "";
+const match = prompt.match(/Write your complete output to (.+?\\.md)\\./);
+if (!match) {
+  console.error("missing output path in prompt");
+  process.exit(2);
+}
+// Deliberately do NOT write to match[1]. Just print the path and exit 0.
+process.stdout.write(match[1]);
+`,
+      );
+      fs.chmodSync(fakeKimi, 0o755);
+      process.env.KIMI_BIN = fakeKimi;
+
+      const result = await runShip({
+        cwd: tmpDir,
+        slug,
+        ship: {
+          provider: "kimi",
+          model: "kimi-model-under-test",
+          reasoning: "high",
+          command: "/ship",
+        },
+        land: {
+          provider: "kimi",
+          model: "kimi-model-under-test",
+          reasoning: "high",
+          command: "/land-and-deploy",
+        },
+      });
+
+      // The contract: when Kimi doesn't write the output file, runShip must
+      // surface that as a hard failure, not a phantom "ship succeeded".
+      // cli.ts checks `result.exitCode !== 0 || result.timedOut` to detect
+      // ship failure, so we assert exitCode is non-zero. The stderr/stdout
+      // should also make the protocol violation visible for forensics.
+      expect(result.exitCode).not.toBe(0);
+      const forensic = `${result.stdout}\n${result.stderr}`;
+      expect(forensic.toLowerCase()).toMatch(/empty|not readable|output file/);
+    } finally {
+      if (oldKimiBin === undefined) delete process.env.KIMI_BIN;
+      else process.env.KIMI_BIN = oldKimiBin;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(path.join(os.homedir(), ".gstack", "build-state", slug), {
+        recursive: true,
+        force: true,
+      });
+      fs.rmSync(path.join(os.homedir(), ".kimi", "tmp", "gstack", slug), {
+        recursive: true,
+        force: true,
+      });
+    }
+  });
+});
+
 // ============================================================================
 // Test framework detection (v1.40.1.0)
 // ============================================================================

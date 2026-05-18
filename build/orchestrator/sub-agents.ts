@@ -986,6 +986,29 @@ export async function runShip(opts: {
     return shipResult;
   }
 
+  // Ship contract: the sub-agent MUST write its report to shipOutput. An empty
+  // file means the inner /ship slash command skipped the write step (Kimi's
+  // --final-message-only just echoed the path) or the staging-dir copy-back
+  // silently dropped a zero-byte file. Treat that as a hard failure so cli.ts
+  // doesn't propagate it as phantom success and run the verified-PR gate
+  // against an empty transcript.
+  const shipText = (() => {
+    try {
+      return fs.readFileSync(shipOutput, "utf8");
+    } catch {
+      return "";
+    }
+  })();
+  if (shipText.trim() === "") {
+    return {
+      ...shipResult,
+      exitCode: 1,
+      stderr:
+        `# ship output file ${shipOutput} is empty — sub-agent did not write a report. ` +
+        `Original captured streams preserved in ${shipResult.logPath}.\n${shipResult.stderr}`,
+    };
+  }
+
   const landInput = path.join(logDir(opts.slug), "land-and-deploy-input.md");
   const landOutput = path.join(logDir(opts.slug), "land-and-deploy-output.md");
   fs.writeFileSync(
