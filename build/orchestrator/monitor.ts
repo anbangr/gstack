@@ -297,6 +297,27 @@ function committedPhaseCount(state: BuildState | null): number {
     .length;
 }
 
+// Per docs/orchestrator-state-machine.md §1.3, `failed` is recoverable, not
+// terminal. Inv A pairs state.failedAtPhase=N with phases[N].status="failed";
+// once recovery advances the phase (manual edit or --mark-phase-committed),
+// the integer becomes stale metadata. The monitor must consult the phase's
+// actual status, not the lingering integer. The failureReason+paused/failed
+// feature branch preserves the documented terminal class where /ship dies
+// mid-flight and leaves a feature paused with a failureReason but no
+// failedAtPhase set.
+function isStateFailed(state: BuildState | null): boolean {
+  if (!state) return false;
+  const idx = state.failedAtPhase;
+  if (idx != null && state.phases?.[idx]?.status === "failed") return true;
+  if (
+    state.failureReason &&
+    state.features?.some((f) => f.status === "paused" || f.status === "failed")
+  ) {
+    return true;
+  }
+  return false;
+}
+
 function phaseStatus(state: BuildState | null): PhaseStatus | "missing" {
   if (!state) return "missing";
   return state.phases[state.currentPhaseIndex]?.status ?? "pending";
@@ -357,7 +378,7 @@ function readRunSnapshot(
     registryOk,
     identityOk,
     completed: state?.completed === true,
-    failed: state?.failedAtPhase != null || Boolean(state?.failureReason),
+    failed: isStateFailed(state),
     committedCount,
     contextSaveCountFile,
     priorContextSaveCount: readContextSaveCount(contextSaveCountFile),
