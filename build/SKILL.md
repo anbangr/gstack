@@ -1,7 +1,7 @@
 ---
 name: build
 preamble-tier: 4
-version: 1.22.2
+version: 1.23.0
 description: |
   gstack autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -2605,11 +2605,21 @@ Release daemon lifecycle:
    # in their command line. If any are found, surface them — the user will need to
    # decide whether to kill or wait. See bug #2 in
    # docs/superpowers/plans/2026-05-18-build-orchestrator-four-failures.md.
-   _ZOMBIE_PIDS=$(pgrep -lf "(kimi|gemini|codex).*${runId}" 2>/dev/null || true)
+   #
+   # pgrep -f matches as a regex. Escape regex metacharacters in $runId
+   # so a `.` (or any other special char) in the runId doesn't widen the
+   # match and reap unrelated processes from OTHER runs. Don't suggest
+   # `pkill -f '$runId'` to the user either — same regex hazard.
+   _ZOMBIE_RUNID_RE=$(printf '%s' "$runId" | sed 's/[.[\^$*?+(){}|]/\\&/g')
+   _ZOMBIE_PIDS=$(pgrep -lf "(kimi|gemini|codex).*${_ZOMBIE_RUNID_RE}" 2>/dev/null || true)
    if [ -n "$_ZOMBIE_PIDS" ]; then
      echo "⚠ Subprocesses from this run are still alive:" >&2
      echo "$_ZOMBIE_PIDS" >&2
-     echo "  Run \`pkill -f '${runId}'\` to clean up, or wait for them to finish." >&2
+     # Use the escaped form in the suggested command too — `pkill -f`
+     # has the same regex semantics, so a naive `pkill -f '<runId>'`
+     # with a `.` in runId would kill processes from other runs.
+     echo "  To clean up, kill the listed PIDs directly (e.g. \`kill <pid>\`)" >&2
+     echo "  or run: pkill -f \"${_ZOMBIE_RUNID_RE}\"" >&2
    fi
    ```
 

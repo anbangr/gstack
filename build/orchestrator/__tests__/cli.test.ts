@@ -318,13 +318,17 @@ describe("safeBranchPart", () => {
     // truncation dropped the unique b0bf5c19 hash, breaking recovery
     // branch lookup. See plan: 2026-05-18-build-orchestrator-four-failures.md.
     const long =
-      "mitosis-oasis-2026-05-18-bundle-0-bug-fix-20260518-180025-b0bf5c19-extra";
+      "mitosis-oasis-2026-05-18-bundle-0-bug-fix-20260518-180025-b0bf5c19-extra-padding";
+    // Assert the test fixture itself exercises the truncation branch.
+    // Otherwise a future edit could shrink it under 72 and silently
+    // skip the path it's named for.
+    expect(long.length).toBeGreaterThan(72);
     const out = safeBranchPart(long);
     expect(out.length).toBeLessThanOrEqual(72);
     // Head preserved for readability
     expect(out.startsWith("mitosis-oasis-2026-05-18-bundle")).toBe(true);
     // Tail preserved so unique suffix survives — load-bearing for identity
-    expect(out.endsWith("19-extra")).toBe(true);
+    expect(out.endsWith("padding")).toBe(true);
   });
 
   it("preserves the b0bf5c19 hash when it's the actual tail", () => {
@@ -337,6 +341,35 @@ describe("safeBranchPart", () => {
 
   it("collapses leading/trailing dashes after sanitization", () => {
     expect(safeBranchPart("---foo-bar---")).toBe("foo-bar");
+  });
+
+  it("collapses double-dot patterns (git-ref invalid)", () => {
+    // git check-ref-format rejects `..` in branch names. Sanitization
+    // must produce a valid ref, not a cryptic-error-shaped one.
+    expect(safeBranchPart("foo..bar")).toBe("foo.bar");
+    expect(safeBranchPart("foo....bar")).toBe("foo.bar");
+    // After collapse, also strip leading/trailing dots
+    expect(safeBranchPart("..escape..")).toBe("escape");
+  });
+
+  it("strips trailing '.lock' suffix (git-ref invalid)", () => {
+    // git reserves <ref>.lock for its internal locking.
+    expect(safeBranchPart("foo.lock")).toBe("foo");
+    expect(safeBranchPart("hash-b0bf5c19.lock")).toBe("hash-b0bf5c19");
+  });
+
+  it("does not produce a trailing-dash head when truncation lands on a dash", () => {
+    // Adversarial appendix finding: head ending in `-` then `-tail`
+    // produces `--` (cosmetically ugly, semantically OK but a smell).
+    // After hardening, the head's trailing dash is stripped before join.
+    // Pad input so the first 60 chars end on a dash.
+    const padTo59 = "a".repeat(59); // 59 chars
+    const input = `${padTo59}-tail-hash-padding-extra`; // total 81+
+    expect(input.length).toBeGreaterThan(72);
+    expect(input[59]).toBe("-");
+    const out = safeBranchPart(input);
+    // No `--` (double dash) in the output:
+    expect(out.includes("--")).toBe(false);
   });
 });
 
@@ -434,18 +467,20 @@ describe("--ship-on-plan-complete flag wiring", () => {
     expect(args.shipOnPlanComplete).toBe(true);
   });
 
-  it("--ship-on-plan-complete is independent of --single-branch (different modes)", () => {
-    // The flags don't conflict at the parser level, but the runtime
-    // wiring treats --single-branch as taking precedence (the
-    // single-branch deferred-ship path already exists). Both can be
-    // set without parse error.
-    const args = parseArgs([
-      "plan.md",
-      "--single-branch",
-      "--ship-on-plan-complete",
-    ]);
-    expect(args.singleBranch).toBe(true);
-    expect(args.shipOnPlanComplete).toBe(true);
+  it("--ship-on-plan-complete + --single-branch is rejected as mutually exclusive", () => {
+    // Previously the parser accepted both; runtime semantics were
+    // undefined (deferred-ship continue fired alongside the
+    // single-branch end-of-loop ship). Now parseArgs hard-fails so
+    // callers can't synthesize an undefined combination by accident.
+    expectParseArgsExit(
+      ["plan.md", "--single-branch", "--ship-on-plan-complete"],
+      "mutually exclusive",
+    );
+    // Order doesn't matter.
+    expectParseArgsExit(
+      ["plan.md", "--ship-on-plan-complete", "--single-branch"],
+      "mutually exclusive",
+    );
   });
 
   it("--ship-on-plan-complete is documented in --help", () => {
@@ -5505,6 +5540,116 @@ describe("maybeAutoCommitTestOnlyDirty (Bug 5)", () => {
       if (old === undefined) delete process.env.GSTACK_QA_NO_AUTO_COMMIT;
       else process.env.GSTACK_QA_NO_AUTO_COMMIT = old;
     }
+  });
+
+  it("GSTACK_QA_NO_AUTO_COMMIT accepts true / yes / TRUE (case-insensitive)", () => {
+    // Regression: pre-fix code did literal `=== "1"` equality, so
+    // GSTACK_QA_NO_AUTO_COMMIT=true silently failed to disable.
+    const old = process.env.GSTACK_QA_NO_AUTO_COMMIT;
+    fs.mkdirSync(path.join(repoDir, "tests"), { recursive: true });
+    try {
+      for (const v of ["true", "yes", "TRUE", "1", "True"]) {
+        process.env.GSTACK_QA_NO_AUTO_COMMIT = v;
+        fs.writeFileSync(
+          path.join(repoDir, "tests", `tv-${v}.test.ts`),
+          "// t\n",
+        );
+        const result = maybeAutoCommitTestOnlyDirty({
+          cwd: repoDir,
+          label: "qa gate",
+          dirtyLines: [`?? tests/tv-${v}.test.ts`],
+        });
+        expect(result.committed).toBe(false);
+        expect(result.reason).toContain("GSTACK_QA_NO_AUTO_COMMIT");
+      }
+    } finally {
+      if (old === undefined) delete process.env.GSTACK_QA_NO_AUTO_COMMIT;
+      else process.env.GSTACK_QA_NO_AUTO_COMMIT = old;
+    }
+  });
+
+  it("auto-split rollback: if production commit fails, test commit is undone (HEAD restored)", () => {
+    // Regression test for the CRITICAL adversarial finding: without
+    // rollback, a failing prod commit leaves the test commit stranded.
+    // Simulate the failure via a pre-commit hook that rejects any
+    // path that is NOT under __tests__. This simulates a realistic
+    // hook (e.g., a Jira-id-on-src/-only hook or a lint-only-on-prod
+    // hook): the test-only commit passes; the production commit fails.
+    const hooksDir = path.join(repoDir, ".git", "hooks");
+    fs.mkdirSync(hooksDir, { recursive: true });
+    const hookPath = path.join(hooksDir, "pre-commit");
+    fs.writeFileSync(
+      hookPath,
+      "#!/bin/sh\n" +
+        "# Reject staged paths under src/ that are NOT under __tests__.\n" +
+        "if git diff --cached --name-only | grep -E '^src/' | grep -v '__tests__' | grep -q .; then\n" +
+        '  echo "hook: production path rejected" >&2\n' +
+        "  exit 1\n" +
+        "fi\n" +
+        "exit 0\n",
+    );
+    fs.chmodSync(hookPath, 0o755);
+
+    fs.mkdirSync(path.join(repoDir, "src"), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, "src", "__tests__"), { recursive: true });
+    fs.writeFileSync(
+      path.join(repoDir, "src", "__tests__", "x.test.ts"),
+      "// t\n",
+    );
+    fs.writeFileSync(path.join(repoDir, "src", "x.ts"), "// p\n");
+
+    const headBefore = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout.trim();
+
+    const result = maybeAutoCommitTestOnlyDirty({
+      cwd: repoDir,
+      label: "qa gate",
+      dirtyLines: ["?? src/__tests__/x.test.ts", "?? src/x.ts"],
+    });
+
+    expect(result.committed).toBe(false);
+    expect(result.reason).toContain("auto-split production commit failed");
+    expect(result.reason).toMatch(/rolled back test commit [0-9a-f]{7}/);
+    expect(result.nonTestPaths).toContain("src/x.ts");
+
+    // HEAD must be back where it started — no stranded test commit.
+    const headAfter = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout.trim();
+    expect(headAfter).toBe(headBefore);
+  });
+
+  it("aborts cleanly on porcelain-parse-unsafe paths (quoted special chars / escapes)", () => {
+    // Adversarial 2b/2c: porcelain v1 quotes paths containing
+    // newlines, tabs, or non-ASCII. The bare parser leaves backslash
+    // escapes literal and can mishandle internal " -> " in rename
+    // names. The gate must refuse rather than pass a misparsed path
+    // to `git add --` and risk half-shipping.
+    const headBefore = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout.trim();
+
+    const result = maybeAutoCommitTestOnlyDirty({
+      cwd: repoDir,
+      label: "qa gate",
+      // Path with a backslash escape (porcelain quoting for non-ASCII):
+      dirtyLines: ["?? tests/caf\\303\\251.test.ts"],
+    });
+
+    expect(result.committed).toBe(false);
+    expect(result.reason).toContain("porcelain parse unsafe");
+    expect(result.nonTestPaths).toBeDefined();
+    expect(result.nonTestPaths?.length).toBeGreaterThan(0);
+
+    const headAfter = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout.trim();
+    expect(headAfter).toBe(headBefore);
   });
 });
 

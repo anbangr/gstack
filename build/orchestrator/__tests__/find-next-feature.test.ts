@@ -198,14 +198,28 @@ describe("allFeaturesReachedPhasesDone", () => {
     expect(allFeaturesReachedPhasesDone(s)).toBe(true);
   });
 
-  it("treats failed features as done so siblings can still ship", () => {
-    // A hard failure shouldn't keep its siblings hostage; the user
-    // re-runs /build for the failed feature separately.
+  it("blocks the gate when any feature is failed (adversarial fix 3a)", () => {
+    // A failed feature can leave the worktree dirty. Treating it as
+    // "done" lets that dirt leak into sibling ships. Block the
+    // deferred-ship gate so the user investigates. Features INDEXED
+    // BEFORE the failed feature can still ship via the per-feature
+    // outer loop; features after will not — safe default.
     const s = state([
       feature({ index: 0, status: "failed" }),
       feature({ index: 1, number: "2", status: "phases_done" }),
     ]);
-    expect(allFeaturesReachedPhasesDone(s)).toBe(true);
+    expect(allFeaturesReachedPhasesDone(s)).toBe(false);
+  });
+
+  it("blocks the gate when any feature is paused (adversarial fix 3b)", () => {
+    // Paused = a ship attempt failed mid-batch. Letting later features
+    // ship while an earlier one is stuck would violate the
+    // ship-in-feature-order invariant. User must triage first.
+    const s = state([
+      feature({ index: 0, status: "phases_done" }),
+      feature({ index: 1, number: "2", status: "paused" }),
+    ]);
+    expect(allFeaturesReachedPhasesDone(s)).toBe(false);
   });
 
   it("returns false for an empty feature list", () => {

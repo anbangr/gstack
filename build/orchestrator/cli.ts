@@ -1361,6 +1361,21 @@ export function parseArgs(argv: string[]): Args {
     console.error(providerErrors.join("\n"));
     process.exit(2);
   }
+  // --single-branch and --ship-on-plan-complete are mutually exclusive.
+  // Single-branch already defers all shipping to the end of the plan
+  // (after the per-feature ship gate is skipped); --ship-on-plan-complete
+  // adds a parallel deferral path on top of multi-branch mode. Stacking
+  // them was previously accepted at the parser but undefined at runtime
+  // (the deferred-ship continue would fire alongside the single-branch
+  // end-of-loop ship). Refuse explicitly.
+  if (args.singleBranch && args.shipOnPlanComplete) {
+    console.error(
+      "--single-branch and --ship-on-plan-complete are mutually exclusive. " +
+        "--single-branch already defers shipping until all features complete; " +
+        "--ship-on-plan-complete is the per-branch equivalent. Pick one.",
+    );
+    process.exit(2);
+  }
   // Claude Code's Bash tool auto-backgrounds commands that run past ~10 min,
   // breaking the monitor's synchronous re-entry contract. When we detect we
   // are running inside Claude Code, cap the monitor wall-time at 9 min so
@@ -2860,14 +2875,43 @@ function featureSlug(feature: FeatureState): string {
 // 72-char ceiling we keep the head (for human readability) and the tail
 // (which carries the unique run hash) so recovery-branch lookup still
 // works. Plain .slice would drop the hash and break identity.
+//
+// Also normalizes for git-ref validity (git check-ref-format rules):
+//   - collapses `..` to `.` (git forbids `..` in ref names)
+//   - strips leading/trailing `.` (forbidden by git)
+//   - strips `.lock` suffix (git treats it as the ref-lock file)
+// These rules used to surface as cryptic `fatal: '...' is not a valid
+// branch name` errors deep in the orchestrator. Doing the
+// normalization here keeps the error visible at the source.
 export function safeBranchPart(value: string): string {
-  const sanitized = value
+  let sanitized = value
     .toLowerCase()
     .replace(/[^a-z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "");
+  // Git-ref hardening: collapse `..` → `.`, drop edge `.`, drop `.lock`
+  // suffix. Loop the `..` replacement because a string like `....` would
+  // otherwise leave `..` after one pass.
+  while (sanitized.includes("..")) {
+    sanitized = sanitized.replace(/\.\.+/g, ".");
+  }
+  sanitized = sanitized.replace(/^\.+|\.+$/g, "");
+  if (sanitized.endsWith(".lock")) {
+    sanitized = sanitized.slice(0, -".lock".length).replace(/\.+$/, "");
+  }
+  // After hardening, edges may have new leading/trailing dashes. Strip again.
+  sanitized = sanitized.replace(/^-+|-+$/g, "");
   if (sanitized.length === 0) return "run";
   if (sanitized.length <= 72) return sanitized;
-  return `${sanitized.slice(0, 60)}-${sanitized.slice(-8)}`;
+  // Head+tail truncation. Strip trailing dash from the head so we don't
+  // produce `xxx--tail` when the head boundary falls on a dash.
+  const headRaw = sanitized.slice(0, 60);
+  const head = headRaw.replace(/-+$/, "");
+  const tailRaw = sanitized.slice(-8);
+  const tail = tailRaw.replace(/^-+/, "");
+  // Defensive: if either side collapses to empty (shouldn't happen
+  // after the edge-trim above, but guard anyway), fall back to the
+  // non-trimmed slice so we never return "".
+  return `${head || headRaw}-${tail || tailRaw}`;
 }
 
 export function ownedFeatureBranch(
@@ -3180,16 +3224,32 @@ export function findNextFeatureIndex(
 }
 
 /**
- * For `--ship-on-plan-complete`: returns true only when every feature in
- * the plan has finished its phase work (status >= phases_done in the
- * lifecycle), used to defer per-feature shipping until the whole plan is
- * ready. Features still doing phase work (pending, running, paused,
- * feature-review states, redo, blocked) block; features past the ship
- * gate (shipping onward) count as done.
+ * For `--ship-on-plan-complete`: returns true only when every feature
+ * in the plan has finished phase work AND there's nothing alive that
+ * would contaminate sibling worktrees if we proceeded to ship.
  *
- * `failed` does NOT block, by design: a feature that hit a hard failure
- * shouldn't keep its siblings from shipping. The user can re-run /build
- * for the failed feature separately.
+ * Statuses that pass the gate:
+ *   - phases_done (ready to ship)
+ *   - shipping / release_queued / landed / origin_verifying /
+ *     origin_verified / committed (already past the gate; siblings can
+ *     ride on top)
+ *
+ * Statuses that BLOCK the gate (so deferred ships don't fire while
+ * something else might still mutate the working tree or branch state):
+ *   - pending, running — phase work still outstanding
+ *   - feature_review_pending, feature_review_running,
+ *     feature_redo_pending, feature_blocked — feature-review lifecycle
+ *     hasn't resolved
+ *   - paused — a ship attempt failed mid-batch; ordering invariant
+ *     would be violated if we let later features ship while an earlier
+ *     one is stuck. User must triage before deferred-ship resumes.
+ *   - failed — adversarial review flagged: a failed feature can leave
+ *     the worktree dirty, and pretending it's "done" lets that dirt
+ *     leak into sibling ships. Blocking failed means the user
+ *     investigates before any deferred ship fires. Features INDEXED
+ *     BEFORE a failed/paused feature can still ship via the outer
+ *     loop's per-feature pass; features INDEXED AFTER will not, which
+ *     is the safe default.
  */
 export function allFeaturesReachedPhasesDone(state: BuildState): boolean {
   const features = state.features ?? [];
@@ -3203,7 +3263,6 @@ export function allFeaturesReachedPhasesDone(state: BuildState): boolean {
       case "origin_verifying":
       case "origin_verified":
       case "committed":
-      case "failed":
         continue;
       // pending, running, feature_review_pending, feature_review_running,
       // feature_redo_pending, feature_blocked — phase work still outstanding
@@ -4341,6 +4400,53 @@ function isTestOnlyPath(filePath: string, globs: string[]): boolean {
 }
 
 /**
+ * Detect porcelain v1 status lines that cannot be unambiguously parsed
+ * back to a single on-disk path. Two known unsafe shapes:
+ *
+ *  1. A surviving leading or trailing `"` after `porcelainStatusToPath`
+ *     strips the outer quotes — means the original was an internally-
+ *     quoted rename target (e.g. `R  "old -> name" -> "new -> name"`)
+ *     and the parser took the wrong half.
+ *  2. A backslash escape (`\n`, `\t`, `\"`, octal like `\303\251`) —
+ *     git porcelain v1 emits these for paths with non-ASCII or control
+ *     bytes; we'd need `-z` mode to decode them safely.
+ *
+ * When either shape is seen, the auto-commit caller MUST bail rather
+ * than pass the path to `git add --`. The pathspec would fail to match
+ * and (in the auto-split path) leave a half-shipped commit on the
+ * branch. Routing to manual recovery is the safe default.
+ *
+ * Long-term fix: have the caller capture porcelain via `git status -z`
+ * and remove this guard. For now, fail closed.
+ */
+function isPorcelainParseUnsafe(path: string): boolean {
+  if (path.includes('"')) return true; // unbalanced quote after strip
+  if (/\\/.test(path)) return true; // escape sequence survived
+  return false;
+}
+
+/** Parse env-var booleans permissively. Accepts "1", "true", "yes" in
+ *  any case (with trailing whitespace tolerated). Empty / unset / any
+ *  other value returns false. Used for GSTACK_QA_NO_AUTO_COMMIT and
+ *  GSTACK_QA_NO_AUTO_SPLIT — users expect idiomatic boolean semantics
+ *  rather than literal "1" string equality. */
+function parseBooleanEnv(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
+/** Read current HEAD SHA for the given worktree. Returns the full SHA
+ *  on success, empty string on any failure (so callers can detect with
+ *  a falsy check). Used by maybeAutoCommitTestOnlyDirty to pin a
+ *  rollback point before the auto-split. */
+function captureHeadSha(cwd: string): string {
+  const r = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" });
+  if (r.status !== 0) return "";
+  return (r.stdout || "").trim();
+}
+
+/**
  * Bug 5: when a review/qa gate leaves the working tree dirty, auto-commit
  * the changes with attribution. Two paths:
  *
@@ -4373,25 +4479,53 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
   dirtyLines: string[];
   globs?: string[];
 }): { committed: boolean; reason: string; nonTestPaths?: string[] } {
-  if (process.env.GSTACK_QA_NO_AUTO_COMMIT === "1") {
-    return { committed: false, reason: "GSTACK_QA_NO_AUTO_COMMIT=1" };
+  if (parseBooleanEnv(process.env.GSTACK_QA_NO_AUTO_COMMIT)) {
+    return { committed: false, reason: "GSTACK_QA_NO_AUTO_COMMIT enabled" };
   }
   const globs = opts.globs ?? DEFAULT_QA_TEST_PATH_GLOBS;
   const paths = opts.dirtyLines.map(porcelainStatusToPath);
   if (paths.length === 0) {
     return { committed: false, reason: "no dirty paths" };
   }
+  // Porcelain parse safety: if any path indicates the parser couldn't
+  // unambiguously recover the on-disk path (rename with literal " -> "
+  // in name, escape-quoted special chars), abort the auto-commit
+  // entirely and route to manual recovery. Half-shipping a misparsed
+  // path is worse than blocking.
+  const unsafe = paths.filter(isPorcelainParseUnsafe);
+  if (unsafe.length > 0) {
+    return {
+      committed: false,
+      reason: `porcelain parse unsafe paths (special chars or escape sequences): ${unsafe.slice(0, 3).join(", ")}${unsafe.length > 3 ? ` (+${unsafe.length - 3} more)` : ""}`,
+      nonTestPaths: unsafe,
+    };
+  }
   const nonTest = paths.filter((p) => !isTestOnlyPath(p, globs));
   const testOnly = paths.filter((p) => isTestOnlyPath(p, globs));
 
-  // Mixed diff path: auto-split, gated on GSTACK_QA_NO_AUTO_SPLIT=1
-  // for opt-out. The skill template warns synthesizers off mixed
-  // diffs, but the gate stays permissive as defense in depth.
+  // Mixed diff path: auto-split, gated on GSTACK_QA_NO_AUTO_SPLIT for
+  // opt-out. The skill template warns synthesizers off mixed diffs,
+  // but the gate stays permissive as defense in depth.
+  //
+  // Rollback safety: between the test commit and the prod commit, we
+  // pin HEAD via a sentinel ref. If the prod commit fails, we
+  // reset --soft to the sentinel so HEAD goes back to the pre-split
+  // state with both layers' changes back in the index. Without this,
+  // a failing pre-commit hook on prod paths would leave the test
+  // commit stranded on the branch with no automatic recovery.
   if (
     nonTest.length > 0 &&
     testOnly.length > 0 &&
-    process.env.GSTACK_QA_NO_AUTO_SPLIT !== "1"
+    !parseBooleanEnv(process.env.GSTACK_QA_NO_AUTO_SPLIT)
   ) {
+    // Pin pre-split HEAD for rollback.
+    const headBefore = captureHeadSha(opts.cwd);
+    if (!headBefore) {
+      return {
+        committed: false,
+        reason: "auto-split aborted: could not read HEAD before split",
+      };
+    }
     // First commit: test paths only.
     const testCommit = commitPathsByList({
       cwd: opts.cwd,
@@ -4411,9 +4545,24 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
       message: buildProductionFixesAutoCommitMessage(opts.label, nonTest),
     });
     if (!prodCommit.ok) {
+      // Rollback: undo the test commit so we return to pre-split state.
+      // We use `reset --soft <sha>` rather than --hard so the user
+      // doesn't lose their dirty changes. Stages stay populated, working
+      // tree unchanged. If rollback itself fails (extremely rare —
+      // means the worktree is mid-corruption), surface BOTH errors so
+      // the user knows manual cleanup is required.
+      const rollback = spawnSync("git", ["reset", "--soft", headBefore], {
+        cwd: opts.cwd,
+        encoding: "utf8",
+      });
+      const rollbackNote =
+        rollback.status === 0
+          ? `rolled back test commit ${testCommit.testSha?.slice(0, 7) ?? "(sha unknown)"}`
+          : `ROLLBACK FAILED — repo at ${headBefore}; manual reset needed: ${(rollback.stderr || "").trim()}`;
       return {
         committed: false,
-        reason: `auto-split production commit failed: ${prodCommit.error}`,
+        reason: `auto-split production commit failed: ${prodCommit.error} (${rollbackNote})`,
+        nonTestPaths: nonTest,
       };
     }
     return {
@@ -4468,7 +4617,7 @@ function commitPathsByList(opts: {
   paths: string[];
   message: string;
   stageMode?: "byPath" | "addAll";
-}): { ok: true } | { ok: false; error: string } {
+}): { ok: true; testSha: string } | { ok: false; error: string } {
   const stageMode = opts.stageMode ?? "byPath";
   const stageArgs =
     stageMode === "addAll" ? ["add", "-A"] : ["add", "--", ...opts.paths];
@@ -4498,7 +4647,11 @@ function commitPathsByList(opts: {
       error: `git commit failed: ${(commitR.stderr || "").trim()}`,
     };
   }
-  return { ok: true };
+  // Capture the newly-created commit's SHA so callers (auto-split
+  // rollback) can cite which commit they undid. Failure to read the
+  // SHA isn't itself a failure of the commit — return empty string so
+  // the caller can still log generically.
+  return { ok: true, testSha: captureHeadSha(opts.cwd) };
 }
 
 function buildTestOnlyAutoCommitMessage(
