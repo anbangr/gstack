@@ -268,6 +268,58 @@ Default test-path globs (cli.ts:`DEFAULT_QA_TEST_PATH_GLOBS`):
 
 ---
 
+## 6.5. Phase-array reconciler (FEATURE_NEEDS_PHASES path)
+
+When the feature reviewer returns `FEATURE_NEEDS_PHASES`, the
+plan-mutator appends new `Phase N.review-K` headings under the named
+feature via `appendFeaturePhases`. The insertion happens before the
+next `## Feature N+1:` heading, mid-array — NOT at the end of the
+plan for any non-last feature.
+
+The orchestrator then re-parses the plan and must merge the new
+parser output into `state.phases` without dropping runtime state for
+shifted downstream phases. `reconcileStatePhasesAfterReparse`
+(`state.ts:292`) is the canonical merge:
+
+1. Index existing `state.phases` by `PhaseState.number` (unique within
+   a plan — the parser rejects duplicate phase headings).
+2. Walk `reparsed.phases` in order. For each phase:
+   - If a `PhaseState` exists for that number: keep it (preserves
+     `status`, `gemini`/`codex` iteration counts, `committedAt`,
+     `error`, etc.), re-key its `index` to the new array position.
+   - If no `PhaseState` exists: append a fresh `{status: "pending"}`
+     entry. Collect its number into `addedNumbers` for the caller.
+3. If any state-tracked phase number is NOT present in
+   `reparsed.phases`: **fail closed**. The plan was edited
+   out-of-band and continuing would silently lose runtime state. The
+   caller (`cli.ts` `FEATURE_NEEDS_PHASES` branch) catches the throw,
+   pauses the feature with a `BLOCKED-feature-N.md` recovery report,
+   and exits 1.
+4. Rebuild every `featureState.phaseIndexes` from the re-parsed
+   `Feature.phaseIndexes` (the parser already produced the correct
+   new positions).
+5. Re-chase `state.currentPhaseIndex` by snapshotting its phase
+   number before mutating `state.phases`, then looking that number up
+   in the rebuilt array.
+
+**Why "join by number" instead of "slice the tail":** the previous
+strategy was `reparsed.phases.slice(oldPhaseCount)` and assumed new
+phases land at the end of the array. For any non-last feature the
+slice returned the shifted-out downstream phase instead of the new
+review phase, the new review phase silently aliased an existing
+`PhaseState` slot, and the inner phase loop fell through to
+`phases_done` without executing the new work. The feature-review
+loop then re-issued `FEATURE_NEEDS_PHASES` until
+`--feature-review-max-iter` was hit. See CHANGELOG v1.40.2.0.
+
+**Asymmetry with feature drops:** the helper fails closed on dropped
+*phases* (data loss is severe) but silently empties
+`featureState.phaseIndexes` when the matching `Feature` is missing
+from `reparsedFeatures`. A future PR may tighten this when the
+`FEATURE_REDO` path lands.
+
+---
+
 ## 7. Lock + active-run record lifecycle
 
 **Lock file:** `~/.gstack/build-state/<slug>.lock` (created via
@@ -329,6 +381,7 @@ For each contract above, the canonical implementation lives at:
 - `reconcilePhaseVisibleGates`: `cli.ts:374`
 - `reconcileFeatureVisibleGates`: `cli.ts:410`
 - `reconcileVisiblePlanState` (entry point): `cli.ts:439`
+- `reconcileStatePhasesAfterReparse`: `state.ts:292`
 - `markPhaseCommittedAfterManualRecovery`: `cli.ts:4304`
 - `resolvePhaseByMarkArg`: `cli.ts:4281`
 - `applyGateHygiene`: `cli.ts:3950`

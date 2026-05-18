@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.40.2.0] - 2026-05-18
+
+**FEATURE_NEEDS_PHASES no longer loops forever on multi-feature plans. The orchestrator's review-phase merge now rebuilds state by phase number, so the appended phases actually run.**
+
+If your plan had more than one `## Feature N:` block and the feature reviewer issued `FEATURE_NEEDS_PHASES`, gstack-build would burn through the `--feature-review-max-iter` cap without ever executing the new phases. The reviewer kept asking for the same missing work because the orchestrator silently dropped the appended review phases onto another feature's runtime state slot. This release fixes the merge by joining state.phases against the re-parsed plan on phase number, preserving runtime state for shifted phases and inserting fresh pending entries for the new ones.
+
+### What changed
+
+`plan-mutator.appendFeaturePhases` inserts `Phase N.review-K` headings before the next `## Feature N+1:` heading, mid-array. The previous merge at `build/orchestrator/cli.ts` used `reparsed.phases.slice(oldPhaseCount)` and assumed new entries land at the tail of the array. For any non-last feature, the slice returned the shifted-out downstream phase instead, and the new review phase silently aliased an existing PhaseState. The inner phase loop then found nothing to run, fell through to `phases_done`, and the next feature-review cycle re-issued `FEATURE_NEEDS_PHASES` until the cap was hit.
+
+A new `reconcileStatePhasesAfterReparse` helper in `build/orchestrator/state.ts` rebuilds state by `PhaseState.number`. Existing phases keep their runtime evidence (status, codex/gemini iteration counts, `committedAt`) at their new positions. Phases missing from the re-parsed plan fail closed with a clear recovery message. `featureState.phaseIndexes` and `state.currentPhaseIndex` get rebuilt from the reparsed Feature objects so the inner phase loop sees the correct positions.
+
+The `cli.ts` call site wraps the helper in a try/catch. If the reconcile throws (the plan was edited out-of-band between the append and the next cycle), the feature is paused with a `BLOCKED-feature-N.md` report instead of crashing the orchestrator with a divergent state.json on disk.
+
+### What this means for builders
+
+If you saw `phasesAdded: 6` in state.json with no code commits across the cycles, this is the fix. The feature-review loop converges on `FEATURE_PASS` as soon as the appended phases actually land. No CLI flag change. No state migration — the helper joins on `PhaseState.number`, which has been persisted since v1.39.x.
+
+### Itemized changes
+
+#### Fixed
+
+- `FEATURE_NEEDS_PHASES` merge at `build/orchestrator/cli.ts` no longer assumes appended phases land at the end of the re-parsed phases array. The new merge rebuilds state by joining on phase number, preserving runtime state for every phase whose index shifted because of the mid-array insert.
+- Resume-after-crash no longer leaves a corrupt state when the reconcile would throw (plan edited out-of-band, parser regression). The call site catches the throw, writes a `BLOCKED-feature-N.md` recovery report, sets `featureState.status = "feature_blocked"`, and exits 1 instead of bubbling to `process.exit` mid-mutation.
+
+#### Added
+
+- `reconcileStatePhasesAfterReparse(state, reparsedPhases, reparsedFeatures)` in `build/orchestrator/state.ts`. Joins state.phases against re-parsed phases by number, rebuilds every `feature.phaseIndexes` from re-parsed Feature objects, chases `state.currentPhaseIndex` forward by phase number, fails closed on dropped phases.
+- 6 unit tests in `build/orchestrator/__tests__/state-reconcile.test.ts` covering last-feature append, mid-array insert preserving downstream runtime state (bug-proving), re-append (review-2 after review-1), identical-parse no-op, fail-closed on dropped phases, and `currentPhaseIndex` chase forward.
+- 2 end-to-end seam tests in `build/orchestrator/__tests__/append-and-reconcile-integration.test.ts` exercising the real `appendFeaturePhases` → `parsePlan` → `reconcileStatePhasesAfterReparse` chain on multi-feature and last-feature plans.
+
+### For contributors
+
+The `reconcileStatePhasesAfterReparse` helper is exported and can be reused if a future feature-review verdict path needs the same number-keyed merge (e.g. a hypothetical `FEATURE_NEEDS_PHASES_AT` that inserts at a named position). The asymmetry between fail-closed phase drops and silent feature-drop (an empty `phaseIndexes` array) is documented in the JSDoc; a future PR may tighten this when the FEATURE_REDO path lands.
+
 ## [1.40.1.0] - 2026-05-17
 
 **The red-verify gate stops running pytest on TypeScript tests. Test-framework autodetect now picks vitest, jest, or pytest from the right signal.**
