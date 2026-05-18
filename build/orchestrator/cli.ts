@@ -3611,7 +3611,7 @@ export function buildKindInstructions(phase: Phase): string[] {
   }
 }
 
-function buildGeminiPromptBody(
+export function buildGeminiPromptBody(
   phase: Phase,
   planFile: string,
   branch: string,
@@ -3656,6 +3656,14 @@ function buildGeminiPromptBody(
       "",
       "Address all blocking findings within the phase scope before committing. Pay",
       "particular attention to missing artifacts and scope gaps the review identified.",
+      "",
+      "If after reading the reviewer's findings you determine every blocking finding",
+      "is already addressed in HEAD (for example, fixed by the prior pass, or a",
+      "duplicate of an earlier finding), write the literal line `NO_CHANGES_NEEDED`",
+      "on its own line in the output summary, briefly explain why in 1-3 sentences",
+      "below that line, and do NOT make a commit. The orchestrator will treat this",
+      "as a successful no-op pass. Only emit this sentinel when the work is genuinely",
+      "complete in HEAD; if any finding still needs code changes, make them and commit.",
     );
   }
 
