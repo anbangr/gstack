@@ -1590,6 +1590,164 @@ describe("inspectProject — REGRESSION: vitest.config.ts beats stray pytest.ini
   });
 });
 
+describe("inspectProject — subdir framework-config discovery", () => {
+  // Regression for the mitosis-prototype skill fault (2026-05-18):
+  // project root has `pyproject.toml [tool.pytest.ini_options]` AND
+  // `openclaw/vitest.config.ts`. The build dispatched pytest against the
+  // whole 2890-test Python suite when the feature under test had TS specs
+  // in `openclaw/`. Bug surfaced as a 15-minute timeout on
+  // `test_mode_runs_to_completion[async]`.
+  it("CRITICAL: vitest.config.ts in subdir beats pytest signal at cwd", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "pyproject.toml"),
+        "[tool.pytest.ini_options]\nminversion = '6.0'\n",
+      );
+      fs.mkdirSync(path.join(cwd, "openclaw"));
+      fs.writeFileSync(path.join(cwd, "openclaw", "vitest.config.ts"), "");
+      const r = inspectProject(cwd);
+      expect(r.framework).toBe("vitest");
+      expect(r.runner).not.toBe("pytest");
+      expect(r.evidence.join(" ")).toContain("openclaw/vitest.config.ts");
+    });
+  });
+  it("jest.config.ts in subdir beats pyproject pytest signal", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "pyproject.toml"),
+        "[tool.pytest.ini_options]\n",
+      );
+      fs.mkdirSync(path.join(cwd, "pkg-a"));
+      fs.writeFileSync(path.join(cwd, "pkg-a", "jest.config.ts"), "");
+      const r = inspectProject(cwd);
+      expect(r.framework).toBe("jest");
+    });
+  });
+  it("playwright.config.ts in subdir beats pyproject pytest signal", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "pyproject.toml"),
+        "[tool.pytest.ini_options]\n",
+      );
+      fs.mkdirSync(path.join(cwd, "e2e"));
+      fs.writeFileSync(path.join(cwd, "e2e", "playwright.config.ts"), "");
+      expect(inspectProject(cwd).framework).toBe("playwright");
+    });
+  });
+  it("cwd-level vitest.config.ts beats subdir jest.config.ts (shallowest wins)", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "vitest.config.ts"), "");
+      fs.mkdirSync(path.join(cwd, "pkg"));
+      fs.writeFileSync(path.join(cwd, "pkg", "jest.config.ts"), "");
+      expect(inspectProject(cwd).framework).toBe("vitest");
+    });
+  });
+  it("subdir-only vitest config in deeply nested package found within depth limit", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "pyproject.toml"),
+        "[tool.pytest.ini_options]\n",
+      );
+      fs.mkdirSync(path.join(cwd, "packages", "foo"), { recursive: true });
+      fs.writeFileSync(
+        path.join(cwd, "packages", "foo", "vitest.config.ts"),
+        "",
+      );
+      expect(inspectProject(cwd).framework).toBe("vitest");
+    });
+  });
+  it("vitest config inside node_modules is IGNORED (skip vendored)", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "pyproject.toml"),
+        "[tool.pytest.ini_options]\n",
+      );
+      fs.mkdirSync(path.join(cwd, "node_modules", "some-pkg"), {
+        recursive: true,
+      });
+      fs.writeFileSync(
+        path.join(cwd, "node_modules", "some-pkg", "vitest.config.ts"),
+        "",
+      );
+      // pyproject still wins because the subdir walk skips node_modules.
+      expect(inspectProject(cwd).framework).toBe("pytest");
+    });
+  });
+  it("vitest config inside vendor is IGNORED", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "pyproject.toml"),
+        "[tool.pytest.ini_options]\n",
+      );
+      fs.mkdirSync(path.join(cwd, "vendor", "thing"), { recursive: true });
+      fs.writeFileSync(
+        path.join(cwd, "vendor", "thing", "vitest.config.ts"),
+        "",
+      );
+      expect(inspectProject(cwd).framework).toBe("pytest");
+    });
+  });
+  it("vitest config inside .worktrees is IGNORED", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "pyproject.toml"),
+        "[tool.pytest.ini_options]\n",
+      );
+      fs.mkdirSync(path.join(cwd, ".worktrees", "lane-a"), { recursive: true });
+      fs.writeFileSync(
+        path.join(cwd, ".worktrees", "lane-a", "vitest.config.ts"),
+        "",
+      );
+      expect(inspectProject(cwd).framework).toBe("pytest");
+    });
+  });
+  it("vitest config deeper than depth limit is NOT found (pytest wins)", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "pyproject.toml"),
+        "[tool.pytest.ini_options]\n",
+      );
+      // depth 5 from cwd: a/b/c/d/e/vitest.config.ts
+      const deep = path.join(cwd, "a", "b", "c", "d", "e");
+      fs.mkdirSync(deep, { recursive: true });
+      fs.writeFileSync(path.join(deep, "vitest.config.ts"), "");
+      // walk depth caps at 3 → vitest not found, pytest wins.
+      expect(inspectProject(cwd).framework).toBe("pytest");
+    });
+  });
+  it("when only pytest.ini at cwd, NO subdir walk runs (cwd-only wins)", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "pytest.ini"), "[pytest]\n");
+      fs.mkdirSync(path.join(cwd, "openclaw"));
+      fs.writeFileSync(path.join(cwd, "openclaw", "vitest.config.ts"), "");
+      // pytest.ini at cwd is a strong explicit signal — subdir walk should
+      // not override it, since the user/project authored pytest.ini at root
+      // intentionally. Only [tool.pytest.ini_options] (which can be a stray
+      // tooling block) is overridable.
+      const r = inspectProject(cwd);
+      // Permissive: either pytest (cwd-only short-circuits) OR vitest if we
+      // chose to subdir-walk even past explicit pytest.ini. Current contract:
+      // explicit pytest.ini wins (consistent with v1: no subdir walk for
+      // explicit pytest config files).
+      expect(r.framework).toBe("pytest");
+    });
+  });
+  it("evidence includes the subdir path of the discovered config", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "pyproject.toml"),
+        "[tool.pytest.ini_options]\n",
+      );
+      fs.mkdirSync(path.join(cwd, "openclaw"));
+      fs.writeFileSync(path.join(cwd, "openclaw", "vitest.config.ts"), "");
+      const r = inspectProject(cwd);
+      const ev = r.evidence.join(" ");
+      // Use posix separator in the assertion since the helper normalises.
+      expect(ev).toMatch(/openclaw[\\/]vitest\.config\.ts/);
+    });
+  });
+});
+
 describe("inspectProject — package.json scripts.test", () => {
   it("scripts.test = 'vitest' yields framework=vitest", () => {
     withTmp((cwd) => {

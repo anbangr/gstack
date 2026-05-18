@@ -1371,6 +1371,14 @@ interface ProjectInspection {
  *     pyproject.toml [tool.pytest...]  → pytest
  *     setup.cfg [tool:pytest]          → pytest
  *
+ *   Priority 1b — JS framework configs in subdirectories (beats Priority 1
+ *   pytest-only signals like `pyproject.toml [tool.pytest.ini_options]` or
+ *   `setup.cfg [tool:pytest]`, but NOT an explicit `pytest.ini` at cwd):
+ *     BFS subdir walk, depth 3, 100ms budget, ignores node_modules/.git/
+ *     vendor/etc. Shallowest hit wins. Mirrors the monorepo case where a
+ *     parent repo has a pytest tooling block at root but the feature under
+ *     test lives in a TS package (e.g. mitosis-prototype/openclaw/).
+ *
  *   Priority 2 — package.json scripts.test (only if Priority 1 missed):
  *     scripts.test matches known runner verb → use as-is, inherit framework
  *     scripts.test is a wrapper (make, bash, …) → runner=wrapper, framework=null
@@ -1440,6 +1448,21 @@ export function inspectProject(
     evidence.push("framework-config: pytest.ini");
     return { runner: "pytest", framework: "pytest", evidence };
   }
+
+  // Priority 1b — JS framework config in subdirectory. Beats the pytest
+  // tooling-block signals below (pyproject.toml / setup.cfg) because those
+  // are weak/conventional and a monorepo can legitimately carry both. An
+  // explicit `pytest.ini` at cwd above is treated as a hard override.
+  const subdirHit = findFrameworkConfigInSubdirs(cwd, now);
+  if (subdirHit) {
+    evidence.push(`framework-config: ${subdirHit.relativePath}`);
+    return {
+      runner: frameworkToRunner(subdirHit.framework, cwd),
+      framework: subdirHit.framework,
+      evidence,
+    };
+  }
+
   if (fs.existsSync(path.join(cwd, "pyproject.toml"))) {
     const toml = safeReadFile(path.join(cwd, "pyproject.toml"));
     if (toml.includes("[tool.pytest.ini_options]")) {
@@ -1588,6 +1611,95 @@ export function inspectProject(
 function firstExisting(cwd: string, candidates: string[]): string | null {
   for (const c of candidates) {
     if (fs.existsSync(path.join(cwd, c))) return c;
+  }
+  return null;
+}
+
+// Bounded BFS for JS framework configs in subdirectories. Shallowest hit
+// wins; same-depth ties resolve in priority order (vitest > jest >
+// playwright). Skips the same ignore set the tie-break walker uses
+// (TIE_BREAK_IGNORE) plus dotdirs.
+const SUBDIR_CONFIG_DEPTH = 3;
+const SUBDIR_CONFIG_BUDGET_MS = 100;
+const SUBDIR_CONFIG_CANDIDATES: Array<{
+  framework: Extract<Framework, "vitest" | "jest" | "playwright">;
+  files: string[];
+}> = [
+  {
+    framework: "vitest",
+    files: ["vitest.config.ts", "vitest.config.js", "vitest.config.mjs"],
+  },
+  {
+    framework: "jest",
+    files: [
+      "jest.config.ts",
+      "jest.config.js",
+      "jest.config.cjs",
+      "jest.config.mjs",
+    ],
+  },
+  {
+    framework: "playwright",
+    files: ["playwright.config.ts", "playwright.config.js"],
+  },
+];
+
+export function findFrameworkConfigInSubdirs(
+  cwd: string,
+  now: () => number,
+): { framework: Framework; relativePath: string } | null {
+  const start = now();
+  // BFS so shallow hits beat deep ones. We only descend into dirs whose
+  // names pass the ignore filter, and we keep depth <= SUBDIR_CONFIG_DEPTH.
+  // Depth 0 (cwd itself) is excluded — that's already covered by the
+  // cwd-only Priority 1 checks above.
+  type QueueItem = { dir: string; depth: number };
+  const queue: QueueItem[] = [];
+
+  // Seed the queue with the immediate children of cwd.
+  let cwdEntries: fs.Dirent[];
+  try {
+    cwdEntries = fs.readdirSync(cwd, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const e of cwdEntries) {
+    if (!e.isDirectory()) continue;
+    if (TIE_BREAK_IGNORE.has(e.name)) continue;
+    if (e.name.startsWith(".")) continue;
+    queue.push({ dir: path.join(cwd, e.name), depth: 1 });
+  }
+
+  while (queue.length > 0) {
+    if (now() - start > SUBDIR_CONFIG_BUDGET_MS) return null;
+    const { dir, depth } = queue.shift()!;
+
+    // Check for any framework config at this directory.
+    for (const candidate of SUBDIR_CONFIG_CANDIDATES) {
+      for (const file of candidate.files) {
+        if (fs.existsSync(path.join(dir, file))) {
+          const rel = path
+            .relative(cwd, path.join(dir, file))
+            .split(path.sep)
+            .join("/");
+          return { framework: candidate.framework, relativePath: rel };
+        }
+      }
+    }
+
+    if (depth >= SUBDIR_CONFIG_DEPTH) continue;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      if (TIE_BREAK_IGNORE.has(e.name)) continue;
+      if (e.name.startsWith(".")) continue;
+      queue.push({ dir: path.join(dir, e.name), depth: depth + 1 });
+    }
   }
   return null;
 }
