@@ -4260,6 +4260,46 @@ function resetPhaseStateForRedo(state: BuildState, phaseIndex: number): void {
   delete (ps as any).dualImpl;
 }
 
+/**
+ * Resolve a `--mark-phase-committed` argument to a single phase.
+ *
+ * Accepts two notations:
+ *   - dot-numbered: "2.1" matches phase.number === "2.1" (plans whose
+ *     headings are `### Phase 2.1: ...`)
+ *   - feature-relative: "2.1" splits into <feat>="2" + <phase>="1" and
+ *     matches phase.featureNumber === "2" && phase.number === "1" (plans
+ *     whose headings are `### Phase 1:` under `## Feature 2:`)
+ *
+ * Bug 3 (Codex outside-voice catch): the original lookup was
+ * `phases.find(p => p.number === input)`, which broke on the mitosis
+ * plan style ("### Phase 1:" per-feature numbering) because phase.number
+ * is just the per-feature stem. Result: "--mark-phase-committed 2.1"
+ * errored `phase not found: 2.1` even though F2.P1 obviously exists.
+ *
+ * Returns null if no unambiguous match. Backward compat with
+ * cli.test.ts:2618 (passes "1.1" against a plan whose phase.number is
+ * literally "1.1") is preserved by the dot-numbered fallback.
+ */
+function resolvePhaseByMarkArg(phases: Phase[], input: string): Phase | null {
+  // 1. Feature-relative form: "<feat>.<phase>" → split and look up by both fields.
+  //    Only attempt this if input contains exactly one dot.
+  const dotIdx = input.indexOf(".");
+  if (dotIdx > 0 && input.lastIndexOf(".") === dotIdx) {
+    const featPart = input.slice(0, dotIdx);
+    const phasePart = input.slice(dotIdx + 1);
+    const featRel = phases.find(
+      (p) => p.featureNumber === featPart && p.number === phasePart,
+    );
+    if (featRel) return featRel;
+  }
+  // 2. Dot-numbered form (or fallback when feature-relative didn't match):
+  //    exact match on phase.number. Handles plans whose headings already
+  //    embed the feature number (### Phase 2.1: ...).
+  const direct = phases.find((p) => p.number === input);
+  if (direct) return direct;
+  return null;
+}
+
 export function markPhaseCommittedAfterManualRecovery(args: {
   state: BuildState;
   phases: Phase[];
@@ -4267,7 +4307,7 @@ export function markPhaseCommittedAfterManualRecovery(args: {
   planFile: string;
   dryRun?: boolean;
 }): { ok: true; phaseIndex: number } | { ok: false; error: string } {
-  const phase = args.phases.find((p) => p.number === args.phaseNumber);
+  const phase = resolvePhaseByMarkArg(args.phases, args.phaseNumber);
   if (!phase) {
     return { ok: false, error: `phase not found: ${args.phaseNumber}` };
   }
