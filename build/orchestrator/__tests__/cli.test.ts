@@ -2813,6 +2813,102 @@ describe("restartFeatureFromOriginIssues", () => {
     expect(feature.status).toBe("paused");
     expect(feature.error).toContain("still failing after 1 auto-fix attempts");
   });
+
+  it("un-flips plan checkboxes when rewinding a committed phase (PREMATURE_COMPLETION defense)", () => {
+    // Repro for the 2026-05-18 mitosis PREMATURE_COMPLETION faults: when
+    // restartFeatureFromOriginIssues rewinds a phase from `committed` to
+    // `tests_green`, the plan checkboxes (flipped during markCommitted) must
+    // be un-flipped too. Without this, a subsequent failure on the re-run
+    // leaves checkboxes [x][x][x] while status is `failed` — the exact
+    // PREMATURE_COMPLETION signature.
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-restart-rewind-"),
+    );
+    const planFile = path.join(tmpDir, "plan.md");
+    const planMd = [
+      "# Plan",
+      "",
+      "## Feature 1: Auth",
+      "",
+      "### Phase 1.1: Tests",
+      "- [x] **Test Specification (test-writer role)**: spec",
+      "- [x] **Implementation (primary-impl role)**: impl",
+      "- [x] **Review & QA (review roles)**: review",
+      "",
+      "### Phase 1.2: Implementation",
+      "- [x] **Test Specification (test-writer role)**: spec",
+      "- [x] **Implementation (primary-impl role)**: impl",
+      "- [x] **Review & QA (review roles)**: review",
+      "",
+    ].join("\n");
+    fs.writeFileSync(planFile, planMd);
+
+    const { state, feature } = stateAndFeature();
+    state.planFile = planFile;
+
+    const phases: Phase[] = [
+      {
+        ...basePhase,
+        index: 0,
+        number: "1.1",
+        name: "Tests",
+        testSpecCheckboxLine: 6,
+        implementationCheckboxLine: 7,
+        reviewCheckboxLine: 8,
+      },
+      {
+        ...basePhase,
+        index: 1,
+        number: "1.2",
+        name: "Implementation",
+        testSpecCheckboxLine: 11,
+        implementationCheckboxLine: 12,
+        reviewCheckboxLine: 13,
+      },
+    ];
+
+    const restart = restartFeatureFromOriginIssues({
+      state,
+      feature,
+      issueLogPath: "/tmp/origin-issues.md",
+      reason: "missing acceptance behavior",
+      phases,
+    });
+
+    expect(restart).toEqual({ restarted: true, phaseIndex: 1 });
+    expect(state.phases[1].status).toBe("tests_green");
+
+    // Phase 1.2 (the rewound phase) checkboxes should be back to [ ].
+    const after = fs.readFileSync(planFile, "utf8").split(/\r?\n/);
+    expect(after[10]).toContain("[ ] **Test Specification");
+    expect(after[11]).toContain("[ ] **Implementation");
+    expect(after[12]).toContain("[ ] **Review & QA");
+
+    // Phase 1.1 (NOT rewound) checkboxes must stay [x].
+    expect(after[5]).toContain("[x] **Test Specification");
+    expect(after[6]).toContain("[x] **Implementation");
+    expect(after[7]).toContain("[x] **Review & QA");
+
+    fs.rmSync(tmpDir, { recursive: true });
+  });
+
+  it("does not un-flip when phases arg is omitted (preserves existing callers)", () => {
+    // Existing tests that pre-date the un-flip wiring must still pass —
+    // when `phases` is omitted, the function falls back to the pre-fix
+    // behavior (rewind status, leave plan markdown alone).
+    const { state, feature } = stateAndFeature();
+    const restart = restartFeatureFromOriginIssues({
+      state,
+      feature,
+      issueLogPath: "/tmp/origin-issues.md",
+      reason: "missing acceptance behavior",
+      // phases intentionally omitted
+    });
+    expect(restart).toEqual({ restarted: true, phaseIndex: 1 });
+    expect(state.phases[1].status).toBe("tests_green");
+    // No fs.readFileSync — proves the function didn't try to touch a
+    // non-existent plan file. If un-flip ran unguarded it would throw ENOENT.
+  });
 });
 
 describe("markPhaseCommittedAfterManualRecovery", () => {

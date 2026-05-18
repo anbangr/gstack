@@ -384,6 +384,61 @@ export function appendFeaturePhases(args: AppendFeaturePhasesArgs): {
 }
 
 /**
+ * Un-flip all phase checkboxes from `[x]` back to `[ ]`. Used when the
+ * orchestrator rewinds a `committed` phase back to an in-flight state
+ * (e.g. `restartFeatureFromOriginIssues` rewinds to `tests_green` to
+ * re-run review/QA after origin verification fails). Without un-flipping,
+ * a subsequent failure leaves checkboxes `[x][x][x]` while phase status
+ * is `failed` — the exact PREMATURE_COMPLETION signature. Symmetric
+ * counterpart of `reconcilePhaseCheckboxes`.
+ */
+export function unflipPhaseCheckboxes(
+  planFile: string,
+  phase: Phase,
+): { unflipped: number; errors: string[] } {
+  const errors: string[] = [];
+  let unflipped = 0;
+
+  if (phase.testSpecCheckboxLine !== -1) {
+    const r = setCheckboxState({
+      planFile,
+      lineNumber: phase.testSpecCheckboxLine,
+      checked: false,
+      expectedMarker: TEST_SPEC_MARKER,
+    });
+    if (r.error) errors.push(`test-spec: ${r.error}`);
+    else if (r.flipped) unflipped++;
+  }
+
+  const implMarker = IMPL_MARKER_BY_KIND[phase.kind ?? "code"];
+  const reviewMarker = REVIEW_MARKER_BY_KIND[phase.kind ?? "code"];
+
+  if (phase.implementationCheckboxLine > 0) {
+    const r = setCheckboxState({
+      planFile,
+      lineNumber: phase.implementationCheckboxLine,
+      checked: false,
+      expectedMarker: implMarker,
+    });
+    if (r.error) errors.push(`impl: ${r.error}`);
+    else if (r.flipped) unflipped++;
+  }
+
+  if (phase.reviewCheckboxLine > 0) {
+    const r = setCheckboxState({
+      planFile,
+      lineNumber: phase.reviewCheckboxLine,
+      checked: false,
+      expectedMarker: reviewMarker,
+    });
+    if (r.error) errors.push(`review: ${r.error}`);
+    else if (r.flipped) unflipped++;
+  }
+
+  return { unflipped, errors };
+}
+
+/**
  * Flip all checkboxes for a single phase. Used by both the startup
  * reconcile (cli.ts) and the one-shot backfill CLI. Returns the count
  * of boxes flipped and any error strings so callers can log differently.

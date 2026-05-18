@@ -105,6 +105,7 @@ import {
   flipPhaseCheckboxes,
   flipTestSpecCheckbox,
   reconcilePhaseCheckboxes,
+  unflipPhaseCheckboxes,
   appendFeaturePhases,
   setCheckboxState,
 } from "./plan-mutator";
@@ -3388,6 +3389,15 @@ export function restartFeatureFromOriginIssues(args: {
   issueLogPath?: string;
   reason?: string;
   maxAttempts?: number;
+  /**
+   * Parsed plan phases — used to un-flip checkboxes when rewinding a
+   * `committed` phase to `tests_green`. Optional so older callers (tests
+   * that exercise the state transition in isolation) keep working; the
+   * production callers in cli.ts ALWAYS pass it. When absent, the rewind
+   * skips checkbox un-flipping and the PREMATURE_COMPLETION risk is
+   * accepted as before.
+   */
+  phases?: Phase[];
 }): { restarted: boolean; phaseIndex?: number; reason?: string } {
   const maxAttempts =
     args.maxAttempts ?? DEFAULT_MAX_ORIGIN_VERIFICATION_ITERATIONS;
@@ -3417,6 +3427,7 @@ export function restartFeatureFromOriginIssues(args: {
   }
 
   const phaseState = args.state.phases[phaseIndex];
+  const wasCommitted = phaseState.status === "committed";
   phaseState.status = "tests_green";
   phaseState.codexReview = undefined;
   phaseState.originIssueLogPath = args.issueLogPath;
@@ -3427,6 +3438,24 @@ export function restartFeatureFromOriginIssues(args: {
   args.feature.featureReview = undefined;
   args.feature.status = "running";
   args.feature.error = `origin verification failed; restarting review loop for phase ${phaseState.number}`;
+
+  // When rewinding a `committed` phase, un-flip the plan markdown checkboxes
+  // too. Without this, a subsequent failure on the re-run leaves checkboxes
+  // `[x][x][x]` while phase status is `failed` — the exact
+  // PREMATURE_COMPLETION signature observed in the 2026-05-18 mitosis faults.
+  // Markdown must follow state backward as faithfully as it follows forward.
+  if (wasCommitted && args.phases) {
+    const phase = args.phases[phaseIndex];
+    if (phase) {
+      const { errors } = unflipPhaseCheckboxes(args.state.planFile, phase);
+      for (const err of errors) {
+        console.warn(
+          `[restart] Phase ${phase.number} checkbox un-flip warning: ${err}`,
+        );
+      }
+    }
+  }
+
   return { restarted: true, phaseIndex };
 }
 
@@ -9877,6 +9906,7 @@ async function main() {
               feature: featureState,
               issueLogPath: originCheck.issueLogPath,
               reason: originCheck.reason,
+              phases,
             });
             saveState(state, { noGbrain: args.noGbrain, log: console.warn });
             logStatus({
@@ -10020,6 +10050,7 @@ async function main() {
                       feature: targetFeature,
                       issueLogPath: finalOriginCheck.issueLogPath,
                       reason: finalOriginCheck.reason,
+                      phases,
                     })
                   : {
                       restarted: false,
