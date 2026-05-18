@@ -46,6 +46,7 @@ import {
   releaseLock,
   readLockInfo,
   lockPath,
+  statePath,
   ensureLogDir,
   deriveStateSlug,
   logDir,
@@ -251,10 +252,12 @@ function saveState(
 }
 
 /**
- * Emit greppable `[plan]` warnings for a `mergeReparsedPhases` report. Both
- * call sites (resume-time repair and the FEATURE_NEEDS_PHASES branch) share
- * this so log shapes stay identical and a single grep catches every merge
- * mutation — context tag distinguishes the call site.
+ * Emit greppable `[plan]` warnings for a `mergeReparsedPhases` report. Today
+ * the merge runs only on the FEATURE_NEEDS_PHASES path during a live build;
+ * the resume guard is fail-closed (see resume guard handling above) so the
+ * `"resume"` context tag is reserved for future use, not currently wired.
+ * Context tag stays explicit so log shapes are uniform if a future code path
+ * adds another merge call site.
  */
 function logMergeReport(
   report: {
@@ -8581,30 +8584,51 @@ async function main() {
           // kind to disk so state-only consumers (fault detectors,
           // drain-faults) can read kind without re-parsing.
           backfillKindFromPlan(state, phases);
-          // Detect state/plan phase-array disagreement and repair by
-          // re-aligning state.phases to the parser's view by `number`.
-          // Triggered by:
-          //   1. State files written by pre-fix gstack versions where
-          //      FEATURE_NEEDS_PHASES mis-merged review phases (see
-          //      `mergeReparsedPhases` in state.ts).
-          //   2. A user hand-editing the plan markdown between runs in a
-          //      way that adds / renames phases.
-          // Repair preserves PhaseState identity for unchanged phase numbers
-          // (status, gemini output paths, codexReview records all survive).
-          // Orphaned state entries (numbers no longer in the plan) are
-          // dropped with a warning. The `arePhasesAligned` predicate checks
-          // both length AND per-index `number` agreement — a length match
-          // alone is insufficient (the original bug produced equal-length
-          // arrays with mis-aligned contents).
-          if (!arePhasesAligned(state, { phases })) {
-            console.warn(
-              `[plan] state.phases disagrees with the parsed plan ` +
-                `(state has ${state.phases.length} phase(s), plan has ${phases.length}). ` +
-                `Re-aligning state to the plan by phase number.`,
+          // Detect state/plan disagreement on resume and FAIL CLOSED.
+          //
+          // Auto-merging on resume was tempting but unsafe: runtime
+          // artifacts on shifted slots (gemini.outputFilePath,
+          // codexReview, committedAt) belong to the work that physically
+          // ran at that slot, not to the phase whose `number` is stored
+          // there in the corrupted JSON. By-number merge would re-attribute
+          // those artifacts to the wrong phase, and a downstream
+          // --mark-phase-committed would mark the wrong phase done — the
+          // real downstream phase would skip its real work. Same silent-
+          // corruption shape as the bug being fixed.
+          //
+          // The right move: stop, surface what's wrong, and let the user
+          // decide. They can delete state.json and start fresh, or
+          // hand-edit it with full context. Re-running with `--no-resume`
+          // also re-creates state from the current plan.
+          //
+          // Trigger: state.phases or state.features disagrees with the
+          // parsed plan on length or per-index `number` — either dimension
+          // proves desync. See `arePhasesAligned` in state.ts.
+          if (!arePhasesAligned(state, { phases, features })) {
+            console.error(
+              `\n✗ state/plan desync detected on resume.\n\n` +
+                `  state.phases length:    ${state.phases.length}\n` +
+                `  parsed plan phases:     ${phases.length}\n` +
+                `  state.features length:  ${state.features?.length ?? 0}\n` +
+                `  parsed plan features:   ${features.length}\n\n` +
+                `This usually means state.json was written by a pre-fix gstack version ` +
+                `(see release notes for the FEATURE_NEEDS_PHASES merge fix) or the plan ` +
+                `markdown was hand-edited between runs.\n\n` +
+                `gstack-build refuses to auto-merge because the on-disk state may ` +
+                `have runtime artifacts (gemini outputs, codex reviews, committedAt ` +
+                `timestamps) attached to phase numbers that no longer match the ` +
+                `parsed plan. Silently merging by number would re-attribute that ` +
+                `work to the wrong phase.\n\n` +
+                `To recover:\n` +
+                `  1. Re-run with --no-resume to rebuild state from the current plan ` +
+                `(loses runtime artifacts, restarts phases from scratch).\n` +
+                `  2. Or delete the state file and run again from scratch:\n` +
+                `       rm ${statePath(slug)}\n` +
+                `  3. Or inspect state.json and the plan markdown side by side, ` +
+                `manually realign the phase numbers, then re-run.\n`,
             );
-            const repair = mergeReparsedPhases(state, { phases, features });
-            logMergeReport(repair, "resume");
-            saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+            exitCode = 2;
+            setupFailed = true;
           }
           if (
             JSON.stringify(loaded.roleConfigs) !== JSON.stringify(args.roles)

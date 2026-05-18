@@ -27,7 +27,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { parsePlan } from "../parser";
 import { appendFeaturePhases, _testWritePlan } from "../plan-mutator";
-import { mergeReparsedPhases } from "../state";
+import { mergeReparsedPhases, arePhasesAligned } from "../state";
 import type { BuildState, PhaseState, SubAgentInvocation } from "../types";
 
 /** Typed sentinel SubAgentInvocation for tests — avoids `as unknown as` double-casts. */
@@ -365,15 +365,19 @@ describe("mergeReparsedPhases — FEATURE_NEEDS_PHASES splice mid-array", () => 
   });
 });
 
-describe("mergeReparsedPhases — resume-path repair of pre-fix on-disk state", () => {
+describe("mergeReparsedPhases — pure function behavior on pre-fix corrupted state", () => {
   // Simulates the exact corrupted-state shape the bug report describes:
   //   * Plan markdown has Feature 1's review phase spliced in mid-array
   //   * On-disk state.json (written by pre-fix gstack) has the OLD phase order
   //     plus a duplicate of the actually-last phase pushed by slice(oldCount)
-  // The cli.ts resume guard detects the disagreement and calls mergeReparsedPhases
-  // to repair. This test pins that the repair restores invariants without losing
-  // PhaseState content (status, committedAt, gemini outputs).
-  it("repairs state.phases for a build started by the pre-fix code path", () => {
+  //
+  // IMPORTANT: cli.ts does NOT auto-invoke this merge on resume. The resume
+  // guard is fail-closed (see cli.ts, "state/plan desync detected on resume")
+  // because by-number merge would re-attribute runtime artifacts to the
+  // wrong phase. This test exercises the pure function's behavior — the
+  // shape of the merge if it WERE called — so future refactors can rely on
+  // a known contract. It is NOT the runtime recovery path.
+  it("rebuilds state.phases to parser order while preserving PhaseState identity (pure function contract)", () => {
     const desyncedMd = `# Plan
 
 ## Feature 1: Auth
@@ -647,5 +651,191 @@ describe("mergeReparsedPhases — resume-path repair of pre-fix on-disk state", 
     expect(state.phases.map((s) => s.number)).toEqual(["1.1", "3.1"]);
     expect(report.orphaned).toEqual(["2.1"]);
     expect(report.added).toEqual(["3.1"]);
+  });
+
+  it("rejects duplicate phase numbers in the parsed plan rather than silently aliasing PhaseState", () => {
+    // Two `### Phase 1.1` headings in the same plan would cause
+    // `stateByNumber.get("1.1")` to return the same object for both array
+    // slots, aliasing .index mutation and downstream status writes. The
+    // parser today never produces duplicates, but a bug in appendFeaturePhases
+    // or a hand-edited plan could. Defense: throw on duplicate parser-side
+    // numbers so the failure mode is loud, not a silent state corruption.
+    const initial = parsePlan(`# Plan
+
+## Feature 1: A
+
+### Phase 1.1: Original
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+`);
+    const state = buildStateFromParsed(initial);
+
+    // Hand-construct a malformed reparsed result with a duplicate number.
+    // (Going through parsePlan + plan-mutator would not produce this; we
+    // call the function directly with a crafted input to exercise the
+    // defense.)
+    const malformed = {
+      phases: [
+        ...initial.phases,
+        // Duplicate of "1.1" — should throw.
+        {
+          ...initial.phases[0],
+          index: 1,
+          name: "Duplicate",
+        },
+      ],
+      features: initial.features,
+    };
+
+    expect(() => mergeReparsedPhases(state, malformed)).toThrow(
+      /duplicate phase number "1\.1"/,
+    );
+  });
+});
+
+describe("arePhasesAligned — drift detection on resume", () => {
+  // The resume-time fail-closed guard in cli.ts uses this predicate to
+  // decide whether to abort with a remediation message. Both phase-level
+  // AND feature-level drift must be detected — feature-only drift (e.g.,
+  // user renames a feature heading) would otherwise leave state.features
+  // stale.
+  it("returns true when state and parsed plan agree on phases and features", () => {
+    const md = `# Plan
+
+## Feature 1: Auth
+
+### Phase 1.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+
+## Feature 2: Billing
+
+### Phase 2.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+`;
+    const parsed = parsePlan(md);
+    const state = buildStateFromParsed(parsed);
+    expect(arePhasesAligned(state, parsed)).toBe(true);
+  });
+
+  it("returns false when phase count disagrees", () => {
+    const initial = parsePlan(`# Plan
+
+## Feature 1: A
+
+### Phase 1.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+`);
+    const state = buildStateFromParsed(initial);
+    const reparsed = parsePlan(`# Plan
+
+## Feature 1: A
+
+### Phase 1.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+
+### Phase 1.2: new
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+`);
+    expect(arePhasesAligned(state, reparsed)).toBe(false);
+  });
+
+  it("returns false when per-index phase number disagrees (the original bug shape)", () => {
+    const initial = parsePlan(`# Plan
+
+## Feature 1: A
+
+### Phase 1.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+
+## Feature 2: B
+
+### Phase 2.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+`);
+    const state = buildStateFromParsed(initial);
+    // Reparsed plan with a review phase spliced under Feature 1 — phase
+    // count grew, AND per-index numbers shift starting at index 1.
+    const reparsed = parsePlan(`# Plan
+
+## Feature 1: A
+
+### Phase 1.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+
+### Phase 1.review-1: new
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+
+## Feature 2: B
+
+### Phase 2.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+`);
+    expect(arePhasesAligned(state, reparsed)).toBe(false);
+  });
+
+  it("returns false when feature count disagrees", () => {
+    const initial = parsePlan(`# Plan
+
+## Feature 1: A
+
+### Phase 1.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+`);
+    const state = buildStateFromParsed(initial);
+    const reparsed = parsePlan(`# Plan
+
+## Feature 1: A
+
+### Phase 1.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+
+## Feature 2: New
+
+### Phase 2.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+`);
+    expect(arePhasesAligned(state, reparsed)).toBe(false);
+  });
+
+  it("returns false when feature numbers disagree even if counts match", () => {
+    // User renamed/replaced a feature heading. Phase count and per-index
+    // phase numbers can still match, but state.features carries stale
+    // metadata that downstream gates would consult.
+    const initial = parsePlan(`# Plan
+
+## Feature 1: Original
+
+### Phase 1.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+`);
+    const state = buildStateFromParsed(initial);
+    // Rename Feature 1 to Feature 2 (different number, same phase
+    // numbering preserved via a hand-edit pretend-scenario). parsePlan
+    // would auto-renumber phases, but we simulate the worst case where
+    // the phase number stayed identical.
+    state.features[0].number = "2"; // simulate post-rename runtime state
+    const reparsed = parsePlan(`# Plan
+
+## Feature 1: Renamed
+
+### Phase 1.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+`);
+    expect(arePhasesAligned(state, reparsed)).toBe(false);
   });
 });

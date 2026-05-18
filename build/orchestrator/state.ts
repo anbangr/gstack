@@ -271,23 +271,31 @@ export interface MergeReparsedPhasesReport {
 }
 
 /**
- * Cheap predicate: does `state.phases` already agree with the parser's view?
+ * Cheap predicate: does the on-disk state already agree with the parser's
+ * view of both phases AND features?
  *
- * Used by the resume-time repair guard in cli.ts to decide whether to invoke
- * the full merge. Equal-length arrays with per-index `number` agreement is
- * sufficient because the merge always assigns `.index = i` and the parser
- * walks top-to-bottom — disagreement on either dimension proves desync.
+ * Used by the resume-time fail-closed guard in cli.ts to decide whether to
+ * abort with a remediation message. Disagreement on any dimension (phase
+ * count, per-index phase number, feature count, per-index feature number)
+ * proves desync — the orchestrator must not silently auto-heal because
+ * runtime artifacts on shifted slots may belong to a different phase than
+ * the stale `number` they're persisted under. See cli.ts resume guard for
+ * the remediation flow.
  *
- * Kept here (next to `mergeReparsedPhases`) so the trigger condition and the
- * repair function stay in sync. Pure (no mutation), safe to call repeatedly.
+ * Pure (no mutation), safe to call repeatedly.
  */
 export function arePhasesAligned(
   state: BuildState,
-  reparsed: { phases: Phase[] },
+  reparsed: { phases: Phase[]; features: Feature[] },
 ): boolean {
   if (state.phases.length !== reparsed.phases.length) return false;
   for (let i = 0; i < state.phases.length; i++) {
     if (state.phases[i].number !== reparsed.phases[i].number) return false;
+  }
+  if ((state.features?.length ?? 0) !== reparsed.features.length) return false;
+  for (let i = 0; i < reparsed.features.length; i++) {
+    const sf = state.features?.[i];
+    if (!sf || sf.number !== reparsed.features[i].number) return false;
   }
   return true;
 }
@@ -334,6 +342,25 @@ export function mergeReparsedPhases(
   state: BuildState,
   reparsed: { phases: Phase[]; features: Feature[] },
 ): MergeReparsedPhasesReport {
+  // Reject duplicate phase numbers in the parser's view: two `### Phase X`
+  // headings with the same number would cause `stateByNumber.get(X)` to
+  // return the same PhaseState object for two array slots, aliasing
+  // `.index` mutation and downstream status writes. The parser today never
+  // produces duplicates (every heading lands at a unique array index), but
+  // a bug in `appendFeaturePhases` or a hand-edited plan could. Fail fast
+  // here rather than silently corrupting state.
+  const parserSeen = new Set<string>();
+  for (const p of reparsed.phases) {
+    if (parserSeen.has(p.number)) {
+      throw new Error(
+        `mergeReparsedPhases: parser produced duplicate phase number "${p.number}". ` +
+          `This is a plan-file or parser bug — refusing to merge to avoid aliasing PhaseState ` +
+          `between two array slots. Inspect the plan markdown for two "### Phase ${p.number}" headings.`,
+      );
+    }
+    parserSeen.add(p.number);
+  }
+
   const stateByNumber = new Map<string, PhaseState>();
   for (const ps of state.phases) {
     stateByNumber.set(ps.number, ps);
