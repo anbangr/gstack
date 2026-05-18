@@ -19,7 +19,7 @@
  *   - --yolo on Gemini for autonomous file edits
  */
 
-import { execFile } from "node:child_process";
+import { execFile } from "./child-registry";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { logDir, ensureLogDir } from "./state";
@@ -1143,37 +1143,459 @@ export function parseVerdict(stdout: string): Verdict {
   return "fail";
 }
 
-export function detectTestCmd(cwd: string): string | null {
-  if (fs.existsSync(path.join(cwd, "package.json"))) {
+// Known test frameworks we explicitly disambiguate. The set is intentionally
+// small — the goal is to break ties when filesystem markers are ambiguous and
+// to hint the testspec LLM at the right assertion library. Unrecognised values
+// from `--test-framework` are rejected at the CLI flag parser.
+export type Framework =
+  | "vitest"
+  | "jest"
+  | "playwright"
+  | "bun"
+  | "pytest"
+  | "go"
+  | "cargo";
+
+const KNOWN_FRAMEWORKS: ReadonlyArray<Framework> = [
+  "vitest",
+  "jest",
+  "playwright",
+  "bun",
+  "pytest",
+  "go",
+  "cargo",
+];
+
+export function isKnownFramework(s: string): s is Framework {
+  return (KNOWN_FRAMEWORKS as ReadonlyArray<string>).includes(s);
+}
+
+// Canonical run command for a framework. Used both when the caller has only
+// the framework name (e.g. --test-framework override) and when inspectProject
+// picks a framework via config-file detection.
+export function frameworkToRunner(framework: Framework, cwd: string): string {
+  switch (framework) {
+    case "vitest":
+      return resolveJsPkgManagerTest(cwd) ?? "npx vitest run";
+    case "jest":
+      return resolveJsPkgManagerTest(cwd) ?? "npx jest";
+    case "playwright":
+      return "npx playwright test";
+    case "bun":
+      return "bun test";
+    case "pytest":
+      return "pytest";
+    case "go":
+      return "go test ./...";
+    case "cargo":
+      return "cargo test";
+  }
+}
+
+// When a JS framework is detected but the caller asks for the runner, prefer
+// the project's package-manager script wiring if it already has one. Returns
+// null when no package.json exists (then fall back to npx invocation).
+function resolveJsPkgManagerTest(cwd: string): string | null {
+  const pkgPath = path.join(cwd, "package.json");
+  if (!fs.existsSync(pkgPath)) return null;
+  let pkg: unknown;
+  try {
+    pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+  } catch {
+    return null;
+  }
+  const scriptsRaw = (pkg as { scripts?: unknown })?.scripts;
+  const scripts =
+    scriptsRaw && typeof scriptsRaw === "object"
+      ? (scriptsRaw as Record<string, unknown>)
+      : null;
+  const testScript =
+    scripts && typeof scripts.test === "string" ? scripts.test.trim() : "";
+  if (!testScript) {
+    const packageManager = detectPackageManager(cwd, pkg as { name?: string });
+    return packageManager === "bun" ? "bun run test" : `${packageManager} test`;
+  }
+  if (/^(bun|npm|pnpm|yarn)\s+(run\s+)?test\b/.test(testScript)) {
+    return testScript;
+  }
+  const packageManager = detectPackageManager(cwd, pkg as { name?: string });
+  return packageManager === "bun" ? "bun run test" : `${packageManager} test`;
+}
+
+interface ProjectInspection {
+  runner: string | null; // the test command to invoke
+  framework: Framework | null; // for prompt hints; may be null even when runner is non-null (wrapper scripts)
+  evidence: string[]; // human-readable trail for logging
+}
+
+/**
+ * Internal source of truth for test-runner and framework detection.
+ *
+ * Detection order (first match wins within each priority band):
+ *
+ *   Priority 1 — framework-config files (most reliable signal):
+ *     vitest.config.{ts,js,mjs}        → vitest
+ *     jest.config.{ts,js,cjs,mjs}      → jest
+ *     playwright.config.{ts,js}        → playwright
+ *     pytest.ini                       → pytest
+ *     pyproject.toml [tool.pytest...]  → pytest
+ *     setup.cfg [tool:pytest]          → pytest
+ *
+ *   Priority 2 — package.json scripts.test (only if Priority 1 missed):
+ *     scripts.test matches known runner verb → use as-is, inherit framework
+ *     scripts.test is a wrapper (make, bash, …) → runner=wrapper, framework=null
+ *     no scripts.test → use `<pkgmgr> test`, framework=null
+ *
+ *   Priority 3 — build-system markers (only if Priority 1+2 missed):
+ *     go.mod      → go test ./...
+ *     Cargo.toml  → cargo test
+ *     bun.lockb   → bun test
+ *
+ *   Priority 4 — source-file tie-break (only when multiple language markers
+ *   exist at cwd AND Priorities 1+2+3 left framework ambiguous):
+ *     bounded walk (depth 4, cap 50 per language, 250ms time budget) counts
+ *     *.test.{ts,tsx,js} vs *_test.py / test_*.py vs *_test.go vs *_test.rs.
+ *     Majority wins. Aborts to first-marker on time budget exceeded.
+ *
+ * When nothing matches: { runner: null, framework: null }.
+ */
+export function inspectProject(
+  cwd: string,
+  opts: { now?: () => number } = {},
+): ProjectInspection {
+  const now = opts.now ?? (() => Date.now());
+  const evidence: string[] = [];
+
+  // Priority 1 — framework-config files.
+  const vitestConfig = firstExisting(cwd, [
+    "vitest.config.ts",
+    "vitest.config.js",
+    "vitest.config.mjs",
+  ]);
+  if (vitestConfig) {
+    evidence.push(`framework-config: ${vitestConfig}`);
+    return {
+      runner: frameworkToRunner("vitest", cwd),
+      framework: "vitest",
+      evidence,
+    };
+  }
+  const jestConfig = firstExisting(cwd, [
+    "jest.config.ts",
+    "jest.config.js",
+    "jest.config.cjs",
+    "jest.config.mjs",
+  ]);
+  if (jestConfig) {
+    evidence.push(`framework-config: ${jestConfig}`);
+    return {
+      runner: frameworkToRunner("jest", cwd),
+      framework: "jest",
+      evidence,
+    };
+  }
+  const playwrightConfig = firstExisting(cwd, [
+    "playwright.config.ts",
+    "playwright.config.js",
+  ]);
+  if (playwrightConfig) {
+    evidence.push(`framework-config: ${playwrightConfig}`);
+    return {
+      runner: frameworkToRunner("playwright", cwd),
+      framework: "playwright",
+      evidence,
+    };
+  }
+  if (fs.existsSync(path.join(cwd, "pytest.ini"))) {
+    evidence.push("framework-config: pytest.ini");
+    return { runner: "pytest", framework: "pytest", evidence };
+  }
+  if (fs.existsSync(path.join(cwd, "pyproject.toml"))) {
+    const toml = safeReadFile(path.join(cwd, "pyproject.toml"));
+    if (toml.includes("[tool.pytest.ini_options]")) {
+      evidence.push("framework-config: pyproject.toml [tool.pytest.ini_options]");
+      return { runner: "pytest", framework: "pytest", evidence };
+    }
+  }
+  if (fs.existsSync(path.join(cwd, "setup.cfg"))) {
+    const cfg = safeReadFile(path.join(cwd, "setup.cfg"));
+    if (cfg.includes("[tool:pytest]")) {
+      evidence.push("framework-config: setup.cfg [tool:pytest]");
+      return { runner: "pytest", framework: "pytest", evidence };
+    }
+  }
+
+  // Priority 2 — package.json scripts.test.
+  const pkgPath = path.join(cwd, "package.json");
+  let pkg: unknown = null;
+  if (fs.existsSync(pkgPath)) {
     try {
-      const pkg = JSON.parse(
-        fs.readFileSync(path.join(cwd, "package.json"), "utf8"),
-      );
-      const testScript =
-        typeof pkg.scripts?.test === "string" ? pkg.scripts.test.trim() : "";
-      if (testScript) {
-        if (/^(bun|npm|pnpm|yarn)\s+(run\s+)?test\b/.test(testScript)) {
-          return testScript;
-        }
-        const packageManager = detectPackageManager(cwd, pkg);
-        return packageManager === "bun"
-          ? "bun run test"
-          : `${packageManager} test`;
-      }
+      pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+      evidence.push("package.json present");
     } catch {
       console.warn(
         "  ⚠ package.json is not valid JSON; skipping npm/bun test detection",
       );
     }
   }
-  if (fs.existsSync(path.join(cwd, "pytest.ini"))) return "pytest";
-  if (fs.existsSync(path.join(cwd, "pyproject.toml"))) {
-    const toml = fs.readFileSync(path.join(cwd, "pyproject.toml"), "utf8");
-    if (toml.includes("[tool.pytest.ini_options]")) return "pytest";
+  if (pkg) {
+    const scriptsRaw = (pkg as { scripts?: unknown }).scripts;
+    const scripts =
+      scriptsRaw && typeof scriptsRaw === "object"
+        ? (scriptsRaw as Record<string, unknown>)
+        : null;
+    const testScript =
+      scripts && typeof scripts.test === "string" ? scripts.test.trim() : "";
+
+    if (testScript) {
+      evidence.push(`package.json scripts.test=${JSON.stringify(testScript)}`);
+      const framework = frameworkFromScript(testScript);
+      if (/^(bun|npm|pnpm|yarn)\s+(run\s+)?test\b/.test(testScript)) {
+        return { runner: testScript, framework, evidence };
+      }
+      const packageManager = detectPackageManager(
+        cwd,
+        pkg as { name?: string },
+      );
+      const runner =
+        packageManager === "bun" ? "bun run test" : `${packageManager} test`;
+      return { runner, framework, evidence };
+    }
+    // package.json present but no scripts.test — fall through; later
+    // priorities (or tie-break) may still pick a runner. We do NOT default
+    // to `<pkgmgr> test` here because that would mask a Python/Go signal
+    // sitting alongside.
   }
-  if (fs.existsSync(path.join(cwd, "go.mod"))) return "go test ./...";
-  if (fs.existsSync(path.join(cwd, "Cargo.toml"))) return "cargo test";
+
+  // Priority 3 — build-system markers (single-language signals).
+  if (fs.existsSync(path.join(cwd, "go.mod"))) {
+    evidence.push("marker: go.mod");
+    // If there's also a package.json, this is ambiguous — defer to Priority 4.
+    if (!pkg) {
+      return { runner: "go test ./...", framework: "go", evidence };
+    }
+  }
+  if (fs.existsSync(path.join(cwd, "Cargo.toml"))) {
+    evidence.push("marker: Cargo.toml");
+    if (!pkg) {
+      return { runner: "cargo test", framework: "cargo", evidence };
+    }
+  }
+  if (fs.existsSync(path.join(cwd, "bun.lockb"))) {
+    evidence.push("marker: bun.lockb");
+    if (!pkg && !fs.existsSync(path.join(cwd, "go.mod"))) {
+      return { runner: "bun test", framework: "bun", evidence };
+    }
+  }
+
+  // Priority 4 — source-file tie-break for ambiguous repos (e.g., package.json
+  // with no scripts.test plus go.mod, or package.json plus pyproject.toml with
+  // no pytest section).
+  const hasGo = fs.existsSync(path.join(cwd, "go.mod"));
+  const hasCargo = fs.existsSync(path.join(cwd, "Cargo.toml"));
+  const hasPyproject = fs.existsSync(path.join(cwd, "pyproject.toml"));
+  const hasJs = pkg !== null;
+  const langSignalCount =
+    (hasGo ? 1 : 0) +
+    (hasCargo ? 1 : 0) +
+    (hasPyproject ? 1 : 0) +
+    (hasJs ? 1 : 0);
+
+  if (langSignalCount >= 2) {
+    const counts = countTestFiles(cwd, 250, now);
+    evidence.push(
+      `tie-break counts: ts=${counts.ts} py=${counts.py} go=${counts.go} rs=${counts.rs}` +
+        (counts.aborted ? " (aborted)" : ""),
+    );
+    if (counts.aborted) {
+      // Fall back to first-match priority order from the legacy detector.
+      if (hasJs)
+        return {
+          runner: resolveJsPkgManagerTest(cwd) ?? "npx vitest run",
+          framework: null,
+          evidence,
+        };
+      if (hasGo)
+        return { runner: "go test ./...", framework: "go", evidence };
+      if (hasCargo) return { runner: "cargo test", framework: "cargo", evidence };
+      if (hasPyproject) return { runner: "pytest", framework: "pytest", evidence };
+    }
+    const winner = pickMajority(counts);
+    if (winner === "ts") {
+      // Bias the runner toward whatever the JS project would use.
+      const runner = resolveJsPkgManagerTest(cwd) ?? "npx vitest run";
+      // Framework stays null — we know it's a JS project but not which
+      // framework. The LLM falls back to repo-inspection.
+      return { runner, framework: null, evidence };
+    }
+    if (winner === "py") return { runner: "pytest", framework: "pytest", evidence };
+    if (winner === "go")
+      return { runner: "go test ./...", framework: "go", evidence };
+    if (winner === "rs")
+      return { runner: "cargo test", framework: "cargo", evidence };
+    // No clear winner (all zero) — fall through to one-signal logic below.
+  }
+
+  // Single language signal but no scripts.test — produce a sensible default.
+  if (hasJs) {
+    const runner = resolveJsPkgManagerTest(cwd);
+    return { runner, framework: null, evidence };
+  }
+  if (hasGo) return { runner: "go test ./...", framework: "go", evidence };
+  if (hasCargo) return { runner: "cargo test", framework: "cargo", evidence };
+  if (hasPyproject) {
+    // pyproject.toml exists but no [tool.pytest.ini_options] — best-effort.
+    return { runner: "pytest", framework: "pytest", evidence };
+  }
+  evidence.push("no markers detected");
+  return { runner: null, framework: null, evidence };
+}
+
+function firstExisting(cwd: string, candidates: string[]): string | null {
+  for (const c of candidates) {
+    if (fs.existsSync(path.join(cwd, c))) return c;
+  }
   return null;
+}
+
+function safeReadFile(p: string): string {
+  try {
+    return fs.readFileSync(p, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+// Map a scripts.test string to a Framework, where recognisable.
+// Returns null for wrapper scripts (`make test`, `bash …`, `./run-tests.sh`).
+function frameworkFromScript(testScript: string): Framework | null {
+  const s = testScript.toLowerCase();
+  if (/\bvitest\b/.test(s)) return "vitest";
+  if (/\bjest\b/.test(s)) return "jest";
+  if (/\bplaywright\b/.test(s)) return "playwright";
+  // "bun test" or "bun run test" is the bun runner; "bun run vitest" was
+  // already caught by the vitest match above.
+  if (/^bun\s+(run\s+)?test\b/.test(testScript)) return "bun";
+  return null;
+}
+
+function pickMajority(counts: {
+  ts: number;
+  py: number;
+  go: number;
+  rs: number;
+}): "ts" | "py" | "go" | "rs" | null {
+  const arr: Array<[("ts" | "py" | "go" | "rs"), number]> = [
+    ["ts", counts.ts],
+    ["py", counts.py],
+    ["go", counts.go],
+    ["rs", counts.rs],
+  ];
+  arr.sort((a, b) => b[1] - a[1]);
+  if (arr[0][1] === 0) return null;
+  if (arr[1][1] === arr[0][1]) return null; // tied
+  return arr[0][0];
+}
+
+// Bounded directory walk that counts test files per language. Stops when:
+//   (a) every language hits the per-language cap (50),
+//   (b) the recursion reaches depth 4, OR
+//   (c) elapsed time > budgetMs.
+const TIE_BREAK_PER_LANG_CAP = 50;
+const TIE_BREAK_DEPTH = 4;
+const TIE_BREAK_IGNORE = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  "build",
+  "__pycache__",
+  "vendor",
+  "vendored",
+  ".worktrees",
+  ".next",
+  ".cache",
+  "coverage",
+  "target",
+]);
+
+export function countTestFiles(
+  cwd: string,
+  budgetMs: number,
+  now: () => number,
+): { ts: number; py: number; go: number; rs: number; aborted: boolean } {
+  const start = now();
+  const counts = { ts: 0, py: 0, go: 0, rs: 0, aborted: false };
+  const allCapped = () =>
+    counts.ts >= TIE_BREAK_PER_LANG_CAP &&
+    counts.py >= TIE_BREAK_PER_LANG_CAP &&
+    counts.go >= TIE_BREAK_PER_LANG_CAP &&
+    counts.rs >= TIE_BREAK_PER_LANG_CAP;
+
+  function walk(dir: string, depth: number): void {
+    if (counts.aborted) return;
+    if (depth > TIE_BREAK_DEPTH) return;
+    if (now() - start > budgetMs) {
+      counts.aborted = true;
+      return;
+    }
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (counts.aborted) return;
+      if (allCapped()) return;
+      const name = entry.name;
+      if (entry.isDirectory()) {
+        if (TIE_BREAK_IGNORE.has(name)) continue;
+        if (name.startsWith(".")) continue;
+        walk(path.join(dir, name), depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (
+        counts.ts < TIE_BREAK_PER_LANG_CAP &&
+        (/\.test\.tsx?$/.test(name) || /\.test\.js$/.test(name) || /\.spec\.tsx?$/.test(name))
+      ) {
+        counts.ts += 1;
+        continue;
+      }
+      if (
+        counts.py < TIE_BREAK_PER_LANG_CAP &&
+        (/^test_.*\.py$/.test(name) || /_test\.py$/.test(name))
+      ) {
+        counts.py += 1;
+        continue;
+      }
+      if (counts.go < TIE_BREAK_PER_LANG_CAP && /_test\.go$/.test(name)) {
+        counts.go += 1;
+        continue;
+      }
+      if (counts.rs < TIE_BREAK_PER_LANG_CAP && /^lib\.rs$/.test(name)) {
+        // Rust doesn't have a canonical *_test.rs pattern; tests are typically
+        // inside #[cfg(test)] modules. Use lib.rs / main.rs presence as a
+        // weak Rust signal. Cargo.toml at root is the strong signal.
+        counts.rs += 1;
+        continue;
+      }
+    }
+  }
+
+  walk(cwd, 0);
+  return counts;
+}
+
+// Public wrappers — preserve the legacy API surface for the 6 call sites in
+// cli.ts. `inspectProject` is the single source of truth.
+
+export function detectTestCmd(cwd: string): string | null {
+  return inspectProject(cwd).runner;
+}
+
+export function detectTestFramework(cwd: string): Framework | null {
+  return inspectProject(cwd).framework;
 }
 
 /**

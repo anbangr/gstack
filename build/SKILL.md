@@ -1166,6 +1166,16 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
      Origin trace: [source plan sections/weeks/blocks covered]
      Acceptance: [what must be true for this feature to satisfy the source plan]
 
+     CRITICAL STRUCTURAL RULES for the lines above (the orchestrator's
+     validator enforces these and will reject the plan if violated):
+     - `Origin trace:` MUST start at column 0 on its own line (line-anchored).
+     - `Acceptance:` MUST start at column 0 on its own line (line-anchored).
+     - DO NOT write them as run-on prose like `Origin trace: ... (cite). Acceptance: ...`
+       on a single line. The validator's regex `^Acceptance:` only matches
+       lines that START with `Acceptance:`. Run-on prose fails the gate.
+     - Both fields are REQUIRED on every `## Feature N:` block. A missing
+       field rejects the plan and triggers a synthesis revision round.
+
      ### Phase X: [Phase Name]
      - [ ] **Test Specification (test-writer role)**: Implement the test cases listed in the
        `#### Test Spec` section below (minimum requirement). You MAY add additional cases you
@@ -1380,6 +1390,34 @@ prior commit.
    user's home directory to a real path like `/Users/alice`; do not emit literal
    `~`, `$HOME`, or `${HOME}`.
 
+   Before writing the synthesis output summary, run a STRUCTURAL SELF-CHECK
+   over every living plan file you produced. For each `## Feature N:`
+   heading, verify two line-anchored conditions in the lines BETWEEN the
+   heading and the next `### Phase` (or next `## ` heading), whichever
+   comes first:
+   - a line that STARTS with `Origin trace:` exists.
+   - a line that STARTS with `Acceptance:` exists.
+   If either is missing or is collapsed into run-on prose on the same line
+   as another field, rewrite the offending feature block before continuing.
+   Repeat until every feature passes.
+
+   After self-check passes, append the synthesis-complete sentinel as the
+   FINAL action of writing each living plan file. The sentinel marks the
+   plan as ready for the fault detector to read; without it the detector
+   treats the file as synthesis-in-progress and stays silent. The exact
+   shape (multi-line, mirrors the plan-reviewer sentinel convention):
+
+   ```
+   <!-- gstack-synthesis-complete
+   ts: <ISO 8601 UTC timestamp at write time>
+   provider: <_SYNTH_PROVIDER value>
+   model: <_SYNTH_MODEL value>
+   reasoning: <_SYNTH_REASONING if applicable, else "default">
+   round: <1 for the first attempt; 2/3 for revision rounds>
+   self_check: passed
+   -->
+   ```
+
    After writing all living plan files, write manifest v2 to $BUILD_TMP_DIR/build-run-manifest.json:
    {
      "manifestId": "<uuid-or-runGroupId>",
@@ -1442,6 +1480,87 @@ prior commit.
        exit 1
        ;;
    esac
+   ```
+
+   **Structural gate (bounded retry).** After the synthesizer subagent
+   exits, run `build/orchestrator/validate-living-plan.ts` against every
+   living plan path the subagent claims to have written, parsing the
+   `- <repoSlug>: <absolute path> (...)` lines from
+   `$BUILD_TMP_DIR/build-synthesis-output.md`. The validator exits 0 on
+   structurally valid plans, 2 with a JSON violation report on stderr if
+   any feature block is missing `Origin trace:` or `Acceptance:` as
+   line-anchored fields, and 1 on IO error. Mirrors the bounded-retry
+   pattern from Step 5.5 (planReviewer):
+
+   ```bash
+   _SYNTH_ROUND=${_SYNTH_ROUND:-1}
+   _SYNTH_VALIDATOR=~/.claude/skills/gstack/build/orchestrator/validate-living-plan.ts
+   _SYNTH_VIOLATIONS_PATH="$BUILD_TMP_DIR/build-synthesis-violations.json"
+   : > "$_SYNTH_VIOLATIONS_PATH"
+   _SYNTH_GATE_FAILED=0
+   while IFS= read -r _LP_PATH; do
+     [ -n "$_LP_PATH" ] || continue
+     [ -f "$_LP_PATH" ] || continue
+     if ! bun run "$_SYNTH_VALIDATOR" "$_LP_PATH" 2> "$_SYNTH_VIOLATIONS_PATH.tmp"; then
+       _SYNTH_GATE_FAILED=1
+       cat "$_SYNTH_VIOLATIONS_PATH.tmp" >> "$_SYNTH_VIOLATIONS_PATH"
+     fi
+     rm -f "$_SYNTH_VIOLATIONS_PATH.tmp"
+   done < <(grep -E '^- ' "$BUILD_TMP_DIR/build-synthesis-output.md" 2>/dev/null | sed -E 's/^- [^:]+: ([^ ]+).*/\1/')
+
+   if [ "$_SYNTH_GATE_FAILED" -eq 1 ]; then
+     if [ "$_SYNTH_ROUND" -ge 3 ]; then
+       echo "PLAN_SYNTHESIS_INVALID: structural gate failed after 2 retries" >&2
+       echo "Violations:" >&2
+       cat "$_SYNTH_VIOLATIONS_PATH" >&2
+       exit 1
+     fi
+     _SYNTH_ROUND=$((_SYNTH_ROUND + 1))
+     # Build a revision prompt that quotes the JSON violations and re-spawn
+     # the synthesizer with the same provider/model. The subagent must
+     # rewrite the offending feature blocks to put `Origin trace:` and
+     # `Acceptance:` on their own lines (line-anchored).
+     {
+       echo "Your previous living plan(s) failed the structural validator."
+       echo "Each violation lists the feature number and which line-anchored field is missing."
+       echo "Rewrite ONLY the offending feature blocks so Origin trace: and Acceptance:"
+       echo "each appear on their own line at column 0 (not as run-on prose)."
+       echo "Then re-run your self-check and re-append the synthesis-complete sentinel."
+       echo ""
+       echo "Validator output:"
+       cat "$_SYNTH_VIOLATIONS_PATH"
+     } > "$BUILD_TMP_DIR/build-synthesis-revision-input.md"
+     # Re-spawn the synthesizer using the same case statement above with
+     # the revision prompt; the next iteration of the loop re-validates.
+     # (Implementations should hoist the synthesizer dispatch into a shell
+     # function _spawn_synthesizer "$_PROMPT_PATH" and call it here.)
+     export _SYNTH_ROUND
+     # Loop back to the dispatch case above with revision input — agent
+     # re-enters Step 5 with the revision-prompt file in place of the
+     # original input.
+   fi
+
+   # Safety-net sentinel: if the validator passed for a plan but the
+   # subagent forgot to append the sentinel, append it from the shell so
+   # the detector wakes up. The sentinel is rich and matches the
+   # convention from plan-reviewer.ts.
+   while IFS= read -r _LP_PATH; do
+     [ -n "$_LP_PATH" ] || continue
+     [ -f "$_LP_PATH" ] || continue
+     if ! grep -q '<!-- gstack-synthesis-complete' "$_LP_PATH" 2>/dev/null; then
+       {
+         echo ""
+         echo "<!-- gstack-synthesis-complete"
+         echo "ts: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+         echo "provider: $_SYNTH_PROVIDER"
+         echo "model: $_SYNTH_MODEL"
+         echo "reasoning: ${_SYNTH_REASONING:-default}"
+         echo "round: $_SYNTH_ROUND"
+         echo "self_check: passed_via_shell_safety_net"
+         echo "-->"
+       } >> "$_LP_PATH"
+     fi
+   done < <(grep -E '^- ' "$BUILD_TMP_DIR/build-synthesis-output.md" 2>/dev/null | sed -E 's/^- [^:]+: ([^ ]+).*/\1/')
    ```
 
    Extract the manifest path from the summary (deterministic shell extraction, not natural-language parsing):
@@ -1827,11 +1946,19 @@ When the monitor emits `RUN_FAILED` with a message like "Feature N: ship succeed
 To recover:
 1. Diagnose why /ship failed (check the log path in the error message).
 2. Fix the underlying issue (e.g., broken `gh` CLI auth, missing PR template, base sync conflict — see the `features[N].error` field in the state JSON).
-3. Edit the state JSON to clear the failure and reset the feature:
-   - File: `~/.gstack/build-state/<slug>.json` (logs remain under `~/.gstack/build-state/<slug>/`)
-   - Remove the top-level `failureReason` key.
-   - Set `features[N].status` to `"phases_done"` (where N is the 0-based feature index).
+3. Reset the feature so the monitor will retry. **Two paths:**
+   - **If the PR did NOT actually merge** (ship failed before push): edit the state JSON to clear the failure and reset the feature.
+     - File: `~/.gstack/build-state/<slug>.json` (logs remain under `~/.gstack/build-state/<slug>/`)
+     - Remove the top-level `failureReason` key.
+     - Set `features[N].status` to `"phases_done"` (where N is the 0-based feature index).
+   - **If the PR DID merge** (ship pushed, PR landed, but the monitor couldn't parse the PR number — or the feature was merged out of band from another lane): use the supported escape hatch instead of hand-editing state. It writes the canonical terminal shape atomically and survives the orchestrator's anti-tamper detector:
+     ```
+     gstack-build mark-shipped --plan <plan.md> --feature <number> [--pr <num>] [--merge-sha <sha>]
+     ```
+     See `build/orchestrator/README.md` § "Mark a feature as already-shipped" for the full guard list.
 4. Re-run the monitor: `gstack-build monitor --manifest ... --watch --supervise`
+
+**Why mark-shipped exists.** Partial JSON hand-edits (e.g. setting `prNumber` without `completedAt`) trip the detector at `cli.ts:7697`, which resets the feature to `phases_done` and tries to re-ship it — the exact failure mode of the polis-mesh incident on 2026-05-17. The `mark-shipped` subcommand writes the full canonical shape (`status=committed` + `completedAt` + `shippedAt` + `prNumber` + `mergeSha`) in one atomic gbrain put, so the detector treats it as a genuine pipeline completion.
 
 ### Step M3.5: Skill Fault Investigator
 
@@ -1841,6 +1968,13 @@ The `fault_investigator_model` is read from `configure.cm` and faults are writte
 ```bash
 _MONITOR_EXIT="${_MONITOR_EXIT:-0}"
 [ -f "$BUILD_TMP_DIR/monitor-exit-code" ] && _MONITOR_EXIT=$(cat "$BUILD_TMP_DIR/monitor-exit-code" 2>/dev/null || printf '0\n')
+
+# Drain any backlog from a previous skill-session crash or interrupted
+# MONITOR_REENTER cycle. The CLI does the same dedup-by-glob the bash below
+# does, so if the bash dispatch fires first on this run, drain is a no-op.
+# If a previous skill session died before reaching Step M3.5, drain catches
+# up here. Failures are non-fatal — the in-skill dispatch below still runs.
+"$_GSTACK_BUILD_CLI" drain-faults --manifest "$BUILD_RUN_MANIFEST" 2>&1 | tee -a "$BUILD_TMP_DIR/drain-faults.log" || true
 
 _FAULT_PRIMARY_DIR="$HOME/.gstack/skill-faults"
 mkdir -p "$_FAULT_PRIMARY_DIR"

@@ -7,9 +7,17 @@ const ORCHESTRATOR_DIR = path.resolve(import.meta.dir, "..");
 
 const MODULE_TEST_OWNERS: Record<string, string[]> = {
   "active-runs.ts": ["active-runs.test.ts", "startup.test.ts"],
+  "artifact-reconcile.ts": ["cli.test.ts", "integration.test.ts"],
   "errors.ts": ["phase-runner.test.ts"],
   "backfill-checkboxes.ts": ["backfill-checkboxes.test.ts"],
   "build-config.ts": ["role-config.test.ts"],
+  "build-doctor.ts": ["cli.test.ts", "integration.test.ts"],
+  "child-registry.ts": ["child-registry.test.ts", "no-bare-spawn.test.ts"],
+  "drain-faults.ts": ["drain-faults.test.ts"],
+  "escalation-streak.ts": ["escalation-streak.test.ts"],
+  "heartbeat.ts": ["cli.test.ts"],
+  "mark-shipped.ts": ["mark-shipped.test.ts"],
+  "pr-info.ts": ["mark-shipped.test.ts"],
   "cli.ts": [
     "cli.test.ts",
     "cli-guardrails.test.ts",
@@ -49,6 +57,7 @@ const MODULE_TEST_OWNERS: Record<string, string[]> = {
   "role-config.ts": ["role-config.test.ts", "cli.test.ts"],
   "ship.ts": ["cli.test.ts", "integration.test.ts"],
   "skill-fault-detector.ts": ["../../../test/skill-fault-detector.test.ts"],
+  "validate-living-plan.ts": ["../../../test/skill-fault-detector.test.ts"],
   "state.ts": ["state.test.ts", "startup.test.ts"],
   "sub-agents.ts": ["sub-agents.test.ts", "cli-security.test.ts"],
   "types.ts": [

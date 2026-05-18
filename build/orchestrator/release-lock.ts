@@ -1,4 +1,4 @@
-import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { spawnSync, type SpawnSyncReturns } from "./child-registry";
 import * as path from "node:path";
 import { safeRegistryKey } from "./registry";
 import { canonicalRepoIdentity } from "./release-identity";

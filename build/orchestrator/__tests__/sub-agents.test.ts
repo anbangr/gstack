@@ -3,6 +3,11 @@ import {
   parseVerdict,
   stripAnsi,
   detectTestCmd,
+  detectTestFramework,
+  inspectProject,
+  countTestFiles,
+  frameworkToRunner,
+  isKnownFramework,
   parseFailureCount,
   parseCoveragePercent,
   injectCoverageFlags,
@@ -1452,5 +1457,404 @@ process.stdout.write(match[1]);
         force: true,
       });
     }
+  });
+});
+
+
+
+// ============================================================================
+// Test framework detection (v1.40.1.0)
+// ============================================================================
+
+function withTmp(fn: (cwd: string) => void): void {
+  const cwd = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "inspect-project-")),
+  );
+  try {
+    fn(cwd);
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+describe("isKnownFramework", () => {
+  it("accepts every Framework literal", () => {
+    for (const f of [
+      "vitest",
+      "jest",
+      "playwright",
+      "bun",
+      "pytest",
+      "go",
+      "cargo",
+    ]) {
+      expect(isKnownFramework(f)).toBe(true);
+    }
+  });
+  it("rejects unknown values", () => {
+    expect(isKnownFramework("mocha")).toBe(false);
+    expect(isKnownFramework("")).toBe(false);
+    expect(isKnownFramework("VITEST")).toBe(false);
+  });
+});
+
+describe("inspectProject — framework-config priority", () => {
+  it("vitest.config.ts beats every other signal", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "package.json"), "{}");
+      fs.writeFileSync(path.join(cwd, "vitest.config.ts"), "");
+      const r = inspectProject(cwd);
+      expect(r.framework).toBe("vitest");
+      expect(r.runner).toMatch(/vitest|npm|pnpm|yarn|bun/);
+    });
+  });
+  it("vitest.config.js detected", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "vitest.config.js"), "");
+      expect(inspectProject(cwd).framework).toBe("vitest");
+    });
+  });
+  it("vitest.config.mjs detected", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "vitest.config.mjs"), "");
+      expect(inspectProject(cwd).framework).toBe("vitest");
+    });
+  });
+  it("jest.config.ts detected", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "jest.config.ts"), "");
+      expect(inspectProject(cwd).framework).toBe("jest");
+    });
+  });
+  it("jest.config.js detected", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "jest.config.js"), "");
+      expect(inspectProject(cwd).framework).toBe("jest");
+    });
+  });
+  it("jest.config.cjs detected", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "jest.config.cjs"), "");
+      expect(inspectProject(cwd).framework).toBe("jest");
+    });
+  });
+  it("jest.config.mjs detected", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "jest.config.mjs"), "");
+      expect(inspectProject(cwd).framework).toBe("jest");
+    });
+  });
+  it("playwright.config.ts detected", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "playwright.config.ts"), "");
+      const r = inspectProject(cwd);
+      expect(r.framework).toBe("playwright");
+      expect(r.runner).toBe("npx playwright test");
+    });
+  });
+  it("playwright.config.js detected", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "playwright.config.js"), "");
+      expect(inspectProject(cwd).framework).toBe("playwright");
+    });
+  });
+  it("setup.cfg [tool:pytest] section detected as pytest", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "setup.cfg"),
+        "[tool:pytest]\nminversion = 6.0\n",
+      );
+      const r = inspectProject(cwd);
+      expect(r.framework).toBe("pytest");
+      expect(r.runner).toBe("pytest");
+    });
+  });
+  it("setup.cfg without [tool:pytest] is NOT detected as pytest", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "setup.cfg"), "[metadata]\nname=foo\n");
+      expect(inspectProject(cwd).framework).not.toBe("pytest");
+    });
+  });
+});
+
+describe("inspectProject — REGRESSION: vitest.config.ts beats stray pytest.ini", () => {
+  it("CRITICAL: framework=vitest, runner not pytest, evidence cites vitest.config.ts", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "package.json"), "{}");
+      fs.writeFileSync(path.join(cwd, "vitest.config.ts"), "");
+      fs.writeFileSync(path.join(cwd, "pytest.ini"), "[pytest]\n");
+      const r = inspectProject(cwd);
+      expect(r.framework).toBe("vitest");
+      expect(r.runner).not.toBe("pytest");
+      expect(r.evidence.join(" ")).toContain("vitest.config.ts");
+    });
+  });
+});
+
+describe("inspectProject — package.json scripts.test", () => {
+  it("scripts.test = 'vitest' yields framework=vitest", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "package.json"),
+        JSON.stringify({ scripts: { test: "vitest" } }),
+      );
+      expect(inspectProject(cwd).framework).toBe("vitest");
+    });
+  });
+  it("scripts.test = 'jest --coverage' yields framework=jest", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "package.json"),
+        JSON.stringify({ scripts: { test: "jest --coverage" } }),
+      );
+      expect(inspectProject(cwd).framework).toBe("jest");
+    });
+  });
+  it("scripts.test = 'bun test' yields framework=bun", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "package.json"),
+        JSON.stringify({ scripts: { test: "bun test" } }),
+      );
+      expect(inspectProject(cwd).framework).toBe("bun");
+    });
+  });
+  it("WRAPPER: scripts.test='make test' yields framework=null", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "package.json"),
+        JSON.stringify({ scripts: { test: "make test" } }),
+      );
+      const r = inspectProject(cwd);
+      expect(r.framework).toBe(null);
+      expect(r.runner).toMatch(/^(npm|pnpm|yarn|bun)\b/);
+    });
+  });
+});
+
+describe("countTestFiles — bounded walk", () => {
+  it("counts *.test.ts and _test.go files in a small tree", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "a.test.ts"), "");
+      fs.writeFileSync(path.join(cwd, "b.test.tsx"), "");
+      fs.writeFileSync(path.join(cwd, "c_test.go"), "");
+      fs.writeFileSync(path.join(cwd, "d_test.py"), "");
+      const r = countTestFiles(cwd, 1000, () => Date.now());
+      expect(r.ts).toBe(2);
+      expect(r.go).toBe(1);
+      expect(r.py).toBe(1);
+      expect(r.aborted).toBe(false);
+    });
+  });
+  it("ignores node_modules/, .git/, dist/, vendored/, __pycache__/", () => {
+    withTmp((cwd) => {
+      for (const ignored of [
+        "node_modules",
+        ".git",
+        "dist",
+        "vendored",
+        "__pycache__",
+      ]) {
+        fs.mkdirSync(path.join(cwd, ignored));
+        fs.writeFileSync(path.join(cwd, ignored, "hidden.test.ts"), "");
+      }
+      fs.writeFileSync(path.join(cwd, "visible.test.ts"), "");
+      const r = countTestFiles(cwd, 1000, () => Date.now());
+      expect(r.ts).toBe(1);
+    });
+  });
+  it("aborts when time budget exceeded (injected clock)", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "a.test.ts"), "");
+      const calls = { n: 0 };
+      const fakeNow = () => {
+        calls.n += 1;
+        return calls.n === 1 ? 0 : 999;
+      };
+      const r = countTestFiles(cwd, 250, fakeNow);
+      expect(r.aborted).toBe(true);
+    });
+  });
+  it("respects depth-4 cap", () => {
+    withTmp((cwd) => {
+      let dir = cwd;
+      for (let depth = 1; depth <= 6; depth += 1) {
+        dir = path.join(dir, `level${depth}`);
+        fs.mkdirSync(dir);
+        fs.writeFileSync(path.join(dir, `d${depth}.test.ts`), "");
+      }
+      fs.writeFileSync(path.join(cwd, "root.test.ts"), "");
+      const r = countTestFiles(cwd, 5000, () => Date.now());
+      // Depth 0 (cwd) + depths 1-4 = 5 files; depths 5-6 excluded.
+      expect(r.ts).toBe(5);
+    });
+  });
+});
+
+describe("inspectProject — tie-break for mixed-language repos", () => {
+  it("majority TS test files → JS runner, framework=null", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "package.json"), "{}");
+      fs.writeFileSync(
+        path.join(cwd, "pyproject.toml"),
+        "[project]\nname='x'\n",
+      );
+      for (let i = 0; i < 7; i += 1) {
+        fs.writeFileSync(path.join(cwd, `a${i}.test.ts`), "");
+      }
+      fs.writeFileSync(path.join(cwd, "z_test.py"), "");
+      const r = inspectProject(cwd);
+      expect(r.runner).toMatch(/^(npm|pnpm|yarn|bun|npx)\b/);
+      expect(r.framework).toBe(null);
+    });
+  });
+  it("majority Python test files → pytest", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "package.json"), "{}");
+      fs.writeFileSync(
+        path.join(cwd, "pyproject.toml"),
+        "[project]\nname='x'\n",
+      );
+      fs.writeFileSync(path.join(cwd, "a.test.ts"), "");
+      for (let i = 0; i < 7; i += 1) {
+        fs.writeFileSync(path.join(cwd, `test_x${i}.py`), "");
+      }
+      const r = inspectProject(cwd);
+      expect(r.runner).toBe("pytest");
+      expect(r.framework).toBe("pytest");
+    });
+  });
+  it("Go + stray package.json (docs site) → go test", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "package.json"), "{}");
+      fs.writeFileSync(path.join(cwd, "go.mod"), "module foo\ngo 1.22\n");
+      for (let i = 0; i < 5; i += 1) {
+        fs.writeFileSync(path.join(cwd, `pkg${i}_test.go`), "");
+      }
+      const r = inspectProject(cwd);
+      expect(r.runner).toBe("go test ./...");
+      expect(r.framework).toBe("go");
+    });
+  });
+});
+
+describe("inspectProject — single-language fallthrough", () => {
+  it("go.mod alone → go test ./...", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "go.mod"), "module foo\ngo 1.22\n");
+      const r = inspectProject(cwd);
+      expect(r.runner).toBe("go test ./...");
+      expect(r.framework).toBe("go");
+    });
+  });
+  it("Cargo.toml alone → cargo test", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "Cargo.toml"),
+        "[package]\nname='x'\nversion='0.1.0'\n",
+      );
+      const r = inspectProject(cwd);
+      expect(r.runner).toBe("cargo test");
+      expect(r.framework).toBe("cargo");
+    });
+  });
+  it("bun.lockb alone → bun test", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "bun.lockb"), "");
+      const r = inspectProject(cwd);
+      expect(r.runner).toBe("bun test");
+      expect(r.framework).toBe("bun");
+    });
+  });
+  it("nothing detected → null", () => {
+    withTmp((cwd) => {
+      const r = inspectProject(cwd);
+      expect(r.runner).toBe(null);
+      expect(r.framework).toBe(null);
+    });
+  });
+});
+
+describe("detectTestFramework wrapper", () => {
+  it("returns the framework from inspectProject", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "vitest.config.ts"), "");
+      expect(detectTestFramework(cwd)).toBe("vitest");
+    });
+  });
+  it("returns null for unrecognised repos", () => {
+    withTmp((cwd) => {
+      expect(detectTestFramework(cwd)).toBe(null);
+    });
+  });
+});
+
+describe("frameworkToRunner mapping", () => {
+  it("vitest → vitest run command", () => {
+    withTmp((cwd) => {
+      expect(frameworkToRunner("vitest", cwd)).toMatch(/vitest/);
+    });
+  });
+  it("pytest → 'pytest'", () => {
+    withTmp((cwd) => {
+      expect(frameworkToRunner("pytest", cwd)).toBe("pytest");
+    });
+  });
+  it("go → 'go test ./...'", () => {
+    withTmp((cwd) => {
+      expect(frameworkToRunner("go", cwd)).toBe("go test ./...");
+    });
+  });
+  it("cargo → 'cargo test'", () => {
+    withTmp((cwd) => {
+      expect(frameworkToRunner("cargo", cwd)).toBe("cargo test");
+    });
+  });
+  it("bun → 'bun test'", () => {
+    withTmp((cwd) => {
+      expect(frameworkToRunner("bun", cwd)).toBe("bun test");
+    });
+  });
+  it("playwright → 'npx playwright test'", () => {
+    withTmp((cwd) => {
+      expect(frameworkToRunner("playwright", cwd)).toBe("npx playwright test");
+    });
+  });
+});
+
+describe("buildGeminiTestSpecPrompt — framework hint", () => {
+  it("framework hint absent when framework=null", async () => {
+    const { buildGeminiTestSpecPrompt } = await import("../cli.ts");
+    const fakePhase = {
+      number: 1,
+      name: "test phase",
+      body: "do the thing",
+      testSpecCheckboxLine: -1,
+    } as any;
+    const out = buildGeminiTestSpecPrompt(fakePhase, "/tmp/plan.md", null);
+    expect(out).not.toContain("Detected test framework");
+  });
+  it("framework hint present when framework='vitest'", async () => {
+    const { buildGeminiTestSpecPrompt } = await import("../cli.ts");
+    const fakePhase = {
+      number: 1,
+      name: "test phase",
+      body: "do the thing",
+      testSpecCheckboxLine: -1,
+    } as any;
+    const out = buildGeminiTestSpecPrompt(fakePhase, "/tmp/plan.md", "vitest");
+    expect(out).toContain("Detected test framework");
+    expect(out).toContain("`vitest`");
+  });
+  it("framework hint omitted by default (backwards compatibility)", async () => {
+    const { buildGeminiTestSpecPrompt } = await import("../cli.ts");
+    const fakePhase = {
+      number: 1,
+      name: "test phase",
+      body: "do the thing",
+      testSpecCheckboxLine: -1,
+    } as any;
+    const out = buildGeminiTestSpecPrompt(fakePhase, "/tmp/plan.md");
+    expect(out).not.toContain("Detected test framework");
   });
 });

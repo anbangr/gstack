@@ -29,6 +29,7 @@ import {
   detectSkillFaults,
   detectLearnedFaults,
   loadLearnedPatterns,
+  extractFeatureBlocks,
   type DetectorInput,
   type SkillFault,
   type LearnedPattern,
@@ -317,7 +318,15 @@ describe("TEST_FIXER_LOOP", () => {
 // ---------------------------------------------------------------------------
 
 describe("PREMATURE_COMPLETION", () => {
-  test("detected when plan has [x] **Implementation** for non-committed phase", () => {
+  // The detector was tightened in v1.40.2.0+ to only fire on terminal-failed
+  // states (failed/blocked/paused). Intermediate states like tests_green,
+  // codex_running, and review_clean are legitimate mid-phase transitions
+  // where the orchestrator has correctly ticked Implementation checkboxes
+  // before reaching `committed`. The previous behavior caused 78
+  // false-positive fires for one healthy Phase 2.1 in the agnt2-prototype
+  // run on 2026-05-16. See drain-faults plan T5 + skill-fault-detector.ts
+  // PREMATURE_COMPLETION_FIRING_STATUSES for the firing-status set.
+  test("detected when plan has [x] **Implementation** for failed phase", () => {
     const dir = makeTmpDir();
     const planWithChecked = [
       "# Plan",
@@ -331,20 +340,20 @@ describe("PREMATURE_COMPLETION", () => {
       "- [ ] **Review & QA**: not done",
     ].join("\n");
     const planPath = writePlan(dir, planWithChecked);
-    const nonCommittedPhase: PhaseState = {
+    const failedPhase: PhaseState = {
       ...committedPhase(0),
-      status: "tests_green", // not 'committed'
+      status: "failed",
     };
     const input = makeInput(dir, {
       livingPlanPath: planPath,
-      state: baseState({ phases: [nonCommittedPhase] }),
+      state: baseState({ phases: [failedPhase] }),
     });
     const faults = detectSkillFaults(input);
     const fault = faults.find((f) => f.category === "PREMATURE_COMPLETION");
     expect(fault).toBeDefined();
   });
 
-  test("detected when plan has [x] **Review & QA** for non-committed phase", () => {
+  test("detected when plan has [x] **Review & QA** for blocked phase", () => {
     const dir = makeTmpDir();
     const planWithChecked = [
       "# Plan",
@@ -358,20 +367,20 @@ describe("PREMATURE_COMPLETION", () => {
       "- [x] **Review & QA**: done",
     ].join("\n");
     const planPath = writePlan(dir, planWithChecked);
-    const nonCommittedPhase: PhaseState = {
+    const blockedPhase: PhaseState = {
       ...committedPhase(0),
-      status: "review_clean",
+      status: "blocked",
     };
     const input = makeInput(dir, {
       livingPlanPath: planPath,
-      state: baseState({ phases: [nonCommittedPhase] }),
+      state: baseState({ phases: [blockedPhase] }),
     });
     const faults = detectSkillFaults(input);
     const fault = faults.find((f) => f.category === "PREMATURE_COMPLETION");
     expect(fault).toBeDefined();
   });
 
-  test("detected with role-qualified Implementation and Review & QA labels", () => {
+  test("detected with role-qualified labels on paused phase", () => {
     const dir = makeTmpDir();
     const planWithQualifiedLabels = [
       "# Plan",
@@ -385,17 +394,104 @@ describe("PREMATURE_COMPLETION", () => {
       "- [x] **Review & QA (Codex Sub-agent)**: done",
     ].join("\n");
     const planPath = writePlan(dir, planWithQualifiedLabels);
-    const nonCommittedPhase: PhaseState = {
+    const pausedPhase: PhaseState = {
+      ...committedPhase(0),
+      status: "paused",
+    };
+    const input = makeInput(dir, {
+      livingPlanPath: planPath,
+      state: baseState({ phases: [pausedPhase] }),
+    });
+    const faults = detectSkillFaults(input);
+    const fault = faults.find((f) => f.category === "PREMATURE_COMPLETION");
+    expect(fault).toBeDefined();
+  });
+
+  // Regression tests for the agnt2-prototype-bisectiongame-settlement
+  // false-positive class (2026-05-16). The detector previously fired during
+  // healthy tests_green / codex_running / review_clean transitions.
+  test("NOT detected for tests_green (healthy intermediate state — regression)", () => {
+    const dir = makeTmpDir();
+    const plan = [
+      "# Plan",
+      "",
+      "### Phase 1: Setup",
+      "",
+      "Origin trace: Feature 1",
+      "Acceptance: tests pass",
+      "",
+      "- [x] **Implementation**: done",
+      "- [ ] **Review & QA**: not done",
+    ].join("\n");
+    const planPath = writePlan(dir, plan);
+    const testsGreenPhase: PhaseState = {
       ...committedPhase(0),
       status: "tests_green",
     };
     const input = makeInput(dir, {
       livingPlanPath: planPath,
-      state: baseState({ phases: [nonCommittedPhase] }),
+      state: baseState({ phases: [testsGreenPhase] }),
     });
     const faults = detectSkillFaults(input);
-    const fault = faults.find((f) => f.category === "PREMATURE_COMPLETION");
-    expect(fault).toBeDefined();
+    expect(
+      faults.find((f) => f.category === "PREMATURE_COMPLETION"),
+    ).toBeUndefined();
+  });
+
+  test("NOT detected for codex_running (healthy intermediate state — regression)", () => {
+    const dir = makeTmpDir();
+    const plan = [
+      "# Plan",
+      "",
+      "### Phase 1: Setup",
+      "",
+      "Origin trace: Feature 1",
+      "Acceptance: tests pass",
+      "",
+      "- [x] **Implementation**: done",
+      "- [ ] **Review & QA**: not done",
+    ].join("\n");
+    const planPath = writePlan(dir, plan);
+    const codexRunningPhase: PhaseState = {
+      ...committedPhase(0),
+      status: "codex_running",
+    };
+    const input = makeInput(dir, {
+      livingPlanPath: planPath,
+      state: baseState({ phases: [codexRunningPhase] }),
+    });
+    const faults = detectSkillFaults(input);
+    expect(
+      faults.find((f) => f.category === "PREMATURE_COMPLETION"),
+    ).toBeUndefined();
+  });
+
+  test("NOT detected for review_clean (healthy intermediate state — regression)", () => {
+    const dir = makeTmpDir();
+    const plan = [
+      "# Plan",
+      "",
+      "### Phase 1: Setup",
+      "",
+      "Origin trace: Feature 1",
+      "Acceptance: tests pass",
+      "",
+      "- [x] **Implementation**: done",
+      "- [x] **Review & QA**: done",
+    ].join("\n");
+    const planPath = writePlan(dir, plan);
+    const reviewCleanPhase: PhaseState = {
+      ...committedPhase(0),
+      status: "review_clean",
+    };
+    const input = makeInput(dir, {
+      livingPlanPath: planPath,
+      state: baseState({ phases: [reviewCleanPhase] }),
+    });
+    const faults = detectSkillFaults(input);
+    expect(
+      faults.find((f) => f.category === "PREMATURE_COMPLETION"),
+    ).toBeUndefined();
   });
 
   test("NOT detected for checked checkboxes whose bold labels only share the gate prefix", () => {
@@ -412,13 +508,16 @@ describe("PREMATURE_COMPLETION", () => {
       "- [x] **Review & QA notes**: document reviewer feedback",
     ].join("\n");
     const planPath = writePlan(dir, planWithSimilarLabels);
-    const nonCommittedPhase: PhaseState = {
+    // Use a firing status (failed) so this test isolates the label-prefix
+    // logic — without it, the test would also pass because tests_green
+    // is silenced by the firing-status gate.
+    const failedPhase: PhaseState = {
       ...committedPhase(0),
-      status: "tests_green",
+      status: "failed",
     };
     const input = makeInput(dir, {
       livingPlanPath: planPath,
-      state: baseState({ phases: [nonCommittedPhase] }),
+      state: baseState({ phases: [failedPhase] }),
     });
     const faults = detectSkillFaults(input);
     expect(
@@ -488,6 +587,10 @@ describe("PLAN_SYNTHESIS_INVALID", () => {
       "### Phase 2.1: Setup",
       "",
       "- [ ] **Implementation**: implement",
+      "",
+      "<!-- gstack-synthesis-complete",
+      "ts: 2026-05-17T08:00:00Z",
+      "-->",
     ].join("\n");
     const planPath = writePlan(dir, planMixed);
     const input = makeInput(dir, { livingPlanPath: planPath });
@@ -538,6 +641,8 @@ describe("PLAN_SYNTHESIS_INVALID", () => {
       "### Phase 1: Setup",
       "",
       "- [ ] **Implementation**: implement",
+      "",
+      "<!-- gstack-synthesis-complete ts: 2026-05-17T08:00:00Z -->",
     ].join("\n");
     const planPath = writePlan(dir, plan);
     const input = makeInput(dir, { livingPlanPath: planPath });
@@ -558,6 +663,8 @@ describe("PLAN_SYNTHESIS_INVALID", () => {
       "### Phase 1: Setup",
       "",
       "- [ ] **Implementation**: implement",
+      "",
+      "<!-- gstack-synthesis-complete ts: 2026-05-17T08:00:00Z -->",
     ].join("\n");
     const planPath = writePlan(dir, plan);
     const input = makeInput(dir, { livingPlanPath: planPath });
@@ -577,6 +684,148 @@ describe("PLAN_SYNTHESIS_INVALID", () => {
     expect(
       faults.find((f) => f.category === "PLAN_SYNTHESIS_INVALID"),
     ).toBeUndefined();
+  });
+
+  // ---- Sentinel gate (Fix #1) ------------------------------------------
+
+  test("NOT detected when sentinel is absent, even with missing Acceptance (synthesis-in-progress)", () => {
+    // The synthesizer subagent has not yet finished writing the plan. The
+    // file exists but the synthesis-complete sentinel hasn't been appended.
+    // Without the sentinel the detector MUST stay silent to avoid racing
+    // mid-write and reporting transient false positives.
+    const dir = makeTmpDir();
+    const plan = [
+      "# Plan",
+      "",
+      "## Feature 1: In-progress",
+      "Origin trace: Source plan Week 1",
+      // Missing Acceptance:
+      "",
+      "### Phase 1: Setup",
+      // No <!-- gstack-synthesis-complete --> sentinel
+    ].join("\n");
+    const planPath = writePlan(dir, plan);
+    const input = makeInput(dir, { livingPlanPath: planPath });
+    const faults = detectSkillFaults(input);
+    expect(
+      faults.find((f) => f.category === "PLAN_SYNTHESIS_INVALID"),
+    ).toBeUndefined();
+  });
+
+  test("gate fires on rich multi-line sentinel with extra unknown fields", () => {
+    // The sentinel format is permissive: only the prefix is required, any
+    // additional `key: value` lines are tolerated for forensics.
+    const dir = makeTmpDir();
+    const plan = [
+      "# Plan",
+      "",
+      "## Feature 1: Bad",
+      "Acceptance: tests pass",
+      "",
+      "### Phase 1: Setup",
+      "",
+      "<!-- gstack-synthesis-complete",
+      "ts: 2026-05-17T08:00:00Z",
+      "provider: claude",
+      "model: claude-opus-4-7",
+      "reasoning: xhigh",
+      "round: 1",
+      "self_check: passed",
+      "future_unknown_key: should_not_break_detector",
+      "-->",
+    ].join("\n");
+    const planPath = writePlan(dir, plan);
+    const input = makeInput(dir, { livingPlanPath: planPath });
+    const faults = detectSkillFaults(input);
+    const fault = faults.find((f) => f.category === "PLAN_SYNTHESIS_INVALID");
+    expect(fault).toBeDefined();
+    expect(fault?.description).toContain("Origin trace:");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractFeatureBlocks (helper, used by detector + validate-living-plan.ts)
+// ---------------------------------------------------------------------------
+
+describe("extractFeatureBlocks", () => {
+  test("excludes a `## Features overview` summary list (Fix #3 regression)", () => {
+    // The agnt2-paper fault investigation observed the OLD substring-match
+    // logic incorrectly counting `## Features overview` checklist items as
+    // feature blocks. The heading-anchored helper must filter them out by
+    // requiring the exact `## Feature N:` heading shape.
+    const plan = [
+      "# Plan",
+      "",
+      "## Features overview",
+      "",
+      "- [ ] Feature 1 — Setup (Phases 1.1, 1.2)",
+      "- [ ] Feature 2 — Wiring (Phases 2.1, 2.2)",
+      "",
+      "## Feature 1: Setup",
+      "Origin trace: Week 1",
+      "Acceptance: tests pass",
+      "",
+      "### Phase 1.1: Bootstrap",
+      "",
+      "## Feature 2: Wiring",
+      "Origin trace: Week 2",
+      "Acceptance: builds run",
+      "",
+      "### Phase 2.1: Connect",
+    ].join("\n");
+    const blocks = extractFeatureBlocks(plan);
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0].number).toBe(1);
+    expect(blocks[0].name).toBe("Setup");
+    expect(blocks[1].number).toBe(2);
+    expect(blocks[1].name).toBe("Wiring");
+  });
+
+  test("parses real-world heading with parens, em dash, and hyphens", () => {
+    // The mitosis plan Feature 5 heading shape — must round-trip cleanly
+    // through the parser. This shape comes straight from a production
+    // synthesizer output and must not regress.
+    const plan = [
+      "## Feature 5: F5 — Tag validation (P1, parallel with F4)",
+      "Origin trace: Source plan §F5",
+      "Acceptance: tags validate against schema",
+      "",
+      "### Phase 5.1: Schema",
+    ].join("\n");
+    const blocks = extractFeatureBlocks(plan);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].number).toBe(5);
+    expect(blocks[0].name).toBe(
+      "F5 — Tag validation (P1, parallel with F4)",
+    );
+    expect(blocks[0].hasOriginTrace).toBe(true);
+    expect(blocks[0].hasAcceptance).toBe(true);
+  });
+
+  test("detects run-on Acceptance prose as hasAcceptance=false", () => {
+    // The mitosis Feature 5 defect class: synthesizer wrote
+    //   `Origin trace: ... (cite). Acceptance: ...`
+    // on a single line as flowing prose. The line-anchored regex must not
+    // match because no line STARTS with `Acceptance:`.
+    const plan = [
+      "## Feature 1: Run-on",
+      "Origin trace: Source plan §1 (cite this). Acceptance: tests pass",
+      "",
+      "### Phase 1: Setup",
+    ].join("\n");
+    const blocks = extractFeatureBlocks(plan);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].hasOriginTrace).toBe(true);
+    expect(blocks[0].hasAcceptance).toBe(false);
+  });
+
+  test("returns empty array on empty input", () => {
+    expect(extractFeatureBlocks("")).toHaveLength(0);
+  });
+
+  test("returns empty array on plan with no Feature blocks", () => {
+    const plan = ["# Plan", "", "## Overview", "", "TBD"].join("\n");
+    expect(extractFeatureBlocks(plan)).toHaveLength(0);
   });
 });
 
@@ -1651,5 +1900,127 @@ describe("M3.6 Phase 2 bash extraction", () => {
     }>;
     expect(parsed).toHaveLength(1);
     expect(parsed[0].category).toBe("TEST_OOM_KILL");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validate-living-plan.ts CLI (Fix #2 — structural gate)
+// ---------------------------------------------------------------------------
+
+describe("validate-living-plan.ts CLI", () => {
+  const VALIDATOR = path.resolve(
+    __dirname,
+    "..",
+    "build",
+    "orchestrator",
+    "validate-living-plan.ts",
+  );
+
+  function runValidator(args: string[]): {
+    code: number;
+    stdout: string;
+    stderr: string;
+  } {
+    const result = spawnSync("bun", ["run", VALIDATOR, ...args], {
+      encoding: "utf8",
+    });
+    return {
+      code: result.status ?? -1,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    };
+  }
+
+  test("exits 0 on a valid plan", () => {
+    const dir = makeTmpDir();
+    const plan = [
+      "## Feature 1: Good",
+      "Origin trace: Source plan Week 1",
+      "Acceptance: tests pass",
+      "",
+      "### Phase 1: Setup",
+    ].join("\n");
+    const planPath = path.join(dir, "valid.md");
+    fs.writeFileSync(planPath, plan, "utf8");
+    const { code } = runValidator([planPath]);
+    expect(code).toBe(0);
+  });
+
+  test("exits 2 with JSON violation when Acceptance: is missing", () => {
+    const dir = makeTmpDir();
+    const plan = [
+      "## Feature 1: NoAcceptance",
+      "Origin trace: Source plan Week 1",
+      "",
+      "### Phase 1: Setup",
+    ].join("\n");
+    const planPath = path.join(dir, "no-acc.md");
+    fs.writeFileSync(planPath, plan, "utf8");
+    const { code, stderr } = runValidator([planPath]);
+    expect(code).toBe(2);
+    const report = JSON.parse(stderr.trim());
+    expect(report.ok).toBe(false);
+    expect(report.violations).toHaveLength(1);
+    expect(report.violations[0].featureNumber).toBe(1);
+    expect(report.violations[0].missing).toEqual(["acceptance"]);
+  });
+
+  test("exits 2 with JSON violation when Origin trace: is missing", () => {
+    const dir = makeTmpDir();
+    const plan = [
+      "## Feature 1: NoOrigin",
+      "Acceptance: tests pass",
+      "",
+      "### Phase 1: Setup",
+    ].join("\n");
+    const planPath = path.join(dir, "no-origin.md");
+    fs.writeFileSync(planPath, plan, "utf8");
+    const { code, stderr } = runValidator([planPath]);
+    expect(code).toBe(2);
+    const report = JSON.parse(stderr.trim());
+    expect(report.violations[0].missing).toEqual(["originTrace"]);
+  });
+
+  test("exits 2 on run-on Acceptance prose (mitosis Feature 5 shape)", () => {
+    const dir = makeTmpDir();
+    const plan = [
+      "## Feature 5: F5 — Tag validation (P1, parallel with F4)",
+      "Origin trace: Source plan §F5 (sub-track A). Acceptance: tags validate",
+      "",
+      "### Phase 5.1: Schema",
+    ].join("\n");
+    const planPath = path.join(dir, "runon.md");
+    fs.writeFileSync(planPath, plan, "utf8");
+    const { code, stderr } = runValidator([planPath]);
+    expect(code).toBe(2);
+    const report = JSON.parse(stderr.trim());
+    expect(report.violations[0].featureNumber).toBe(5);
+    expect(report.violations[0].missing).toEqual(["acceptance"]);
+  });
+
+  test("exits 1 when given a nonexistent plan path", () => {
+    const { code, stderr } = runValidator([
+      "/tmp/this-path-should-not-exist-validate-test.md",
+    ]);
+    expect(code).toBe(1);
+    expect(stderr).toContain("error:");
+  });
+
+  test("exits 1 when given no arguments", () => {
+    const { code, stderr } = runValidator([]);
+    expect(code).toBe(1);
+    expect(stderr).toContain("usage:");
+  });
+
+  test("exits 2 on plan with no Feature blocks (synthesizer wrote a stub)", () => {
+    const dir = makeTmpDir();
+    const plan = ["# Plan", "", "## Overview", "", "TBD"].join("\n");
+    const planPath = path.join(dir, "stub.md");
+    fs.writeFileSync(planPath, plan, "utf8");
+    const { code, stderr } = runValidator([planPath]);
+    expect(code).toBe(2);
+    const report = JSON.parse(stderr.trim());
+    expect(report.featureCount).toBe(0);
+    expect(report.violations).toHaveLength(1);
   });
 });

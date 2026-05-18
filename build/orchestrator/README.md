@@ -73,10 +73,12 @@ feature groups before handing the living plan to this CLI:
 
 ```markdown
 ## Feature 1: Authentication
+
 Origin trace: Week 1 / Phase 2, Week 2 / Phase 1
 Acceptance: Login, logout, and session expiry satisfy the source plan.
 
 ### Phase 1.1: Auth tests
+
 - [ ] **Test Specification (Gemini Sub-agent)**: Write failing tests that cover...
 - [ ] **Implementation (Gemini Sub-agent)**: Make all failing tests pass; the CLI runs the Green tests gate afterward...
 - [ ] **Review & QA (review roles)**: Run /review, optional secondary review if configured, and /qa...
@@ -90,16 +92,20 @@ Each phase supports two formats:
 checkboxes per phase. The CLI-owned runtime gates between those checkboxes are
 Verify Red and Green tests, so the full lifecycle is Test Specification ->
 Verify Red -> Implementation -> Green tests -> Review/QA.
+
 ```markdown
 ### Phase 1: Skeleton + parser
+
 - [ ] **Test Specification (Gemini Sub-agent)**: Write failing tests that cover...
 - [ ] **Implementation (Gemini Sub-agent)**: Make all failing tests pass; the CLI runs the Green tests gate afterward...
 - [ ] **Review & QA (review roles)**: Run /review, optional secondary review if configured, and /qa...
 ```
 
 **Legacy format (still supported)** — 2 checkboxes per phase:
+
 ```markdown
 ### Phase 1: Skeleton + parser
+
 - [ ] **Implementation (Gemini Sub-agent)**: Write parser.ts with...
 - [ ] **Review & QA (review roles)**: Run /review, optional secondary review if configured, and /qa...
 ```
@@ -309,6 +315,7 @@ Planner metadata is read from each phase body:
 
 ```md
 ### Phase 1.2: UI shell
+
 Touches: src/ui/ProfileShell.tsx, src/ui/ProfileShell.test.tsx
 Depends on: 1.1
 ```
@@ -330,37 +337,37 @@ to update default role routing, retry caps, or timeout values. Use
 `GSTACK_BUILD_CONFIG_FILE` to run with an alternate config file without editing
 the repo copy. `GSTACK_BUILD_DEFAULTS_FILE` remains as a legacy alias.
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `GEMINI_BIN` | `gemini` | Path to Gemini CLI. |
-| `CODEX_BIN` | `codex` | Path to Codex CLI. |
-| `CLAUDE_BIN` | `claude` | Path to Claude Code. |
-| `GBRAIN_BIN` | `gbrain` | Path to gbrain CLI (optional). |
-| `GSTACK_BUILD_CONFIG_FILE` | `build/configure.cm` | Alternate build config file. |
-| `GSTACK_BUILD_DEFAULTS_FILE` | `build/configure.cm` | Legacy alias for `GSTACK_BUILD_CONFIG_FILE`. |
-| `GSTACK_BUILD_TEST_WRITER_MODEL` | role default | Failing-test writer model. |
-| `GSTACK_BUILD_PRIMARY_IMPL_MODEL` | role default | Primary implementation model. |
-| `GSTACK_BUILD_TEST_FIXER_MODEL` | role default | Test-fixer model. |
-| `GSTACK_BUILD_SECONDARY_IMPL_MODEL` | role default | Dual-impl secondary model. |
-| `GSTACK_BUILD_REVIEW_MODEL` | role default | Primary review model. |
-| `GSTACK_BUILD_REVIEW_SECONDARY_MODEL` | role default | Secondary review model. |
-| `GSTACK_BUILD_QA_MODEL` | role default | QA model. |
-| `GSTACK_BUILD_SHIP_MODEL` | role default | Ship model. |
-| `GSTACK_BUILD_LAND_MODEL` | role default | Land model. |
-| `GSTACK_BUILD_<ROLE>_PROVIDER` | role default | Provider override where supported; dual-impl primary, secondary, and judge roles are model-agnostic. |
-| `GSTACK_BUILD_<ROLE>_REASONING` | role default | Role reasoning override. |
-| `GSTACK_BUILD_<ROLE>_COMMAND` | role default | Command override for review, QA, ship, and land roles. |
-| `GSTACK_BUILD_GEMINI_TIMEOUT` | `600000` | Per-Gemini-call timeout in ms (10 min). |
-| `GSTACK_BUILD_CODEX_TIMEOUT` | `900000` | Per-Codex-iteration timeout in ms (15 min). |
-| `GSTACK_BUILD_SHIP_TIMEOUT` | `1800000` | Final ship-step timeout in ms (30 min). |
-| `GSTACK_BUILD_CODEX_MAX_ITER` | `5` | Hard cap on recursive review gate iterations. |
-| `GSTACK_BUILD_TEST_TIMEOUT` | `300000` | Per-test-run timeout in ms (5 min). |
-| `GSTACK_BUILD_TEST_MAX_ITER` | `5` | Hard cap on test-fixer iterations when tests fail post-impl. |
-| `GSTACK_BUILD_RED_MAX_ITER` | `3` | Hard cap on test-writer re-spec iterations when tests pass trivially (VERIFY_RED). |
-| `GSTACK_BUILD_JUDGE_TIMEOUT` | `600000` | Per-judge-call timeout in ms (10 min). Dual-impl only. |
-| `GSTACK_BUILD_JUDGE_MODEL` | role default | Model passed to `claude --model` for the judge. Dual-impl only. |
-| `GSTACK_BUILD_CODEX_IMPL_SANDBOX` | `workspace-write` | Sandbox mode for `runCodexImpl`. Set to `danger-full-access` to opt in to looser sandboxing (worktrees share .git/remotes — be aware). |
-| `GSTACK_BUILD_CODEX_REVIEW_SANDBOX` | `workspace-write` | Sandbox mode for Codex review/QA gates. If unset, known local sandbox-block failures retry once with `danger-full-access`; setting this env var disables that automatic retry. |
+| Variable                              | Default              | Purpose                                                                                                                                                                        |
+| ------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GEMINI_BIN`                          | `gemini`             | Path to Gemini CLI.                                                                                                                                                            |
+| `CODEX_BIN`                           | `codex`              | Path to Codex CLI.                                                                                                                                                             |
+| `CLAUDE_BIN`                          | `claude`             | Path to Claude Code.                                                                                                                                                           |
+| `GBRAIN_BIN`                          | `gbrain`             | Path to gbrain CLI (optional).                                                                                                                                                 |
+| `GSTACK_BUILD_CONFIG_FILE`            | `build/configure.cm` | Alternate build config file.                                                                                                                                                   |
+| `GSTACK_BUILD_DEFAULTS_FILE`          | `build/configure.cm` | Legacy alias for `GSTACK_BUILD_CONFIG_FILE`.                                                                                                                                   |
+| `GSTACK_BUILD_TEST_WRITER_MODEL`      | role default         | Failing-test writer model.                                                                                                                                                     |
+| `GSTACK_BUILD_PRIMARY_IMPL_MODEL`     | role default         | Primary implementation model.                                                                                                                                                  |
+| `GSTACK_BUILD_TEST_FIXER_MODEL`       | role default         | Test-fixer model.                                                                                                                                                              |
+| `GSTACK_BUILD_SECONDARY_IMPL_MODEL`   | role default         | Dual-impl secondary model.                                                                                                                                                     |
+| `GSTACK_BUILD_REVIEW_MODEL`           | role default         | Primary review model.                                                                                                                                                          |
+| `GSTACK_BUILD_REVIEW_SECONDARY_MODEL` | role default         | Secondary review model.                                                                                                                                                        |
+| `GSTACK_BUILD_QA_MODEL`               | role default         | QA model.                                                                                                                                                                      |
+| `GSTACK_BUILD_SHIP_MODEL`             | role default         | Ship model.                                                                                                                                                                    |
+| `GSTACK_BUILD_LAND_MODEL`             | role default         | Land model.                                                                                                                                                                    |
+| `GSTACK_BUILD_<ROLE>_PROVIDER`        | role default         | Provider override where supported; dual-impl primary, secondary, and judge roles are model-agnostic.                                                                           |
+| `GSTACK_BUILD_<ROLE>_REASONING`       | role default         | Role reasoning override.                                                                                                                                                       |
+| `GSTACK_BUILD_<ROLE>_COMMAND`         | role default         | Command override for review, QA, ship, and land roles.                                                                                                                         |
+| `GSTACK_BUILD_GEMINI_TIMEOUT`         | `600000`             | Per-Gemini-call timeout in ms (10 min).                                                                                                                                        |
+| `GSTACK_BUILD_CODEX_TIMEOUT`          | `900000`             | Per-Codex-iteration timeout in ms (15 min).                                                                                                                                    |
+| `GSTACK_BUILD_SHIP_TIMEOUT`           | `1800000`            | Final ship-step timeout in ms (30 min).                                                                                                                                        |
+| `GSTACK_BUILD_CODEX_MAX_ITER`         | `5`                  | Hard cap on recursive review gate iterations.                                                                                                                                  |
+| `GSTACK_BUILD_TEST_TIMEOUT`           | `300000`             | Per-test-run timeout in ms (5 min).                                                                                                                                            |
+| `GSTACK_BUILD_TEST_MAX_ITER`          | `5`                  | Hard cap on test-fixer iterations when tests fail post-impl.                                                                                                                   |
+| `GSTACK_BUILD_RED_MAX_ITER`           | `3`                  | Hard cap on test-writer re-spec iterations when tests pass trivially (VERIFY_RED).                                                                                             |
+| `GSTACK_BUILD_JUDGE_TIMEOUT`          | `600000`             | Per-judge-call timeout in ms (10 min). Dual-impl only.                                                                                                                         |
+| `GSTACK_BUILD_JUDGE_MODEL`            | role default         | Model passed to `claude --model` for the judge. Dual-impl only.                                                                                                                |
+| `GSTACK_BUILD_CODEX_IMPL_SANDBOX`     | `workspace-write`    | Sandbox mode for `runCodexImpl`. Set to `danger-full-access` to opt in to looser sandboxing (worktrees share .git/remotes — be aware).                                         |
+| `GSTACK_BUILD_CODEX_REVIEW_SANDBOX`   | `workspace-write`    | Sandbox mode for Codex review/QA gates. If unset, known local sandbox-block failures retry once with `danger-full-access`; setting this env var disables that automatic retry. |
 
 ## Living plan storage
 
@@ -403,17 +410,76 @@ The `<slug>` is `build-<plan-basename-without-ext>`, e.g. `build-agnt2-impl-plan
 
 The orchestrator stops at any of these and writes the failure reason into the state file. Resume picks up at the same phase after the user fixes the underlying issue.
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `Gemini timed out (after 1 retry)` | Phase too large, network blip, or Gemini hung | Raise `GSTACK_BUILD_GEMINI_TIMEOUT`, or split the phase |
-| `Codex review failed to converge` | One review gate could not reach `GATE PASS` within `GSTACK_BUILD_CODEX_MAX_ITER` attempts | Read the phase review logs, fix the underlying issue manually, resume |
-| `Codex output did not contain GATE PASS or GATE FAIL` | Codex changed output format, or hit an internal error | Read the log; usually means the codex CLI itself errored |
-| `Tests still failing after N fix iterations` | Gemini can't converge; tests and impl are in conflict | Read `phase-N-gemini-fix-*.log`, fix manually, resume |
-| `Gemini could not produce failing tests after N attempts` | Tests pass before implementation (trivially-asserting tests) | Read `phase-N-gemini-testspec-*.log`, tighten the phase description, resume |
-| `plan checkbox flip failed: line N no longer contains "**Implementation"` | Plan file edited externally between parse and mutate | Re-run; the orchestrator re-parses on every start |
-| `another gstack-build instance is running` | Another process holds the lock, or stale lock | Either wait, or `rm ~/.gstack/build-state/<slug>.lock` if you're sure it's stale |
+| Symptom                                                                   | Likely cause                                                                              | Fix                                                                              |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `Gemini timed out (after 1 retry)`                                        | Phase too large, network blip, or Gemini hung                                             | Raise `GSTACK_BUILD_GEMINI_TIMEOUT`, or split the phase                          |
+| `Codex review failed to converge`                                         | One review gate could not reach `GATE PASS` within `GSTACK_BUILD_CODEX_MAX_ITER` attempts | Read the phase review logs, fix the underlying issue manually, resume            |
+| `Codex output did not contain GATE PASS or GATE FAIL`                     | Codex changed output format, or hit an internal error                                     | Read the log; usually means the codex CLI itself errored                         |
+| `Tests still failing after N fix iterations`                              | Gemini can't converge; tests and impl are in conflict                                     | Read `phase-N-gemini-fix-*.log`, fix manually, resume                            |
+| `Gemini could not produce failing tests after N attempts`                 | Tests pass before implementation (trivially-asserting tests)                              | Read `phase-N-gemini-testspec-*.log`, tighten the phase description, resume      |
+| `plan checkbox flip failed: line N no longer contains "**Implementation"` | Plan file edited externally between parse and mutate                                      | Re-run; the orchestrator re-parses on every start                                |
+| `another gstack-build instance is running`                                | Another process holds the lock, or stale lock                                             | Either wait, or `rm ~/.gstack/build-state/<slug>.lock` if you're sure it's stale |
 
 Exit codes: `0` clean run, `1` phase failed, `2` bad args, `3` lock contention, `130` SIGINT.
+
+## Mark a feature as already-shipped
+
+When a feature was merged outside the orchestrator's normal pipeline (manual
+ship from another lane, parallel merge, recovery after a killed orchestrator),
+the orchestrator's anti-tamper detector will treat any partial hand-edit to
+state as a `manual JSON state patch that bypassed ship+land+verify` and reset
+the feature to `phases_done`, trying to re-ship it. The supported way out:
+
+```bash
+gstack-build mark-shipped --plan <plan.md> --feature <number> [--pr <num>] [--merge-sha <sha>]
+```
+
+This writes the canonical terminal-state shape the detector trusts —
+`status=committed`, `completedAt`, `shippedAt`, `prNumber`, `mergeSha` — in one
+atomic local + gbrain write. Safety guards before any write:
+
+1. Refuses if any live orchestrator owns the same plan (stop it first).
+2. Auto-resolves `--pr` via `gh pr list --state merged --head <branch>` when
+   omitted. If multiple PRs match, the most-recently-merged wins.
+3. Verifies the PR is genuinely `MERGED` via `gh pr view`. Single source of
+   truth for `mergeSha` (`mergeCommit.oid`).
+4. If `--merge-sha` was passed, errors out on mismatch — catches operator
+   typos before any write.
+5. No-op + clean success message when the feature is already terminal.
+
+Does NOT touch `currentFeatureIndex` — that stays the orchestrator's
+responsibility. `findNextFeatureIndex()` will skip the feature naturally on
+the next launch because `isFeatureTerminal()` now returns true.
+
+Exit codes for mark-shipped: `0` success or no-op, `2` bad args / missing
+state / feature not found, `3` active orchestrator refused, `4` PR not
+merged, `5` `--merge-sha` mismatch.
+
+## Child process management
+
+Every spawn the orchestrator makes routes through `child-registry.ts`, a thin
+wrapper around `node:child_process` that:
+
+- Spawns each child detached (its own process group), so
+  `process.kill(-pid, signal)` reaches the whole subtree.
+- Tracks live pids in an in-memory registry.
+- Installs `SIGTERM` / `SIGINT` / `SIGHUP` handlers at orchestrator startup.
+  On any of those signals: SIGTERM every live group, wait up to 2 seconds,
+  SIGKILL survivors, then exit.
+
+`__tests__/no-bare-spawn.test.ts` is a static invariant: any new file under
+`build/orchestrator/` that imports from `node:child_process` directly fails CI.
+All `spawn`/`spawnSync`/`execFile` imports must go through
+`./child-registry` instead.
+
+**SIGKILL caveat.** `kill -9 <orchestrator-pid>` cannot be intercepted —
+the kernel terminates the process without running userspace cleanup, so
+in-flight children are reparented to init and outlive the orchestrator. This
+is standard POSIX behavior. The pre-fix polis-mesh incident hit this when the
+operator escalated straight to `kill -9` and `gbrain put` subprocesses
+survived. The fix handles the survivable signals (the common `kill`/SIGTERM,
+Ctrl-C/SIGINT, terminal-disconnect/SIGHUP) cleanly. For SIGKILL recovery,
+follow up with `pkill -9 gbrain` (or whichever subagent is still alive).
 
 ## Architecture
 
@@ -430,10 +496,40 @@ release-lock.ts remote git ref lock, heartbeat refresh, stale-owner handling
 release-daemon.ts FIFO queued release worker, scratch checkout, drift repair
 gbrain.ts       gbrain CLI wrapper (best-effort, never throws)
 ship.ts         configurable /ship + /land-and-deploy delegation
+mark-shipped.ts operator escape hatch — write canonical terminal state shape
+pr-info.ts      gh pr lookup helpers (findMergedPRForBranch, readMergedPRInfo)
+child-registry.ts drop-in spawn wrappers + signal handlers (reap detached children)
 types.ts        Phase, PhaseState, BuildState
 ```
 
 The state machine is the heart of the design and is deliberately a pure function: `(currentPhaseState, lastResult) → (nextAction, newPhaseState)`. The driver in `cli.ts` is the only place with I/O. This makes every state transition trivially unit-testable — see `__tests__/phase-runner.test.ts` for the full transition table.
+
+## Subcommand: `drain-faults`
+
+Recovers stranded skill-fault investigations from a build's `monitor-output.log`.
+Used when a `/build` skill session dies before reaching Step M3.5 (host crash,
+context limit, manual abort) so monitor-detected faults never got investigated.
+
+```bash
+# Recovery via manifest path (the build-run-manifest.json a /build session creates):
+gstack-build drain-faults --manifest /path/to/build-run-manifest.json
+
+# Or point directly at the BUILD_TMP_DIR containing monitor-output.log:
+gstack-build drain-faults --build-tmp-dir /path/to/.llm-tmp/build-runs/XXX
+
+# Optional flags:
+gstack-build drain-faults --manifest ... --dry-run              # Parse and plan only, no spawns
+gstack-build drain-faults --manifest ... --catch-all            # Fire a discovery investigator when log has RUN_FAILED but no faults
+gstack-build drain-faults --manifest ... --investigator-timeout-ms 600000   # Per-investigator timeout (default 10 min)
+```
+
+Idempotent: subsequent runs dedup against on-disk reports in `~/.gstack/skill-faults/`.
+The `/build` skill template calls this at the top of Step M3.5 automatically;
+manual invocation is for after-the-fact recovery.
+
+The monitor mode (`gstack-build monitor`) ALSO calls drain inline on terminal
+events so investigations fire even if no skill agent is alive. Two paths, same
+dedup — belt-and-suspenders.
 
 ## Testing
 
