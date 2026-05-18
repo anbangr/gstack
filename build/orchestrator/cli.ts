@@ -4833,6 +4833,15 @@ export function applyMutableAgentHygiene(opts: {
     workspaceRoot: string | null;
     snapshot: GitSnapshot | null;
   };
+  /** When true AND the only remaining hygiene error is "did not create a new commit"
+   *  AND the agent's output summary contains a line starting with `NO_CHANGES_NEEDED`,
+   *  treat the run as a successful no-op pass. Used for RUN_GEMINI_FROM_REVIEW
+   *  (re-runs after reviewer feedback) where the reviewer's finding may already be
+   *  addressed in HEAD (duplicate finding, fixed by prior pass). The dirty-tree and
+   *  parent-workspace assertions stay strict — only the no-commit error is forgiven.
+   *  Opt-in per call site; the first RUN_GEMINI pass and the test-fixer keep the
+   *  strict default. */
+  allowNoChangesSentinel?: boolean;
 }): SubAgentResult {
   if (!opts.before) {
     return opts.result;
@@ -4909,6 +4918,31 @@ export function applyMutableAgentHygiene(opts: {
     ...checks.flatMap((check) => check.errors),
   ];
   if (errors.length === 0) return opts.result;
+  // NO_CHANGES_NEEDED sentinel — opt-in for review re-runs. When the ONLY
+  // remaining hygiene error is the no-new-commit one AND the agent wrote
+  // `NO_CHANGES_NEEDED` on its own line in the output summary, treat as
+  // success. Any other hygiene problem (dirty tree, parent-workspace
+  // mutation, empty output, blind execution) still fails. See the
+  // RUN_GEMINI_FROM_REVIEW call site for the only consumer.
+  if (
+    opts.allowNoChangesSentinel &&
+    errors.length === 1 &&
+    errors[0].includes("did not create a new commit") &&
+    opts.outputFilePath
+  ) {
+    let summary = "";
+    try {
+      summary = fs.readFileSync(opts.outputFilePath, "utf8");
+    } catch {
+      // Unreadable output -> fall through to the failure path below.
+    }
+    if (/^NO_CHANGES_NEEDED\b/m.test(summary)) {
+      console.warn(
+        `  ✓ ${opts.label} reported NO_CHANGES_NEEDED — reviewer finding already addressed in HEAD`,
+      );
+      return opts.result;
+    }
+  }
   return hygieneFailureResult(errors.join("\n"), opts.result.logPath);
 }
 
@@ -6004,6 +6038,12 @@ async function runPhase(args: {
         // if the audit verdict stands. Reviewer can still GATE FAIL on the
         // summary if more is expected.
         requireNewCommit: !phase.auditOnly,
+        // Reviewer findings may already be addressed in HEAD (duplicate
+        // finding, fixed by the prior pass). The prompt instructs the agent
+        // to emit `NO_CHANGES_NEEDED` in that case; honor it here. Strict
+        // for first-pass RUN_GEMINI and RUN_GEMINI_FIX; "no commit" there
+        // means the agent never started.
+        allowNoChangesSentinel: true,
         allowSubmoduleRecovery: args.allowSubmoduleRecovery,
         parentWorkspace,
       });
