@@ -49,6 +49,7 @@ import {
 } from "./state";
 import {
   activeOwnedBranches,
+  activeRunRecordPath,
   defaultActiveRunRegistryDir,
   isPidAlive,
   normalizeRepoPath,
@@ -640,6 +641,8 @@ export interface Args {
   allowSubmoduleRecovery: string[];
   /** Mark a phase committed after manual recovery without rerunning earlier phase steps. */
   markPhaseCommitted?: string;
+  /** Stop a running gstack-build daemon by run-id. SIGTERM with 30s graceful timeout. */
+  stopRun?: string;
   /**
    * Skip the per-feature meta-review pass that fires after all phases of
    * a feature commit. Default off — review runs unless the skip heuristic
@@ -782,6 +785,7 @@ export function parseArgs(argv: string[]): Args {
     allowWorkspaceRoot: false,
     allowSubmoduleRecovery: [],
     markPhaseCommitted: undefined,
+    stopRun: undefined,
     skipFeatureReview: false,
     featureReviewMaxIter: DEFAULT_FEATURE_REVIEW_MAX_ITER,
     noPlanReview: false,
@@ -874,6 +878,13 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.markPhaseCommitted = next;
+    } else if (a === "--stop-run") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--stop-run requires a run-id");
+        process.exit(2);
+      }
+      args.stopRun = next;
     } else if (a === "--manifest") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
@@ -2093,7 +2104,14 @@ Flags:
                        Repeat for multiple submodules.
   --mark-phase-committed <phase>
                        Mark a manually recovered phase committed without rerunning
-                       test-spec, implementation, tests, or review steps.
+                       test-spec, implementation, tests, or review steps. Accepts
+                       either "<phase>" (dot-numbered plans) or "<feature>.<phase>"
+                       (per-feature plans).
+  --stop-run <run-id>  Stop a running gstack-build daemon by run-id. Reads the PID
+                       from the active-runs registry, signals SIGTERM, waits up to
+                       30s for graceful exit, then verifies the lock is gone.
+                       Refuses to signal a PID whose command line doesn't contain
+                       gstack/build/orchestrator/cli.ts (safe against PID reuse).
   --origin-plan <file> Original source plan. Verified after each feature and archived after final completion.
   --max-codex-iter N   Cap recursive Codex iterations (default ${DEFAULT_MAX_CODEX_ITERATIONS}).
   -h, --help           Show this help.
@@ -7614,6 +7632,118 @@ export async function runDoctorMode(args: Args): Promise<number> {
   return report.worstSeverity === "P0" ? 1 : 0;
 }
 
+/**
+ * Bug 6: --stop-run <run-id> handler.
+ *
+ * Stops a running gstack-build daemon by reading the PID from the active-run
+ * registry, sending SIGTERM, waiting up to 30s for graceful exit, and verifying
+ * the lock file is gone. Refuses to signal a PID whose command line does not
+ * contain "gstack/build/orchestrator/cli.ts" — protects against PID reuse,
+ * where the registered PID has been recycled by an unrelated process.
+ *
+ * Exit codes:
+ *   0  daemon stopped cleanly (or was already dead)
+ *   1  active-run record missing/unreadable
+ *   2  PID does not belong to a gstack-build process (PID reuse guard)
+ *   3  daemon still alive after 30s timeout
+ *   4  signal failed (permission denied, etc)
+ */
+export async function runStopRun(
+  runId: string,
+  activeRunRegistry: string,
+): Promise<number> {
+  const recordPath = activeRunRecordPath(activeRunRegistry, runId);
+  let record: ActiveRunRecord;
+  try {
+    const raw = fs.readFileSync(recordPath, "utf8");
+    record = JSON.parse(raw) as ActiveRunRecord;
+  } catch (err) {
+    console.error(
+      `--stop-run: active-run record not found or unreadable at ${recordPath}: ${(err as Error).message}`,
+    );
+    return 1;
+  }
+
+  const pid = record.pid;
+  if (!Number.isInteger(pid) || pid <= 0) {
+    console.error(`--stop-run: active-run record has invalid pid: ${pid}`);
+    return 1;
+  }
+
+  // Already-dead PID: nothing to signal. The orphan sweep above will have
+  // updated the record status, so this is a no-op success.
+  if (!isPidAlive(pid)) {
+    console.log(`--stop-run: pid ${pid} is not alive — daemon already stopped`);
+    // Best-effort: update the registry record to reflect status.
+    try {
+      record.status = "completed";
+      record.lastUpdatedAt = new Date().toISOString();
+      writeActiveRunRecord(activeRunRegistry, record);
+    } catch {
+      // Ignore — the sweep at next startup will fix this.
+    }
+    return 0;
+  }
+
+  // PID reuse guard: verify the live PID actually belongs to a gstack-build
+  // process. ps -p $PID -o command= prints just the command. We look for the
+  // canonical orchestrator script path. False negatives are safer than false
+  // positives — refuse to signal anything ambiguous.
+  const psR = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
+    encoding: "utf8",
+  });
+  if (psR.status !== 0) {
+    console.error(
+      `--stop-run: ps failed for pid ${pid}: ${(psR.stderr || "").trim()}`,
+    );
+    return 4;
+  }
+  const psOut = (psR.stdout || "").trim();
+  if (!psOut.includes("gstack/build/orchestrator/cli.ts")) {
+    console.error(
+      `--stop-run: pid ${pid} is not a gstack-build process (cmd: ${psOut.slice(0, 120)})`,
+    );
+    return 2;
+  }
+
+  // Signal SIGTERM. The orchestrator's signal handler (cli.ts ~7800) marks
+  // active-run paused and releases the lock before exiting.
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (err) {
+    console.error(
+      `--stop-run: kill -TERM ${pid} failed: ${(err as Error).message}`,
+    );
+    return 4;
+  }
+  console.log(`--stop-run: sent SIGTERM to pid ${pid}, waiting up to 30s...`);
+
+  // Poll for up to 30s, with 1s steps. Bail early when the PID is dead.
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    if (!isPidAlive(pid)) {
+      console.log(`--stop-run: pid ${pid} exited after ${i + 1}s`);
+      // Verify the lock file was released. acquireLock's dead-PID auto-clear
+      // will catch any orphan on the next run start anyway, but reporting the
+      // state here saves the user a follow-up command.
+      const lockFile = lockPath(record.stateSlug);
+      if (fs.existsSync(lockFile)) {
+        console.warn(
+          `--stop-run: lock file still present at ${lockFile} (orphan; next run will auto-clear)`,
+        );
+      } else {
+        console.log(`--stop-run: lock file released`);
+      }
+      return 0;
+    }
+  }
+
+  console.error(
+    `--stop-run: pid ${pid} still alive after 30s — investigate manually`,
+  );
+  return 3;
+}
+
 async function main() {
   // Install SIGTERM/SIGINT/SIGHUP handlers before spawning anything so the
   // first sub-process to outlive a survivable signal still gets reaped.
@@ -7633,6 +7763,14 @@ async function main() {
     sweepOrphans(args.activeRunRegistry);
   } catch (err) {
     console.warn(`[sweep] startup sweep failed: ${(err as Error).message}`);
+  }
+
+  // Bug 6: --stop-run handler. Runs after orphan sweep so a dead-PID lock
+  // is auto-cleared first; otherwise stop-run can short-circuit on a stale
+  // lock instead of telling the user the daemon was already gone.
+  if (args.stopRun) {
+    const exitCode = await runStopRun(args.stopRun, args.activeRunRegistry);
+    process.exit(exitCode);
   }
 
   if (args.mode === "merge") {
