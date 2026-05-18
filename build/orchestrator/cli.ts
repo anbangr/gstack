@@ -741,6 +741,26 @@ export function resolveTestCmd(args: Args, cwd: string): string | null {
 }
 
 /**
+ * Per-phase wrapper around resolveTestCmd. If the phase declares a per-phase
+ * test-command via `<!-- testCmd: <cmd> -->` in its body, honor that;
+ * otherwise fall through to the existing resolution priority.
+ *
+ * Why this exists: polyglot monorepos can need different runners for
+ * different phases of the same plan (e.g. mitosis-prototype's Python schema
+ * feature and TypeScript openclaw feature sharing a root). detectTestCmd's
+ * static heuristic can only pick one. The plan author knows which runner
+ * each phase needs; this lets them say so.
+ */
+export function resolveTestCmdForPhase(
+  args: Args,
+  cwd: string,
+  phase: Phase,
+): string | null {
+  if (phase.testCmdOverride) return phase.testCmdOverride;
+  return resolveTestCmd(args, cwd);
+}
+
+/**
  * Resolve the framework name for prompt-hint purposes. Mirror of resolveTestCmd
  * but returns just the framework label (vitest|jest|…) or null.
  */
@@ -5795,7 +5815,7 @@ async function runPhase(args: {
           stdout: "[dry-run] tests would fail (Red)",
         });
       } else {
-        const testCmd = resolveTestCmd(args, cwd);
+        const testCmd = resolveTestCmdForPhase(args, cwd, phase);
         if (!testCmd) {
           console.warn(
             "  ⚠ no test command detected; assuming Red for VERIFY_RED",
@@ -5830,7 +5850,7 @@ async function runPhase(args: {
           stdout: "[dry-run] tests would pass (Green)",
         });
       } else {
-        effectiveTestCmd = resolveTestCmd(args, cwd);
+        effectiveTestCmd = resolveTestCmdForPhase(args, cwd, phase);
         if (!effectiveTestCmd) {
           // No test cmd: skip test verification, treat as green.
           console.warn(
@@ -6050,7 +6070,7 @@ async function runPhase(args: {
         const phaseN = phase.number;
         const it = action.iteration;
 
-        const dualTestCmd = resolveTestCmd(args, cwd);
+        const dualTestCmd = resolveTestCmdForPhase(args, cwd, phase);
 
         const runCandidate = async (candidate: DualImplCandidateKey) => {
           const opponent: DualImplCandidateKey =
@@ -6430,7 +6450,7 @@ async function runPhase(args: {
           );
           // Re-run tests inline since cached results are stale.
           // Reuse the existing testCmd detection below.
-          const testCmd = resolveTestCmd(args, cwd);
+          const testCmd = resolveTestCmdForPhase(args, cwd, phase);
           if (!testCmd) {
             console.warn(
               "  ⚠ no test command detected for dual-tests; assuming both green",
@@ -6496,7 +6516,7 @@ async function runPhase(args: {
           };
         }
       } else {
-        const testCmd = resolveTestCmd(args, cwd);
+        const testCmd = resolveTestCmdForPhase(args, cwd, phase);
         if (!testCmd) {
           // No test cmd: assume both green so judge runs.
           console.warn(

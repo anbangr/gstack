@@ -656,3 +656,127 @@ This phase shows how to use the annotation:
     expect(phases[2].auditOnly).toBe(true);
   });
 });
+
+describe("parsePlan — testCmd annotation", () => {
+  it("sets phase.testCmdOverride when <!-- testCmd: ... --> appears in body", () => {
+    const md = `### Phase 1: Pytest-only phase in a polyglot repo
+<!-- testCmd: pytest tests/test_capability_assembler_behavior.py -->
+- [ ] **Implementation**: emit behavior defaults from layer 1
+- [ ] **Review**: confirm tests pass
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases).toHaveLength(1);
+    expect(phases[0].testCmdOverride).toBe(
+      "pytest tests/test_capability_assembler_behavior.py",
+    );
+  });
+
+  it("leaves phase.testCmdOverride undefined when annotation is absent", () => {
+    const md = `### Phase 1: Normal phase
+- [ ] **Implementation**: write code
+- [ ] **Review**: review code
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases).toHaveLength(1);
+    expect(phases[0].testCmdOverride).toBeUndefined();
+  });
+
+  it("ignores <!-- testCmd: ... --> inside a fenced code block", () => {
+    // Plan documentation showing the syntax must not become the active command.
+    const md = `### Phase 1: Documentation phase
+This phase shows how to use the annotation:
+
+\`\`\`markdown
+<!-- testCmd: pytest tests/foo.py -->
+\`\`\`
+
+- [ ] **Implementation**: document it
+- [ ] **Review**: review the docs
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases[0].testCmdOverride).toBeUndefined();
+  });
+
+  it("combines <!-- testCmd: ... --> with <!-- kind: code --> on the same phase", () => {
+    const md = `### Phase 1: Layer 1 generator emits behavior defaults
+<!-- kind: code -->
+<!-- testCmd: pytest tests/test_capability_assembler_behavior.py -->
+- [ ] **Implementation**: emit defaults
+- [ ] **Review**: confirm green
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases[0].kind).toBe("code");
+    expect(phases[0].testCmdOverride).toBe(
+      "pytest tests/test_capability_assembler_behavior.py",
+    );
+  });
+
+  it("matches case-insensitively on the key and trims the value", () => {
+    const md = `### Phase 1: Mixed case key
+<!-- TESTCMD: pytest tests/foo.py -->
+- [ ] **Implementation**: do
+- [ ] **Review**: review
+
+### Phase 2: Extra whitespace around value
+<!--   testCmd:   pytest tests/bar.py   -->
+- [ ] **Implementation**: do
+- [ ] **Review**: review
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases).toHaveLength(2);
+    expect(phases[0].testCmdOverride).toBe("pytest tests/foo.py");
+    expect(phases[1].testCmdOverride).toBe("pytest tests/bar.py");
+  });
+
+  it("preserves embedded shell metacharacters verbatim in the captured value", () => {
+    // pytest -k "expr and other" is a legitimate selector; we must NOT escape or
+    // strip these characters. The shell-evaluation trust boundary is the user's,
+    // same as --test-cmd on the CLI.
+    const md = `### Phase 1: Filtered pytest run
+<!-- testCmd: pytest -k "behavior and not slow" tests/ -->
+- [ ] **Implementation**: do
+- [ ] **Review**: review
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases[0].testCmdOverride).toBe(
+      'pytest -k "behavior and not slow" tests/',
+    );
+  });
+
+  it("warns and ignores an empty <!-- testCmd: --> annotation", () => {
+    const md = `### Phase 1: Typo'd annotation
+<!-- testCmd:   -->
+- [ ] **Implementation**: do
+- [ ] **Review**: review
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(phases[0].testCmdOverride).toBeUndefined();
+    expect(
+      warnings.some(
+        (w) =>
+          w.includes("Phase 1") && w.includes("testCmd annotation is empty"),
+      ),
+    ).toBe(true);
+  });
+
+  it("first occurrence wins when multiple annotations are present", () => {
+    // Defensive: prevents a later malformed/empty repeat from clobbering an
+    // earlier good value, and matches the audit-only / kind first-write-wins
+    // pattern.
+    const md = `### Phase 1: Two annotations
+<!-- testCmd: pytest tests/first.py -->
+<!-- testCmd: pytest tests/second.py -->
+- [ ] **Implementation**: do
+- [ ] **Review**: review
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases[0].testCmdOverride).toBe("pytest tests/first.py");
+  });
+});
