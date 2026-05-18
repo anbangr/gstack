@@ -823,6 +823,10 @@ export function parseArgs(argv: string[]): Args {
   };
   const positional: string[] = [];
   const roleFlags = buildRoleFlagMap();
+  // Tracks whether the user explicitly passed --max-wall-ms. When false,
+  // the post-loop Claude-Code wall-time cap can safely override the default
+  // without trampling an operator's intent.
+  let userSetMaxWallMs = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--print-only") args.printOnly = true;
@@ -941,6 +945,7 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.monitorMaxWallMs = n;
+      userSetMaxWallMs = true;
     } else if (a === "--feature-review-max-iter") {
       const next = argv[++i];
       const n = Number(next);
@@ -1352,7 +1357,43 @@ export function parseArgs(argv: string[]): Args {
     console.error(providerErrors.join("\n"));
     process.exit(2);
   }
+  // Claude Code's Bash tool auto-backgrounds commands that run past ~10 min,
+  // breaking the monitor's synchronous re-entry contract. When we detect we
+  // are running inside Claude Code, cap the monitor wall-time at 9 min so
+  // every cycle exits with MONITOR_REENTER before the host backgrounds us.
+  // Explicit --max-wall-ms wins so power users can opt out.
+  const cap = resolveClaudeCodeMonitorWallMsCap({
+    env: process.env,
+    userSetMaxWallMs,
+    currentMaxWallMs: args.monitorMaxWallMs,
+  });
+  if (cap !== null) {
+    args.monitorMaxWallMs = cap;
+  }
   return args;
+}
+
+/**
+ * Returns the wall-time cap to apply when running inside Claude Code, or
+ * null when no cap should be applied. Exported for unit testing — see
+ * __tests__/claude-code-wall-cap.test.ts.
+ *
+ * Rules:
+ *  - User explicitly set --max-wall-ms ⟹ no cap (respect intent).
+ *  - CLAUDECODE env var unset ⟹ no cap.
+ *  - Current value already at or below 540000 ⟹ no cap (idempotent).
+ *  - Otherwise return 540000 (9 minutes, below the ~10 min Bash limit).
+ */
+export function resolveClaudeCodeMonitorWallMsCap(opts: {
+  env: NodeJS.ProcessEnv;
+  userSetMaxWallMs: boolean;
+  currentMaxWallMs: number;
+}): number | null {
+  if (opts.userSetMaxWallMs) return null;
+  if (!opts.env.CLAUDECODE) return null;
+  const CLAUDE_CODE_CAP_MS = 540_000;
+  if (opts.currentMaxWallMs <= CLAUDE_CODE_CAP_MS) return null;
+  return CLAUDE_CODE_CAP_MS;
 }
 
 export function validateRoleProviders(
