@@ -422,6 +422,27 @@ The orchestrator stops at any of these and writes the failure reason into the st
 
 Exit codes: `0` clean run, `1` phase failed, `2` bad args, `3` lock contention, `130` SIGINT.
 
+## Running inside Claude Code or other supervisors
+
+`gstack-build monitor --watch` is a foreground process by design. It exits with
+code `12` (`MONITOR_REENTER`) when it hits its wall-time budget, and the caller
+re-enters with the same flags to continue. That exit code is only meaningful
+to a synchronous caller — if the monitor is backgrounded with `nohup … &
+disown` or similar, the caller loses the signal and the build silently stalls.
+
+**Background the orchestrator, not the monitor.** Patterns like `gstack-build
+… & disown` work for the orchestrator itself; only the foreground monitor
+needs to stay attached.
+
+**Claude Code's Bash auto-background threshold.** Claude Code backgrounds
+commands that run past ~10 minutes, which breaks the monitor's synchronous
+re-entry contract. Since v1.40+, `parseArgs` detects `CLAUDECODE` in the
+environment and caps `monitorMaxWallMs` to `540000` (9 min) when the user
+hasn't passed `--max-wall-ms` explicitly. Each Bash invocation re-enters the
+monitor, and the build progresses one cycle at a time. To opt out (e.g.
+custom supervisor wrapping Claude Code) pass `--max-wall-ms <ms>` and the
+auto-cap is skipped.
+
 ## Mark a feature as already-shipped
 
 When a feature was merged outside the orchestrator's normal pipeline (manual
