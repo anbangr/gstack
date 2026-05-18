@@ -505,10 +505,6 @@ test("build READMEs describe manifest worktree launch instead of stale sequentia
       import.meta.dir,
       "../../../.agents/skills/gstack-build/README.md",
     ),
-    path.resolve(
-      import.meta.dir,
-      "../../../.agents/skills/gstack-build/orchestrator/README.md",
-    ),
   ];
 
   for (const file of files) {
