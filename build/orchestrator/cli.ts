@@ -9064,15 +9064,61 @@ async function main() {
                 // indexes and adding pending PhaseStates for the new ones.
                 // It also rebuilds every feature.phaseIndexes from the
                 // reparsed Feature objects.
+                //
+                // The reconciler throws if a phase present in state is
+                // missing from the re-parsed plan (out-of-band edit, parser
+                // regression). Catch that here so we pause the feature with
+                // a BLOCKED report rather than crashing the orchestrator —
+                // by the time we reach this branch, appendFeaturePhases has
+                // already written the plan and phasesAdded is persisted, so
+                // an uncaught throw would leave the on-disk state diverged
+                // from the plan file until next /ship.
                 const newContent = fs.readFileSync(args.planFile, "utf8");
                 const reparsed = parsePlan(newContent, {
                   dualImpl: args.dualImpl,
                 });
-                const { addedNumbers } = reconcileStatePhasesAfterReparse(
-                  state,
-                  reparsed.phases,
-                  reparsed.features,
-                );
+                let addedNumbers: string[];
+                try {
+                  ({ addedNumbers } = reconcileStatePhasesAfterReparse(
+                    state,
+                    reparsed.phases,
+                    reparsed.features,
+                  ));
+                } catch (err) {
+                  const reason = `Plan re-parse after FEATURE_NEEDS_PHASES dropped phases that state still tracks: ${(err as Error).message}`;
+                  console.error(`✗ Feature ${featureState.number}: ${reason}`);
+                  const lastReportPath =
+                    featureState.featureReview?.outputFilePaths?.at(-1);
+                  const md = buildBlockedFeatureMd({
+                    feature: featureDef,
+                    featureState,
+                    reason,
+                    lastReportPath,
+                    planFile: args.planFile,
+                    timestamp: new Date().toISOString(),
+                  });
+                  const blockedPath = path.join(
+                    cwd,
+                    `BLOCKED-feature-${featureState.number}.md`,
+                  );
+                  try {
+                    fs.writeFileSync(blockedPath, md);
+                    console.error(`  → Wrote ${blockedPath}`);
+                  } catch (writeErr) {
+                    console.error(
+                      `  → Failed to write ${blockedPath}: ${(writeErr as Error).message}`,
+                    );
+                  }
+                  ensureBlockedGitignored(cwd);
+                  featureState.status = "feature_blocked";
+                  featureState.error = featureState.error ?? reason;
+                  saveState(state, {
+                    noGbrain: args.noGbrain,
+                    log: console.warn,
+                  });
+                  reviewLoopAction = "blocked";
+                  break;
+                }
                 // Replace outer-scope arrays so subsequent iterations see
                 // the new shape.
                 phases = reparsed.phases;

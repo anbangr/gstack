@@ -342,9 +342,13 @@ export function reconcileStatePhasesAfterReparse(
   // Rebuild every feature.phaseIndexes from the reparsed Feature objects.
   // The parser already populated reparsed Feature.phaseIndexes with the
   // correct new positions; we just copy.
-  for (const fs of state.features ?? []) {
-    const refreshed = reparsedFeatures.find((f) => f.number === fs.number);
-    fs.phaseIndexes = refreshed ? [...refreshed.phaseIndexes] : [];
+  // Loop var is `featureState` (not `fs`) to avoid shadowing the module-level
+  // `import * as fs from "fs"`.
+  for (const featureState of state.features ?? []) {
+    const refreshed = reparsedFeatures.find(
+      (f) => f.number === featureState.number,
+    );
+    featureState.phaseIndexes = refreshed ? [...refreshed.phaseIndexes] : [];
   }
 
   // Chase currentPhaseIndex forward by number.
