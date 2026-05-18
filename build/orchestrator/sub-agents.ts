@@ -141,6 +141,67 @@ export function checkPhaseScope(inputFilePath: string): PhaseScopeCheck {
   return { ok: true, promptChars, filePathMentions };
 }
 
+/**
+ * F3: budget-aware fallback policy.
+ *
+ * The existing fallback contract (`primaryMs / 2`) assumes the failure mode
+ * is a transient model service hiccup. When the primary actually TIMED OUT,
+ * the failure mode is more likely "task too big for the budget" — and giving
+ * the backup half the time the primary just exhausted produces "blind
+ * execution": the backup model runs out of read budget, gives up on
+ * `read_file` calls, and writes inferred edits.
+ *
+ * Policy:
+ *   - On primary `error` (exit != 0 without timedOut): keep the half-budget
+ *     contract. This is the "model hiccup" case the fallback was designed
+ *     for. Caller invokes resolveFallbackForConfigured as before.
+ *   - On primary `timeout`: re-check scope with a stricter threshold (half
+ *     of GSTACK_BUILD_MAX_PROMPT_CHARS, defaulting to half the default).
+ *       - If the input now trips the stricter scope check → return
+ *         phase_oversized; no backup spawn. Caller surfaces a clear "split
+ *         this phase" verdict instead of producing inferred edits.
+ *       - Otherwise → escalate the backup timeout to the primary's budget.
+ *         Same prompt, same time, different model — the actual fallback
+ *         contract.
+ *
+ * Pure function: takes the failure kind, the primary's resolved timeout,
+ * the input file size in bytes, and a stricter threshold; returns the
+ * dispatch verdict. cli.ts/dispatch site is responsible for converting
+ * `phase_oversized` into the SubAgentResult shape callers expect.
+ */
+export type TimeoutFallbackVerdict =
+  | { kind: "halved_budget"; timeoutMs: number }
+  | { kind: "escalate_budget"; timeoutMs: number }
+  | { kind: "phase_oversized"; reason: string };
+
+export function resolveTimeoutFallback(opts: {
+  primaryFailureKind: "timeout" | "error";
+  primaryTimeoutMs: number;
+  inputFileSize: number;
+  strictThresholdBytes: number;
+}): TimeoutFallbackVerdict {
+  // Non-timeout failures: keep existing half-budget contract.
+  if (opts.primaryFailureKind === "error") {
+    return {
+      kind: "halved_budget",
+      timeoutMs: Math.max(60000, Math.floor(opts.primaryTimeoutMs / 2)),
+    };
+  }
+  // Timeout: re-check scope with a stricter threshold.
+  if (opts.inputFileSize > opts.strictThresholdBytes) {
+    return {
+      kind: "phase_oversized",
+      reason:
+        `phase prompt is ${opts.inputFileSize} bytes; ` +
+        `exceeds stricter post-timeout threshold of ${opts.strictThresholdBytes} bytes. ` +
+        `Primary timed out on this size, so the backup would too. Decompose the phase, ` +
+        `or raise GSTACK_BUILD_MAX_PROMPT_CHARS to widen the threshold.`,
+    };
+  }
+  // Timeout but scope re-check passed: same budget the primary had.
+  return { kind: "escalate_budget", timeoutMs: opts.primaryTimeoutMs };
+}
+
 export type Verdict = "pass" | "fail" | "unclear";
 
 export interface SubAgentResult {
@@ -1256,15 +1317,62 @@ export async function runConfiguredRoleTask(
   // internal phase dispatcher and this slash-command dispatcher accept
   // different opt shapes (codexDefaultCommand, sandbox).
   if ((result.timedOut || result.exitCode !== 0) && opts.role.backupProvider) {
+    // F3: budget-aware fallback. On primary.timedOut, re-check scope with
+    // a stricter threshold. If the input is too big, surface phase_oversized
+    // directly instead of letting Gemini run on half-budget and produce
+    // blind-execution edits. If scope passes, escalate the backup timeout
+    // to match the primary so the fallback runs on the same budget the
+    // primary just exhausted.
+    const inputFileSize = (() => {
+      try {
+        return fs.statSync(opts.inputFilePath).size;
+      } catch {
+        return 0;
+      }
+    })();
+    const maxChars = envNumberOrDefault("GSTACK_BUILD_MAX_PROMPT_CHARS", 10000);
+    const verdict = resolveTimeoutFallback({
+      primaryFailureKind: result.timedOut ? "timeout" : "error",
+      primaryTimeoutMs: resolved.primaryMs,
+      inputFileSize,
+      strictThresholdBytes: Math.floor(maxChars / 2),
+    });
+
+    if (verdict.kind === "phase_oversized") {
+      console.warn(
+        `[gstack-build] ${opts.logPrefix}: primary ${opts.role.provider} timed out; ` +
+          `${verdict.reason} Skipping backup spawn.`,
+      );
+      fs.writeFileSync(opts.outputFilePath, "");
+      return {
+        stdout: "",
+        stderr: `phase_oversized: ${verdict.reason}`,
+        exitCode: 1,
+        timedOut: false,
+        logPath: result.logPath,
+        durationMs: result.durationMs,
+        retries: result.retries,
+      };
+    }
+
     console.warn(
       `[gstack-build] ${opts.logPrefix}: primary ${opts.role.provider} failed ` +
         `(exit=${result.exitCode ?? "null"}, timedOut=${result.timedOut}); ` +
-        `falling back to ${opts.role.backupProvider} with timeout ${resolved.backupMs}ms (single-shot)`,
+        `falling back to ${opts.role.backupProvider} with timeout ${verdict.timeoutMs}ms (single-shot, ${verdict.kind})`,
     );
     // Zero stale primary output before backup runs. If backup also fails, the
     // caller gets an empty outputFilePath plus the backup's non-zero exit code.
     fs.writeFileSync(opts.outputFilePath, "");
-    return runConfiguredRoleTask(resolveFallbackForConfigured(opts, resolved));
+    // Pass the verdict's budget through resolved so the recursive call's
+    // resolveRoleTimeouts honors it. We override resolved.backupMs only when
+    // escalate_budget fired; halved_budget keeps the existing math.
+    const fallbackResolved = {
+      ...resolved,
+      backupMs: verdict.timeoutMs,
+    };
+    return runConfiguredRoleTask(
+      resolveFallbackForConfigured(opts, fallbackResolved),
+    );
   }
 
   return result;
@@ -1420,12 +1528,51 @@ interface ProjectInspection {
  *
  * When nothing matches: { runner: null, framework: null }.
  */
+/**
+ * Read `gstack.testCmd: <command>` from CLAUDE.md at the project root.
+ * Returns the trimmed command string, or null when:
+ *   - CLAUDE.md does not exist
+ *   - the line is missing
+ *   - the value side is empty / whitespace only
+ *
+ * This is Priority 0 in inspectProject: a project-level escape hatch that
+ * beats every heuristic. CLAUDE.md's "Platform-agnostic design" rule says
+ * the project owns its config; gstack reads it.
+ */
+export function readClaudeMdTestCmd(cwd: string): string | null {
+  const claudeMdPath = path.join(cwd, "CLAUDE.md");
+  let body: string;
+  try {
+    body = fs.readFileSync(claudeMdPath, "utf8");
+  } catch {
+    return null;
+  }
+  // Match "gstack.testCmd: <value>" at the start of a line. Value ends at
+  // newline. Allow horizontal whitespace around the colon, but NOT newlines
+  // (so an empty value on its own line doesn't slurp the next paragraph).
+  const match = body.match(/^gstack\.testCmd[ \t]*:[ \t]*([^\n]*)$/m);
+  if (!match) return null;
+  const value = match[1].trim();
+  return value.length > 0 ? value : null;
+}
+
 export function inspectProject(
   cwd: string,
   opts: { now?: () => number } = {},
 ): ProjectInspection {
   const now = opts.now ?? (() => Date.now());
   const evidence: string[] = [];
+
+  // Priority 0 — explicit CLAUDE.md override. Beats every heuristic. Per
+  // CLAUDE.md "Platform-agnostic design": the project owns its config;
+  // gstack reads it. This is the escape hatch for multi-language repos
+  // (Go service with Node tooling sidecar, etc.) where the tie-break
+  // heuristic flips to the wrong runner.
+  const override = readClaudeMdTestCmd(cwd);
+  if (override) {
+    evidence.push("CLAUDE.md gstack.testCmd override");
+    return { runner: override, framework: null, evidence };
+  }
 
   // Priority 1 — framework-config files.
   const vitestConfig = firstExisting(cwd, [

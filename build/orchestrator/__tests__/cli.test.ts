@@ -1775,6 +1775,91 @@ describe("post-agent hygiene helpers", () => {
     expect(verdict).toEqual({ ok: true, errors: [] });
   });
 
+  it("cleans a stale .git/index.lock (>10s old) before host-committing summary-listed files", () => {
+    // Reproduces F0+F1 from AGNT2 run: a concurrent gstack-build process or a
+    // crashed git op leaves .git/index.lock around; the host-commit recovery
+    // step's `git add` fails with "Unable to create '.../.git/index.lock':
+    // File exists." Pre-fix this surfaces as "QA agent couldn't git add."
+    const before = captureGitSnapshot(tmpDir!);
+    const summary = path.join(tmpDir!, ".llm-tmp", "summary.md");
+    fs.mkdirSync(path.dirname(summary), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir!, "README.md"), "changed\n");
+    fs.writeFileSync(
+      summary,
+      [
+        "# Primary implementor summary",
+        "",
+        "## Files changed",
+        "- `README.md` — update docs.",
+        "",
+        "## Commit",
+        "- Conventional commit message: `feat: stale-lock survivor`",
+      ].join("\n"),
+    );
+
+    // Plant a stale .git/index.lock with mtime 60s in the past. A fresh
+    // lock (< 10s) must NOT be cleaned — that belongs to an active git op.
+    const lockPath = path.join(tmpDir!, ".git", "index.lock");
+    fs.writeFileSync(lockPath, "");
+    const staleMtime = new Date(Date.now() - 60_000);
+    fs.utimesSync(lockPath, staleMtime, staleMtime);
+
+    const recovery = recoverMutableAgentCommit({
+      cwd: tmpDir!,
+      before,
+      outputFilePath: summary,
+      label: "primary implementor",
+    });
+
+    expect(recovery.recovered).toBe(true);
+    expect(recovery.errors).toEqual([]);
+    expect(fs.existsSync(lockPath)).toBe(false);
+    expect(git(["log", "-1", "--pretty=%s"], tmpDir!)).toBe(
+      "feat: stale-lock survivor",
+    );
+  });
+
+  it("leaves a fresh .git/index.lock (<10s old) in place and surfaces a clear error", () => {
+    // Negative case: a lock that's < 10s old belongs to a concurrent active
+    // git op. Removing it would corrupt that op's transaction. The recovery
+    // must NOT clean fresh locks; instead, surface the git error so the
+    // operator knows to retry.
+    const before = captureGitSnapshot(tmpDir!);
+    const summary = path.join(tmpDir!, ".llm-tmp", "summary.md");
+    fs.mkdirSync(path.dirname(summary), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir!, "README.md"), "changed\n");
+    fs.writeFileSync(
+      summary,
+      [
+        "# Primary implementor summary",
+        "",
+        "## Files changed",
+        "- `README.md` — update docs.",
+        "",
+        "## Commit",
+        "- Conventional commit message: `feat: fresh-lock-blocked`",
+      ].join("\n"),
+    );
+
+    const lockPath = path.join(tmpDir!, ".git", "index.lock");
+    fs.writeFileSync(lockPath, "");
+    // mtime = now (fresh); fs.writeFileSync already set this, but be explicit.
+    const freshMtime = new Date(Date.now() - 1_000);
+    fs.utimesSync(lockPath, freshMtime, freshMtime);
+
+    const recovery = recoverMutableAgentCommit({
+      cwd: tmpDir!,
+      before,
+      outputFilePath: summary,
+      label: "primary implementor",
+    });
+
+    expect(recovery.recovered).toBe(false);
+    expect(recovery.errors.join("\n")).toMatch(/index\.lock|File exists/);
+    // Fresh lock survives: we did not clobber a concurrent op's transaction.
+    expect(fs.existsSync(lockPath)).toBe(true);
+  });
+
   it("recovers uncommitted files listed as markdown links in agent summaries", () => {
     const before = captureGitSnapshot(tmpDir!);
     const summary = path.join(tmpDir!, ".llm-tmp", "summary.md");

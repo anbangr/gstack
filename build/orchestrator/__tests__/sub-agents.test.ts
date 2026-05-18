@@ -28,6 +28,7 @@ import {
   resolveRoleTimeouts,
   resolveFallbackForConfigured,
   resolveFallbackForRoleTask,
+  resolveTimeoutFallback,
   checkPhaseScope,
   type RunConfiguredRoleTaskOpts,
   type RunRoleTaskOpts,
@@ -1965,6 +1966,80 @@ describe("inspectProject — tie-break for mixed-language repos", () => {
   });
 });
 
+describe("inspectProject — CLAUDE.md gstack.testCmd override", () => {
+  // Reproduces F2 from AGNT2 run: a Go service with a Node tooling sidecar
+  // has both go.mod and package.json. The tie-break heuristic flipped to
+  // `npx vitest run`, test-fixer ran in a Go directory with no JS tests to
+  // fix, hygiene rejected. The fix: an explicit CLAUDE.md override is
+  // Priority 0, ahead of every heuristic.
+  it("Go + Node sidecar with gstack.testCmd override → returns override verbatim", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "go.mod"), "module foo\ngo 1.22\n");
+      fs.writeFileSync(
+        path.join(cwd, "package.json"),
+        JSON.stringify({ scripts: { test: "vitest run" } }),
+      );
+      // Stack the deck against go test: more TS test files than Go.
+      for (let i = 0; i < 5; i += 1) {
+        fs.writeFileSync(path.join(cwd, `a${i}.test.ts`), "");
+      }
+      fs.writeFileSync(path.join(cwd, "pkg_test.go"), "package foo\n");
+      // Override in CLAUDE.md beats the heuristic.
+      fs.writeFileSync(
+        path.join(cwd, "CLAUDE.md"),
+        "# proj\n\ngstack.testCmd: go test ./...\n\nmore prose\n",
+      );
+
+      const r = inspectProject(cwd);
+      expect(r.runner).toBe("go test ./...");
+      // framework stays null when override is used — we know the command,
+      // not the framework, and don't need to guess.
+      expect(r.framework).toBe(null);
+      expect(r.evidence.some((e) => e.includes("CLAUDE.md"))).toBe(true);
+    });
+  });
+
+  it("override beats vitest.config.ts (the highest-priority heuristic)", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "vitest.config.ts"), "");
+      fs.writeFileSync(path.join(cwd, "package.json"), "{}");
+      fs.writeFileSync(
+        path.join(cwd, "CLAUDE.md"),
+        "gstack.testCmd: pnpm exec vitest run --reporter=verbose\n",
+      );
+
+      const r = inspectProject(cwd);
+      expect(r.runner).toBe("pnpm exec vitest run --reporter=verbose");
+      expect(r.framework).toBe(null);
+    });
+  });
+
+  it("ignores a malformed/empty override and falls through to heuristics", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "go.mod"), "module foo\ngo 1.22\n");
+      // Empty value on the right-hand side: not a usable command. Ignore.
+      fs.writeFileSync(
+        path.join(cwd, "CLAUDE.md"),
+        "gstack.testCmd:\n\nrest of doc\n",
+      );
+
+      const r = inspectProject(cwd);
+      // Falls through to single-language Go fallthrough (Priority 3).
+      expect(r.runner).toBe("go test ./...");
+      expect(r.framework).toBe("go");
+    });
+  });
+
+  it("no CLAUDE.md present → falls through to heuristics", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "go.mod"), "module foo\ngo 1.22\n");
+      const r = inspectProject(cwd);
+      expect(r.runner).toBe("go test ./...");
+      expect(r.framework).toBe("go");
+    });
+  });
+});
+
 describe("inspectProject — single-language fallthrough", () => {
   it("go.mod alone → go test ./...", () => {
     withTmp((cwd) => {
@@ -2320,6 +2395,57 @@ describe("resolveFallbackForConfigured", () => {
     const resolved = resolveRoleTimeouts(baseOpts.role);
     const out = resolveFallbackForConfigured(baseOpts, resolved);
     expect(out.logPrefix).toBe("primary-impl-backup-gemini");
+  });
+});
+
+describe("resolveTimeoutFallback (F3 budget-aware fallback)", () => {
+  // Reproduces F3 from AGNT2 run: Kimi test-fixer timed out, Gemini backup got
+  // "blind execution" because Gemini was given half the time Kimi just
+  // exhausted on the same prompt. Symptom: backup model gives up reading and
+  // starts guessing. Fix shape: on primary.timedOut === true (not generic
+  // exitCode != 0), re-check scope; if oversized, surface phase_oversized
+  // directly; otherwise escalate backup timeout to match the primary.
+  it("returns 'phase_oversized' verdict when re-check trips a stricter threshold", () => {
+    // Pre-fix this function doesn't exist. Post-fix: timed out + input
+    // exceeds stricter threshold → no Gemini spawn, return verdict.
+    const v = resolveTimeoutFallback({
+      primaryFailureKind: "timeout",
+      primaryTimeoutMs: 1_500_000,
+      inputFileSize: 200_000, // bytes — large prompt
+      strictThresholdBytes: 100_000,
+    });
+    expect(v.kind).toBe("phase_oversized");
+    if (v.kind === "phase_oversized") {
+      expect(v.reason).toMatch(/200000|too large|exceeds/);
+    }
+  });
+
+  it("escalates backup timeout to the primary's budget when scope re-check passes", () => {
+    const v = resolveTimeoutFallback({
+      primaryFailureKind: "timeout",
+      primaryTimeoutMs: 1_500_000,
+      inputFileSize: 50_000,
+      strictThresholdBytes: 100_000,
+    });
+    expect(v.kind).toBe("escalate_budget");
+    if (v.kind === "escalate_budget") {
+      // Same budget Kimi had, not half.
+      expect(v.timeoutMs).toBe(1_500_000);
+    }
+  });
+
+  it("keeps half-budget behavior for non-timeout failures (model service hiccup)", () => {
+    const v = resolveTimeoutFallback({
+      primaryFailureKind: "error",
+      primaryTimeoutMs: 1_500_000,
+      inputFileSize: 50_000,
+      strictThresholdBytes: 100_000,
+    });
+    expect(v.kind).toBe("halved_budget");
+    if (v.kind === "halved_budget") {
+      // Current behavior: backupMs = max(60s, primary/2) ≈ 750_000.
+      expect(v.timeoutMs).toBe(750_000);
+    }
   });
 });
 

@@ -2233,6 +2233,39 @@ export function recoverMutableAgentCommit(opts: {
     };
   }
 
+  // F0+F1: a concurrent gstack-build process or a crashed git op can leave
+  // .git/index.lock around. The next `git add` then fails with "Unable to
+  // create '.../.git/index.lock': File exists." Fresh locks (< 10s old)
+  // belong to an active git op — clobbering them corrupts that transaction.
+  // Stale locks (>= 10s old) are abandoned; remove them so recovery proceeds.
+  const lockPath = path.join(opts.cwd, ".git", "index.lock");
+  try {
+    const lockStat = fs.statSync(lockPath);
+    const ageMs = Date.now() - lockStat.mtimeMs;
+    if (ageMs >= 10_000) {
+      try {
+        fs.unlinkSync(lockPath);
+        console.warn(
+          `[${opts.label}] cleaned stale .git/index.lock (mtime ${lockStat.mtime.toISOString()}, age ${Math.round(ageMs / 1000)}s) before host-commit recovery`,
+        );
+      } catch (err) {
+        // If we can't remove it (EPERM, somebody recreated it), let the
+        // `git add` below fail with the original error — don't mask.
+        console.warn(
+          `[${opts.label}] could not remove stale .git/index.lock: ${(err as Error).message}`,
+        );
+      }
+    }
+  } catch (err) {
+    // ENOENT is the happy path: no lock to worry about. Anything else is
+    // unexpected but non-fatal here; `git add` will surface the real issue.
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(
+        `[${opts.label}] unexpected error checking .git/index.lock: ${(err as Error).message}`,
+      );
+    }
+  }
+
   const add = spawnSync("git", ["add", "--", ...stagedPaths], {
     cwd: opts.cwd,
     encoding: "utf8",
