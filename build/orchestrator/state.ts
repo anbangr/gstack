@@ -255,6 +255,108 @@ export function backfillKindFromPlan(
 }
 
 /**
+ * Reconcile state.phases against a freshly re-parsed plan after the
+ * orchestrator mutates the plan mid-run (FEATURE_NEEDS_PHASES verdict
+ * path). The plan-mutator inserts new phase headings under the named
+ * feature, which lives anywhere in the plan — not necessarily at the
+ * end. That insertion shifts the parser-assigned `Phase.index` of every
+ * downstream phase by the number of newly inserted entries.
+ *
+ * The old strategy was "slice the tail of reparsed.phases and push" — it
+ * assumed new phases land at the end of the array. For any non-last
+ * feature that assumption silently aliased the new review phase onto
+ * an existing PhaseState slot, leaving the new phase un-executed and
+ * corrupting the downstream feature's runtime state.
+ *
+ * The fix is to rebuild state.phases by joining against reparsed.phases
+ * on phase number (PhaseState.number, Phase.number — both are unique
+ * within a plan because the parser rejects duplicate headings).
+ *
+ *   - Existing phases: keep their PhaseState (status, gemini/codex
+ *     iteration counts, etc.) and re-key the in-memory `index` to the
+ *     new array position.
+ *   - New phases: append a fresh `{status: "pending"}` PhaseState.
+ *   - Dropped phases: fail closed. The plan was edited out-of-band
+ *     and continuing would silently lose runtime state.
+ *
+ * Also rebuilds every `feature.phaseIndexes` from the reparsed Feature
+ * objects so downstream readers (the inner phase loop, parallel
+ * planner, mark-shipped, monitor) see indexes that match the new
+ * `state.phases` positions.
+ *
+ * `state.currentPhaseIndex` is rechased by the original phase's
+ * `.number`. If the in-flight phase was somehow dropped (shouldn't
+ * happen — the fail-closed branch above would have thrown), the
+ * pointer is cleared.
+ */
+export function reconcileStatePhasesAfterReparse(
+  state: BuildState,
+  reparsedPhases: Phase[],
+  reparsedFeatures: Feature[],
+): { addedNumbers: string[] } {
+  const byNumber = new Map<string, PhaseState>();
+  for (const ps of state.phases) {
+    byNumber.set(ps.number, ps);
+  }
+
+  // Snapshot currentPhaseIndex → number BEFORE we mutate state.phases.
+  let currentPhaseNumber: string | undefined;
+  if (state.currentPhaseIndex != null) {
+    currentPhaseNumber = state.phases[state.currentPhaseIndex]?.number;
+  }
+
+  const next: PhaseState[] = [];
+  const added: string[] = [];
+  for (const p of reparsedPhases) {
+    const existing = byNumber.get(p.number);
+    if (existing) {
+      existing.index = p.index;
+      existing.name = p.name;
+      if (!existing.kind && p.kind) existing.kind = p.kind;
+      next.push(existing);
+      byNumber.delete(p.number);
+    } else {
+      next.push({
+        index: p.index,
+        number: p.number,
+        name: p.name,
+        status: "pending",
+        kind: p.kind ?? "code",
+      });
+      added.push(p.number);
+    }
+  }
+
+  const dropped = [...byNumber.keys()];
+  if (dropped.length > 0) {
+    throw new Error(
+      `reconcileStatePhasesAfterReparse: ${dropped.length} phase(s) ` +
+        `present in state but missing from re-parsed plan: ${dropped.join(", ")}. ` +
+        `Refusing to drop runtime state. Inspect the plan file and resume with ` +
+        `--no-resume if the drop was intentional.`,
+    );
+  }
+
+  state.phases = next;
+
+  // Rebuild every feature.phaseIndexes from the reparsed Feature objects.
+  // The parser already populated reparsed Feature.phaseIndexes with the
+  // correct new positions; we just copy.
+  for (const fs of state.features ?? []) {
+    const refreshed = reparsedFeatures.find((f) => f.number === fs.number);
+    fs.phaseIndexes = refreshed ? [...refreshed.phaseIndexes] : [];
+  }
+
+  // Chase currentPhaseIndex forward by number.
+  if (currentPhaseNumber != null) {
+    const refreshed = next.find((ps) => ps.number === currentPhaseNumber);
+    state.currentPhaseIndex = refreshed?.index;
+  }
+
+  return { addedNumbers: added };
+}
+
+/**
  * Load state for a plan. Strategy:
  *   1. Try local JSON (fast, always-on, source of truth).
  *   2. If JSON missing AND gbrain available, try gbrain (resume on a
