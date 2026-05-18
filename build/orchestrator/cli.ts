@@ -72,12 +72,13 @@ import {
   type Action,
 } from "./phase-runner";
 import {
-  runGemini,
   runKimi,
   runClaudeTask,
   runSlashCommand,
   runConfiguredRoleTask,
   runRoleTask as runGeminiRoleTask,
+  resolveRoleTimeouts,
+  resolveFallbackForRoleTask,
   detectTestCmd,
   detectTestFramework,
   frameworkToRunner,
@@ -3443,11 +3444,20 @@ export async function runRoleTask(opts: {
   phaseNumber: string;
   iteration: number;
   logPrefix: string;
+  timeoutMs?: number;
+  retryOnTimeout?: boolean;
 }): Promise<SubAgentResult> {
+  const resolved = resolveRoleTimeouts(opts.role, opts.timeoutMs);
+  const effectiveTimeoutMs = resolved.primaryMs;
+  const retryOnTimeout =
+    opts.retryOnTimeout !== undefined
+      ? opts.retryOnTimeout
+      : resolved.retryOnTimeout;
+
   let result: SubAgentResult;
 
   if (opts.role.provider === "gemini") {
-    result = await runGemini({
+    result = await runGeminiRoleTask({
       inputFilePath: opts.inputFilePath,
       outputFilePath: opts.outputFilePath,
       cwd: opts.cwd,
@@ -3456,6 +3466,8 @@ export async function runRoleTask(opts: {
       iteration: opts.iteration,
       logPrefix: opts.logPrefix,
       model: opts.role.model,
+      timeoutMs: effectiveTimeoutMs,
+      retryOnTimeout,
     });
   } else if (opts.role.provider === "kimi") {
     result = await runKimi({
@@ -3467,6 +3479,8 @@ export async function runRoleTask(opts: {
       iteration: opts.iteration,
       logPrefix: opts.logPrefix,
       model: opts.role.model,
+      timeoutMs: effectiveTimeoutMs,
+      retryOnTimeout,
     });
   } else if (opts.role.provider === "codex") {
     result = await runCodexImpl({
@@ -3479,6 +3493,8 @@ export async function runRoleTask(opts: {
       logPrefix: opts.logPrefix,
       model: opts.role.model,
       reasoning: opts.role.reasoning,
+      timeoutMs: effectiveTimeoutMs,
+      retryOnTimeout,
     });
   } else {
     result = await runClaudeTask({
@@ -3491,34 +3507,25 @@ export async function runRoleTask(opts: {
       logPrefix: opts.logPrefix,
       model: opts.role.model,
       reasoning: opts.role.reasoning,
+      timeoutMs: effectiveTimeoutMs,
+      retryOnTimeout,
     });
   }
 
-  // MIRROR: sub-agents.ts::runConfiguredRoleTask contains an identical fallback
-  // block for the sub-agent dispatcher. Any change to this logic (log format,
-  // clear-before-backup, role shape) must also be applied there.
+  // MIRROR: sub-agents.ts::runConfiguredRoleTask runs an identical fallback via
+  // resolveFallbackForConfigured. The two functions exist because the CLI's
+  // internal phase dispatcher and the slash-command dispatcher accept
+  // different opt shapes (codexDefaultCommand, sandbox).
   if ((result.timedOut || result.exitCode !== 0) && opts.role.backupProvider) {
     console.warn(
       `[gstack-build] ${opts.logPrefix}: primary ${opts.role.provider} failed ` +
         `(exit=${result.exitCode ?? "null"}, timedOut=${result.timedOut}); ` +
-        `falling back to ${opts.role.backupProvider}`,
+        `falling back to ${opts.role.backupProvider} with timeout ${resolved.backupMs}ms (single-shot)`,
     );
     // Zero stale primary output before backup runs. If backup also fails, the
     // caller gets an empty outputFilePath plus the backup's non-zero exit code.
     fs.writeFileSync(opts.outputFilePath, "");
-    return runRoleTask({
-      ...opts,
-      logPrefix: `${opts.logPrefix}-backup-${opts.role.backupProvider}`,
-      role: {
-        provider: opts.role.backupProvider,
-        // Empty string when backupModel is absent: all argv builders use a falsy
-        // check (e.g. `opts.model ? ["-m", opts.model] : []`), so "" suppresses
-        // the flag and lets the provider use its configured default.
-        model: opts.role.backupModel ?? "",
-        reasoning: opts.role.reasoning,
-        command: opts.role.command,
-      },
-    });
+    return runRoleTask(resolveFallbackForRoleTask(opts, resolved));
   }
 
   return result;
@@ -3532,56 +3539,17 @@ async function runJudgeRole(opts: {
   slug: string;
   phaseNumber: string;
 }): Promise<SubAgentResult> {
-  const command =
-    "Judge the two implementations described in the instructions. Do not edit files.";
-  if (opts.role.provider === "gemini") {
-    return runGeminiRoleTask({
-      inputFilePath: opts.inputFilePath,
-      outputFilePath: opts.outputFilePath,
-      cwd: opts.cwd,
-      slug: opts.slug,
-      phaseNumber: opts.phaseNumber,
-      iteration: 1,
-      logPrefix: "judge",
-      command,
-      model: opts.role.model,
-      gate: false,
-      timeoutMs: DEFAULT_JUDGE_TIMEOUT_MS,
-    });
-  }
-  if (opts.role.provider === "kimi") {
-    return runKimi({
-      inputFilePath: opts.inputFilePath,
-      outputFilePath: opts.outputFilePath,
-      cwd: opts.cwd,
-      slug: opts.slug,
-      phaseNumber: opts.phaseNumber,
-      iteration: 1,
-      logPrefix: "judge",
-      command,
-      model: opts.role.model,
-      gate: false,
-      timeoutMs: DEFAULT_JUDGE_TIMEOUT_MS,
-    });
-  }
-  if (opts.role.provider === "codex") {
-    return runCodexReview({
-      inputFilePath: opts.inputFilePath,
-      outputFilePath: opts.outputFilePath,
-      cwd: opts.cwd,
-      slug: opts.slug,
-      phaseNumber: opts.phaseNumber,
-      iteration: 1,
-      logPrefix: "judge",
-      command,
-      model: opts.role.model,
-      reasoning: opts.role.reasoning,
-      sandbox: "read-only",
-      gate: false,
-      timeoutMs: DEFAULT_JUDGE_TIMEOUT_MS,
-    });
-  }
-  return runClaudeTask({
+  // Inject the judge command via a role copy so runConfiguredRoleTask sees it.
+  // The caller-passed timeoutMs (DEFAULT_JUDGE_TIMEOUT_MS) still wins over
+  // role.timeoutMs via resolveRoleTimeouts precedence; setting role.timeoutMs
+  // on a judge in configure.cm now takes effect through the same path.
+  const judgeRole: RoleConfig = {
+    ...opts.role,
+    command:
+      opts.role.command ??
+      "Judge the two implementations described in the instructions. Do not edit files.",
+  };
+  return runConfiguredRoleTask({
     inputFilePath: opts.inputFilePath,
     outputFilePath: opts.outputFilePath,
     cwd: opts.cwd,
@@ -3589,11 +3557,10 @@ async function runJudgeRole(opts: {
     phaseNumber: opts.phaseNumber,
     iteration: 1,
     logPrefix: "judge",
-    command,
-    model: opts.role.model,
-    reasoning: opts.role.reasoning,
-    gate: false,
+    role: judgeRole,
     timeoutMs: DEFAULT_JUDGE_TIMEOUT_MS,
+    gate: false,
+    sandbox: "read-only",
   });
 }
 
