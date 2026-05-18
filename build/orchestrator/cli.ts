@@ -2483,8 +2483,6 @@ export function ensureFeatureBranch(args: {
         singleBranch: args.singleBranch,
       })
     : existing;
-  args.feature.branch = branch;
-  args.state.branch = branch;
   logStatus({
     slug: args.state.slug,
     featureNumber: args.feature.number,
@@ -2495,6 +2493,10 @@ export function ensureFeatureBranch(args: {
   });
 
   if (args.dryRun || !createFeatureBranch) {
+    // Safe to record now: dry-run doesn't touch git, and the non-create
+    // path uses the already-checked-out `existing` branch.
+    args.feature.branch = branch;
+    args.state.branch = branch;
     saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
     return true;
   }
@@ -2502,6 +2504,15 @@ export function ensureFeatureBranch(args: {
   // Worktree-safe: fetch origin/<base> then branch from that tracking ref
   // directly. Avoids `git checkout <base>` which fails when another worktree
   // already has that branch checked out.
+  //
+  // INVARIANT: do NOT assign args.feature.branch until the branch ACTUALLY
+  // exists in git. Otherwise a fetch or checkout failure persists a phantom
+  // branch name into state; on resume the saved-branch path tries to check
+  // out the never-created branch and the build enters a permanent "failed
+  // to checkout saved feature branch" loop (observed 2026-05-18 on the
+  // implementor-hygiene-hardening build after a broken
+  // `refs/remotes/origin/main 2` macOS Finder dupe made `git fetch origin
+  // main` fail).
   const fetchBase = spawnSync("git", ["fetch", "origin", base], {
     cwd: args.cwd,
     encoding: "utf8",
@@ -2532,6 +2543,9 @@ export function ensureFeatureBranch(args: {
       return false;
     }
   }
+  // Branch exists in git now — safe to persist.
+  args.feature.branch = branch;
+  args.state.branch = branch;
   saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
   return true;
 }

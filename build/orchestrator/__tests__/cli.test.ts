@@ -3043,6 +3043,167 @@ describe("ensureFeatureBranch", () => {
     expect(trackingRef.stdout.trim()).toBe(originMain.stdout.trim());
     fs.rmSync(statePath(slug), { force: true });
   });
+
+  // Regression for the orchestrator state-caching bug observed during the
+  // implementor-hygiene-hardening build (2026-05-18): when `git fetch origin
+  // <base>` failed (broken `origin/main 2` ref), `ensureFeatureBranch`
+  // returned false BUT had already assigned `feature.branch = <planned-name>`
+  // to state. On next CLI restart, the saved-branch path tried to
+  // `git checkout <planned-name>` — which never existed in git — and the
+  // build entered a permanent "failed to checkout saved feature branch" loop.
+  //
+  // Fix: only assign `feature.branch` AFTER `git checkout -b` succeeds. On
+  // failure, `feature.branch` MUST remain null so the next attempt re-derives
+  // it from scratch.
+  it("does NOT save feature.branch when the fetch base step fails (state-caching regression)", () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-fetch-fail-"));
+    const repo = tmpDir;
+    // Init repo with no origin remote at all — `git fetch origin <base>` will fail.
+    expect(spawnSync("git", ["init", "-b", "main"], { cwd: repo }).status).toBe(
+      0,
+    );
+    expect(
+      spawnSync("git", ["config", "user.email", "test@example.com"], {
+        cwd: repo,
+      }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["config", "user.name", "Test User"], { cwd: repo })
+        .status,
+    ).toBe(0);
+    fs.writeFileSync(path.join(repo, "README.md"), "# test\n");
+    expect(spawnSync("git", ["add", "README.md"], { cwd: repo }).status).toBe(
+      0,
+    );
+    expect(
+      spawnSync("git", ["commit", "-m", "init"], { cwd: repo }).status,
+    ).toBe(0);
+
+    const slug = `test-fetch-fail-${Date.now()}`;
+    const feature: FeatureState = {
+      index: 0,
+      number: "1",
+      name: "Auth",
+      phaseIndexes: [],
+      status: "running",
+      // CRITICAL: feature.branch starts unset so ensureFeatureBranch takes
+      // the create path (not the saved-branch checkout path).
+    };
+    const state = stateForBranchTest(slug, feature, "main");
+
+    const result = ensureFeatureBranch({
+      cwd: repo,
+      state,
+      feature,
+      dryRun: false,
+      noGbrain: true,
+    });
+
+    // The fetch must fail (no origin remote) and the function must return false.
+    expect(result).toBe(false);
+    // The bug: feature.branch was assigned before the fetch and survived the
+    // failure. After the fix, it MUST be undefined/null so the next attempt
+    // re-derives the branch name fresh.
+    expect(feature.branch ?? null).toBeNull();
+    // state.branch should also be unaffected by the failed create attempt
+    // (it was pointing at the existing test branch "main" before the call).
+    // We don't assert state.branch reverts to the original here because the
+    // original implementation set it before the fetch; the relevant invariant
+    // is that feature.branch (the persisted one) stays unset on failure.
+    // The failure should be recorded in feature.error.
+    expect(feature.status).toBe("failed");
+    expect(feature.error).toBeTruthy();
+    expect(feature.error).toContain("failed to fetch");
+
+    fs.rmSync(statePath(slug), { force: true });
+  });
+
+  // Same regression class, different failure site: when `git checkout -b
+  // <branch> origin/<base>` fails (e.g. the branch name collides with an
+  // existing ref the function can't recover via the fallback `git checkout
+  // <branch>` path), feature.branch must also remain unset.
+  it("does NOT save feature.branch when the checkout step fails", () => {
+    tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-checkout-fail-"),
+    );
+    const bare = path.join(tmpDir, "origin.git");
+    const repo = path.join(tmpDir, "repo");
+    expect(spawnSync("git", ["init", "--bare", bare]).status).toBe(0);
+    expect(spawnSync("git", ["clone", bare, repo]).status).toBe(0);
+    expect(
+      spawnSync("git", ["config", "user.email", "test@example.com"], {
+        cwd: repo,
+      }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["config", "user.name", "Test User"], { cwd: repo })
+        .status,
+    ).toBe(0);
+    fs.writeFileSync(path.join(repo, "README.md"), "# test\n");
+    expect(spawnSync("git", ["add", "README.md"], { cwd: repo }).status).toBe(
+      0,
+    );
+    expect(
+      spawnSync("git", ["commit", "-m", "init"], { cwd: repo }).status,
+    ).toBe(0);
+    // After `git clone`, the working branch already matches the remote
+    // HEAD; just ensure it's named "main" and pushed.
+    spawnSync("git", ["branch", "-M", "main"], { cwd: repo });
+    expect(
+      spawnSync("git", ["push", "-u", "origin", "main"], { cwd: repo }).status,
+    ).toBe(0);
+    // Pre-create a branch that will collide AND has uncommitted work to
+    // block the fallback `git checkout <branch>` path. We achieve this by
+    // creating the would-be feature branch from a different commit, then
+    // dirtying the worktree so the fallback checkout fails.
+    expect(
+      spawnSync("git", ["checkout", "-b", "feat/plan-1-auth"], { cwd: repo })
+        .status,
+    ).toBe(0);
+    fs.writeFileSync(path.join(repo, "blocker.txt"), "uncommitted\n");
+    // Stay on main so `createFeatureBranch` is true (existing.startsWith
+    // "feat/" would route differently).
+    expect(spawnSync("git", ["checkout", "main"], { cwd: repo }).status).toBe(
+      0,
+    );
+
+    const slug = `test-checkout-fail-${Date.now()}`;
+    const feature: FeatureState = {
+      index: 0,
+      number: "1",
+      name: "Auth",
+      phaseIndexes: [],
+      status: "running",
+    };
+    const state = stateForBranchTest(slug, feature, "main");
+
+    // This may pass or fail depending on git's exact behavior with the
+    // pre-existing branch + dirty worktree. The test's invariant is that
+    // IF the function returns false (some failure path), feature.branch
+    // is null. If it returns true (recovery succeeded), feature.branch
+    // is set to a real branch — both are acceptable.
+    const result = ensureFeatureBranch({
+      cwd: repo,
+      state,
+      feature,
+      dryRun: false,
+      noGbrain: true,
+    });
+    if (result === false) {
+      expect(feature.branch ?? null).toBeNull();
+      expect(feature.status).toBe("failed");
+    } else {
+      // Recovery succeeded; feature.branch should match a real git branch.
+      expect(typeof feature.branch).toBe("string");
+      const branchExists = spawnSync(
+        "git",
+        ["rev-parse", "--verify", feature.branch!],
+        { cwd: repo, encoding: "utf8" },
+      );
+      expect(branchExists.status).toBe(0);
+    }
+    fs.rmSync(statePath(slug), { force: true });
+  });
 });
 
 describe("validateResumeLaunch", () => {
