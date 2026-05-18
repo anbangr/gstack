@@ -2,6 +2,7 @@ import { spawnSync, type SpawnSyncReturns } from "./child-registry";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { findOpenPrForBranch } from "./pr-info";
 import { atomicWriteJson, readJsonRegistry, safeRegistryKey } from "./registry";
 import { canonicalRepoIdentity } from "./release-identity";
 
@@ -52,7 +53,10 @@ export function defaultReleaseQueueDir(): string {
 }
 
 export function releaseQueueRecordId(
-  record: Pick<ReleaseQueueRecord, "repoPath" | "repoIdentity" | "baseBranch" | "prNumber">,
+  record: Pick<
+    ReleaseQueueRecord,
+    "repoPath" | "repoIdentity" | "baseBranch" | "prNumber"
+  >,
 ): string {
   const repoKey = record.repoIdentity
     ? safeRegistryKey(record.repoIdentity)
@@ -67,9 +71,15 @@ export function releaseQueueRecordId(
 
 export function releaseQueueRecordPath(
   queueDir: string,
-  record: Pick<ReleaseQueueRecord, "repoPath" | "repoIdentity" | "baseBranch" | "prNumber">,
+  record: Pick<
+    ReleaseQueueRecord,
+    "repoPath" | "repoIdentity" | "baseBranch" | "prNumber"
+  >,
 ): string {
-  return path.join(path.resolve(queueDir), `${releaseQueueRecordId(record)}.json`);
+  return path.join(
+    path.resolve(queueDir),
+    `${releaseQueueRecordId(record)}.json`,
+  );
 }
 
 function isReleaseQueueRecord(value: unknown): value is ReleaseQueueRecord {
@@ -90,7 +100,9 @@ function isReleaseQueueRecord(value: unknown): value is ReleaseQueueRecord {
   );
 }
 
-export function isReleaseQueueStatus(value: unknown): value is ReleaseQueueStatus {
+export function isReleaseQueueStatus(
+  value: unknown,
+): value is ReleaseQueueStatus {
   return (
     value === "queued" ||
     value === "claiming" ||
@@ -121,7 +133,9 @@ export function writeReleaseQueueRecord(
   return next;
 }
 
-export function readReleaseQueueRecords(queueDir: string): ReleaseQueueRecord[] {
+export function readReleaseQueueRecords(
+  queueDir: string,
+): ReleaseQueueRecord[] {
   return readJsonRegistry(queueDir, isReleaseQueueRecord, {
     debugName: "release-queue",
   }).sort((a, b) => {
@@ -157,10 +171,20 @@ export function queuedMarker(record: ReleaseQueueRecord): string {
   return `${RELEASE_QUEUE_MARKER_START}\n${JSON.stringify(payload, null, 2)}\n${RELEASE_QUEUE_MARKER_END}`;
 }
 
-export function parseQueuedMarker(body: string): Partial<ReleaseQueueRecord> | null {
-  const escapedStart = RELEASE_QUEUE_MARKER_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const escapedEnd = RELEASE_QUEUE_MARKER_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = body.match(new RegExp(`${escapedStart}\\s*([\\s\\S]*?)\\s*${escapedEnd}`));
+export function parseQueuedMarker(
+  body: string,
+): Partial<ReleaseQueueRecord> | null {
+  const escapedStart = RELEASE_QUEUE_MARKER_START.replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&",
+  );
+  const escapedEnd = RELEASE_QUEUE_MARKER_END.replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&",
+  );
+  const match = body.match(
+    new RegExp(`${escapedStart}\\s*([\\s\\S]*?)\\s*${escapedEnd}`),
+  );
   if (!match) return null;
   try {
     const parsed = JSON.parse(match[1]) as Partial<ReleaseQueueRecord>;
@@ -191,16 +215,20 @@ export function discoverBuildQueuedPullRequests(
   repoPath: string,
   run: typeof spawnSync = spawnSync,
 ): { records: ReleaseQueueRecord[]; error?: string } {
-  const r = run("gh", [
-    "pr",
-    "list",
-    "--state",
-    "open",
-    "--label",
-    RELEASE_QUEUE_LABEL,
-    "--json",
-    "number,url,baseRefName,headRefName,body,isCrossRepository",
-  ], { cwd: repoPath, encoding: "utf8" }) as SpawnSyncReturns<string>;
+  const r = run(
+    "gh",
+    [
+      "pr",
+      "list",
+      "--state",
+      "open",
+      "--label",
+      RELEASE_QUEUE_LABEL,
+      "--json",
+      "number,url,baseRefName,headRefName,body,isCrossRepository",
+    ],
+    { cwd: repoPath, encoding: "utf8" },
+  ) as SpawnSyncReturns<string>;
   if (r.status !== 0) {
     return { records: [], error: r.stderr || r.stdout || "gh pr list failed" };
   }
@@ -247,7 +275,9 @@ export function parseShipOutput(text: string): {
     text.match(/\bPR\s+#(\d+)\b/i) ??
     text.match(/pull\/(\d+)\b/i) ??
     text.match(/\bMR\s+!(\d+)\b/i);
-  const urlMatch = text.match(/https?:\/\/\S+\/(?:pull|merge_requests)\/\d+\S*/i);
+  const urlMatch = text.match(
+    /https?:\/\/\S+\/(?:pull|merge_requests)\/\d+\S*/i,
+  );
   const versionMatch =
     text.match(/\bv(\d+\.\d+\.\d+\.\d+)\b/) ??
     text.match(/\bVERSION[:=\s]+(\d+\.\d+\.\d+\.\d+)\b/i);
@@ -255,6 +285,56 @@ export function parseShipOutput(text: string): {
     prNumber: prMatch ? Number(prMatch[1]) : undefined,
     prUrl: urlMatch?.[0],
     version: versionMatch?.[1],
+  };
+}
+
+export type ResolveShipPrResult =
+  | { ok: true; prNumber: number; prUrl?: string; version?: string }
+  | { ok: false; error: string };
+
+/**
+ * Decide whether a queued-release /ship actually produced an open PR on the
+ * remote. parseShipOutput is fast but trusts the sub-agent's prose; for ship
+ * the source of truth is `gh pr list --head <branch>`. Strategy:
+ *
+ *   1. parseShipOutput first (free).
+ *   2. Always cross-check with findOpenPrForBranch. If gh returns a PR for the
+ *      branch, prefer its number/url over what the parser said — the parser
+ *      may have matched a stale "#5" in carried-over prose while the real
+ *      open PR is #42.
+ *   3. If both fail, return a descriptive error naming the branch. cli.ts
+ *      surfaces that error instead of the historic "PR number could not be
+ *      parsed" string, which conflated parse-failure with no-PR-on-remote.
+ *
+ * Returns version from parse when present (used for release-queue records).
+ */
+export function resolveShipPr(opts: {
+  outputText: string;
+  branch: string;
+  cwd: string;
+  run?: typeof spawnSync;
+}): ResolveShipPrResult {
+  const parsed = parseShipOutput(opts.outputText);
+  const gh = findOpenPrForBranch(opts.cwd, opts.branch, opts.run);
+  if (gh) {
+    return {
+      ok: true,
+      prNumber: gh.number,
+      prUrl: gh.url,
+      version: parsed.version,
+    };
+  }
+  if (parsed.prNumber) {
+    return {
+      ok: true,
+      prNumber: parsed.prNumber,
+      prUrl: parsed.prUrl,
+      version: parsed.version,
+    };
+  }
+  return {
+    ok: false,
+    error: `ship reported success but no open PR exists on remote for branch ${opts.branch}`,
   };
 }
 
@@ -279,13 +359,11 @@ export function prBaseAndHead(
   prNumber: number,
   run: typeof spawnSync = spawnSync,
 ): { baseBranch: string; featureBranch: string } {
-  const r = run("gh", [
-    "pr",
-    "view",
-    String(prNumber),
-    "--json",
-    "baseRefName,headRefName",
-  ], { cwd, encoding: "utf8" }) as SpawnSyncReturns<string>;
+  const r = run(
+    "gh",
+    ["pr", "view", String(prNumber), "--json", "baseRefName,headRefName"],
+    { cwd, encoding: "utf8" },
+  ) as SpawnSyncReturns<string>;
   if (r.status !== 0) {
     return { baseBranch: "main", featureBranch: currentBranch(cwd) };
   }
@@ -329,13 +407,18 @@ export function markPrQueued(
     { cwd, encoding: "utf8" },
   );
   if (bodyResult.status !== 0) {
-    return { ok: false, error: bodyResult.stderr || bodyResult.stdout || "gh pr view body failed" };
+    return {
+      ok: false,
+      error: bodyResult.stderr || bodyResult.stdout || "gh pr view body failed",
+    };
   }
   const body = bodyResult.stdout.trimEnd();
   const marker = queuedMarker(record);
   const nextBody = body.includes(RELEASE_QUEUE_MARKER_START)
     ? body.replace(
-        new RegExp(`${RELEASE_QUEUE_MARKER_START}[\\s\\S]*?${RELEASE_QUEUE_MARKER_END}`),
+        new RegExp(
+          `${RELEASE_QUEUE_MARKER_START}[\\s\\S]*?${RELEASE_QUEUE_MARKER_END}`,
+        ),
         marker,
       )
     : `${body}${body ? "\n\n" : ""}${marker}`;
@@ -361,7 +444,10 @@ export function verifyPrQueued(
     { cwd, encoding: "utf8" },
   ) as SpawnSyncReturns<string>;
   if (viewed.status !== 0) {
-    return { ok: false, error: viewed.stderr || viewed.stdout || "gh pr view failed" };
+    return {
+      ok: false,
+      error: viewed.stderr || viewed.stdout || "gh pr view failed",
+    };
   }
   try {
     const parsed = JSON.parse(viewed.stdout) as {
@@ -374,7 +460,8 @@ export function verifyPrQueued(
         ? label === RELEASE_QUEUE_LABEL
         : label.name === RELEASE_QUEUE_LABEL,
     );
-    if (!hasLabel) return { ok: false, error: `missing ${RELEASE_QUEUE_LABEL} label` };
+    if (!hasLabel)
+      return { ok: false, error: `missing ${RELEASE_QUEUE_LABEL} label` };
     const marker = parseQueuedMarker(parsed.body ?? "");
     if (!marker) return { ok: false, error: "missing queued PR marker" };
     if (marker.prNumber && marker.prNumber !== record.prNumber) {
