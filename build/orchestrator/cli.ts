@@ -249,10 +249,19 @@ function saveState(
  * Given a phase's runtime status, return the set of phase gates that should
  * show as done (checked) in the plan file. Exhaustive over all PhaseStatus
  * values so TypeScript enforces coverage when new statuses are added.
+ *
+ * Returns `undefined` for `failed` (and the exhaustive `default`) to mean
+ * "no opinion — leave the plan alone." This is structurally different from
+ * returning `{}`, which means "no gates are done." The reconciler in
+ * `reconcilePhaseVisibleGates` treats `undefined` as a no-op, so a phase
+ * stuck in `failed` does NOT have its visible gates un-checked. Returning
+ * `{}` here previously caused the recovery-scenario bug where the
+ * reconciler would actively flip user-edited `[x]` back to `[ ]` on every
+ * `saveState` tick.
  */
 export function phaseGateProjection(
   status: PhaseStatus,
-): Partial<Record<PhaseGate, boolean>> {
+): Partial<Record<PhaseGate, boolean>> | undefined {
   switch (status) {
     case "pending":
     case "test_spec_running":
@@ -290,11 +299,11 @@ export function phaseGateProjection(
         review_qa: true,
       };
     case "failed":
-      return {};
+      return undefined;
     default: {
       const _exhaustive: never = status;
       void _exhaustive;
-      return {};
+      return undefined;
     }
   }
 }
@@ -302,11 +311,19 @@ export function phaseGateProjection(
 /**
  * Given a feature's runtime status, return the set of feature gates that
  * should show as done in the plan file.
+ *
+ * Returns `undefined` for `failed` (and the exhaustive `default`) to mean
+ * "no opinion — leave the plan alone." Mirrors `phaseGateProjection`:
+ * the reconciler in `reconcileFeatureVisibleGates` treats `undefined` as
+ * a no-op, so a feature stuck in `failed` does NOT have its visible gates
+ * un-checked. The other "return {}" cases (pending/running/etc) are the
+ * truthful "no gates done yet" answer, not the ambiguous "I have no
+ * opinion" sentinel.
  */
 export function featureGateProjection(
   status: FeatureStatus,
   opts: { skipShip?: boolean; singleBranch?: boolean } = {},
-): Partial<Record<FeatureGate, boolean>> {
+): Partial<Record<FeatureGate, boolean>> | undefined {
   switch (status) {
     case "pending":
     case "running":
@@ -316,8 +333,9 @@ export function featureGateProjection(
     case "feature_redo_pending":
     case "feature_blocked":
     case "paused":
-    case "failed":
       return {};
+    case "failed":
+      return undefined;
     case "shipping":
     case "release_queued":
       return { feature_review: true };
@@ -343,7 +361,7 @@ export function featureGateProjection(
     default: {
       const _exhaustive: never = status;
       void _exhaustive;
-      return {};
+      return undefined;
     }
   }
 }
@@ -355,6 +373,10 @@ function reconcilePhaseVisibleGates(
 ): number {
   if (!phase.gates) return 0;
   const desired = phaseGateProjection(phaseState.status);
+  // Bug 1 fix: undefined means "no opinion" — leave the plan alone. This
+  // is what stops the reconciler from un-checking [x] when a phase is in
+  // `failed` and the user is mid-recovery.
+  if (desired === undefined) return 0;
   let changed = 0;
   for (const [gateKey, gs] of Object.entries(phase.gates) as [
     PhaseGate,
@@ -362,6 +384,14 @@ function reconcilePhaseVisibleGates(
   ][]) {
     const shouldBeDone = !!desired[gateKey];
     if (gs.done !== shouldBeDone) {
+      // Bug 2 defense-in-depth: never un-check. Even when projection
+      // legitimately wants false, if the plan shows [x], leave it. This
+      // protects against any future projection function returning a
+      // truthful `false` for a status whose plan view shouldn't be erased.
+      // Plan checkboxes only monotonically advance via this reconciler;
+      // explicit recovery scripts can still un-check via setCheckboxState
+      // directly.
+      if (!shouldBeDone && gs.done) continue;
       const result = setCheckboxState({
         planFile,
         lineNumber: gs.line,
@@ -385,6 +415,8 @@ function reconcileFeatureVisibleGates(
 ): number {
   if (!feature.gates) return 0;
   const desired = featureGateProjection(featureState.status, opts);
+  // Bug 1 fix mirror: undefined means "no opinion" — leave the plan alone.
+  if (desired === undefined) return 0;
   let changed = 0;
   for (const [gateKey, gs] of Object.entries(feature.gates) as [
     FeatureGate,
@@ -392,6 +424,8 @@ function reconcileFeatureVisibleGates(
   ][]) {
     const shouldBeDone = !!desired[gateKey];
     if (gs.done !== shouldBeDone) {
+      // Bug 2 defense-in-depth mirror: never un-check.
+      if (!shouldBeDone && gs.done) continue;
       const result = setCheckboxState({
         planFile,
         lineNumber: gs.line,
