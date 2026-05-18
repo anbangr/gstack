@@ -159,13 +159,14 @@ When a phase has a `**Test Specification` checkbox, the orchestrator runs a 7-st
 
 The orchestrator auto-detects the test runner by searching the project root (`cwd`) in priority order:
 
-1. `--test-cmd <cmd>` flag (explicit override — takes precedence over everything)
-2. `package.json` → `scripts.test` (e.g. `bun test`, `npm test`)
-3. `pytest.ini` → `pytest`
-4. `pyproject.toml` with `[tool.pytest.ini_options]` → `pytest`
-5. `go.mod` → `go test ./...`
-6. `Cargo.toml` → `cargo test`
-7. None found → warn and skip Red/Green verification (test spec still written; review gates still run)
+1. Per-phase `<!-- testCmd: <cmd> -->` annotation in the plan body (highest priority — overrides everything for that single phase)
+2. `--test-cmd <cmd>` flag (explicit per-run override)
+3. `package.json` → `scripts.test` (e.g. `bun test`, `npm test`)
+4. `pytest.ini` → `pytest`
+5. `pyproject.toml` with `[tool.pytest.ini_options]` → `pytest`
+6. `go.mod` → `go test ./...`
+7. `Cargo.toml` → `cargo test`
+8. None found → warn and skip Red/Green verification (test spec still written; review gates still run)
 
 ```bash
 # Explicit override — use when auto-detection picks the wrong command:
@@ -174,6 +175,42 @@ gstack-build plans/...md --test-cmd "bun test src/"
 # Monorepo: runTests splits on whitespace, so use bash -c for shell operators:
 gstack-build plans/...md --test-cmd "bash -c 'cd packages/api && bun test'"
 ```
+
+#### Per-phase test-command override
+
+In polyglot monorepos the same repo can need different runners for different
+phases of the same plan. The autodetect heuristic only picks one. To point a
+single phase at a specific runner, add an HTML-comment annotation to the phase
+body:
+
+```markdown
+### Phase 1: Update generation pipeline to emit behavior defaults
+
+<!-- testCmd: pytest tests/test_capability_assembler_behavior.py -->
+
+- [ ] **Test Specification**: write the failing tests
+- [ ] **Implementation**: emit behavior defaults from Layer 1
+- [ ] **Review**: confirm green
+```
+
+The annotation can appear anywhere in the phase body (before or interleaved
+with checkboxes). The value is read verbatim, trimmed, and passed to the same
+shell invocation as `--test-cmd` — `pytest -k "expr and other"` works, multi-word
+commands work, environment overrides like `PYTHONPATH=. python3 -m pytest …`
+work.
+
+**Scope:** the annotation overrides VERIFY_RED, the test-fix loop, the green-tests
+gate, and dual-impl tournament runs, for this phase only. Sibling phases without
+an annotation fall through to `--test-cmd` and then to the autodetect chain.
+
+**Trust:** the value is shell-evaluated, same trust level as `--test-cmd` on
+the command line. Treat plans you didn't author the way you'd treat a shell
+script — review before running `gstack-build`.
+
+**When to reach for it:** the orchestrator reports `Gemini could not produce
+failing tests after N attempts (GSTACK_BUILD_RED_MAX_ITER)` and you can see
+in `phase-N-tests-1.log` that the wrong runner ran (e.g. `npx vitest run` for
+a Python phase). Add the annotation, resume.
 
 ### Common workflows
 
@@ -410,15 +447,15 @@ The `<slug>` is `build-<plan-basename-without-ext>`, e.g. `build-agnt2-impl-plan
 
 The orchestrator stops at any of these and writes the failure reason into the state file. Resume picks up at the same phase after the user fixes the underlying issue.
 
-| Symptom                                                                   | Likely cause                                                                              | Fix                                                                              |
-| ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `Gemini timed out (after 1 retry)`                                        | Phase too large, network blip, or Gemini hung                                             | Raise `GSTACK_BUILD_GEMINI_TIMEOUT`, or split the phase                          |
-| `Codex review failed to converge`                                         | One review gate could not reach `GATE PASS` within `GSTACK_BUILD_CODEX_MAX_ITER` attempts | Read the phase review logs, fix the underlying issue manually, resume            |
-| `Codex output did not contain GATE PASS or GATE FAIL`                     | Codex changed output format, or hit an internal error                                     | Read the log; usually means the codex CLI itself errored                         |
-| `Tests still failing after N fix iterations`                              | Gemini can't converge; tests and impl are in conflict                                     | Read `phase-N-gemini-fix-*.log`, fix manually, resume                            |
-| `Gemini could not produce failing tests after N attempts`                 | Tests pass before implementation (trivially-asserting tests)                              | Read `phase-N-gemini-testspec-*.log`, tighten the phase description, resume      |
-| `plan checkbox flip failed: line N no longer contains "**Implementation"` | Plan file edited externally between parse and mutate                                      | Re-run; the orchestrator re-parses on every start                                |
-| `another gstack-build instance is running`                                | Another process holds the lock, or stale lock                                             | Either wait, or `rm ~/.gstack/build-state/<slug>.lock` if you're sure it's stale |
+| Symptom                                                                   | Likely cause                                                                                                                    | Fix                                                                                                                                                                                                                                           |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Gemini timed out (after 1 retry)`                                        | Phase too large, network blip, or Gemini hung                                                                                   | Raise `GSTACK_BUILD_GEMINI_TIMEOUT`, or split the phase                                                                                                                                                                                       |
+| `Codex review failed to converge`                                         | One review gate could not reach `GATE PASS` within `GSTACK_BUILD_CODEX_MAX_ITER` attempts                                       | Read the phase review logs, fix the underlying issue manually, resume                                                                                                                                                                         |
+| `Codex output did not contain GATE PASS or GATE FAIL`                     | Codex changed output format, or hit an internal error                                                                           | Read the log; usually means the codex CLI itself errored                                                                                                                                                                                      |
+| `Tests still failing after N fix iterations`                              | Gemini can't converge; tests and impl are in conflict                                                                           | Read `phase-N-gemini-fix-*.log`, fix manually, resume                                                                                                                                                                                         |
+| `Gemini could not produce failing tests after N attempts`                 | Either trivially-asserting tests, OR the wrong test runner is detected (e.g. vitest runs for a pytest phase in a polyglot repo) | Inspect `phase-N-tests-1.log`'s `# command:` header. If the runner is wrong, add `<!-- testCmd: <correct-cmd> -->` to the phase body. If the runner is right, read `phase-N-gemini-testspec-*.log` and tighten the phase description. Resume. |
+| `plan checkbox flip failed: line N no longer contains "**Implementation"` | Plan file edited externally between parse and mutate                                                                            | Re-run; the orchestrator re-parses on every start                                                                                                                                                                                             |
+| `another gstack-build instance is running`                                | Another process holds the lock, or stale lock                                                                                   | Either wait, or `rm ~/.gstack/build-state/<slug>.lock` if you're sure it's stale                                                                                                                                                              |
 
 Exit codes: `0` clean run, `1` phase failed, `2` bad args, `3` lock contention, `130` SIGINT.
 

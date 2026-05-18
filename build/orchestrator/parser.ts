@@ -60,6 +60,16 @@ const BODY_KIND_PATTERN =
  *  applies, and reviews/QA still run on the existing HEAD. */
 const AUDIT_ONLY_PATTERN = /<!--\s*audit-only\s*-->/i;
 
+/** Per-phase test-command override: HTML comment anywhere in phase body.
+ *  Captures the verbatim command, trimmed of leading/trailing whitespace.
+ *  The captured value is shell-evaluated downstream (same trust level as the
+ *  CLI's --test-cmd flag) so plan authors can point a single phase at a
+ *  different runner. Useful in polyglot monorepos where detectTestCmd's
+ *  static heuristic would pick the wrong language for this phase's tests.
+ *  Lazy `.+?` so a trailing `-->` on the same line doesn't bleed past the
+ *  intended end of the value. Empty values are warned and ignored. */
+const TESTCMD_PATTERN = /<!--\s*testCmd:\s*(.+?)\s*-->/i;
+
 /** Implementation checkbox regex keyed by phase kind. */
 const IMPL_LABELS_BY_KIND: Record<PhaseKind, RegExp> = {
   code: /^\s*-\s+\[([ xX])\]\s+\*\*Implementation\b/,
@@ -224,6 +234,7 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
         kind: p.kind ?? "code",
         dualImpl: !!opts.dualImpl,
         auditOnly: !!p.auditOnly,
+        ...(p.testCmdOverride ? { testCmdOverride: p.testCmdOverride } : {}),
         ...(p.gates && Object.keys(p.gates).length > 0
           ? { gates: p.gates }
           : {}),
@@ -345,6 +356,25 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
     // never trips this flag.
     if (!currentPhase.auditOnly && AUDIT_ONLY_PATTERN.test(line)) {
       currentPhase.auditOnly = true;
+    }
+
+    // Detect <!-- testCmd: <cmd> --> annotation. First occurrence wins (so a
+    // later malformed/empty repeat does not clobber an earlier good value).
+    // FENCE handler above skips matches inside ``` blocks. An empty/whitespace-only
+    // capture is warned and ignored — silent ignore would hide a typo like
+    // `<!-- testCmd:   -->` and leave the user wondering why the default still ran.
+    if (!currentPhase.testCmdOverride && TESTCMD_PATTERN.test(line)) {
+      const cm = line.match(TESTCMD_PATTERN);
+      if (cm) {
+        const value = cm[1].trim();
+        if (value) {
+          currentPhase.testCmdOverride = value;
+        } else {
+          warnings.push(
+            `Phase ${currentPhase.number ?? "?"}: testCmd annotation is empty; ignoring`,
+          );
+        }
+      }
     }
 
     const testSpecMatch = line.match(TESTSPEC_CHECKBOX);

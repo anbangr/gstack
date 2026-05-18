@@ -151,6 +151,14 @@ export interface Phase {
    *  When true, the post-impl hygiene check skips the "must commit" assertion;
    *  the "must leave tree clean" assertion still applies. */
   auditOnly?: boolean;
+  /** Per-phase test-command override, parsed from `<!-- testCmd: <cmd> -->` in
+   *  the phase body. Overrides the autodetected / `--test-cmd` runner at every
+   *  test-execution callsite for THIS phase only. Lets polyglot monorepos point
+   *  a phase at the right language's test runner when the static heuristic in
+   *  detectTestCmd would pick the wrong one (e.g. a Python feature in a repo
+   *  with a sibling vitest sidecar). The value is shell-evaluated; same trust
+   *  level as the CLI's --test-cmd flag. */
+  testCmdOverride?: string;
   /** Parsed gate state for per-phase checkboxes (test_spec, verify_red, implementation, green_tests, review_qa). */
   gates?: Partial<Record<PhaseGate, PlanGateState>>;
 }

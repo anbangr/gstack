@@ -645,7 +645,7 @@ export function applyResult(
     next.redSpecAttempts = attempts;
     if (attempts >= DEFAULT_MAX_RED_SPEC_ITERATIONS) {
       next.status = "failed";
-      next.error = `Gemini could not produce failing tests after ${attempts} attempts (GSTACK_BUILD_RED_MAX_ITER)`;
+      next.error = `Gemini could not produce failing tests after ${attempts} attempts (GSTACK_BUILD_RED_MAX_ITER). If the test runner is misdetected (e.g. vitest ran for a pytest phase), override per-phase by adding \`<!-- testCmd: <your-test-command> -->\` to the phase body in the plan.`;
       return next;
     }
     next.status = "test_spec_running";
