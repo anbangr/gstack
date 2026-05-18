@@ -25,6 +25,12 @@ import {
   runSlashCommand,
   mergeOutputFile,
   stageGeminiIO,
+  resolveRoleTimeouts,
+  resolveFallbackForConfigured,
+  resolveFallbackForRoleTask,
+  checkPhaseScope,
+  type RunConfiguredRoleTaskOpts,
+  type RunRoleTaskOpts,
 } from "../sub-agents";
 import fs from "node:fs";
 import os from "node:os";
@@ -1948,5 +1954,632 @@ describe("stageGeminiIO", () => {
 
     // After cleanup, outputFilePath should hold the agent's content.
     expect(fs.readFileSync(outputFile, "utf8")).toBe("agent wrote this");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Timeout-fix helpers: resolveRoleTimeouts, resolveFallback*, checkPhaseScope
+// ---------------------------------------------------------------------------
+
+describe("resolveRoleTimeouts", () => {
+  const baseRole = {
+    provider: "kimi" as const,
+    model: "kimi-x",
+    reasoning: "high" as const,
+  };
+
+  it("falls back to provider default when role.timeoutMs unset", () => {
+    const r = resolveRoleTimeouts(baseRole);
+    expect(r.primaryMs).toBe(1500000); // KIMI default (bumped to 25min in phase 1.1)
+  });
+
+  it("role.timeoutMs wins over provider default", () => {
+    const r = resolveRoleTimeouts({ ...baseRole, timeoutMs: 1800000 });
+    expect(r.primaryMs).toBe(1800000);
+  });
+
+  it("callerTimeoutMs wins over role.timeoutMs", () => {
+    const r = resolveRoleTimeouts({ ...baseRole, timeoutMs: 1800000 }, 60000);
+    expect(r.primaryMs).toBe(60000);
+  });
+
+  it("backupMs is max(60s, floor(primary/2))", () => {
+    expect(resolveRoleTimeouts(baseRole).backupMs).toBe(750000); // 1500000/2 (kimi default)
+    expect(
+      resolveRoleTimeouts({ ...baseRole, timeoutMs: 200000 }).backupMs,
+    ).toBe(100000);
+  });
+
+  it("backupMs floor is 60s when primary is small", () => {
+    const r = resolveRoleTimeouts({ ...baseRole, timeoutMs: 100000 });
+    expect(r.backupMs).toBe(60000); // not 50000
+  });
+
+  it("role.backupTimeoutMs wins over the half-default", () => {
+    const r = resolveRoleTimeouts({
+      ...baseRole,
+      timeoutMs: 900000,
+      backupTimeoutMs: 300000,
+    });
+    expect(r.backupMs).toBe(300000);
+  });
+
+  it("retryOnTimeout defaults true; false when role sets it", () => {
+    expect(resolveRoleTimeouts(baseRole).retryOnTimeout).toBe(true);
+    expect(
+      resolveRoleTimeouts({ ...baseRole, retryOnTimeout: false })
+        .retryOnTimeout,
+    ).toBe(false);
+    expect(
+      resolveRoleTimeouts({ ...baseRole, retryOnTimeout: true }).retryOnTimeout,
+    ).toBe(true);
+  });
+
+  it("claude provider falls back to codex default (BuildTimeoutsMs has no claude key)", () => {
+    const r = resolveRoleTimeouts({ ...baseRole, provider: "claude" });
+    expect(r.primaryMs).toBe(900000); // codex default
+  });
+
+  it("gemini provider uses gemini default", () => {
+    const r = resolveRoleTimeouts({ ...baseRole, provider: "gemini" });
+    expect(r.primaryMs).toBe(900000); // gemini default
+  });
+});
+
+describe("resolveFallbackForConfigured", () => {
+  const baseOpts: RunConfiguredRoleTaskOpts = {
+    inputFilePath: "/tmp/in",
+    outputFilePath: "/tmp/out",
+    cwd: "/tmp",
+    slug: "test",
+    logPrefix: "primary-impl",
+    role: {
+      provider: "kimi",
+      model: "kimi-x",
+      reasoning: "high",
+      backupProvider: "gemini",
+      backupModel: "gemini-x",
+    },
+    codexDefaultCommand: "/gstack-review",
+    sandbox: "workspace-write",
+  };
+
+  it("swaps provider/model to backup", () => {
+    const resolved = resolveRoleTimeouts(baseOpts.role, baseOpts.timeoutMs);
+    const out = resolveFallbackForConfigured(baseOpts, resolved);
+    expect(out.role.provider).toBe("gemini");
+    expect(out.role.model).toBe("gemini-x");
+  });
+
+  it("sets backup timeout to resolved.backupMs", () => {
+    const resolved = resolveRoleTimeouts(baseOpts.role);
+    const out = resolveFallbackForConfigured(baseOpts, resolved);
+    expect(out.timeoutMs).toBe(resolved.backupMs);
+    expect(out.timeoutMs).toBe(750000); // half of 1500s kimi default
+  });
+
+  it("explicitly clears codexDefaultCommand (caller-specific)", () => {
+    const resolved = resolveRoleTimeouts(baseOpts.role);
+    const out = resolveFallbackForConfigured(baseOpts, resolved);
+    expect(out.codexDefaultCommand).toBeUndefined();
+  });
+
+  it("sets retryOnTimeout:false on backup role (single-shot)", () => {
+    const resolved = resolveRoleTimeouts(baseOpts.role);
+    const out = resolveFallbackForConfigured(baseOpts, resolved);
+    expect(out.role.retryOnTimeout).toBe(false);
+  });
+
+  it("preserves sandbox setting for codex backup paths", () => {
+    const resolved = resolveRoleTimeouts(baseOpts.role);
+    const out = resolveFallbackForConfigured(baseOpts, resolved);
+    expect(out.sandbox).toBe("workspace-write");
+  });
+
+  it("empty string backupModel when role.backupModel absent (lets provider default win)", () => {
+    const resolved = resolveRoleTimeouts({
+      ...baseOpts.role,
+      backupModel: undefined,
+    });
+    const out = resolveFallbackForConfigured(
+      { ...baseOpts, role: { ...baseOpts.role, backupModel: undefined } },
+      resolved,
+    );
+    expect(out.role.model).toBe("");
+  });
+
+  it("appends -backup-<provider> to the logPrefix", () => {
+    const resolved = resolveRoleTimeouts(baseOpts.role);
+    const out = resolveFallbackForConfigured(baseOpts, resolved);
+    expect(out.logPrefix).toBe("primary-impl-backup-gemini");
+  });
+});
+
+describe("resolveFallbackForRoleTask", () => {
+  const baseOpts: RunRoleTaskOpts = {
+    role: {
+      provider: "kimi",
+      model: "kimi-x",
+      reasoning: "high",
+      backupProvider: "gemini",
+      backupModel: "gemini-x",
+    },
+    inputFilePath: "/tmp/in",
+    outputFilePath: "/tmp/out",
+    cwd: "/tmp",
+    slug: "test",
+    phaseNumber: "1",
+    iteration: 1,
+    logPrefix: "primary-impl",
+  };
+
+  it("swaps provider/model to backup", () => {
+    const resolved = resolveRoleTimeouts(baseOpts.role);
+    const out = resolveFallbackForRoleTask(baseOpts, resolved);
+    expect(out.role.provider).toBe("gemini");
+    expect(out.role.model).toBe("gemini-x");
+  });
+
+  it("sets backup timeout + single-shot", () => {
+    const resolved = resolveRoleTimeouts(baseOpts.role);
+    const out = resolveFallbackForRoleTask(baseOpts, resolved);
+    expect(out.timeoutMs).toBe(750000); // half of 1500s kimi default
+    expect(out.retryOnTimeout).toBe(false);
+    expect(out.role.retryOnTimeout).toBe(false);
+  });
+
+  it("appends -backup-<provider> to the logPrefix", () => {
+    const resolved = resolveRoleTimeouts(baseOpts.role);
+    const out = resolveFallbackForRoleTask(baseOpts, resolved);
+    expect(out.logPrefix).toBe("primary-impl-backup-gemini");
+  });
+});
+
+describe("checkPhaseScope", () => {
+  const oldMaxChars = process.env.GSTACK_BUILD_MAX_PROMPT_CHARS;
+  const oldMaxFiles = process.env.GSTACK_BUILD_MAX_FILES_PER_PHASE;
+  afterEach(() => {
+    if (oldMaxChars === undefined)
+      delete process.env.GSTACK_BUILD_MAX_PROMPT_CHARS;
+    else process.env.GSTACK_BUILD_MAX_PROMPT_CHARS = oldMaxChars;
+    if (oldMaxFiles === undefined)
+      delete process.env.GSTACK_BUILD_MAX_FILES_PER_PHASE;
+    else process.env.GSTACK_BUILD_MAX_FILES_PER_PHASE = oldMaxFiles;
+  });
+
+  it("ok:true for a small prompt", () => {
+    const tmp = path.join(os.tmpdir(), `scope-small-${Date.now()}.md`);
+    fs.writeFileSync(tmp, "implement foo.ts");
+    try {
+      const r = checkPhaseScope(tmp);
+      expect(r.ok).toBe(true);
+      expect(r.promptChars).toBeGreaterThan(0);
+    } finally {
+      fs.rmSync(tmp);
+    }
+  });
+
+  it("ok:false when prompt exceeds 10000 chars by default", () => {
+    const tmp = path.join(os.tmpdir(), `scope-large-${Date.now()}.md`);
+    fs.writeFileSync(tmp, "a".repeat(12000));
+    try {
+      const r = checkPhaseScope(tmp);
+      expect(r.ok).toBe(false);
+      expect(r.reason).toContain("12000 chars");
+    } finally {
+      fs.rmSync(tmp);
+    }
+  });
+
+  it("ok:false when prompt mentions more than 4 distinct file paths", () => {
+    const tmp = path.join(os.tmpdir(), `scope-files-${Date.now()}.md`);
+    fs.writeFileSync(
+      tmp,
+      "modify a.ts, b.ts, c.ts, d.ts, e.ts, and f.ts — six files in total",
+    );
+    try {
+      const r = checkPhaseScope(tmp);
+      expect(r.ok).toBe(false);
+      expect(r.filePathMentions).toBeGreaterThan(4);
+    } finally {
+      fs.rmSync(tmp);
+    }
+  });
+
+  it("respects GSTACK_BUILD_MAX_PROMPT_CHARS env override", () => {
+    process.env.GSTACK_BUILD_MAX_PROMPT_CHARS = "50";
+    const tmp = path.join(os.tmpdir(), `scope-env-chars-${Date.now()}.md`);
+    fs.writeFileSync(
+      tmp,
+      "this prompt is longer than fifty characters, easily.",
+    );
+    try {
+      const r = checkPhaseScope(tmp);
+      expect(r.ok).toBe(false);
+    } finally {
+      fs.rmSync(tmp);
+    }
+  });
+
+  it("respects GSTACK_BUILD_MAX_FILES_PER_PHASE env override", () => {
+    process.env.GSTACK_BUILD_MAX_FILES_PER_PHASE = "1";
+    const tmp = path.join(os.tmpdir(), `scope-env-files-${Date.now()}.md`);
+    fs.writeFileSync(tmp, "modify a.ts and b.ts");
+    try {
+      const r = checkPhaseScope(tmp);
+      expect(r.ok).toBe(false);
+      expect(r.filePathMentions).toBe(2);
+    } finally {
+      fs.rmSync(tmp);
+    }
+  });
+
+  it("ok:true for missing input file (don't break the caller)", () => {
+    const r = checkPhaseScope("/nonexistent/path/that/does/not/exist.md");
+    expect(r.ok).toBe(true);
+    expect(r.promptChars).toBe(0);
+    expect(r.filePathMentions).toBe(0);
+  });
+
+  it("counts distinct file paths (dedupes repeats)", () => {
+    const tmp = path.join(os.tmpdir(), `scope-dedupe-${Date.now()}.md`);
+    fs.writeFileSync(tmp, "foo.ts and foo.ts again and foo.ts thrice");
+    try {
+      const r = checkPhaseScope(tmp);
+      expect(r.filePathMentions).toBe(1);
+    } finally {
+      fs.rmSync(tmp);
+    }
+  });
+});
+
+describe("runConfiguredRoleTask: timeout-fix integration", () => {
+  it("skips retry on timeout when role.retryOnTimeout is false", async () => {
+    // primary kimi sleeps past timeout (100ms). With retryOnTimeout:false,
+    // the runner spawns exactly once, then falls through to backup.
+    // We count spawns by having the fake kimi append to a counter file.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "retry-skip-"));
+    const slug = `retry-skip-${process.pid}-${Date.now()}`;
+    const oldKimiBin = process.env.KIMI_BIN;
+    const oldGeminiBin = process.env.GEMINI_BIN;
+    const callsPath = path.join(tmpDir, "kimi-calls.txt");
+    try {
+      const fakeKimi = path.join(tmpDir, "kimi");
+      fs.writeFileSync(
+        fakeKimi,
+        `#!/bin/sh\necho call >> ${callsPath}\nsleep 10\n`,
+      );
+      fs.chmodSync(fakeKimi, 0o755);
+
+      const fakeGemini = path.join(tmpDir, "gemini");
+      fs.writeFileSync(
+        fakeGemini,
+        `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const prompt = args[args.indexOf("-p") + 1] || "";
+const match = prompt.match(/Write your complete output to (.+?\\.md)\\./);
+if (!match) process.exit(2);
+fs.writeFileSync(match[1], "backup ok");
+process.stdout.write(match[1]);
+`,
+      );
+      fs.chmodSync(fakeGemini, 0o755);
+
+      process.env.KIMI_BIN = fakeKimi;
+      process.env.GEMINI_BIN = fakeGemini;
+
+      const inputFilePath = path.join(tmpDir, "input.md");
+      const outputFilePath = path.join(tmpDir, "output.md");
+      fs.writeFileSync(inputFilePath, "small");
+      fs.writeFileSync(outputFilePath, "");
+
+      await runConfiguredRoleTask({
+        inputFilePath,
+        outputFilePath,
+        cwd: tmpDir,
+        slug,
+        logPrefix: "ship-retry-skip",
+        timeoutMs: 800,
+        role: {
+          provider: "kimi",
+          model: "kimi-x",
+          reasoning: "high",
+          backupProvider: "gemini",
+          backupModel: "gemini-x",
+          retryOnTimeout: false,
+        },
+      });
+
+      // Exactly one kimi spawn (no retry), then gemini backup ran.
+      const calls = fs.readFileSync(callsPath, "utf8").trim().split("\n");
+      expect(calls.length).toBe(1);
+      expect(fs.readFileSync(outputFilePath, "utf8")).toBe("backup ok");
+    } finally {
+      if (oldKimiBin === undefined) delete process.env.KIMI_BIN;
+      else process.env.KIMI_BIN = oldKimiBin;
+      if (oldGeminiBin === undefined) delete process.env.GEMINI_BIN;
+      else process.env.GEMINI_BIN = oldGeminiBin;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(path.join(os.homedir(), ".gstack", "build-state", slug), {
+        recursive: true,
+        force: true,
+      });
+      fs.rmSync(path.join(os.homedir(), ".kimi", "tmp", "gstack", slug), {
+        recursive: true,
+        force: true,
+      });
+      fs.rmSync(path.join(os.homedir(), ".gemini", "tmp", "gstack", slug), {
+        recursive: true,
+        force: true,
+      });
+    }
+  });
+
+  it("retries on timeout by default (backwards compat)", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "retry-default-"));
+    const slug = `retry-default-${process.pid}-${Date.now()}`;
+    const oldKimiBin = process.env.KIMI_BIN;
+    const oldGeminiBin = process.env.GEMINI_BIN;
+    const callsPath = path.join(tmpDir, "kimi-calls.txt");
+    try {
+      const fakeKimi = path.join(tmpDir, "kimi");
+      fs.writeFileSync(
+        fakeKimi,
+        `#!/bin/sh\necho call >> ${callsPath}\nsleep 10\n`,
+      );
+      fs.chmodSync(fakeKimi, 0o755);
+      const fakeGemini = path.join(tmpDir, "gemini");
+      fs.writeFileSync(
+        fakeGemini,
+        `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const prompt = args[args.indexOf("-p") + 1] || "";
+const match = prompt.match(/Write your complete output to (.+?\\.md)\\./);
+if (!match) process.exit(2);
+fs.writeFileSync(match[1], "backup ok");
+process.stdout.write(match[1]);
+`,
+      );
+      fs.chmodSync(fakeGemini, 0o755);
+
+      process.env.KIMI_BIN = fakeKimi;
+      process.env.GEMINI_BIN = fakeGemini;
+
+      const inputFilePath = path.join(tmpDir, "input.md");
+      const outputFilePath = path.join(tmpDir, "output.md");
+      fs.writeFileSync(inputFilePath, "small");
+      fs.writeFileSync(outputFilePath, "");
+
+      await runConfiguredRoleTask({
+        inputFilePath,
+        outputFilePath,
+        cwd: tmpDir,
+        slug,
+        logPrefix: "ship-retry-default",
+        timeoutMs: 500,
+        role: {
+          provider: "kimi",
+          model: "kimi-x",
+          reasoning: "high",
+          backupProvider: "gemini",
+          backupModel: "gemini-x",
+          // no retryOnTimeout → default true → kimi retries once before fallback
+        },
+      });
+
+      // Two kimi spawns (primary + retry), then gemini backup.
+      const calls = fs.readFileSync(callsPath, "utf8").trim().split("\n");
+      expect(calls.length).toBe(2);
+    } finally {
+      if (oldKimiBin === undefined) delete process.env.KIMI_BIN;
+      else process.env.KIMI_BIN = oldKimiBin;
+      if (oldGeminiBin === undefined) delete process.env.GEMINI_BIN;
+      else process.env.GEMINI_BIN = oldGeminiBin;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(path.join(os.homedir(), ".gstack", "build-state", slug), {
+        recursive: true,
+        force: true,
+      });
+      fs.rmSync(path.join(os.homedir(), ".kimi", "tmp", "gstack", slug), {
+        recursive: true,
+        force: true,
+      });
+      fs.rmSync(path.join(os.homedir(), ".gemini", "tmp", "gstack", slug), {
+        recursive: true,
+        force: true,
+      });
+    }
+  });
+
+  it("phase_oversized fail-fast for primary-impl logPrefix when prompt > maxChars", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oversized-"));
+    const slug = `oversized-${process.pid}-${Date.now()}`;
+    const oldKimiBin = process.env.KIMI_BIN;
+    const callsPath = path.join(tmpDir, "kimi-calls.txt");
+    try {
+      // Fake kimi that records calls; this should never get called.
+      const fakeKimi = path.join(tmpDir, "kimi");
+      fs.writeFileSync(
+        fakeKimi,
+        `#!/bin/sh\necho call >> ${callsPath}\nexit 0\n`,
+      );
+      fs.chmodSync(fakeKimi, 0o755);
+      process.env.KIMI_BIN = fakeKimi;
+
+      const inputFilePath = path.join(tmpDir, "input.md");
+      const outputFilePath = path.join(tmpDir, "output.md");
+      // Oversized prompt: exceeds default 10000 char threshold.
+      fs.writeFileSync(inputFilePath, "x".repeat(12000));
+      fs.writeFileSync(outputFilePath, "stale");
+
+      const result = await runConfiguredRoleTask({
+        inputFilePath,
+        outputFilePath,
+        cwd: tmpDir,
+        slug,
+        logPrefix: "primary-impl", // gated role
+        role: {
+          provider: "kimi",
+          model: "kimi-x",
+          reasoning: "high",
+        },
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("phase_oversized");
+      expect(result.timedOut).toBe(false);
+      expect(fs.existsSync(callsPath)).toBe(false); // no spawn
+      expect(fs.readFileSync(outputFilePath, "utf8")).toBe(""); // output cleared
+    } finally {
+      if (oldKimiBin === undefined) delete process.env.KIMI_BIN;
+      else process.env.KIMI_BIN = oldKimiBin;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(path.join(os.homedir(), ".gstack", "build-state", slug), {
+        recursive: true,
+        force: true,
+      });
+    }
+  });
+
+  it("oversized check skipped for non-impl roles (e.g. judge logPrefix)", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oversized-skip-"));
+    const slug = `oversized-skip-${process.pid}-${Date.now()}`;
+    const oldKimiBin = process.env.KIMI_BIN;
+    try {
+      const fakeKimi = path.join(tmpDir, "kimi");
+      fs.writeFileSync(
+        fakeKimi,
+        `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const idx = args.indexOf("-p");
+const prompt = idx >= 0 ? args[idx + 1] : "";
+// Both kimi-task and codex-review use "to <path>" in their prompt — but
+// runKimi uses staged paths inside its own staging dir. Just write a non-empty
+// status to the staged output dir referenced in the prompt and exit 0.
+const match = prompt.match(/output to (.+?\\.md)\\./);
+if (match) { try { fs.writeFileSync(match[1], "ok"); } catch (e) {} }
+process.stdout.write(match ? match[1] : "ok");
+`,
+      );
+      fs.chmodSync(fakeKimi, 0o755);
+      process.env.KIMI_BIN = fakeKimi;
+
+      const inputFilePath = path.join(tmpDir, "input.md");
+      const outputFilePath = path.join(tmpDir, "output.md");
+      // Oversized prompt — would trigger fail-fast for primary-impl, but logPrefix is "judge".
+      fs.writeFileSync(inputFilePath, "x".repeat(12000));
+      fs.writeFileSync(outputFilePath, "");
+
+      const result = await runConfiguredRoleTask({
+        inputFilePath,
+        outputFilePath,
+        cwd: tmpDir,
+        slug,
+        logPrefix: "judge", // not in ENFORCE_SCOPE_ROLES
+        role: {
+          provider: "kimi",
+          model: "kimi-x",
+          reasoning: "high",
+        },
+      });
+
+      // No fail-fast — kimi was actually invoked.
+      expect(result.stderr).not.toContain("phase_oversized");
+    } finally {
+      if (oldKimiBin === undefined) delete process.env.KIMI_BIN;
+      else process.env.KIMI_BIN = oldKimiBin;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(path.join(os.homedir(), ".gstack", "build-state", slug), {
+        recursive: true,
+        force: true,
+      });
+      fs.rmSync(path.join(os.homedir(), ".kimi", "tmp", "gstack", slug), {
+        recursive: true,
+        force: true,
+      });
+    }
+  });
+
+  it("backup uses halved-and-floored timeout (450s when primary defaults to 900s)", async () => {
+    // We can't directly observe the spawn timeout from outside, but we can
+    // observe the warning message via console.warn. Use a fake console.warn
+    // capture via process.stderr buffering.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "halved-"));
+    const slug = `halved-${process.pid}-${Date.now()}`;
+    const oldKimiBin = process.env.KIMI_BIN;
+    const oldGeminiBin = process.env.GEMINI_BIN;
+    const oldWarn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.join(" "));
+    };
+    try {
+      const fakeKimi = path.join(tmpDir, "kimi");
+      fs.writeFileSync(fakeKimi, `#!/bin/sh\nexit 1\n`);
+      fs.chmodSync(fakeKimi, 0o755);
+      const fakeGemini = path.join(tmpDir, "gemini");
+      fs.writeFileSync(
+        fakeGemini,
+        `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const prompt = args[args.indexOf("-p") + 1] || "";
+const match = prompt.match(/Write your complete output to (.+?\\.md)\\./);
+if (match) fs.writeFileSync(match[1], "backup ok");
+process.stdout.write(match ? match[1] : "");
+`,
+      );
+      fs.chmodSync(fakeGemini, 0o755);
+      process.env.KIMI_BIN = fakeKimi;
+      process.env.GEMINI_BIN = fakeGemini;
+
+      const inputFilePath = path.join(tmpDir, "input.md");
+      const outputFilePath = path.join(tmpDir, "output.md");
+      fs.writeFileSync(inputFilePath, "small");
+      fs.writeFileSync(outputFilePath, "");
+
+      await runConfiguredRoleTask({
+        inputFilePath,
+        outputFilePath,
+        cwd: tmpDir,
+        slug,
+        logPrefix: "ship-halved",
+        // No timeoutMs passed → role.timeoutMs unset → provider default = 900s → backup = 450s
+        role: {
+          provider: "kimi",
+          model: "kimi-x",
+          reasoning: "high",
+          backupProvider: "gemini",
+          backupModel: "gemini-x",
+        },
+      });
+
+      const warn = warnings.find((w) => w.includes("falling back"));
+      expect(warn).toBeDefined();
+      expect(warn).toContain("750000ms"); // half of kimi 1500000 default
+      expect(warn).toContain("single-shot");
+    } finally {
+      console.warn = oldWarn;
+      if (oldKimiBin === undefined) delete process.env.KIMI_BIN;
+      else process.env.KIMI_BIN = oldKimiBin;
+      if (oldGeminiBin === undefined) delete process.env.GEMINI_BIN;
+      else process.env.GEMINI_BIN = oldGeminiBin;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(path.join(os.homedir(), ".gstack", "build-state", slug), {
+        recursive: true,
+        force: true,
+      });
+      fs.rmSync(path.join(os.homedir(), ".kimi", "tmp", "gstack", slug), {
+        recursive: true,
+        force: true,
+      });
+      fs.rmSync(path.join(os.homedir(), ".gemini", "tmp", "gstack", slug), {
+        recursive: true,
+        force: true,
+      });
+    }
   });
 });

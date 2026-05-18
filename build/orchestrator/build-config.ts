@@ -228,6 +228,30 @@ function validateRoles(value: unknown, filePath: string): RoleConfigs {
         `${filePath}:roles.${key}.backupModel must be a string when present`,
       );
     }
+    if (
+      role.timeoutMs != null &&
+      (!Number.isInteger(role.timeoutMs) || role.timeoutMs <= 0)
+    ) {
+      throw new Error(
+        `${filePath}:roles.${key}.timeoutMs must be a positive integer (ms) when present`,
+      );
+    }
+    if (
+      role.backupTimeoutMs != null &&
+      (!Number.isInteger(role.backupTimeoutMs) || role.backupTimeoutMs <= 0)
+    ) {
+      throw new Error(
+        `${filePath}:roles.${key}.backupTimeoutMs must be a positive integer (ms) when present`,
+      );
+    }
+    if (
+      role.retryOnTimeout != null &&
+      typeof role.retryOnTimeout !== "boolean"
+    ) {
+      throw new Error(
+        `${filePath}:roles.${key}.retryOnTimeout must be a boolean when present`,
+      );
+    }
   }
   return roles as RoleConfigs;
 }

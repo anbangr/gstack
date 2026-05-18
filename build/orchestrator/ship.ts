@@ -32,6 +32,9 @@ export async function shipAndDeploy(args: {
       command: args.shipRole.command || "/gstack-ship",
       backupProvider: args.shipRole.backupProvider,
       backupModel: args.shipRole.backupModel,
+      timeoutMs: args.shipRole.timeoutMs,
+      backupTimeoutMs: args.shipRole.backupTimeoutMs,
+      retryOnTimeout: args.shipRole.retryOnTimeout,
     },
     land: {
       provider: args.landRole.provider,
@@ -40,6 +43,9 @@ export async function shipAndDeploy(args: {
       command: args.landRole.command || "/gstack-land-and-deploy",
       backupProvider: args.landRole.backupProvider,
       backupModel: args.landRole.backupModel,
+      timeoutMs: args.landRole.timeoutMs,
+      backupTimeoutMs: args.landRole.backupTimeoutMs,
+      retryOnTimeout: args.landRole.retryOnTimeout,
     },
   });
 }
