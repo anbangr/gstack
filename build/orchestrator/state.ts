@@ -264,6 +264,32 @@ export interface MergeReparsedPhasesReport {
    * these so a future regression doesn't silently drop runtime state.
    */
   orphaned: string[];
+  /** Feature numbers added to the plan (present in reparsed.features, absent in state.features). */
+  addedFeatures: string[];
+  /** Feature numbers no longer in the parsed plan (present in state.features, absent in reparsed.features). */
+  orphanedFeatures: string[];
+}
+
+/**
+ * Cheap predicate: does `state.phases` already agree with the parser's view?
+ *
+ * Used by the resume-time repair guard in cli.ts to decide whether to invoke
+ * the full merge. Equal-length arrays with per-index `number` agreement is
+ * sufficient because the merge always assigns `.index = i` and the parser
+ * walks top-to-bottom — disagreement on either dimension proves desync.
+ *
+ * Kept here (next to `mergeReparsedPhases`) so the trigger condition and the
+ * repair function stay in sync. Pure (no mutation), safe to call repeatedly.
+ */
+export function arePhasesAligned(
+  state: BuildState,
+  reparsed: { phases: Phase[] },
+): boolean {
+  if (state.phases.length !== reparsed.phases.length) return false;
+  for (let i = 0; i < state.phases.length; i++) {
+    if (state.phases[i].number !== reparsed.phases[i].number) return false;
+  }
+  return true;
 }
 
 /**
@@ -287,10 +313,21 @@ export interface MergeReparsedPhasesReport {
  *     committedAt, etc.);
  *   - otherwise, create a fresh `pending` PhaseState at index `i`.
  *
- * Then sync `state.features[f].phaseIndexes` from `reparsed.features[f]`
- * (preserving FeatureState.status and other in-flight fields).
+ * Then sync features: per-feature phaseIndexes are taken from the parser, and
+ * features added/removed at the top level are surfaced in the report.
+ *
+ * Last-write-wins on duplicate numbers: if `state.phases` contains two
+ * PhaseStates with the same `number` (e.g., corruption from a pre-fix
+ * /build that pushed a duplicate of the last phase), only the LAST entry
+ * survives Map insertion. The earlier entry is silently dropped — losing
+ * any fields planted on it. This is intentional: the duplicate is itself
+ * the corruption artifact, and there is no principled way to choose which
+ * of two same-numbered entries holds the "real" runtime state. The repair
+ * collapses to one canonical entry per number.
  *
  * In-place: mutates `state.phases` and `state.features[*].phaseIndexes`.
+ * `state.currentPhaseIndex` and `state.currentFeatureIndex` are NOT touched
+ * (callers manage cursor placement; the merge only fixes the array shape).
  * Returns a diff report so callers can log meaningfully.
  */
 export function mergeReparsedPhases(
@@ -313,7 +350,11 @@ export function mergeReparsedPhases(
     if (existing) {
       existing.index = i;
       existing.name = p.name;
-      if (p.kind && !existing.kind) existing.kind = p.kind;
+      // Backfill kind on existing entries if it's missing. The new-entry
+      // branch below defaults to "code" when the parser didn't supply a
+      // kind; keep this branch symmetric so post-merge invariant is
+      // uniform across re-aligned and freshly-added phases.
+      if (!existing.kind) existing.kind = p.kind ?? "code";
       nextPhases.push(existing);
     } else {
       nextPhases.push({
@@ -336,20 +377,44 @@ export function mergeReparsedPhases(
 
   // Sync per-feature phaseIndexes from the parser. The parser is the
   // source of truth for "which phases belong to which feature." Preserve
-  // the FeatureState object identity (status, branch, prNumber, etc.).
-  for (
-    let f = 0;
-    f < state.features.length && f < reparsed.features.length;
-    f++
-  ) {
-    const featureState = state.features[f];
+  // FeatureState object identity (status, branch, prNumber, etc.) by
+  // matching on `number`, not array position — production never removes
+  // features today, but match-by-number means we'd preserve in-flight
+  // state if a user reordered ## Feature headings between runs.
+  const featuresByNumber = new Map<string, FeatureState>();
+  for (const fs of state.features) {
+    featuresByNumber.set(fs.number, fs);
+  }
+  const seenFeatureNumbers = new Set<string>();
+  const nextFeatures: FeatureState[] = [];
+  const addedFeatures: string[] = [];
+  for (let f = 0; f < reparsed.features.length; f++) {
     const parsedFeature = reparsed.features[f];
-    if (featureState && parsedFeature) {
-      featureState.phaseIndexes = [...parsedFeature.phaseIndexes];
+    seenFeatureNumbers.add(parsedFeature.number);
+    const existing = featuresByNumber.get(parsedFeature.number);
+    if (existing) {
+      existing.index = f;
+      existing.name = parsedFeature.name;
+      existing.phaseIndexes = [...parsedFeature.phaseIndexes];
+      nextFeatures.push(existing);
+    } else {
+      nextFeatures.push({
+        index: f,
+        number: parsedFeature.number,
+        name: parsedFeature.name,
+        phaseIndexes: [...parsedFeature.phaseIndexes],
+        status: "pending",
+      });
+      addedFeatures.push(parsedFeature.number);
     }
   }
+  const orphanedFeatures: string[] = [];
+  for (const fs of state.features) {
+    if (!seenFeatureNumbers.has(fs.number)) orphanedFeatures.push(fs.number);
+  }
+  state.features = nextFeatures;
 
-  return { added, orphaned };
+  return { added, orphaned, addedFeatures, orphanedFeatures };
 }
 
 /**

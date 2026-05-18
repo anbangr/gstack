@@ -41,6 +41,7 @@ import {
   saveState as persistBuildState,
   backfillKindFromPlan,
   mergeReparsedPhases,
+  arePhasesAligned,
   acquireLock,
   releaseLock,
   readLockInfo,
@@ -246,6 +247,43 @@ function saveState(
         `[plan] warning: gate visibility reconcile failed: ${err}`,
       );
     }
+  }
+}
+
+/**
+ * Emit greppable `[plan]` warnings for a `mergeReparsedPhases` report. Both
+ * call sites (resume-time repair and the FEATURE_NEEDS_PHASES branch) share
+ * this so log shapes stay identical and a single grep catches every merge
+ * mutation — context tag distinguishes the call site.
+ */
+function logMergeReport(
+  report: {
+    added: string[];
+    orphaned: string[];
+    addedFeatures: string[];
+    orphanedFeatures: string[];
+  },
+  context: "resume" | "phases_added",
+): void {
+  if (report.added.length > 0) {
+    console.warn(
+      `[plan] (${context}) added ${report.added.length} phase(s) from plan: ${report.added.join(", ")}`,
+    );
+  }
+  if (report.orphaned.length > 0) {
+    console.warn(
+      `[plan] (${context}) dropped ${report.orphaned.length} runtime state entry(s) for phases no longer in the plan: ${report.orphaned.join(", ")}`,
+    );
+  }
+  if (report.addedFeatures.length > 0) {
+    console.warn(
+      `[plan] (${context}) added ${report.addedFeatures.length} feature(s) from plan: ${report.addedFeatures.join(", ")}`,
+    );
+  }
+  if (report.orphanedFeatures.length > 0) {
+    console.warn(
+      `[plan] (${context}) dropped ${report.orphanedFeatures.length} runtime feature state entry(s) for features no longer in the plan: ${report.orphanedFeatures.join(", ")}`,
+    );
   }
 }
 
@@ -8554,31 +8592,18 @@ async function main() {
           // Repair preserves PhaseState identity for unchanged phase numbers
           // (status, gemini output paths, codexReview records all survive).
           // Orphaned state entries (numbers no longer in the plan) are
-          // dropped with a warning. A length match alone is insufficient —
-          // the original bug produced equal-length arrays with mis-aligned
-          // contents.
-          const stateNeedsRepair =
-            state.phases.length !== phases.length ||
-            state.phases.some(
-              (ps, i) => phases[i] && ps.number !== phases[i].number,
-            );
-          if (stateNeedsRepair) {
+          // dropped with a warning. The `arePhasesAligned` predicate checks
+          // both length AND per-index `number` agreement — a length match
+          // alone is insufficient (the original bug produced equal-length
+          // arrays with mis-aligned contents).
+          if (!arePhasesAligned(state, { phases })) {
             console.warn(
               `[plan] state.phases disagrees with the parsed plan ` +
                 `(state has ${state.phases.length} phase(s), plan has ${phases.length}). ` +
                 `Re-aligning state to the plan by phase number.`,
             );
             const repair = mergeReparsedPhases(state, { phases, features });
-            if (repair.added.length > 0) {
-              console.warn(
-                `[plan] added ${repair.added.length} phase(s) from plan: ${repair.added.join(", ")}`,
-              );
-            }
-            if (repair.orphaned.length > 0) {
-              console.warn(
-                `[plan] dropped ${repair.orphaned.length} runtime state entry(s) for phases no longer in the plan: ${repair.orphaned.join(", ")}`,
-              );
-            }
+            logMergeReport(repair, "resume");
             saveState(state, { noGbrain: args.noGbrain, log: console.warn });
           }
           if (
@@ -9103,11 +9128,7 @@ async function main() {
                   dualImpl: args.dualImpl,
                 });
                 const mergeReport = mergeReparsedPhases(state, reparsed);
-                if (mergeReport.orphaned.length > 0) {
-                  console.warn(
-                    `[plan] warning: dropped runtime state for phases no longer in the plan: ${mergeReport.orphaned.join(", ")}`,
-                  );
-                }
+                logMergeReport(mergeReport, "phases_added");
                 // Replace outer-scope arrays so subsequent iterations see
                 // the new shape.
                 phases = reparsed.phases;

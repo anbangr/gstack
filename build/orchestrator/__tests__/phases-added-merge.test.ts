@@ -28,7 +28,19 @@ import * as path from "node:path";
 import { parsePlan } from "../parser";
 import { appendFeaturePhases, _testWritePlan } from "../plan-mutator";
 import { mergeReparsedPhases } from "../state";
-import type { BuildState, PhaseState } from "../types";
+import type { BuildState, PhaseState, SubAgentInvocation } from "../types";
+
+/** Typed sentinel SubAgentInvocation for tests — avoids `as unknown as` double-casts. */
+function makeSentinelInvocation(
+  overrides: Partial<SubAgentInvocation> = {},
+): SubAgentInvocation {
+  return {
+    startedAt: "2026-05-18T15:10:00Z",
+    outputLogPath: "phase-impl.log",
+    outputFilePath: "phase-impl.md",
+    ...overrides,
+  };
+}
 
 /** Minimal BuildState scaffold for these tests — only the fields the merge touches. */
 function buildStateFromParsed(parsed: {
@@ -113,11 +125,10 @@ describe("mergeReparsedPhases — FEATURE_NEEDS_PHASES splice mid-array", () => 
       // Plant a sentinel on a Feature 2 phase that the OLD merge math
       // overwrote/duplicated. After the fix, this exact object must still
       // be at the slot whose number === "2.1" (i.e. parsed index 4).
-      state.phases[3].gemini = {
-        outputPath: "phase-2.1-impl.md",
+      state.phases[3].gemini = makeSentinelInvocation({
+        outputFilePath: "phase-2.1-impl.md",
         outputLogPath: "phase-2.1-impl.log",
-        startedAt: "2026-05-18T15:10:00Z",
-      } as unknown as PhaseState["gemini"];
+      });
       const sentinelObj = state.phases[3];
 
       // Feature-review on Feature 1 returns FEATURE_NEEDS_PHASES; append
@@ -165,17 +176,21 @@ describe("mergeReparsedPhases — FEATURE_NEEDS_PHASES splice mid-array", () => 
       const numbers = state.phases.map((s) => s.number);
       expect(new Set(numbers).size).toBe(numbers.length);
 
-      // The merge report names the one added phase.
+      // The merge report names the one added phase. No feature-level
+      // mutation expected for this case (the splice happened inside an
+      // existing feature).
       expect(report.added).toEqual(["1.review-1"]);
       expect(report.orphaned).toEqual([]);
+      expect(report.addedFeatures).toEqual([]);
+      expect(report.orphanedFeatures).toEqual([]);
 
       // Existing PhaseState identity is preserved: state.phases[4] is the
       // SAME object that was state.phases[3] before the merge. The sentinel
-      // gemini.outputPath survives, but the .index field is rewritten 3 -> 4.
+      // gemini.outputFilePath survives, but the .index field is rewritten 3 -> 4.
       expect(state.phases[4]).toBe(sentinelObj);
       expect(state.phases[4].index).toBe(4);
       expect(state.phases[4].number).toBe("2.1");
-      expect(state.phases[4].gemini?.outputPath).toBe("phase-2.1-impl.md");
+      expect(state.phases[4].gemini?.outputFilePath).toBe("phase-2.1-impl.md");
 
       // Feature 1's committed status survives.
       expect(state.phases[0].status).toBe("committed");
@@ -246,6 +261,8 @@ describe("mergeReparsedPhases — FEATURE_NEEDS_PHASES splice mid-array", () => 
       expect(state.phases[2].status).toBe("pending");
       expect(state.phases[2].index).toBe(2);
       expect(report.added).toEqual(["1.review-1"]);
+      expect(report.addedFeatures).toEqual([]);
+      expect(report.orphanedFeatures).toEqual([]);
       expect(state.features[0].phaseIndexes).toEqual([0, 1, 2]);
     } finally {
       fs.rmSync(path.dirname(planFile), { recursive: true, force: true });
@@ -299,6 +316,8 @@ describe("mergeReparsedPhases — FEATURE_NEEDS_PHASES splice mid-array", () => 
       expect(state.phases[3].number).toBe("2.1");
       expect(state.phases[3].status).toBe("pending");
       expect(report.added).toEqual(["1.review-1", "1.review-2"]);
+      expect(report.addedFeatures).toEqual([]);
+      expect(report.orphanedFeatures).toEqual([]);
       expect(state.features[0].phaseIndexes).toEqual([0, 1, 2]);
       expect(state.features[1].phaseIndexes).toEqual([3]);
     } finally {
@@ -334,6 +353,8 @@ describe("mergeReparsedPhases — FEATURE_NEEDS_PHASES splice mid-array", () => 
       const report = mergeReparsedPhases(state, reparsed);
 
       expect(report.orphaned).toEqual(["1.ghost"]);
+      expect(report.addedFeatures).toEqual([]);
+      expect(report.orphanedFeatures).toEqual([]);
       // Orphan is dropped (the parser view is authoritative — there is no
       // such phase in the plan file anymore, so keeping the runtime entry
       // would only re-introduce the desync we just fixed).
@@ -459,18 +480,18 @@ describe("mergeReparsedPhases — resume-path repair of pre-fix on-disk state", 
           committedAt: "2026-05-18T15:10:00Z",
         },
         // Slot 3 is the bug: the pre-fix code ran the review against this
-        // slot, leaving gemini.outputPath pointing at the new review phase
-        // while .number still describes Feature 2's first phase.
+        // slot, leaving gemini.outputFilePath pointing at the new review
+        // phase while .number still describes Feature 2's first phase.
         {
           index: 3,
           number: "2.1",
           name: "Invoice model",
           status: "pending",
-          gemini: {
-            outputPath: "phase-1.review-1-impl.md",
+          gemini: makeSentinelInvocation({
+            outputFilePath: "phase-1.review-1-impl.md",
             outputLogPath: "phase-1.review-1-impl.log",
             startedAt: "2026-05-18T15:30:00Z",
-          } as unknown as PhaseState["gemini"],
+          }),
         },
         {
           index: 4,
@@ -478,13 +499,27 @@ describe("mergeReparsedPhases — resume-path repair of pre-fix on-disk state", 
           name: "Charge endpoint",
           status: "pending",
         },
-        { index: 5, number: "3.1", name: "Email job", status: "pending" },
+        // First "3.1" — pin a distinct sentinel so we can verify which
+        // duplicate survives the Map-based dedupe.
+        {
+          index: 5,
+          number: "3.1",
+          name: "Email job",
+          status: "pending",
+          gemini: makeSentinelInvocation({
+            outputFilePath: "FIRST-3.1-impl.md",
+          }),
+        },
         // Duplicate "3.1" with index 6 — what the OLD slice() merge pushed.
+        // Distinct sentinel from the first one.
         {
           index: 6,
           number: "3.1",
           name: "Email job",
           status: "pending",
+          gemini: makeSentinelInvocation({
+            outputFilePath: "DUPLICATE-3.1-impl.md",
+          }),
         },
       ],
       completed: false,
@@ -528,9 +563,24 @@ describe("mergeReparsedPhases — resume-path repair of pre-fix on-disk state", 
 
     // The previously-stale slot now correctly describes "2.1" (parser index
     // 4) and retained the gemini sentinel that was planted on it. This is
-    // the user-visible recovery: gemini.outputPath now matches its slot.
+    // the user-visible recovery: gemini.outputFilePath now matches its slot.
     expect(state.phases[4].number).toBe("2.1");
-    expect(state.phases[4].gemini?.outputPath).toBe("phase-1.review-1-impl.md");
+    expect(state.phases[4].gemini?.outputFilePath).toBe(
+      "phase-1.review-1-impl.md",
+    );
+
+    // Duplicate-number collapse: pins the last-write-wins semantic
+    // documented in mergeReparsedPhases. The Map insertion order means the
+    // SECOND "3.1" entry (the corruption duplicate at original index 6)
+    // overwrote the first in stateByNumber, so the duplicate's sentinel
+    // is what survives. The first "3.1"'s sentinel is dropped silently —
+    // this is by design, since the duplicate is the corruption artifact
+    // and there is no principled way to choose between two same-numbered
+    // PhaseStates. Future refactors that change this contract should
+    // update this assertion deliberately.
+    expect(state.phases[6].gemini?.outputFilePath).toBe(
+      "DUPLICATE-3.1-impl.md",
+    );
 
     // featureState.phaseIndexes resync with the parser.
     expect(state.features[0].phaseIndexes).toEqual([0, 1, 2, 3]);
@@ -539,7 +589,63 @@ describe("mergeReparsedPhases — resume-path repair of pre-fix on-disk state", 
 
     // No orphans reported (everything in state had a matching parser entry,
     // including the duplicate which collapsed into the canonical "3.1" slot).
+    // No feature-level mutation: parser sees the same 3 features as state.
     expect(report.orphaned).toEqual([]);
     expect(report.added).toEqual(["1.review-1"]);
+    expect(report.addedFeatures).toEqual([]);
+    expect(report.orphanedFeatures).toEqual([]);
+
+    // The merge MUST NOT touch cursor fields. callers manage cursor
+    // placement; the merge only fixes the array shape.
+    expect(state.currentPhaseIndex).toBe(3);
+    expect(state.currentFeatureIndex).toBe(1);
+  });
+
+  it("surfaces added and orphaned features in the report", () => {
+    // State knows about 2 features (Feature 1, Feature 2). The parsed
+    // plan adds Feature 3 (new) and removes Feature 2 (orphan). Production
+    // never hits this today, but the report shape must surface both deltas
+    // so a future runtime change can act on them.
+    const initial = parsePlan(`# Plan
+
+## Feature 1: Auth
+
+### Phase 1.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+
+## Feature 2: Billing
+
+### Phase 2.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+`);
+    const state = buildStateFromParsed(initial);
+
+    const reparsed = parsePlan(`# Plan
+
+## Feature 1: Auth
+
+### Phase 1.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+
+## Feature 3: Notify
+
+### Phase 3.1: x
+- [ ] **Implementation**: x
+- [ ] **Review**: y
+`);
+
+    const report = mergeReparsedPhases(state, reparsed);
+
+    expect(report.addedFeatures).toEqual(["3"]);
+    expect(report.orphanedFeatures).toEqual(["2"]);
+    expect(state.features.map((f) => f.number)).toEqual(["1", "3"]);
+    expect(state.features.length).toBe(2);
+    // The orphaned Feature 2's phases also drop from state.phases.
+    expect(state.phases.map((s) => s.number)).toEqual(["1.1", "3.1"]);
+    expect(report.orphaned).toEqual(["2.1"]);
+    expect(report.added).toEqual(["3.1"]);
   });
 });
