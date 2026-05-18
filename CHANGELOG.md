@@ -1,5 +1,43 @@
 # Changelog
 
+## [1.40.3.0] - 2026-05-18
+
+**Review re-runs that find the work already in HEAD now pass cleanly instead of forcing a manual `--mark-phase-committed` recovery. The hygiene gate honors an explicit `NO_CHANGES_NEEDED` sentinel from the agent — on review re-runs only.**
+
+If a reviewer's finding was already addressed in a prior pass, the primary implementor rerun used to leave the working tree clean with no new commit, and `applyMutableAgentHygiene` then flagged `primary implementor rerun did not create a new commit` as a hygiene failure. The recovery hint printed `gstack-build --mark-phase-committed <feature>.<phase>` and the builder had to type it for every legitimate no-op review fix. This release teaches the orchestrator to recognize when no work is needed and skip the no-commit assertion, scoped narrowly to one call site so first-pass implementations and test-fixer agents stay strict.
+
+### What changed
+
+The `RUN_GEMINI_FROM_REVIEW` prompt (the re-run after reviewer feedback) now ends with explicit instructions: if every blocking finding is already addressed in HEAD, write the literal line `NO_CHANGES_NEEDED` on its own line, explain why in 1-3 sentences, and skip the commit. The instruction lives OUTSIDE the `<<<REVIEW_FEEDBACK_BEGIN/END>>>` fence, so reviewer-controlled prose can't trigger or suppress it.
+
+`applyMutableAgentHygiene` takes a new opt `allowNoChangesSentinel?: boolean`. When set AND the sole remaining hygiene error is the no-new-commit one AND the agent's output summary matches `/^NO_CHANGES_NEEDED\b/m`, the gate returns the original result unmodified and logs `✓ {label} reported NO_CHANGES_NEEDED — reviewer finding already addressed in HEAD`. The dirty-tree assertion, parent-workspace mutation check, empty-output check, blind-execution detection, and timed-out/non-zero-exit early-return all stay strict — only the no-commit error is forgiven, and only when the sentinel is unambiguously present.
+
+Wiring is scoped: `allowNoChangesSentinel: true` is set on the `RUN_GEMINI_FROM_REVIEW` call site at `build/orchestrator/cli.ts:6043` only. The first-pass `RUN_GEMINI` and `RUN_GEMINI_FIX` (test fixer) call sites stay unchanged — "no commit" there means the agent never started, not "work is already done."
+
+The intercept matches the error via a shared `NO_NEW_COMMIT_ERROR_SUFFIX` constant defined next to `validatePostAgentHygiene` (the function that emits the error), with `endsWith` against the constant rather than a free-form substring sniff. Future validators can add new errors without ambiguity at the intercept.
+
+### What this means for builders
+
+If you saw repeated `--mark-phase-committed` prompts on review re-runs because Codex/Gemini correctly determined the prior pass already addressed the finding, this is the fix. The phase advances on its own. Real "agent did nothing" failures (crashed before commit, blind execution, dirty tree without commit) still fire the gate as before. The convergence-cap iteration limit catches any agent that sandbags by emitting `NO_CHANGES_NEEDED` repeatedly without convergence.
+
+### Itemized changes
+
+#### Fixed
+
+- `applyMutableAgentHygiene` no longer fails review re-runs when the primary implementor correctly determines the reviewer's finding is already addressed in HEAD and emits the `NO_CHANGES_NEEDED` sentinel. Forgives only the no-new-commit error, only when the sentinel is on its own line, only when the call site opted in. Every other hygiene check stays strict.
+
+#### Added
+
+- `allowNoChangesSentinel?: boolean` opt on `applyMutableAgentHygiene`. Per-call-site opt-in; defaults to false. Wired only at the `RUN_GEMINI_FROM_REVIEW` call site.
+- `NO_CHANGES_NEEDED` affordance in the `buildGeminiPromptBody` reviewFeedback branch. Tells the agent how to signal "no work needed, fix already in HEAD" without sandbagging — only emit after independently verifying HEAD.
+- `NO_NEW_COMMIT_ERROR_SUFFIX` shared constant in `cli.ts` so the intercept and the emitter never disagree on the error string.
+- 5 regression tests in `build/orchestrator/__tests__/no-changes-sentinel.test.ts` pinning: sentinel + opt → success, opt absent → still fails, dirty tree → still fails, sentinel missing → still fails, sentinel in mid-line prose → still fails (line-start anchor).
+- 4 prompt-builder tests in `build/orchestrator/__tests__/build-gemini-prompt.test.ts` pinning: instruction present when reviewFeedback non-null, absent on first pass, absent when reviewFeedback null, placed AFTER the review-feedback fence.
+
+### For contributors
+
+`buildGeminiPromptBody` is now exported so prompt-shape tests can exercise it directly. The pattern (line-start anchored sentinel + sole-error intercept + per-call-site opt-in) generalizes if a future phase kind needs a similar "no-op success" path — e.g. an audit phase that found nothing to flag. Keep the strict default; opt in deliberately.
+
 ## [1.40.2.0] - 2026-05-18
 
 **FEATURE_NEEDS_PHASES no longer loops forever on multi-feature plans. The orchestrator's review-phase merge now rebuilds state by phase number, so the appended phases actually run.**
