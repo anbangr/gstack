@@ -7,6 +7,8 @@ import {
   cloneRoleConfigs,
   migrateLegacyModels,
   parseProvider,
+  parseBoolean,
+  parsePositiveInt,
 } from "../role-config";
 import {
   BUILD_DEFAULTS,
@@ -312,5 +314,125 @@ describe("role config precedence helpers", () => {
     expect(roles.primaryImpl.model).toBe("legacy-primary-model");
     expect(roles.secondaryImpl.model).toBe("legacy-secondary-model");
     expect(roles.reviewSecondary.model).toBe("legacy-review-model");
+  });
+});
+
+describe("parseBoolean / parsePositiveInt", () => {
+  it('parseBoolean accepts "true"/"false" only', () => {
+    expect(parseBoolean("true", "x")).toBe(true);
+    expect(parseBoolean("false", "x")).toBe(false);
+    expect(() => parseBoolean("yes", "x")).toThrow();
+    expect(() => parseBoolean("1", "x")).toThrow();
+    expect(() => parseBoolean("", "x")).toThrow();
+  });
+
+  it("parsePositiveInt accepts positive integers, rejects others", () => {
+    expect(parsePositiveInt("1000", "x")).toBe(1000);
+    expect(parsePositiveInt("900000", "x")).toBe(900000);
+    expect(() => parsePositiveInt("-1", "x")).toThrow();
+    expect(() => parsePositiveInt("0", "x")).toThrow();
+    expect(() => parsePositiveInt("3.5", "x")).toThrow();
+    expect(() => parsePositiveInt("abc", "x")).toThrow();
+    expect(() => parsePositiveInt("", "x")).toThrow();
+  });
+});
+
+describe("RoleConfig timeout-fix fields", () => {
+  it("BUILD_DEFAULTS sets retryOnTimeout:false on primaryImpl/testFixer/ship/land", () => {
+    expect(BUILD_DEFAULTS.roles.primaryImpl.retryOnTimeout).toBe(false);
+    expect(BUILD_DEFAULTS.roles.testFixer.retryOnTimeout).toBe(false);
+    expect(BUILD_DEFAULTS.roles.ship.retryOnTimeout).toBe(false);
+    expect(BUILD_DEFAULTS.roles.land.retryOnTimeout).toBe(false);
+  });
+
+  it("BUILD_DEFAULTS does NOT set retryOnTimeout on other roles", () => {
+    expect(BUILD_DEFAULTS.roles.testWriter.retryOnTimeout).toBeUndefined();
+    expect(BUILD_DEFAULTS.roles.judge.retryOnTimeout).toBeUndefined();
+    expect(BUILD_DEFAULTS.roles.review.retryOnTimeout).toBeUndefined();
+    expect(BUILD_DEFAULTS.roles.qa.retryOnTimeout).toBeUndefined();
+  });
+
+  it("applyEnvRoleConfig parses GSTACK_BUILD_PRIMARY_IMPL_TIMEOUT", () => {
+    const roles = applyEnvRoleConfig(cloneRoleConfigs(), {
+      GSTACK_BUILD_PRIMARY_IMPL_TIMEOUT: "1800000",
+    });
+    expect(roles.primaryImpl.timeoutMs).toBe(1800000);
+  });
+
+  it("applyEnvRoleConfig parses GSTACK_BUILD_PRIMARY_IMPL_BACKUP_TIMEOUT", () => {
+    const roles = applyEnvRoleConfig(cloneRoleConfigs(), {
+      GSTACK_BUILD_PRIMARY_IMPL_BACKUP_TIMEOUT: "300000",
+    });
+    expect(roles.primaryImpl.backupTimeoutMs).toBe(300000);
+  });
+
+  it("applyEnvRoleConfig parses GSTACK_BUILD_PRIMARY_IMPL_RETRY_ON_TIMEOUT", () => {
+    const rolesTrue = applyEnvRoleConfig(cloneRoleConfigs(), {
+      GSTACK_BUILD_PRIMARY_IMPL_RETRY_ON_TIMEOUT: "true",
+    });
+    expect(rolesTrue.primaryImpl.retryOnTimeout).toBe(true);
+    const rolesFalse = applyEnvRoleConfig(cloneRoleConfigs(), {
+      GSTACK_BUILD_PRIMARY_IMPL_RETRY_ON_TIMEOUT: "false",
+    });
+    expect(rolesFalse.primaryImpl.retryOnTimeout).toBe(false);
+  });
+
+  it("applyEnvRoleConfig rejects malformed env vars", () => {
+    expect(() =>
+      applyEnvRoleConfig(cloneRoleConfigs(), {
+        GSTACK_BUILD_PRIMARY_IMPL_TIMEOUT: "-1",
+      }),
+    ).toThrow();
+    expect(() =>
+      applyEnvRoleConfig(cloneRoleConfigs(), {
+        GSTACK_BUILD_PRIMARY_IMPL_RETRY_ON_TIMEOUT: "yes",
+      }),
+    ).toThrow();
+  });
+
+  it("applyRoleOverride sets timeoutMs", () => {
+    const roles = cloneRoleConfigs();
+    applyRoleOverride(roles, "primaryImpl", "timeoutMs", "1800000");
+    expect(roles.primaryImpl.timeoutMs).toBe(1800000);
+  });
+
+  it("applyRoleOverride sets backupTimeoutMs", () => {
+    const roles = cloneRoleConfigs();
+    applyRoleOverride(roles, "primaryImpl", "backupTimeoutMs", "300000");
+    expect(roles.primaryImpl.backupTimeoutMs).toBe(300000);
+  });
+
+  it("applyRoleOverride sets retryOnTimeout", () => {
+    const roles = cloneRoleConfigs();
+    applyRoleOverride(roles, "judge", "retryOnTimeout", "false");
+    expect(roles.judge.retryOnTimeout).toBe(false);
+  });
+
+  it("applyRoleOverride rejects negative timeoutMs", () => {
+    const roles = cloneRoleConfigs();
+    expect(() =>
+      applyRoleOverride(roles, "primaryImpl", "timeoutMs", "-100"),
+    ).toThrow();
+  });
+
+  it("applyRoleOverride rejects non-boolean retryOnTimeout", () => {
+    const roles = cloneRoleConfigs();
+    expect(() =>
+      applyRoleOverride(roles, "judge", "retryOnTimeout", "maybe"),
+    ).toThrow();
+  });
+
+  it("cloneRoleConfigs preserves new optional fields when set", () => {
+    const roles = cloneRoleConfigs({
+      primaryImpl: {
+        ...DEFAULT_ROLE_CONFIGS.primaryImpl,
+        timeoutMs: 1200000,
+        backupTimeoutMs: 400000,
+        retryOnTimeout: false,
+      },
+    });
+    expect(roles.primaryImpl.timeoutMs).toBe(1200000);
+    expect(roles.primaryImpl.backupTimeoutMs).toBe(400000);
+    expect(roles.primaryImpl.retryOnTimeout).toBe(false);
   });
 });
