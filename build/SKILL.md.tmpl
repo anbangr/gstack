@@ -1276,7 +1276,8 @@ To recover:
 ### Step M3.5: Skill Fault Investigator
 
 After the monitor exits, scan its output for skill-fault detections and dispatch investigators.
-The `fault_investigator_model` is read from `configure.cm` and faults are written to `~/.gstack/skill-faults/`:
+The `fault_investigator_model` is read from `configure.cm` and faults are written to `~/.gstack/skill-faults/`.
+Drain-faults is RESOLVED-aware: a `SKILL_FAULT_DETECTED` followed by a matching `SKILL_FAULT_RESOLVED` in the same log is treated as a closed transient session and skipped — no investigator runs for it.
 
 ```bash
 _MONITOR_EXIT="${_MONITOR_EXIT:-0}"

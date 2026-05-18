@@ -372,21 +372,62 @@ export function parseFaultLog(logContent: string): {
   totalEvents: number;
   hasRunFailed: boolean;
 } {
+  // Order-aware scan. Walk events linearly, tracking per-(runId, faultId)
+  // "open" state. DETECTED opens a session for that fault id. RESOLVED
+  // closes the session AND drops any pending row that opened it. A second
+  // DETECTED after a RESOLVED is a fresh session (the transient cleared,
+  // then came back) — it survives.
+  //
+  // Per-(runId, category) dedup runs on top: among surviving DETECTEDs,
+  // the FIRST one we kept wins the row slot (matches the prior behavior
+  // for legacy logs without faultId).
+  //
+  // Legacy logs whose DETECTED events lack faultId never match RESOLVED
+  // events (different keying) and follow the old dedup-by-category path.
   let totalEvents = 0;
   let hasRunFailed = false;
   const seen = new Set<string>();
   const rows: FaultRow[] = [];
+  // Open DETECTED-row ids → index in `rows`. A later RESOLVED removes the
+  // open id from the map AND splices the row out of `rows`.
+  const openRowIndex = new Map<string, number>();
 
   for (const line of logContent.split("\n")) {
     if (!line.trim()) continue;
-    let parsed: SkillFaultDetectedPayload;
+    let parsed: any;
     try {
       parsed = JSON.parse(line);
     } catch {
       continue;
     }
-    if (parsed.event === "RUN_FAILED") hasRunFailed = true;
-    if (parsed.event !== "SKILL_FAULT_DETECTED") continue;
+    if (parsed?.event === "RUN_FAILED") {
+      hasRunFailed = true;
+      continue;
+    }
+    if (parsed?.event === "SKILL_FAULT_RESOLVED") {
+      if (
+        typeof parsed.runId === "string" &&
+        typeof parsed.faultId === "string"
+      ) {
+        const pairKey = `${parsed.runId}|${parsed.faultId}`;
+        const rowIdx = openRowIndex.get(pairKey);
+        if (typeof rowIdx === "number") {
+          // Splice the open row out (drop from investigator queue).
+          const removed = rows.splice(rowIdx, 1);
+          if (removed.length > 0) {
+            const removedCategoryKey = `${sanitizeForFilename(removed[0].runId)}|${sanitizeForFilename(removed[0].category)}`;
+            seen.delete(removedCategoryKey);
+          }
+          openRowIndex.delete(pairKey);
+          // Reindex subsequent open entries to account for the splice.
+          for (const [k, v] of openRowIndex) {
+            if (v > rowIdx) openRowIndex.set(k, v - 1);
+          }
+        }
+      }
+      continue;
+    }
+    if (parsed?.event !== "SKILL_FAULT_DETECTED") continue;
     if (!Array.isArray(parsed.faults)) continue;
 
     const runId = typeof parsed.runId === "string" ? parsed.runId : "unknown";
@@ -394,10 +435,16 @@ export function parseFaultLog(logContent: string): {
       totalEvents += 1;
       const category =
         typeof fault.category === "string" ? fault.category : "UNKNOWN";
-      const key = `${sanitizeForFilename(runId)}|${sanitizeForFilename(category)}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
+      const categoryKey = `${sanitizeForFilename(runId)}|${sanitizeForFilename(category)}`;
+      if (seen.has(categoryKey)) continue;
+      seen.add(categoryKey);
       rows.push({ runId, category, fault, event: parsed });
+      // Track open state by faultId so a later RESOLVED can splice this
+      // row out if the session closes before drain time.
+      const faultId = (fault as any).faultId;
+      if (typeof faultId === "string") {
+        openRowIndex.set(`${runId}|${faultId}`, rows.length - 1);
+      }
     }
   }
 
