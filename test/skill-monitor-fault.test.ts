@@ -502,3 +502,243 @@ describe("SkillFaultDetectedEvent type shape (types.ts)", () => {
     expect(ev.event in MONITOR_EXIT_CODES).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// DETECTED → RESOLVED diff across ticks (fixes
+// SKILL_FAULT_DETECTED_IS_APPEND_ONLY_TELEMETRY).
+//
+// The monitor maintains an active-fault registry keyed by (runId, faultId).
+// First time a fault appears: emit SKILL_FAULT_DETECTED, add to registry.
+// Subsequent ticks while fault still firing: no event.
+// Fault stops firing: emit SKILL_FAULT_RESOLVED, remove from registry.
+//
+// Registry is disk-backed at activeFaultRegistryDir so --monitor-once
+// invocations across CLI calls see resolutions; tests pass a tmpdir.
+// ---------------------------------------------------------------------------
+
+describe("active-fault registry diffing (DETECTED → RESOLVED)", () => {
+  function makeStateWithCodexConvergence(
+    iterations: number,
+    extraState: Partial<BuildState> = {},
+  ): Partial<BuildState> {
+    return {
+      ...extraState,
+      phases: [
+        {
+          index: 0,
+          number: "1",
+          name: "Phase",
+          status: "tests_green",
+          codexReview: {
+            iterations,
+            outputLogPaths: [],
+          },
+        },
+      ],
+    };
+  }
+
+  it("tick 1: new fault → emits SKILL_FAULT_DETECTED", () => {
+    const data = makeManifest();
+    const run = data.runs[0];
+    writeState(
+      run,
+      makeStateWithCodexConvergence(DEFAULT_MAX_CODEX_ITERATIONS),
+    );
+    const registryDir = path.join(tmpDir, "registry");
+
+    const r = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-11T00:00:30.000Z"),
+      pollMs: 60_000,
+      activeFaultRegistryDir: registryDir,
+    } as any);
+
+    const events = (r as any).skillFaultEvents as any[];
+    const detected = events.filter((e) => e.event === "SKILL_FAULT_DETECTED");
+    const resolved = events.filter((e) => e.event === "SKILL_FAULT_RESOLVED");
+    expect(detected.length).toBeGreaterThan(0);
+    expect(resolved.length).toBe(0);
+  });
+
+  it("tick 2 with same fault still firing → emits NO event (registry suppresses repeat)", () => {
+    const data = makeManifest();
+    const run = data.runs[0];
+    writeState(
+      run,
+      makeStateWithCodexConvergence(DEFAULT_MAX_CODEX_ITERATIONS),
+    );
+    const registryDir = path.join(tmpDir, "registry");
+    const manifestPath = writeManifest(data);
+
+    // Tick 1: prime the registry.
+    evaluateMonitorOnce({
+      manifestPath,
+      now: new Date("2026-05-11T00:00:30.000Z"),
+      pollMs: 60_000,
+      activeFaultRegistryDir: registryDir,
+    } as any);
+
+    // Tick 2: same state, fault still active.
+    const r = evaluateMonitorOnce({
+      manifestPath,
+      now: new Date("2026-05-11T00:01:30.000Z"),
+      pollMs: 60_000,
+      activeFaultRegistryDir: registryDir,
+    } as any);
+
+    const events = (r as any).skillFaultEvents as any[];
+    expect(events).toEqual([]);
+  });
+
+  it("tick 3 with fault cleared → emits SKILL_FAULT_RESOLVED, removes from registry", () => {
+    const data = makeManifest();
+    const run = data.runs[0];
+    const registryDir = path.join(tmpDir, "registry");
+    const manifestPath = writeManifest(data);
+
+    // Tick 1: fault present.
+    writeState(
+      run,
+      makeStateWithCodexConvergence(DEFAULT_MAX_CODEX_ITERATIONS),
+    );
+    evaluateMonitorOnce({
+      manifestPath,
+      now: new Date("2026-05-11T00:00:30.000Z"),
+      pollMs: 60_000,
+      activeFaultRegistryDir: registryDir,
+    } as any);
+
+    // Tick 2: fault gone (iterations rewound below cap; not realistic but
+    // matches "detector returns empty" which is the cleanup signal).
+    writeState(run, {
+      phases: [{ index: 0, number: "1", name: "Phase", status: "pending" }],
+    });
+    const r = evaluateMonitorOnce({
+      manifestPath,
+      now: new Date("2026-05-11T00:01:30.000Z"),
+      pollMs: 60_000,
+      activeFaultRegistryDir: registryDir,
+    } as any);
+
+    const events = (r as any).skillFaultEvents as any[];
+    const resolved = events.filter((e) => e.event === "SKILL_FAULT_RESOLVED");
+    expect(resolved.length).toBeGreaterThan(0);
+    expect(resolved[0]).toMatchObject({
+      event: "SKILL_FAULT_RESOLVED",
+      runId: run.runId,
+    });
+    // Resolved event carries firstDetectedAt + lastDetectedAt + the fault id.
+    expect(resolved[0].firstDetectedAt).toBeDefined();
+    expect(resolved[0].lastDetectedAt).toBeDefined();
+    expect(resolved[0].faultId).toBeDefined();
+  });
+
+  it("after RESOLVED, fresh DETECTED on a re-occurrence (registry cleared correctly)", () => {
+    const data = makeManifest();
+    const run = data.runs[0];
+    const registryDir = path.join(tmpDir, "registry");
+    const manifestPath = writeManifest(data);
+
+    // Tick 1: fault present → DETECTED.
+    writeState(
+      run,
+      makeStateWithCodexConvergence(DEFAULT_MAX_CODEX_ITERATIONS),
+    );
+    evaluateMonitorOnce({
+      manifestPath,
+      now: new Date("2026-05-11T00:00:30.000Z"),
+      pollMs: 60_000,
+      activeFaultRegistryDir: registryDir,
+    } as any);
+
+    // Tick 2: fault gone → RESOLVED.
+    writeState(run, {
+      phases: [{ index: 0, number: "1", name: "Phase", status: "pending" }],
+    });
+    evaluateMonitorOnce({
+      manifestPath,
+      now: new Date("2026-05-11T00:01:30.000Z"),
+      pollMs: 60_000,
+      activeFaultRegistryDir: registryDir,
+    } as any);
+
+    // Tick 3: same fault recurs → fresh DETECTED, no spurious RESOLVED.
+    writeState(
+      run,
+      makeStateWithCodexConvergence(DEFAULT_MAX_CODEX_ITERATIONS),
+    );
+    const r = evaluateMonitorOnce({
+      manifestPath,
+      now: new Date("2026-05-11T00:02:30.000Z"),
+      pollMs: 60_000,
+      activeFaultRegistryDir: registryDir,
+    } as any);
+
+    const events = (r as any).skillFaultEvents as any[];
+    const detected = events.filter((e) => e.event === "SKILL_FAULT_DETECTED");
+    const resolved = events.filter((e) => e.event === "SKILL_FAULT_RESOLVED");
+    expect(detected.length).toBeGreaterThan(0);
+    expect(resolved.length).toBe(0);
+  });
+
+  it("registry persists across separate evaluateMonitorOnce calls (disk-backed)", () => {
+    const data = makeManifest();
+    const run = data.runs[0];
+    const registryDir = path.join(tmpDir, "registry");
+    const manifestPath = writeManifest(data);
+
+    // Tick 1: prime registry on disk.
+    writeState(
+      run,
+      makeStateWithCodexConvergence(DEFAULT_MAX_CODEX_ITERATIONS),
+    );
+    evaluateMonitorOnce({
+      manifestPath,
+      now: new Date("2026-05-11T00:00:30.000Z"),
+      pollMs: 60_000,
+      activeFaultRegistryDir: registryDir,
+    } as any);
+
+    // Registry file should exist after tick 1.
+    const files = fs.readdirSync(registryDir);
+    expect(files.length).toBeGreaterThan(0);
+
+    // Tick 2 (separate "process" — fresh evaluateMonitorOnce call) reads
+    // registry from disk, sees fault still firing → no event.
+    const r = evaluateMonitorOnce({
+      manifestPath,
+      now: new Date("2026-05-11T00:01:30.000Z"),
+      pollMs: 60_000,
+      activeFaultRegistryDir: registryDir,
+    } as any);
+    expect((r as any).skillFaultEvents).toEqual([]);
+  });
+
+  it("backwards-compat: omitting activeFaultRegistryDir keeps old per-tick DETECTED emission", () => {
+    // Existing callers without the new opt get unchanged behavior. This
+    // avoids breaking any consumer not ready for RESOLVED events.
+    const data = makeManifest();
+    const run = data.runs[0];
+    writeState(
+      run,
+      makeStateWithCodexConvergence(DEFAULT_MAX_CODEX_ITERATIONS),
+    );
+    const manifestPath = writeManifest(data);
+
+    const r1 = evaluateMonitorOnce({
+      manifestPath,
+      now: new Date("2026-05-11T00:00:30.000Z"),
+      pollMs: 60_000,
+    });
+    const r2 = evaluateMonitorOnce({
+      manifestPath,
+      now: new Date("2026-05-11T00:01:30.000Z"),
+      pollMs: 60_000,
+    });
+
+    // Both ticks emit DETECTED — no diffing without registry.
+    expect((r1 as any).skillFaultEvents.length).toBeGreaterThan(0);
+    expect((r2 as any).skillFaultEvents.length).toBeGreaterThan(0);
+  });
+});

@@ -2016,7 +2016,8 @@ To recover:
 ### Step M3.5: Skill Fault Investigator
 
 After the monitor exits, scan its output for skill-fault detections and dispatch investigators.
-The `fault_investigator_model` is read from `configure.cm` and faults are written to `~/.gstack/skill-faults/`:
+The `fault_investigator_model` is read from `configure.cm` and faults are written to `~/.gstack/skill-faults/`.
+Drain-faults is RESOLVED-aware: a `SKILL_FAULT_DETECTED` followed by a matching `SKILL_FAULT_RESOLVED` in the same log is treated as a closed transient session and skipped — no investigator runs for it.
 
 ```bash
 _MONITOR_EXIT="${_MONITOR_EXIT:-0}"
@@ -2047,7 +2048,13 @@ fi
 
 if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
   _FAULT_ROWS=""
-  _FAULT_LINES=$(grep '"event":"SKILL_FAULT_DETECTED"' "$BUILD_TMP_DIR/monitor-output.log" 2>/dev/null || grep "SKILL_FAULT_DETECTED" "$BUILD_TMP_DIR/monitor-output.log" 2>/dev/null || true)
+  # Read BOTH DETECTED and RESOLVED events so the jq below can drop DETECTEDs
+  # that have a later matching RESOLVED in the same log. Mirrors the
+  # order-aware logic in build/orchestrator/drain-faults.ts:parseFaultLog —
+  # without this filter, the in-skill dispatcher fires investigators for
+  # already-resolved transient faults that the CLI drain-faults pass at
+  # line 1291 correctly dropped.
+  _FAULT_LINES=$(grep -E '"event":"SKILL_FAULT_(DETECTED|RESOLVED)"' "$BUILD_TMP_DIR/monitor-output.log" 2>/dev/null || grep "SKILL_FAULT_DETECTED" "$BUILD_TMP_DIR/monitor-output.log" 2>/dev/null || true)
   if [ -n "$_FAULT_LINES" ]; then
     _FAULT_SECONDARY_DIR=""
     if _GSTACK_SKILL_TARGET=$(readlink "$HOME/.claude/skills/gstack" 2>/dev/null); then
@@ -2061,9 +2068,39 @@ if [ -f "$BUILD_TMP_DIR/monitor-output.log" ]; then
 
     # Each SKILL_FAULT_DETECTED line is a JSON event:
     #   {event,timestamp,runId,stateSlug,stateFile,manifestPath,
-    #    faults:[{category,severity,description,sourceFiles,evidence}]}
-    # Flatten to TSV: runId<TAB>category<TAB>fault-json-base64<TAB>event-json-base64.
-    _FAULT_ROWS=$(printf '%s\n' "$_FAULT_LINES" | jq -rc 'select(.event == "SKILL_FAULT_DETECTED") as $ev | ($ev.runId // "unknown") as $rid | ($ev.faults // [])[] | [($rid|tostring), ((.category // "UNKNOWN")|tostring), (. | @base64), ($ev | @base64)] | @tsv' 2>/dev/null || true)
+    #    faults:[{category,severity,description,sourceFiles,evidence,faultId?}]}
+    # Each SKILL_FAULT_RESOLVED line is:
+    #   {event,timestamp,runId,faultId,firstDetectedAt,lastDetectedAt}
+    #
+    # Order-aware walk (mirrors build/orchestrator/drain-faults.ts:parseFaultLog):
+    # For each (runId, faultId) pair, DETECTED opens / re-opens the session,
+    # RESOLVED closes it. At end of walk, emit ONE row per still-open pair
+    # using the LATEST DETECTED event for that pair. Plus emit all "legacy"
+    # DETECTED faults (no faultId — pre-fix logs or future categories that
+    # opt out of the diff) unconditionally; downstream dedup-by-(runId,
+    # category) collapses any duplicates from re-occurrences. TSV flatten:
+    # runId<TAB>category<TAB>fault-json-base64<TAB>event-json-base64.
+    _FAULT_ROWS=$(printf '%s\n' "$_FAULT_LINES" | jq -rc --slurp '
+      (reduce .[] as $e ({open: {}, legacy: []};
+        if ($e.event == "SKILL_FAULT_DETECTED") then
+          reduce ($e.faults // [])[] as $f (.;
+            if ($f.faultId // "") != "" then
+              .open["\($e.runId)|\($f.faultId)"] = {ev: $e, fault: $f}
+            else
+              .legacy += [{ev: $e, fault: $f}]
+            end)
+        elif ($e.event == "SKILL_FAULT_RESOLVED") then
+          if (.open["\($e.runId)|\($e.faultId)"] // null) != null then
+            .open = (.open | del(.["\($e.runId)|\($e.faultId)"]))
+          else . end
+        else . end)) as $s
+      | (($s.open | to_entries[] | .value) , ($s.legacy[]))
+      | .ev as $ev
+      | .fault as $fault
+      | ($ev.runId // "unknown") as $rid
+      | [($rid|tostring), (($fault.category // "UNKNOWN")|tostring), ($fault | @base64), ($ev | @base64)]
+      | @tsv
+    ' 2>/dev/null || true)
 
     _resolve_fault_path() {
       _FAULT_INPUT="$1"

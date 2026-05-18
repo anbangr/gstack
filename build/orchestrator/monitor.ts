@@ -15,8 +15,14 @@ import type {
   BuildState,
   PhaseStatus,
   SkillFaultDetectedEvent,
+  SkillFaultEvent,
+  SkillFaultResolvedEvent,
 } from "./types";
-import { detectSkillFaults, loadLearnedPatterns } from "./skill-fault-detector";
+import {
+  detectSkillFaults,
+  faultId as computeFaultId,
+  loadLearnedPatterns,
+} from "./skill-fault-detector";
 
 export type MonitorEventName =
   | "RUN_RUNNING"
@@ -102,12 +108,28 @@ export interface MonitorOnceOptions {
   pollMs?: number;
   now?: Date;
   spawnResume?: boolean;
+  /**
+   * Directory holding the disk-backed active-fault registry. When set, the
+   * monitor diffs the current tick's faults against the registry and emits
+   * SKILL_FAULT_RESOLVED for ids that disappeared. When omitted, the
+   * monitor stays append-only (back-compat: every tick emits DETECTED for
+   * every active fault, no RESOLVED events).
+   *
+   * Per-runId file: `<dir>/<safeRunId>.json`. Atomic tmp+rename writes.
+   */
+  activeFaultRegistryDir?: string;
 }
 
 export interface MonitorEvaluation {
   manifest?: BuildRunManifest;
   events: MonitorEvent[];
-  skillFaultEvents: SkillFaultDetectedEvent[];
+  /**
+   * Mix of SKILL_FAULT_DETECTED (new faults) and SKILL_FAULT_RESOLVED
+   * (faults that stopped firing on this tick). Order: detected events
+   * before resolved events, then in the order the corresponding faults
+   * were emitted by detectSkillFaults / the registry diff.
+   */
+  skillFaultEvents: SkillFaultEvent[];
   terminalEvent: MonitorEvent;
 }
 
@@ -527,12 +549,69 @@ function runEvent(
   );
 }
 
+// ---------------------------------------------------------------------------
+// Active-fault registry (disk-backed) — for the DETECTED → RESOLVED diff.
+// Per-runId JSON file at <activeFaultRegistryDir>/<safeRunId>.json shaped as:
+//   { [faultId: string]: { firstDetectedAt, lastDetectedAt, fault } }
+// Atomic write via tmp+rename so a crashed monitor doesn't corrupt state.
+// ---------------------------------------------------------------------------
+
+interface ActiveFaultEntry {
+  firstDetectedAt: string;
+  lastDetectedAt: string;
+  fault: import("./skill-fault-detector").SkillFault;
+}
+
+type ActiveFaultRegistry = Record<string, ActiveFaultEntry>;
+
+function safeRegistryRunId(runId: string): string {
+  return runId.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+function registryPathFor(dir: string, runId: string): string {
+  return path.join(dir, `${safeRegistryRunId(runId)}.json`);
+}
+
+function readActiveFaultRegistry(
+  dir: string,
+  runId: string,
+): ActiveFaultRegistry {
+  const file = registryPathFor(dir, runId);
+  try {
+    const raw = fs.readFileSync(file, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as ActiveFaultRegistry;
+    }
+  } catch {
+    // ENOENT or malformed → start fresh.
+  }
+  return {};
+}
+
+function writeActiveFaultRegistry(
+  dir: string,
+  runId: string,
+  registry: ActiveFaultRegistry,
+): void {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const file = registryPathFor(dir, runId);
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(registry, null, 2));
+    fs.renameSync(tmp, file);
+  } catch {
+    // Best-effort: don't break the monitor for a registry write failure.
+  }
+}
+
 export function evaluateMonitorOnce(
   opts: MonitorOnceOptions,
 ): MonitorEvaluation {
   const now = opts.now ?? new Date();
   const pollMs = opts.pollMs ?? 60_000;
-  const skillFaultEvents: SkillFaultDetectedEvent[] = [];
+  const skillFaultEvents: SkillFaultEvent[] = [];
+  const registryDir = opts.activeFaultRegistryDir;
   try {
     const manifest = loadMonitorManifest(opts.manifestPath);
     const events: MonitorEvent[] = [];
@@ -553,7 +632,66 @@ export function evaluateMonitorOnce(
           },
           learnedPatterns,
         );
-        if (faults.length > 0) {
+
+        if (registryDir) {
+          // Diff against the disk-backed registry. New ids → DETECTED.
+          // Still-active ids → bump lastDetectedAt, no event. Vanished
+          // ids → RESOLVED.
+          const runId = snapshot.run.runId;
+          const registry = readActiveFaultRegistry(registryDir, runId);
+          const ts = nowIso(now);
+          const currentIds = new Set<string>();
+          const newFaults: typeof faults = [];
+          for (const fault of faults) {
+            const id = computeFaultId(fault);
+            currentIds.add(id);
+            if (registry[id]) {
+              // Still firing: bump timestamp.
+              registry[id].lastDetectedAt = ts;
+            } else {
+              // New: register + flag for DETECTED emission.
+              registry[id] = {
+                firstDetectedAt: ts,
+                lastDetectedAt: ts,
+                fault,
+              };
+              newFaults.push(fault);
+            }
+          }
+          if (newFaults.length > 0) {
+            // Stamp faultId on each fault payload so downstream consumers
+            // (drain-faults, log readers) can pair DETECTED with RESOLVED.
+            const stampedFaults = newFaults.map((f) => ({
+              ...f,
+              faultId: computeFaultId(f),
+            }));
+            skillFaultEvents.push({
+              event: "SKILL_FAULT_DETECTED",
+              timestamp: ts,
+              runId: snapshot.run.runId,
+              stateSlug: snapshot.run.stateSlug,
+              stateFile: snapshot.stateFile,
+              manifestPath: opts.manifestPath,
+              faults: stampedFaults as typeof faults,
+            });
+          }
+          // Resolved: registry entries that aren't in the current tick.
+          for (const [id, entry] of Object.entries(registry)) {
+            if (!currentIds.has(id)) {
+              skillFaultEvents.push({
+                event: "SKILL_FAULT_RESOLVED",
+                timestamp: ts,
+                runId: snapshot.run.runId,
+                faultId: id,
+                firstDetectedAt: entry.firstDetectedAt,
+                lastDetectedAt: entry.lastDetectedAt,
+              });
+              delete registry[id];
+            }
+          }
+          writeActiveFaultRegistry(registryDir, runId, registry);
+        } else if (faults.length > 0) {
+          // Back-compat path: no registry, every tick emits DETECTED.
           skillFaultEvents.push({
             event: "SKILL_FAULT_DETECTED",
             timestamp: nowIso(now),
