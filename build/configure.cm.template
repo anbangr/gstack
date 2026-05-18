@@ -89,7 +89,7 @@
   },
   "timeoutsMs": {
     "gemini": 600000,
-    "kimi": 600000,
+    "kimi": 1500000,
     "codex": 900000,
     "ship": 1800000,
     "test": 300000,
