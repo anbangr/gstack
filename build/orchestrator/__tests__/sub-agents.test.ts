@@ -1965,6 +1965,80 @@ describe("inspectProject — tie-break for mixed-language repos", () => {
   });
 });
 
+describe("inspectProject — CLAUDE.md gstack.testCmd override", () => {
+  // Reproduces F2 from AGNT2 run: a Go service with a Node tooling sidecar
+  // has both go.mod and package.json. The tie-break heuristic flipped to
+  // `npx vitest run`, test-fixer ran in a Go directory with no JS tests to
+  // fix, hygiene rejected. The fix: an explicit CLAUDE.md override is
+  // Priority 0, ahead of every heuristic.
+  it("Go + Node sidecar with gstack.testCmd override → returns override verbatim", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "go.mod"), "module foo\ngo 1.22\n");
+      fs.writeFileSync(
+        path.join(cwd, "package.json"),
+        JSON.stringify({ scripts: { test: "vitest run" } }),
+      );
+      // Stack the deck against go test: more TS test files than Go.
+      for (let i = 0; i < 5; i += 1) {
+        fs.writeFileSync(path.join(cwd, `a${i}.test.ts`), "");
+      }
+      fs.writeFileSync(path.join(cwd, "pkg_test.go"), "package foo\n");
+      // Override in CLAUDE.md beats the heuristic.
+      fs.writeFileSync(
+        path.join(cwd, "CLAUDE.md"),
+        "# proj\n\ngstack.testCmd: go test ./...\n\nmore prose\n",
+      );
+
+      const r = inspectProject(cwd);
+      expect(r.runner).toBe("go test ./...");
+      // framework stays null when override is used — we know the command,
+      // not the framework, and don't need to guess.
+      expect(r.framework).toBe(null);
+      expect(r.evidence.some((e) => e.includes("CLAUDE.md"))).toBe(true);
+    });
+  });
+
+  it("override beats vitest.config.ts (the highest-priority heuristic)", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "vitest.config.ts"), "");
+      fs.writeFileSync(path.join(cwd, "package.json"), "{}");
+      fs.writeFileSync(
+        path.join(cwd, "CLAUDE.md"),
+        "gstack.testCmd: pnpm exec vitest run --reporter=verbose\n",
+      );
+
+      const r = inspectProject(cwd);
+      expect(r.runner).toBe("pnpm exec vitest run --reporter=verbose");
+      expect(r.framework).toBe(null);
+    });
+  });
+
+  it("ignores a malformed/empty override and falls through to heuristics", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "go.mod"), "module foo\ngo 1.22\n");
+      // Empty value on the right-hand side: not a usable command. Ignore.
+      fs.writeFileSync(
+        path.join(cwd, "CLAUDE.md"),
+        "gstack.testCmd:\n\nrest of doc\n",
+      );
+
+      const r = inspectProject(cwd);
+      // Falls through to single-language Go fallthrough (Priority 3).
+      expect(r.runner).toBe("go test ./...");
+      expect(r.framework).toBe("go");
+    });
+  });
+
+  it("no CLAUDE.md present → falls through to heuristics", () => {
+    withTmp((cwd) => {
+      fs.writeFileSync(path.join(cwd, "go.mod"), "module foo\ngo 1.22\n");
+      const r = inspectProject(cwd);
+      expect(r.runner).toBe("go test ./...");
+      expect(r.framework).toBe("go");
+    });
+  });
+});
+
 describe("inspectProject — single-language fallthrough", () => {
   it("go.mod alone → go test ./...", () => {
     withTmp((cwd) => {

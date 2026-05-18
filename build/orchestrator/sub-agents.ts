@@ -1420,12 +1420,51 @@ interface ProjectInspection {
  *
  * When nothing matches: { runner: null, framework: null }.
  */
+/**
+ * Read `gstack.testCmd: <command>` from CLAUDE.md at the project root.
+ * Returns the trimmed command string, or null when:
+ *   - CLAUDE.md does not exist
+ *   - the line is missing
+ *   - the value side is empty / whitespace only
+ *
+ * This is Priority 0 in inspectProject: a project-level escape hatch that
+ * beats every heuristic. CLAUDE.md's "Platform-agnostic design" rule says
+ * the project owns its config; gstack reads it.
+ */
+export function readClaudeMdTestCmd(cwd: string): string | null {
+  const claudeMdPath = path.join(cwd, "CLAUDE.md");
+  let body: string;
+  try {
+    body = fs.readFileSync(claudeMdPath, "utf8");
+  } catch {
+    return null;
+  }
+  // Match "gstack.testCmd: <value>" at the start of a line. Value ends at
+  // newline. Allow horizontal whitespace around the colon, but NOT newlines
+  // (so an empty value on its own line doesn't slurp the next paragraph).
+  const match = body.match(/^gstack\.testCmd[ \t]*:[ \t]*([^\n]*)$/m);
+  if (!match) return null;
+  const value = match[1].trim();
+  return value.length > 0 ? value : null;
+}
+
 export function inspectProject(
   cwd: string,
   opts: { now?: () => number } = {},
 ): ProjectInspection {
   const now = opts.now ?? (() => Date.now());
   const evidence: string[] = [];
+
+  // Priority 0 — explicit CLAUDE.md override. Beats every heuristic. Per
+  // CLAUDE.md "Platform-agnostic design": the project owns its config;
+  // gstack reads it. This is the escape hatch for multi-language repos
+  // (Go service with Node tooling sidecar, etc.) where the tie-break
+  // heuristic flips to the wrong runner.
+  const override = readClaudeMdTestCmd(cwd);
+  if (override) {
+    evidence.push("CLAUDE.md gstack.testCmd override");
+    return { runner: override, framework: null, evidence };
+  }
 
   // Priority 1 — framework-config files.
   const vitestConfig = firstExisting(cwd, [
