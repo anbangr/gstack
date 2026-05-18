@@ -50,6 +50,7 @@ import {
 } from "./state";
 import {
   activeOwnedBranches,
+  activeRunRecordPath,
   defaultActiveRunRegistryDir,
   isPidAlive,
   normalizeRepoPath,
@@ -251,10 +252,19 @@ function saveState(
  * Given a phase's runtime status, return the set of phase gates that should
  * show as done (checked) in the plan file. Exhaustive over all PhaseStatus
  * values so TypeScript enforces coverage when new statuses are added.
+ *
+ * Returns `undefined` for `failed` (and the exhaustive `default`) to mean
+ * "no opinion — leave the plan alone." This is structurally different from
+ * returning `{}`, which means "no gates are done." The reconciler in
+ * `reconcilePhaseVisibleGates` treats `undefined` as a no-op, so a phase
+ * stuck in `failed` does NOT have its visible gates un-checked. Returning
+ * `{}` here previously caused the recovery-scenario bug where the
+ * reconciler would actively flip user-edited `[x]` back to `[ ]` on every
+ * `saveState` tick.
  */
 export function phaseGateProjection(
   status: PhaseStatus,
-): Partial<Record<PhaseGate, boolean>> {
+): Partial<Record<PhaseGate, boolean>> | undefined {
   switch (status) {
     case "pending":
     case "test_spec_running":
@@ -292,11 +302,11 @@ export function phaseGateProjection(
         review_qa: true,
       };
     case "failed":
-      return {};
+      return undefined;
     default: {
       const _exhaustive: never = status;
       void _exhaustive;
-      return {};
+      return undefined;
     }
   }
 }
@@ -304,11 +314,19 @@ export function phaseGateProjection(
 /**
  * Given a feature's runtime status, return the set of feature gates that
  * should show as done in the plan file.
+ *
+ * Returns `undefined` for `failed` (and the exhaustive `default`) to mean
+ * "no opinion — leave the plan alone." Mirrors `phaseGateProjection`:
+ * the reconciler in `reconcileFeatureVisibleGates` treats `undefined` as
+ * a no-op, so a feature stuck in `failed` does NOT have its visible gates
+ * un-checked. The other "return {}" cases (pending/running/etc) are the
+ * truthful "no gates done yet" answer, not the ambiguous "I have no
+ * opinion" sentinel.
  */
 export function featureGateProjection(
   status: FeatureStatus,
   opts: { skipShip?: boolean; singleBranch?: boolean } = {},
-): Partial<Record<FeatureGate, boolean>> {
+): Partial<Record<FeatureGate, boolean>> | undefined {
   switch (status) {
     case "pending":
     case "running":
@@ -318,8 +336,9 @@ export function featureGateProjection(
     case "feature_redo_pending":
     case "feature_blocked":
     case "paused":
-    case "failed":
       return {};
+    case "failed":
+      return undefined;
     case "shipping":
     case "release_queued":
       return { feature_review: true };
@@ -345,7 +364,7 @@ export function featureGateProjection(
     default: {
       const _exhaustive: never = status;
       void _exhaustive;
-      return {};
+      return undefined;
     }
   }
 }
@@ -357,6 +376,10 @@ function reconcilePhaseVisibleGates(
 ): number {
   if (!phase.gates) return 0;
   const desired = phaseGateProjection(phaseState.status);
+  // Bug 1 fix: undefined means "no opinion" — leave the plan alone. This
+  // is what stops the reconciler from un-checking [x] when a phase is in
+  // `failed` and the user is mid-recovery.
+  if (desired === undefined) return 0;
   let changed = 0;
   for (const [gateKey, gs] of Object.entries(phase.gates) as [
     PhaseGate,
@@ -364,6 +387,14 @@ function reconcilePhaseVisibleGates(
   ][]) {
     const shouldBeDone = !!desired[gateKey];
     if (gs.done !== shouldBeDone) {
+      // Bug 2 defense-in-depth: never un-check. Even when projection
+      // legitimately wants false, if the plan shows [x], leave it. This
+      // protects against any future projection function returning a
+      // truthful `false` for a status whose plan view shouldn't be erased.
+      // Plan checkboxes only monotonically advance via this reconciler;
+      // explicit recovery scripts can still un-check via setCheckboxState
+      // directly.
+      if (!shouldBeDone && gs.done) continue;
       const result = setCheckboxState({
         planFile,
         lineNumber: gs.line,
@@ -387,6 +418,8 @@ function reconcileFeatureVisibleGates(
 ): number {
   if (!feature.gates) return 0;
   const desired = featureGateProjection(featureState.status, opts);
+  // Bug 1 fix mirror: undefined means "no opinion" — leave the plan alone.
+  if (desired === undefined) return 0;
   let changed = 0;
   for (const [gateKey, gs] of Object.entries(feature.gates) as [
     FeatureGate,
@@ -394,6 +427,8 @@ function reconcileFeatureVisibleGates(
   ][]) {
     const shouldBeDone = !!desired[gateKey];
     if (gs.done !== shouldBeDone) {
+      // Bug 2 defense-in-depth mirror: never un-check.
+      if (!shouldBeDone && gs.done) continue;
       const result = setCheckboxState({
         planFile,
         lineNumber: gs.line,
@@ -608,6 +643,8 @@ export interface Args {
   allowSubmoduleRecovery: string[];
   /** Mark a phase committed after manual recovery without rerunning earlier phase steps. */
   markPhaseCommitted?: string;
+  /** Stop a running gstack-build daemon by run-id. SIGTERM with 30s graceful timeout. */
+  stopRun?: string;
   /**
    * Skip the per-feature meta-review pass that fires after all phases of
    * a feature commit. Default off — review runs unless the skip heuristic
@@ -750,6 +787,7 @@ export function parseArgs(argv: string[]): Args {
     allowWorkspaceRoot: false,
     allowSubmoduleRecovery: [],
     markPhaseCommitted: undefined,
+    stopRun: undefined,
     skipFeatureReview: false,
     featureReviewMaxIter: DEFAULT_FEATURE_REVIEW_MAX_ITER,
     noPlanReview: false,
@@ -842,6 +880,13 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.markPhaseCommitted = next;
+    } else if (a === "--stop-run") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--stop-run requires a run-id");
+        process.exit(2);
+      }
+      args.stopRun = next;
     } else if (a === "--manifest") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
@@ -2430,7 +2475,14 @@ Flags:
                        Repeat for multiple submodules.
   --mark-phase-committed <phase>
                        Mark a manually recovered phase committed without rerunning
-                       test-spec, implementation, tests, or review steps.
+                       test-spec, implementation, tests, or review steps. Accepts
+                       either "<phase>" (dot-numbered plans) or "<feature>.<phase>"
+                       (per-feature plans).
+  --stop-run <run-id>  Stop a running gstack-build daemon by run-id. Reads the PID
+                       from the active-runs registry, signals SIGTERM, waits up to
+                       30s for graceful exit, then verifies the lock is gone.
+                       Refuses to signal a PID whose command line doesn't contain
+                       gstack/build/orchestrator/cli.ts (safe against PID reuse).
   --origin-plan <file> Original source plan. Verified after each feature and archived after final completion.
   --max-codex-iter N   Cap recursive Codex iterations (default ${DEFAULT_MAX_CODEX_ITERATIONS}).
   -h, --help           Show this help.
@@ -4093,6 +4145,120 @@ function isFailedGateResult(result: SubAgentResult, verdict: Verdict): boolean {
   return result.timedOut || result.exitCode !== 0 || verdict !== "pass";
 }
 
+/**
+ * Default glob patterns identifying paths that should be safe to auto-commit
+ * when a review/qa gate leaves them dirty. Matches the common conventions
+ * across Node / Python / Ruby / Go test layouts. A project can override by
+ * setting `qa_test_path_globs: [...]` in ~/.gstack/projects/{slug}/config.yaml,
+ * but for almost everyone the default set is enough.
+ */
+const DEFAULT_QA_TEST_PATH_GLOBS = [
+  "**/test/**",
+  "**/tests/**",
+  "**/__tests__/**",
+  "**/spec/**",
+  "**/specs/**",
+  "**/*.test.*",
+  "**/*.spec.*",
+  "**/*_test.*",
+  "**/*_spec.*",
+  "spec/**",
+];
+
+/** Convert a git-porcelain status line ("M path", " D path", "?? path") to
+ *  just the path portion. Handles rename arrows (" -> ") and quoted paths. */
+function porcelainStatusToPath(line: string): string {
+  const trimmed = line.slice(3).trim();
+  const renamed = trimmed.includes(" -> ")
+    ? trimmed.split(" -> ").pop() || trimmed
+    : trimmed;
+  return renamed.replace(/^"|"$/g, "");
+}
+
+/** Tiny glob → regex translator covering the patterns in DEFAULT_QA_TEST_PATH_GLOBS.
+ *  Supports `**`, `*`, and `?`. Anchored at both ends. Not a general glob engine. */
+function globToRegExp(glob: string): RegExp {
+  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  const withGlobs = escaped
+    .replace(/\*\*\/?/g, "<<DSTAR>>")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\?/g, "[^/]")
+    .replace(/<<DSTAR>>/g, "(?:.*/)?");
+  return new RegExp(`^${withGlobs}$`);
+}
+
+function isTestOnlyPath(filePath: string, globs: string[]): boolean {
+  return globs.some((g) => globToRegExp(g).test(filePath));
+}
+
+/**
+ * Bug 5: when a review/qa gate leaves the working tree dirty AND every dirty
+ * path matches a test-path glob, auto-commit the changes with attribution.
+ * Returns true if the auto-commit fired (caller should re-check hygiene as
+ * clean), false otherwise (caller falls through to the normal fail path).
+ *
+ * Backout knob: `GSTACK_QA_NO_AUTO_COMMIT=1` reverts to pre-fix behavior.
+ *
+ * The auto-commit is intentionally narrow: source-code changes still require
+ * human review. Only test-only expansions get the auto-commit pass. Matches
+ * the screenshot's "Codex genuinely wants to expand coverage and leaves
+ * test files dirty" complaint while keeping the safety property for any
+ * non-test change.
+ */
+export function maybeAutoCommitTestOnlyDirty(opts: {
+  cwd: string;
+  label: string;
+  dirtyLines: string[];
+  globs?: string[];
+}): { committed: boolean; reason: string } {
+  if (process.env.GSTACK_QA_NO_AUTO_COMMIT === "1") {
+    return { committed: false, reason: "GSTACK_QA_NO_AUTO_COMMIT=1" };
+  }
+  const globs = opts.globs ?? DEFAULT_QA_TEST_PATH_GLOBS;
+  const paths = opts.dirtyLines.map(porcelainStatusToPath);
+  if (paths.length === 0) {
+    return { committed: false, reason: "no dirty paths" };
+  }
+  const nonTest = paths.filter((p) => !isTestOnlyPath(p, globs));
+  if (nonTest.length > 0) {
+    return {
+      committed: false,
+      reason: `non-test paths present: ${nonTest.slice(0, 3).join(", ")}${
+        nonTest.length > 3 ? ` (+${nonTest.length - 3} more)` : ""
+      }`,
+    };
+  }
+  // All paths test-only → auto-commit.
+  const addR = spawnSync("git", ["add", "-A"], { cwd: opts.cwd });
+  if (addR.status !== 0) {
+    return {
+      committed: false,
+      reason: `git add failed: ${(addR.stderr?.toString() || "").trim()}`,
+    };
+  }
+  const message = `chore(qa): expand coverage via ${opts.label} (auto-committed)\n\nAuto-committed by gstack-build because the ${opts.label} role left only\ntest-path changes dirty. The hygiene gate previously failed in this case\neven when Codex/Gemini did legitimate coverage expansion. To revert this\nbehavior set GSTACK_QA_NO_AUTO_COMMIT=1.\n\nFiles:\n${paths.map((p) => `  ${p}`).join("\n")}`;
+  const commitR = spawnSync(
+    "git",
+    [
+      "-c",
+      "user.name=gstack-build (qa auto-commit)",
+      "-c",
+      "user.email=gstack-build+qa@local",
+      "commit",
+      "-m",
+      message,
+    ],
+    { cwd: opts.cwd, encoding: "utf8" },
+  );
+  if (commitR.status !== 0) {
+    return {
+      committed: false,
+      reason: `git commit failed: ${(commitR.stderr || "").trim()}`,
+    };
+  }
+  return { committed: true, reason: `committed ${paths.length} test path(s)` };
+}
+
 function applyGateHygiene(opts: {
   result: SubAgentResult;
   before: GitSnapshot;
@@ -4104,7 +4270,7 @@ function applyGateHygiene(opts: {
   };
 }): SubAgentResult {
   if (opts.result.timedOut || opts.result.exitCode !== 0) return opts.result;
-  const checks = [
+  let checks = [
     validatePostAgentHygiene({
       cwd: opts.cwd,
       before: opts.before,
@@ -4116,7 +4282,51 @@ function applyGateHygiene(opts: {
       label: opts.label,
     }),
   ];
-  const errors = checks.flatMap((check) => check.errors);
+  let errors = checks.flatMap((check) => check.errors);
+  // Bug 5: review/qa gates that left only test-path changes dirty can be
+  // auto-committed instead of failing. We only attempt the auto-commit when
+  // the ONLY hygiene problem is the dirty tree (no parent-workspace mutation,
+  // no other validator errors). Re-check hygiene after committing so the
+  // gate result still includes the cleaner verdict.
+  const isGateRole =
+    opts.label.startsWith("qa") ||
+    opts.label.startsWith("review") ||
+    opts.label.startsWith("reviewSecondary");
+  if (errors.length > 0 && isGateRole) {
+    const after = captureGitSnapshot(opts.cwd);
+    const allowedStatus = /^\?\? \.llm-tmp(\/|$)/;
+    const dirtyLines = after.status.filter((line) => !allowedStatus.test(line));
+    const onlyDirtyError =
+      errors.length === 1 && errors[0].includes("left the working tree dirty");
+    if (onlyDirtyError && dirtyLines.length > 0) {
+      const auto = maybeAutoCommitTestOnlyDirty({
+        cwd: opts.cwd,
+        label: opts.label,
+        dirtyLines,
+      });
+      if (auto.committed) {
+        console.warn(
+          `  ✓ ${opts.label} auto-committed test-only dirty tree (${auto.reason})`,
+        );
+        // Re-validate to confirm the tree is now clean.
+        checks = [
+          validatePostAgentHygiene({
+            cwd: opts.cwd,
+            before: opts.before,
+            label: opts.label,
+          }),
+          validateParentWorkspaceUnchanged({
+            before: opts.parentWorkspace?.snapshot ?? null,
+            workspaceRoot: opts.parentWorkspace?.workspaceRoot ?? null,
+            label: opts.label,
+          }),
+        ];
+        errors = checks.flatMap((check) => check.errors);
+      } else {
+        console.warn(`  ⚠ ${opts.label} auto-commit skipped: ${auto.reason}`);
+      }
+    }
+  }
   if (errors.length === 0) return opts.result;
   return hygieneFailureResult(errors.join("\n"), opts.result.logPath);
 }
@@ -4598,6 +4808,46 @@ function resetPhaseStateForRedo(state: BuildState, phaseIndex: number): void {
   delete (ps as any).dualImpl;
 }
 
+/**
+ * Resolve a `--mark-phase-committed` argument to a single phase.
+ *
+ * Accepts two notations:
+ *   - dot-numbered: "2.1" matches phase.number === "2.1" (plans whose
+ *     headings are `### Phase 2.1: ...`)
+ *   - feature-relative: "2.1" splits into <feat>="2" + <phase>="1" and
+ *     matches phase.featureNumber === "2" && phase.number === "1" (plans
+ *     whose headings are `### Phase 1:` under `## Feature 2:`)
+ *
+ * Bug 3 (Codex outside-voice catch): the original lookup was
+ * `phases.find(p => p.number === input)`, which broke on the mitosis
+ * plan style ("### Phase 1:" per-feature numbering) because phase.number
+ * is just the per-feature stem. Result: "--mark-phase-committed 2.1"
+ * errored `phase not found: 2.1` even though F2.P1 obviously exists.
+ *
+ * Returns null if no unambiguous match. Backward compat with
+ * cli.test.ts:2618 (passes "1.1" against a plan whose phase.number is
+ * literally "1.1") is preserved by the dot-numbered fallback.
+ */
+function resolvePhaseByMarkArg(phases: Phase[], input: string): Phase | null {
+  // 1. Feature-relative form: "<feat>.<phase>" → split and look up by both fields.
+  //    Only attempt this if input contains exactly one dot.
+  const dotIdx = input.indexOf(".");
+  if (dotIdx > 0 && input.lastIndexOf(".") === dotIdx) {
+    const featPart = input.slice(0, dotIdx);
+    const phasePart = input.slice(dotIdx + 1);
+    const featRel = phases.find(
+      (p) => p.featureNumber === featPart && p.number === phasePart,
+    );
+    if (featRel) return featRel;
+  }
+  // 2. Dot-numbered form (or fallback when feature-relative didn't match):
+  //    exact match on phase.number. Handles plans whose headings already
+  //    embed the feature number (### Phase 2.1: ...).
+  const direct = phases.find((p) => p.number === input);
+  if (direct) return direct;
+  return null;
+}
+
 export function markPhaseCommittedAfterManualRecovery(args: {
   state: BuildState;
   phases: Phase[];
@@ -4605,7 +4855,7 @@ export function markPhaseCommittedAfterManualRecovery(args: {
   planFile: string;
   dryRun?: boolean;
 }): { ok: true; phaseIndex: number } | { ok: false; error: string } {
-  const phase = args.phases.find((p) => p.number === args.phaseNumber);
+  const phase = resolvePhaseByMarkArg(args.phases, args.phaseNumber);
   if (!phase) {
     return { ok: false, error: `phase not found: ${args.phaseNumber}` };
   }
@@ -4647,23 +4897,30 @@ export function markPhaseCommittedAfterManualRecovery(args: {
     }
   }
 
-  const clearsBuildFailure =
-    args.state.failedAtPhase === phase.index ||
-    (args.state.failedAtPhase == null && phaseState.status === "failed");
-  args.state.phases[phase.index] = markCommitted(phaseState);
-  args.state.currentPhaseIndex = findNextPhaseIndex(args.state.phases);
-  if (args.state.failedAtPhase === phase.index) {
-    delete args.state.failedAtPhase;
-  }
-  if (clearsBuildFailure) {
-    delete args.state.failureReason;
-  }
-  const feature = args.state.features?.[phase.featureIndex];
-  if (feature && clearsBuildFailure) {
-    if (feature.status === "paused" || feature.status === "failed") {
-      feature.status = "running";
+  // Bug 4: gate the in-memory state mutations on !dryRun. The CLI caller's
+  // trailing saveState (cli.ts ~7769) writes whatever state object we leave
+  // here, so if we mutate it during a dry-run preview, the next save flushes
+  // the "preview" to disk — the opposite of what --dry-run promises.
+  // Plan-file flips above are already gated on !args.dryRun (line 4328+).
+  if (!args.dryRun) {
+    const clearsBuildFailure =
+      args.state.failedAtPhase === phase.index ||
+      (args.state.failedAtPhase == null && phaseState.status === "failed");
+    args.state.phases[phase.index] = markCommitted(phaseState);
+    args.state.currentPhaseIndex = findNextPhaseIndex(args.state.phases);
+    if (args.state.failedAtPhase === phase.index) {
+      delete args.state.failedAtPhase;
     }
-    delete feature.error;
+    if (clearsBuildFailure) {
+      delete args.state.failureReason;
+    }
+    const feature = args.state.features?.[phase.featureIndex];
+    if (feature && clearsBuildFailure) {
+      if (feature.status === "paused" || feature.status === "failed") {
+        feature.status = "running";
+      }
+      delete feature.error;
+    }
   }
   return { ok: true, phaseIndex: phase.index };
 }
@@ -7747,6 +8004,118 @@ export async function runDoctorMode(args: Args): Promise<number> {
   return report.worstSeverity === "P0" ? 1 : 0;
 }
 
+/**
+ * Bug 6: --stop-run <run-id> handler.
+ *
+ * Stops a running gstack-build daemon by reading the PID from the active-run
+ * registry, sending SIGTERM, waiting up to 30s for graceful exit, and verifying
+ * the lock file is gone. Refuses to signal a PID whose command line does not
+ * contain "gstack/build/orchestrator/cli.ts" — protects against PID reuse,
+ * where the registered PID has been recycled by an unrelated process.
+ *
+ * Exit codes:
+ *   0  daemon stopped cleanly (or was already dead)
+ *   1  active-run record missing/unreadable
+ *   2  PID does not belong to a gstack-build process (PID reuse guard)
+ *   3  daemon still alive after 30s timeout
+ *   4  signal failed (permission denied, etc)
+ */
+export async function runStopRun(
+  runId: string,
+  activeRunRegistry: string,
+): Promise<number> {
+  const recordPath = activeRunRecordPath(activeRunRegistry, runId);
+  let record: ActiveRunRecord;
+  try {
+    const raw = fs.readFileSync(recordPath, "utf8");
+    record = JSON.parse(raw) as ActiveRunRecord;
+  } catch (err) {
+    console.error(
+      `--stop-run: active-run record not found or unreadable at ${recordPath}: ${(err as Error).message}`,
+    );
+    return 1;
+  }
+
+  const pid = record.pid;
+  if (!Number.isInteger(pid) || pid <= 0) {
+    console.error(`--stop-run: active-run record has invalid pid: ${pid}`);
+    return 1;
+  }
+
+  // Already-dead PID: nothing to signal. The orphan sweep above will have
+  // updated the record status, so this is a no-op success.
+  if (!isPidAlive(pid)) {
+    console.log(`--stop-run: pid ${pid} is not alive — daemon already stopped`);
+    // Best-effort: update the registry record to reflect status.
+    try {
+      record.status = "completed";
+      record.lastUpdatedAt = new Date().toISOString();
+      writeActiveRunRecord(activeRunRegistry, record);
+    } catch {
+      // Ignore — the sweep at next startup will fix this.
+    }
+    return 0;
+  }
+
+  // PID reuse guard: verify the live PID actually belongs to a gstack-build
+  // process. ps -p $PID -o command= prints just the command. We look for the
+  // canonical orchestrator script path. False negatives are safer than false
+  // positives — refuse to signal anything ambiguous.
+  const psR = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
+    encoding: "utf8",
+  });
+  if (psR.status !== 0) {
+    console.error(
+      `--stop-run: ps failed for pid ${pid}: ${(psR.stderr || "").trim()}`,
+    );
+    return 4;
+  }
+  const psOut = (psR.stdout || "").trim();
+  if (!psOut.includes("gstack/build/orchestrator/cli.ts")) {
+    console.error(
+      `--stop-run: pid ${pid} is not a gstack-build process (cmd: ${psOut.slice(0, 120)})`,
+    );
+    return 2;
+  }
+
+  // Signal SIGTERM. The orchestrator's signal handler (cli.ts ~7800) marks
+  // active-run paused and releases the lock before exiting.
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (err) {
+    console.error(
+      `--stop-run: kill -TERM ${pid} failed: ${(err as Error).message}`,
+    );
+    return 4;
+  }
+  console.log(`--stop-run: sent SIGTERM to pid ${pid}, waiting up to 30s...`);
+
+  // Poll for up to 30s, with 1s steps. Bail early when the PID is dead.
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    if (!isPidAlive(pid)) {
+      console.log(`--stop-run: pid ${pid} exited after ${i + 1}s`);
+      // Verify the lock file was released. acquireLock's dead-PID auto-clear
+      // will catch any orphan on the next run start anyway, but reporting the
+      // state here saves the user a follow-up command.
+      const lockFile = lockPath(record.stateSlug);
+      if (fs.existsSync(lockFile)) {
+        console.warn(
+          `--stop-run: lock file still present at ${lockFile} (orphan; next run will auto-clear)`,
+        );
+      } else {
+        console.log(`--stop-run: lock file released`);
+      }
+      return 0;
+    }
+  }
+
+  console.error(
+    `--stop-run: pid ${pid} still alive after 30s — investigate manually`,
+  );
+  return 3;
+}
+
 async function main() {
   // Install SIGTERM/SIGINT/SIGHUP handlers before spawning anything so the
   // first sub-process to outlive a survivable signal still gets reaped.
@@ -7766,6 +8135,14 @@ async function main() {
     sweepOrphans(args.activeRunRegistry);
   } catch (err) {
     console.warn(`[sweep] startup sweep failed: ${(err as Error).message}`);
+  }
+
+  // Bug 6: --stop-run handler. Runs after orphan sweep so a dead-PID lock
+  // is auto-cleared first; otherwise stop-run can short-circuit on a stale
+  // lock instead of telling the user the daemon was already gone.
+  if (args.stopRun) {
+    const exitCode = await runStopRun(args.stopRun, args.activeRunRegistry);
+    process.exit(exitCode);
   }
 
   if (args.mode === "merge") {
@@ -8047,6 +8424,13 @@ async function main() {
         console.error(`\n✗ --mark-phase-committed failed: ${marked.error}\n`);
         exitCode = 2;
         setupFailed = true;
+      } else if (args.dryRun) {
+        // Bug 4: --dry-run must NOT persist state. Honor the flag by skipping
+        // the trailing saveState. Tell the user what would have changed so the
+        // preview is meaningful.
+        console.log(
+          `\n✓ [DRY RUN] Would mark phase ${args.markPhaseCommitted} committed (state NOT written).`,
+        );
       } else {
         console.log(
           `\n✓ Marked phase ${args.markPhaseCommitted} committed after manual recovery.`,
