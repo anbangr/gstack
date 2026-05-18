@@ -28,6 +28,7 @@ import { spawnSync } from "child_process";
 import {
   detectSkillFaults,
   detectLearnedFaults,
+  faultId,
   loadLearnedPatterns,
   extractFeatureBlocks,
   type DetectorInput,
@@ -795,9 +796,7 @@ describe("extractFeatureBlocks", () => {
     const blocks = extractFeatureBlocks(plan);
     expect(blocks).toHaveLength(1);
     expect(blocks[0].number).toBe(5);
-    expect(blocks[0].name).toBe(
-      "F5 — Tag validation (P1, parallel with F4)",
-    );
+    expect(blocks[0].name).toBe("F5 — Tag validation (P1, parallel with F4)");
     expect(blocks[0].hasOriginTrace).toBe(true);
     expect(blocks[0].hasAcceptance).toBe(true);
   });
@@ -2022,5 +2021,81 @@ describe("validate-living-plan.ts CLI", () => {
     const report = JSON.parse(stderr.trim());
     expect(report.featureCount).toBe(0);
     expect(report.violations).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// faultId helper — composite identity for the monitor's active-fault registry.
+// Fixes the SKILL_FAULT_DETECTED_IS_APPEND_ONLY_TELEMETRY issue: monitor needs
+// a stable key per (category, phase, source) to diff DETECTED → RESOLVED
+// across ticks. Two phases sharing a category (e.g. PREMATURE_COMPLETION on
+// phase 1 AND phase 2) must resolve independently.
+// ---------------------------------------------------------------------------
+
+describe("faultId", () => {
+  function mkFault(over: Partial<SkillFault> = {}): SkillFault {
+    return {
+      category: "PREMATURE_COMPLETION",
+      severity: "HIGH",
+      description: "test",
+      sourceFiles: [],
+      evidence: {},
+      ...over,
+    };
+  }
+
+  test("same category + phaseIndex + sourceFile → same id", () => {
+    const a = mkFault({
+      category: "X",
+      sourceFiles: ["plan.md"],
+      evidence: { phaseIndex: 2 },
+    });
+    const b = mkFault({
+      category: "X",
+      sourceFiles: ["plan.md"],
+      evidence: { phaseIndex: 2 },
+    });
+    expect(faultId(a)).toBe(faultId(b));
+  });
+
+  test("different phaseIndex → different id", () => {
+    const a = mkFault({ evidence: { phaseIndex: 1 } });
+    const b = mkFault({ evidence: { phaseIndex: 2 } });
+    expect(faultId(a)).not.toBe(faultId(b));
+  });
+
+  test("different category → different id", () => {
+    const a = mkFault({ category: "PREMATURE_COMPLETION" });
+    const b = mkFault({ category: "CODEX_CONVERGENCE" });
+    expect(faultId(a)).not.toBe(faultId(b));
+  });
+
+  test("different first sourceFile → different id", () => {
+    const a = mkFault({ sourceFiles: ["plan-a.md"] });
+    const b = mkFault({ sourceFiles: ["plan-b.md"] });
+    expect(faultId(a)).not.toBe(faultId(b));
+  });
+
+  test("missing phaseIndex collapses to stable 'all' placeholder", () => {
+    const a = mkFault({ evidence: {} });
+    const b = mkFault({ evidence: {} });
+    expect(faultId(a)).toBe(faultId(b));
+    expect(faultId(a)).toContain(":all:");
+  });
+
+  test("missing sourceFiles collapses to stable '*' placeholder", () => {
+    const a = mkFault({ sourceFiles: [] });
+    const b = mkFault({ sourceFiles: [] });
+    expect(faultId(a)).toBe(faultId(b));
+    expect(faultId(a)).toContain(":*");
+  });
+
+  test("only the FIRST sourceFile contributes to identity", () => {
+    // Two faults with the same category+phaseIndex but different second
+    // sourceFiles still share an id — the second is additional evidence,
+    // not a different "fault".
+    const a = mkFault({ sourceFiles: ["plan.md", "log-1.txt"] });
+    const b = mkFault({ sourceFiles: ["plan.md", "log-2.txt"] });
+    expect(faultId(a)).toBe(faultId(b));
   });
 });

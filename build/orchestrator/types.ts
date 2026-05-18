@@ -22,6 +22,28 @@ export interface SkillFaultDetectedEvent {
   faults: SkillFault[];
 }
 
+/**
+ * Emitted by the monitor when a previously-detected fault (matched by
+ * runId + faultId) is no longer firing on the current tick. Closes the
+ * DETECTED → RESOLVED session that started with the earlier
+ * SkillFaultDetectedEvent. Consumers (e.g. drain-faults) use this to
+ * suppress investigator dispatches for already-resolved transient faults.
+ *
+ * Only emitted when the caller passes activeFaultRegistryDir to
+ * evaluateMonitorOnce; without that opt, the monitor stays append-only
+ * (back-compat with existing log readers).
+ */
+export interface SkillFaultResolvedEvent {
+  event: "SKILL_FAULT_RESOLVED";
+  timestamp: string;
+  runId: string;
+  faultId: string;
+  firstDetectedAt: string;
+  lastDetectedAt: string;
+}
+
+export type SkillFaultEvent = SkillFaultDetectedEvent | SkillFaultResolvedEvent;
+
 export type PhaseKind =
   | "code"
   | "writing"

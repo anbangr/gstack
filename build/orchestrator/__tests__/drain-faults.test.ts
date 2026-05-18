@@ -195,6 +195,96 @@ describe("parseFaultLog", () => {
     expect(r.rows).toHaveLength(1);
     expect(r.hasRunFailed).toBe(true);
   });
+
+  // Fix for SKILL_FAULT_DETECTED_IS_APPEND_ONLY_TELEMETRY: when a fault is
+  // RESOLVED later in the log, drain-faults must NOT spawn an investigator
+  // for it. The runId+faultId pair identifies the fault session; a RESOLVED
+  // event closes that session.
+  test("DETECTED followed by RESOLVED for same (runId, faultId) → drops the DETECTED row", () => {
+    const detected = faultEvent("run-a", "FOO");
+    // Embed faultId on the DETECTED's fault so drain-faults can match it.
+    (detected as any).faults[0].faultId = "FOO:all:*";
+    const resolved = {
+      event: "SKILL_FAULT_RESOLVED",
+      timestamp: new Date().toISOString(),
+      runId: "run-a",
+      faultId: "FOO:all:*",
+      firstDetectedAt: new Date().toISOString(),
+      lastDetectedAt: new Date().toISOString(),
+    };
+    const lines = [JSON.stringify(detected), JSON.stringify(resolved)].join(
+      "\n",
+    );
+    const r = parseFaultLog(lines);
+    expect(r.rows).toHaveLength(0);
+  });
+
+  test("RESOLVED for a DIFFERENT faultId does NOT drop the DETECTED row", () => {
+    const detected = faultEvent("run-a", "FOO");
+    (detected as any).faults[0].faultId = "FOO:all:*";
+    const resolved = {
+      event: "SKILL_FAULT_RESOLVED",
+      timestamp: new Date().toISOString(),
+      runId: "run-a",
+      faultId: "BAR:all:*", // different fault
+      firstDetectedAt: new Date().toISOString(),
+      lastDetectedAt: new Date().toISOString(),
+    };
+    const lines = [JSON.stringify(detected), JSON.stringify(resolved)].join(
+      "\n",
+    );
+    const r = parseFaultLog(lines);
+    expect(r.rows).toHaveLength(1);
+  });
+
+  test("DETECTED → RESOLVED → DETECTED (re-occurrence) keeps the latest DETECTED", () => {
+    // Fault transient: appears, resolves, appears again. The second DETECTED
+    // is a fresh session and SHOULD trigger an investigator.
+    const firstDetected = faultEvent("run-a", "FOO");
+    (firstDetected as any).faults[0].faultId = "FOO:all:*";
+    const resolved = {
+      event: "SKILL_FAULT_RESOLVED",
+      timestamp: "2026-05-18T10:00:00.000Z",
+      runId: "run-a",
+      faultId: "FOO:all:*",
+      firstDetectedAt: "2026-05-18T09:55:00.000Z",
+      lastDetectedAt: "2026-05-18T09:58:00.000Z",
+    };
+    const secondDetected = faultEvent("run-a", "FOO");
+    (secondDetected as any).timestamp = "2026-05-18T10:30:00.000Z";
+    (secondDetected as any).faults[0].faultId = "FOO:all:*";
+    const lines = [
+      JSON.stringify(firstDetected),
+      JSON.stringify(resolved),
+      JSON.stringify(secondDetected),
+    ].join("\n");
+    const r = parseFaultLog(lines);
+    expect(r.rows).toHaveLength(1);
+  });
+
+  test("RESOLVED only (no DETECTED) → no rows, no errors", () => {
+    const resolved = {
+      event: "SKILL_FAULT_RESOLVED",
+      timestamp: new Date().toISOString(),
+      runId: "run-a",
+      faultId: "FOO:all:*",
+      firstDetectedAt: new Date().toISOString(),
+      lastDetectedAt: new Date().toISOString(),
+    };
+    const r = parseFaultLog(JSON.stringify(resolved));
+    expect(r.rows).toHaveLength(0);
+  });
+
+  test("backwards-compat: DETECTED without faultId field still dedups by (runId, category)", () => {
+    // Pre-fix DETECTED events don't carry faultId. drain-faults must
+    // continue handling them (legacy logs in the wild).
+    const lines: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      lines.push(JSON.stringify(faultEvent("run-a", "FOO")));
+    }
+    const r = parseFaultLog(lines.join("\n"));
+    expect(r.rows).toHaveLength(1); // existing dedup behavior
+  });
 });
 
 // ---------------------------------------------------------------------------
