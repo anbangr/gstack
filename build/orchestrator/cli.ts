@@ -1814,7 +1814,7 @@ export function discardBlindExecutionChanges(
   }
   // Compute worktree root at call time (NOT at module load) so tests that
   // override $HOME via useIsolatedGstackHome see their tempdir, not the
-  // real home (gpt-5.5 plan-review IMPORTANT objection).
+  // real home (plan-review IMPORTANT objection).
   const worktreeRoot = path.join(
     process.env.HOME ?? os.homedir(),
     ".gstack",
@@ -4349,7 +4349,7 @@ export function applyMutableAgentHygiene(opts: {
     return opts.result;
   }
   // D6: blind-execution probe runs BEFORE the timedOut/nonzero early-return
-  // (gpt-5.5 plan-review IMPORTANT #6) so blind agents that crashed or hit
+  // (plan-review IMPORTANT #6) so blind agents that crashed or hit
   // a timeout still get their pre-existing dirty + untracked state restored
   // path-by-path, not nuked by a `git reset --hard`.
   const blind = detectBlindExecution(opts.result.logPath);
@@ -4359,9 +4359,7 @@ export function applyMutableAgentHygiene(opts: {
     );
     const discard = discardBlindExecutionChanges(opts.cwd, opts.before);
     if (!discard.ok) {
-      console.warn(
-        `  ⚠ discardBlindExecutionChanges failed: ${discard.error}`,
-      );
+      console.warn(`  ⚠ discardBlindExecutionChanges failed: ${discard.error}`);
     } else {
       if (discard.restored?.length) {
         console.warn(
