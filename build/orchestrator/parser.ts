@@ -33,8 +33,14 @@ import type {
 } from "./types";
 
 const FEATURE_HEADING = /^##\s+Feature\s+(\d+(?:\.\d+)?)\s*:\s*(.+?)\s*$/i;
+// Phase number: integer, integer.integer, or integer.integer<letter> (e.g. 2.1a).
+// The optional [a-z] suffix supports sub-lettered phases that split a
+// previously-numbered phase without renumbering the rest of the plan.
 const PHASE_HEADING =
-  /^###\s+Phase\s+(\d+(?:\.\d+)?)\s*(?:\[[^\]]*\])?\s*:\s*(.+?)\s*$/;
+  /^###\s+Phase\s+(\d+(?:\.\d+)?[a-z]?)\s*(?:\[[^\]]*\])?\s*:\s*(.+?)\s*$/;
+// Soft detector: any `### Phase ...` line that fails PHASE_HEADING. Used to
+// emit a warning so malformed phase headings don't disappear silently.
+const PHASE_HEADING_SOFT = /^###\s+Phase\b/i;
 
 /** Primary format: [kind] bracket in phase heading. */
 const HEADING_KIND_PATTERN = /\[(code|writing|experiment|research|manual)\]/i;
@@ -260,6 +266,16 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
       continue;
     }
 
+    // Looks like a phase heading but the strict regex rejected it. Without
+    // this branch, malformed `### Phase ...` lines get treated as prose and
+    // disappear silently — the operator only discovers the lost phase when
+    // the executable-phase count comes up short.
+    if (PHASE_HEADING_SOFT.test(line)) {
+      warnings.push(
+        `Line ${i + 1}: malformed phase heading was ignored — ${JSON.stringify(line.trim())}. Expected "### Phase <N|N.M|N.Mx>: <name>" (sub-letter suffix optional).`,
+      );
+    }
+
     const featureMatch = line.match(FEATURE_HEADING);
     if (featureMatch) {
       finalize(i);
@@ -312,7 +328,12 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
     // Detect HTML comment kind annotation inline (so kind is known before checkboxes).
     if (!currentPhase.kind && BODY_KIND_PATTERN.test(line)) {
       const km = line.match(BODY_KIND_PATTERN);
-      if (km) currentPhase.kind = parseKind(km[1], currentPhase.number ?? "?", warnings);
+      if (km)
+        currentPhase.kind = parseKind(
+          km[1],
+          currentPhase.number ?? "?",
+          warnings,
+        );
     }
 
     // Detect <!-- audit-only --> annotation. The FENCE handler above already
