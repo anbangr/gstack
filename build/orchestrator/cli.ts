@@ -40,6 +40,7 @@ import {
   loadState,
   saveState as persistBuildState,
   backfillKindFromPlan,
+  reconcileStatePhasesAfterReparse,
   acquireLock,
   releaseLock,
   readLockInfo,
@@ -9051,52 +9052,34 @@ async function main() {
                 break;
               }
               if (out.action === "phases_added") {
-                // Re-parse the plan and merge new phases into BuildState.
-                // The plan-mutator appended under the current feature; new
-                // entries land at the end of the phases array (parser walks
-                // top-to-bottom).
+                // Re-parse the plan after the feature-reviewer's append.
+                // plan-mutator inserts new phase headings UNDER the named
+                // feature, before the next `## Feature N+1:` heading — not
+                // at end-of-file. For any non-last feature, that shifts the
+                // parser-assigned Phase.index of every downstream phase.
+                //
+                // reconcileStatePhasesAfterReparse rebuilds state.phases by
+                // joining on phase number (PhaseState.number, Phase.number),
+                // preserving runtime state for existing phases at their new
+                // indexes and adding pending PhaseStates for the new ones.
+                // It also rebuilds every feature.phaseIndexes from the
+                // reparsed Feature objects.
                 const newContent = fs.readFileSync(args.planFile, "utf8");
                 const reparsed = parsePlan(newContent, {
                   dualImpl: args.dualImpl,
                 });
-                const oldPhaseCount = phases.length;
-                const addedPhases = reparsed.phases.slice(oldPhaseCount);
-                for (const np of addedPhases) {
-                  state.phases.push({
-                    index: np.index,
-                    number: np.number,
-                    name: np.name,
-                    status: "pending",
-                  });
-                  if (np.featureIndex === featureDef.index) {
-                    featureState.phaseIndexes.push(np.index);
-                  }
-                }
+                const { addedNumbers } = reconcileStatePhasesAfterReparse(
+                  state,
+                  reparsed.phases,
+                  reparsed.features,
+                );
                 // Replace outer-scope arrays so subsequent iterations see
                 // the new shape.
                 phases = reparsed.phases;
                 features = reparsed.features;
-                // Keep the gate visibility projection in sync with the new arrays.
                 if (visiblePlanProjection) {
                   visiblePlanProjection.phases = phases;
                   visiblePlanProjection.features = features;
-                }
-                // The featureDef reference is now stale (parser produced a
-                // new object). Rebind so the next loop iteration sees the
-                // up-to-date phaseIndexes array.
-                const refreshed = features[featureDef.index];
-                if (refreshed) {
-                  // featureDef is `const` in scope above so we cannot
-                  // reassign — but its mutable fields (phaseIndexes) are
-                  // updated in-place above. Verify identity holds.
-                  if (
-                    refreshed.phaseIndexes.length <
-                    featureState.phaseIndexes.length
-                  ) {
-                    // Defensive: parser may strip phases that lost their
-                    // checkboxes. Trust the parser's view in that case.
-                    featureState.phaseIndexes = [...refreshed.phaseIndexes];
-                  }
                 }
                 featureState.status = "running";
                 saveState(state, {
@@ -9104,7 +9087,11 @@ async function main() {
                   log: console.warn,
                 });
                 console.log(
-                  `  → Plan amended with ${addedPhases.length} new phase(s); re-running phase loop.`,
+                  `  → Plan amended with ${addedNumbers.length} new phase(s)` +
+                    (addedNumbers.length > 0
+                      ? ` (${addedNumbers.join(", ")})`
+                      : "") +
+                    `; re-running phase loop.`,
                 );
                 reviewLoopAction = "phases_added";
                 break;
