@@ -4341,18 +4341,31 @@ function isTestOnlyPath(filePath: string, globs: string[]): boolean {
 }
 
 /**
- * Bug 5: when a review/qa gate leaves the working tree dirty AND every dirty
- * path matches a test-path glob, auto-commit the changes with attribution.
- * Returns true if the auto-commit fired (caller should re-check hygiene as
- * clean), false otherwise (caller falls through to the normal fail path).
+ * Bug 5: when a review/qa gate leaves the working tree dirty, auto-commit
+ * the changes with attribution. Two paths:
  *
- * Backout knob: `GSTACK_QA_NO_AUTO_COMMIT=1` reverts to pre-fix behavior.
+ *   (a) All paths test-only → single commit with the standard
+ *       "expand coverage" message (legacy behavior).
+ *   (b) Mixed test + production paths → split into TWO commits when
+ *       `--qa-auto-split` is enabled (default ON, opt-out via
+ *       GSTACK_QA_NO_AUTO_SPLIT=1): first commit stages only test
+ *       paths with the standard message, second commit stages
+ *       production paths with a "production fixes" message that
+ *       makes the role's intent legible in `git log`.
  *
- * The auto-commit is intentionally narrow: source-code changes still require
- * human review. Only test-only expansions get the auto-commit pass. Matches
- * the screenshot's "Codex genuinely wants to expand coverage and leaves
- * test files dirty" complaint while keeping the safety property for any
- * non-test change.
+ * Splitting matters because the skill template tells synthesizer
+ * agents to keep Review & QA test-only (see SKILL.md.tmpl Phase A
+ * fix), but live runs still sometimes produce mixed diffs (e.g. a
+ * reviewer finds a real bug and fixes inline). Without auto-split,
+ * the user has to manually `--mark-phase-committed` to recover.
+ *
+ * Backout knobs:
+ *   - GSTACK_QA_NO_AUTO_COMMIT=1 — disable both paths entirely.
+ *   - GSTACK_QA_NO_AUTO_SPLIT=1 — disable (b) only, leaving (a).
+ *
+ * The split is intentionally clear in git log: two commits with
+ * different messages. A future bisect on the production-fixes commit
+ * isolates the inline fix from the coverage expansion.
  */
 export function maybeAutoCommitTestOnlyDirty(opts: {
   cwd: string;
@@ -4369,6 +4382,50 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
     return { committed: false, reason: "no dirty paths" };
   }
   const nonTest = paths.filter((p) => !isTestOnlyPath(p, globs));
+  const testOnly = paths.filter((p) => isTestOnlyPath(p, globs));
+
+  // Mixed diff path: auto-split, gated on GSTACK_QA_NO_AUTO_SPLIT=1
+  // for opt-out. The skill template warns synthesizers off mixed
+  // diffs, but the gate stays permissive as defense in depth.
+  if (
+    nonTest.length > 0 &&
+    testOnly.length > 0 &&
+    process.env.GSTACK_QA_NO_AUTO_SPLIT !== "1"
+  ) {
+    // First commit: test paths only.
+    const testCommit = commitPathsByList({
+      cwd: opts.cwd,
+      paths: testOnly,
+      message: buildTestOnlyAutoCommitMessage(opts.label, testOnly),
+    });
+    if (!testCommit.ok) {
+      return {
+        committed: false,
+        reason: `auto-split test commit failed: ${testCommit.error}`,
+      };
+    }
+    // Second commit: production paths.
+    const prodCommit = commitPathsByList({
+      cwd: opts.cwd,
+      paths: nonTest,
+      message: buildProductionFixesAutoCommitMessage(opts.label, nonTest),
+    });
+    if (!prodCommit.ok) {
+      return {
+        committed: false,
+        reason: `auto-split production commit failed: ${prodCommit.error}`,
+      };
+    }
+    return {
+      committed: true,
+      reason: `auto-split: committed ${testOnly.length} test path(s) + ${nonTest.length} production path(s)`,
+    };
+  }
+
+  // Pure non-test diff (no test paths at all) — opt-out path:
+  // bail to manual recovery. We don't auto-commit production-only
+  // changes from a review/qa role; that would skip the whole point of
+  // human review on source code.
   if (nonTest.length > 0) {
     return {
       committed: false,
@@ -4378,15 +4435,50 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
       nonTestPaths: nonTest,
     };
   }
-  // All paths test-only → auto-commit.
-  const addR = spawnSync("git", ["add", "-A"], { cwd: opts.cwd });
-  if (addR.status !== 0) {
+
+  // All paths test-only → single auto-commit (legacy behavior).
+  const single = commitPathsByList({
+    cwd: opts.cwd,
+    paths,
+    message: buildTestOnlyAutoCommitMessage(opts.label, paths),
+    stageMode: "addAll",
+  });
+  if (!single.ok) {
     return {
       committed: false,
-      reason: `git add failed: ${(addR.stderr?.toString() || "").trim()}`,
+      reason: single.error ?? "commit failed",
     };
   }
-  const message = `chore(qa): expand coverage via ${opts.label} (auto-committed)\n\nAuto-committed by gstack-build because the ${opts.label} role left only\ntest-path changes dirty. The hygiene gate previously failed in this case\neven when Codex/Gemini did legitimate coverage expansion. To revert this\nbehavior set GSTACK_QA_NO_AUTO_COMMIT=1.\n\nFiles:\n${paths.map((p) => `  ${p}`).join("\n")}`;
+  return { committed: true, reason: `committed ${paths.length} test path(s)` };
+}
+
+/**
+ * Stage and commit a specific list of paths. Helper for
+ * maybeAutoCommitTestOnlyDirty's auto-split path. Uses identity
+ * "gstack-build (qa auto-commit)" so both halves of a split are
+ * grep-able in git log.
+ *
+ * stageMode="byPath" (default): stage exactly the listed paths.
+ * stageMode="addAll": stage every dirty path (`git add -A`). Used by
+ * the legacy single-commit path to preserve byte-for-byte behavior on
+ * the all-test-paths case.
+ */
+function commitPathsByList(opts: {
+  cwd: string;
+  paths: string[];
+  message: string;
+  stageMode?: "byPath" | "addAll";
+}): { ok: true } | { ok: false; error: string } {
+  const stageMode = opts.stageMode ?? "byPath";
+  const stageArgs =
+    stageMode === "addAll" ? ["add", "-A"] : ["add", "--", ...opts.paths];
+  const addR = spawnSync("git", stageArgs, { cwd: opts.cwd, encoding: "utf8" });
+  if (addR.status !== 0) {
+    return {
+      ok: false,
+      error: `git add failed: ${(addR.stderr || "").trim()}`,
+    };
+  }
   const commitR = spawnSync(
     "git",
     [
@@ -4396,17 +4488,31 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
       "user.email=gstack-build+qa@local",
       "commit",
       "-m",
-      message,
+      opts.message,
     ],
     { cwd: opts.cwd, encoding: "utf8" },
   );
   if (commitR.status !== 0) {
     return {
-      committed: false,
-      reason: `git commit failed: ${(commitR.stderr || "").trim()}`,
+      ok: false,
+      error: `git commit failed: ${(commitR.stderr || "").trim()}`,
     };
   }
-  return { committed: true, reason: `committed ${paths.length} test path(s)` };
+  return { ok: true };
+}
+
+function buildTestOnlyAutoCommitMessage(
+  label: string,
+  paths: string[],
+): string {
+  return `chore(qa): expand coverage via ${label} (auto-committed)\n\nAuto-committed by gstack-build because the ${label} role left only\ntest-path changes dirty. The hygiene gate previously failed in this case\neven when Codex/Gemini did legitimate coverage expansion. To revert this\nbehavior set GSTACK_QA_NO_AUTO_COMMIT=1.\n\nFiles:\n${paths.map((p) => `  ${p}`).join("\n")}`;
+}
+
+function buildProductionFixesAutoCommitMessage(
+  label: string,
+  paths: string[],
+): string {
+  return `chore(qa): production fixes from ${label} (auto-split)\n\nAuto-committed by gstack-build via the hygiene gate's auto-split path:\nthe ${label} role left a mixed test + production diff dirty, so the\ngate split it into two commits (this one, plus a preceding test-only\ncommit). The split makes the role's intent legible in git log and\nallows independent bisect of production vs test changes.\n\nThe skill template tells synthesizer agents to keep Review & QA\nlimited to test paths and to emit follow-up [code] phases for real\nbugs; this commit is the safety net for when that contract isn't met.\nTo disable splitting (and fall back to manual recovery) set\nGSTACK_QA_NO_AUTO_SPLIT=1. To disable all auto-commits set\nGSTACK_QA_NO_AUTO_COMMIT=1.\n\nFiles:\n${paths.map((p) => `  ${p}`).join("\n")}`;
 }
 
 function applyGateHygiene(opts: {

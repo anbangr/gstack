@@ -5372,15 +5372,102 @@ describe("maybeAutoCommitTestOnlyDirty (Bug 5)", () => {
     expect(lastMsg).toContain("(auto-committed)");
   });
 
-  it("refuses to commit when ANY dirty path is non-test (e.g. server/routes.ts)", () => {
+  it("auto-splits mixed test+production diff into two commits (default behavior)", () => {
+    // Failure 3 from the mitosis-oasis incident: a review/qa role
+    // produced a mixed diff. Previously the gate refused entirely and
+    // required manual --mark-phase-committed recovery. The auto-split
+    // path puts test changes in one commit and production fixes in a
+    // second, both attributed to gstack-build (qa auto-commit).
     fs.mkdirSync(path.join(repoDir, "server", "__tests__"), {
       recursive: true,
     });
     fs.writeFileSync(
       path.join(repoDir, "server", "__tests__", "bar.test.ts"),
-      "// test\n",
+      "// new coverage\n",
     );
+    fs.writeFileSync(path.join(repoDir, "server", "routes.ts"), "// fix\n");
+
+    const result = maybeAutoCommitTestOnlyDirty({
+      cwd: repoDir,
+      label: "Codex review",
+      dirtyLines: ["?? server/__tests__/bar.test.ts", "?? server/routes.ts"],
+    });
+
+    expect(result.committed).toBe(true);
+    expect(result.reason).toContain("auto-split");
+    expect(result.reason).toContain("1 test path");
+    expect(result.reason).toContain("1 production path");
+
+    // Verify two commits landed with the right messages, in the right
+    // order. The test-only commit should be FIRST (older), production
+    // SECOND (newer/HEAD).
+    const log = spawnSync(
+      "git",
+      ["log", "-2", "--pretty=format:%s%n%b%n---END---"],
+      { cwd: repoDir, encoding: "utf8" },
+    ).stdout;
+    expect(log).toContain("chore(qa): expand coverage via Codex review");
+    expect(log).toContain("chore(qa): production fixes from Codex review");
+    expect(log).toContain("(auto-split)");
+
+    // HEAD~1 should be the test-only commit (older).
+    const head1Msg = spawnSync("git", ["log", "-1", "--pretty=%s", "HEAD~1"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout;
+    expect(head1Msg).toContain("expand coverage");
+    // HEAD should be the production commit (newer).
+    const headMsg = spawnSync("git", ["log", "-1", "--pretty=%s"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout;
+    expect(headMsg).toContain("production fixes");
+  });
+
+  it("GSTACK_QA_NO_AUTO_SPLIT=1 disables auto-split, falls back to manual recovery on mixed diff", () => {
+    const old = process.env.GSTACK_QA_NO_AUTO_SPLIT;
+    process.env.GSTACK_QA_NO_AUTO_SPLIT = "1";
+    try {
+      fs.mkdirSync(path.join(repoDir, "server", "__tests__"), {
+        recursive: true,
+      });
+      fs.writeFileSync(
+        path.join(repoDir, "server", "__tests__", "bar.test.ts"),
+        "// test\n",
+      );
+      fs.writeFileSync(path.join(repoDir, "server", "routes.ts"), "// src\n");
+      const headBefore = spawnSync("git", ["rev-parse", "HEAD"], {
+        cwd: repoDir,
+        encoding: "utf8",
+      }).stdout.trim();
+
+      const result = maybeAutoCommitTestOnlyDirty({
+        cwd: repoDir,
+        label: "qa gate",
+        dirtyLines: ["?? server/__tests__/bar.test.ts", "?? server/routes.ts"],
+      });
+
+      expect(result.committed).toBe(false);
+      expect(result.reason).toContain("non-test paths present");
+      expect(result.reason).toContain("server/routes.ts");
+      const headAfter = spawnSync("git", ["rev-parse", "HEAD"], {
+        cwd: repoDir,
+        encoding: "utf8",
+      }).stdout.trim();
+      expect(headAfter).toBe(headBefore);
+    } finally {
+      if (old === undefined) delete process.env.GSTACK_QA_NO_AUTO_SPLIT;
+      else process.env.GSTACK_QA_NO_AUTO_SPLIT = old;
+    }
+  });
+
+  it("refuses to commit when ALL paths are production (no test paths to split with)", () => {
+    // The auto-split path requires BOTH layers to fire. A pure
+    // production-only diff from a review/qa role still bails to manual
+    // recovery — we never auto-commit production-only changes.
+    fs.mkdirSync(path.join(repoDir, "server"), { recursive: true });
     fs.writeFileSync(path.join(repoDir, "server", "routes.ts"), "// src\n");
+    fs.writeFileSync(path.join(repoDir, "server", "auth.ts"), "// src\n");
     const headBefore = spawnSync("git", ["rev-parse", "HEAD"], {
       cwd: repoDir,
       encoding: "utf8",
@@ -5389,12 +5476,11 @@ describe("maybeAutoCommitTestOnlyDirty (Bug 5)", () => {
     const result = maybeAutoCommitTestOnlyDirty({
       cwd: repoDir,
       label: "qa gate",
-      dirtyLines: ["?? server/__tests__/bar.test.ts", "?? server/routes.ts"],
+      dirtyLines: ["?? server/routes.ts", "?? server/auth.ts"],
     });
 
     expect(result.committed).toBe(false);
     expect(result.reason).toContain("non-test paths present");
-    expect(result.reason).toContain("server/routes.ts");
     const headAfter = spawnSync("git", ["rev-parse", "HEAD"], {
       cwd: repoDir,
       encoding: "utf8",

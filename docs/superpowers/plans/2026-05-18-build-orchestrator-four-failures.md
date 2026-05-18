@@ -710,9 +710,28 @@ generated SKILL.md together.
 
 5. **#1 (CLI) — Head+tail truncation in `safeBranchPart`.** Defense in
    depth in case Phase A #5 leaves any other long-input path.
-6. **#2 (CLI) — Remove `detached: true` default in
-   `child-registry.spawn`; add startup zombie sweep.** Stops the leak
-   at the source.
+6. **#2 (CLI) — SKIPPED after deeper investigation.** The plan's
+   recommendation to "remove `detached: true` default" was based on the
+   investigation agent's read; reading the actual
+   `build/orchestrator/child-registry.ts:1-27` and `monitor.ts:494-499`
+   reveals that the `detached: true` default and `child.unref()` are
+   intentional and load-bearing:
+   - `detached: true` gives every child its own process group so the
+     parent's SIGTERM/SIGINT/SIGHUP handler can reach the whole tree
+     via `process.kill(-pid, signal)`. Removing it would silently break
+     group-signal reaping.
+   - `child.unref()` lets the foreground monitor's resumed `gstack-build`
+     child survive the monitor's own re-entry on `--max-wall-ms`.
+   - `sweepOrphans` already protects dead-PID + fresh-heartbeat from
+     reaping (supervised-restart case), which is by design.
+
+   The screenshot's zombies survived because the user `pkill`'d the
+   hierarchy after a graceful path failed, bypassing the SIGTERM
+   contract. The Phase A4 fix (subprocess-leak warning in the
+   skill-template completion report at SKILL.md.tmpl:1823) is the right
+   mitigation: surface the leak to the user before declaring done, so
+   they can clean up. No CLI changes for Failure 2.
+
 7. **#4 (CLI) — Add `--ship-on-plan-complete` flag.** Enables Phase A
    #4's "option C" (deferred-bundle multi-branch) in the template.
 8. **#3 (CLI) — Auto-split mixed test+prod diff in
