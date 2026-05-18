@@ -28,6 +28,7 @@ import {
   resolveRoleTimeouts,
   resolveFallbackForConfigured,
   resolveFallbackForRoleTask,
+  resolveTimeoutFallback,
   checkPhaseScope,
   type RunConfiguredRoleTaskOpts,
   type RunRoleTaskOpts,
@@ -2394,6 +2395,57 @@ describe("resolveFallbackForConfigured", () => {
     const resolved = resolveRoleTimeouts(baseOpts.role);
     const out = resolveFallbackForConfigured(baseOpts, resolved);
     expect(out.logPrefix).toBe("primary-impl-backup-gemini");
+  });
+});
+
+describe("resolveTimeoutFallback (F3 budget-aware fallback)", () => {
+  // Reproduces F3 from AGNT2 run: Kimi test-fixer timed out, Gemini backup got
+  // "blind execution" because Gemini was given half the time Kimi just
+  // exhausted on the same prompt. Symptom: backup model gives up reading and
+  // starts guessing. Fix shape: on primary.timedOut === true (not generic
+  // exitCode != 0), re-check scope; if oversized, surface phase_oversized
+  // directly; otherwise escalate backup timeout to match the primary.
+  it("returns 'phase_oversized' verdict when re-check trips a stricter threshold", () => {
+    // Pre-fix this function doesn't exist. Post-fix: timed out + input
+    // exceeds stricter threshold → no Gemini spawn, return verdict.
+    const v = resolveTimeoutFallback({
+      primaryFailureKind: "timeout",
+      primaryTimeoutMs: 1_500_000,
+      inputFileSize: 200_000, // bytes — large prompt
+      strictThresholdBytes: 100_000,
+    });
+    expect(v.kind).toBe("phase_oversized");
+    if (v.kind === "phase_oversized") {
+      expect(v.reason).toMatch(/200000|too large|exceeds/);
+    }
+  });
+
+  it("escalates backup timeout to the primary's budget when scope re-check passes", () => {
+    const v = resolveTimeoutFallback({
+      primaryFailureKind: "timeout",
+      primaryTimeoutMs: 1_500_000,
+      inputFileSize: 50_000,
+      strictThresholdBytes: 100_000,
+    });
+    expect(v.kind).toBe("escalate_budget");
+    if (v.kind === "escalate_budget") {
+      // Same budget Kimi had, not half.
+      expect(v.timeoutMs).toBe(1_500_000);
+    }
+  });
+
+  it("keeps half-budget behavior for non-timeout failures (model service hiccup)", () => {
+    const v = resolveTimeoutFallback({
+      primaryFailureKind: "error",
+      primaryTimeoutMs: 1_500_000,
+      inputFileSize: 50_000,
+      strictThresholdBytes: 100_000,
+    });
+    expect(v.kind).toBe("halved_budget");
+    if (v.kind === "halved_budget") {
+      // Current behavior: backupMs = max(60s, primary/2) ≈ 750_000.
+      expect(v.timeoutMs).toBe(750_000);
+    }
   });
 });
 
