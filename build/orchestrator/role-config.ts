@@ -10,6 +10,28 @@ export interface RoleConfig {
   command?: string;
   backupProvider?: RoleProvider;
   backupModel?: string;
+  /**
+   * Primary timeout override in ms. When unset, sub-agents fall back to the
+   * caller-passed timeout, then to BUILD_DEFAULTS.timeoutsMs[provider].
+   */
+  timeoutMs?: number;
+  /**
+   * Backup timeout override in ms. When unset, the backup defaults to
+   * max(60000, floor(primaryMs / 2)). Operators with multi-file primary
+   * prompts should set this explicitly to keep the backup viable.
+   */
+  backupTimeoutMs?: number;
+  /**
+   * When false, the same-budget retry on timeout is skipped. Default true
+   * for backwards compat. configure.cm sets this to false on primaryImpl,
+   * testFixer, ship, and land — roles whose prompts span multiple files
+   * where a second 15-min attempt with the same budget rarely helps.
+   *
+   * IMPORTANT: this gates ONLY the time-budget retry (result.timedOut).
+   * Codex transport-failure retries (network hiccups, TLS resets) stay
+   * enabled regardless — those are a separate failure mode.
+   */
+  retryOnTimeout?: boolean;
 }
 
 export interface RoleConfigs {
@@ -67,7 +89,10 @@ export type RoleField =
   | "reasoning"
   | "command"
   | "backupProvider"
-  | "backupModel";
+  | "backupModel"
+  | "timeoutMs"
+  | "backupTimeoutMs"
+  | "retryOnTimeout";
 
 export const DEFAULT_ROLE_CONFIGS: RoleConfigs = BUILD_DEFAULTS.roles;
 
@@ -106,6 +131,21 @@ export function applyEnvRoleConfig(
         `${prefix}_BACKUP_PROVIDER`,
       );
     if (backupModel) next[key].backupModel = backupModel;
+    const timeout = env[`${prefix}_TIMEOUT`];
+    const backupTimeout = env[`${prefix}_BACKUP_TIMEOUT`];
+    const retryOnTimeout = env[`${prefix}_RETRY_ON_TIMEOUT`];
+    if (timeout)
+      next[key].timeoutMs = parsePositiveInt(timeout, `${prefix}_TIMEOUT`);
+    if (backupTimeout)
+      next[key].backupTimeoutMs = parsePositiveInt(
+        backupTimeout,
+        `${prefix}_BACKUP_TIMEOUT`,
+      );
+    if (retryOnTimeout)
+      next[key].retryOnTimeout = parseBoolean(
+        retryOnTimeout,
+        `${prefix}_RETRY_ON_TIMEOUT`,
+      );
   }
   return next;
 }
@@ -125,6 +165,18 @@ export function applyRoleOverride(
     roles[role].backupProvider = parseProvider(value, `${role}.backupProvider`);
   else if (field === "backupModel") roles[role].backupModel = value;
   else if (field === "command") roles[role].command = value;
+  else if (field === "timeoutMs")
+    roles[role].timeoutMs = parsePositiveInt(value, `${role}.timeoutMs`);
+  else if (field === "backupTimeoutMs")
+    roles[role].backupTimeoutMs = parsePositiveInt(
+      value,
+      `${role}.backupTimeoutMs`,
+    );
+  else if (field === "retryOnTimeout")
+    roles[role].retryOnTimeout = parseBoolean(
+      value,
+      `${role}.retryOnTimeout`,
+    );
   else {
     // TypeScript narrows field to never here — adding a new RoleField without
     // a handler above produces a compile error, preventing silent catch-all corruption.
@@ -153,6 +205,19 @@ export function parseReasoning(value: string, label: string): RoleReasoning {
   )
     return value;
   throw new Error(`${label} must be one of: low, medium, high, xhigh`);
+}
+
+export function parseBoolean(value: string, label: string): boolean {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error(`${label} must be one of: true, false`);
+}
+
+export function parsePositiveInt(value: string, label: string): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0)
+    throw new Error(`${label} must be a positive integer (ms)`);
+  return n;
 }
 
 export function roleLabel(role: RoleConfig): string {
