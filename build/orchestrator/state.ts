@@ -255,6 +255,37 @@ export function backfillKindFromPlan(
 }
 
 /**
+ * Cheap predicate: does `state` already agree with the parser's view on
+ * both phases AND features?
+ *
+ * Used by the resume-time fail-closed guard in cli.ts to decide whether
+ * to abort with a remediation message. Disagreement on any dimension
+ * (phase count, per-index phase number, feature count, per-index feature
+ * number) proves desync. The reconciler is wired only on the in-run
+ * FEATURE_NEEDS_PHASES path; on resume, by-number merging would
+ * silently re-attribute runtime artifacts (gemini outputs, codexReview
+ * records) on slots whose stale `.number` no longer matches the parsed
+ * plan — same silent-corruption shape as the bug PR #42 fixed.
+ *
+ * Pure; safe to call repeatedly.
+ */
+export function arePhasesAligned(
+  state: BuildState,
+  reparsed: { phases: Phase[]; features: Feature[] },
+): boolean {
+  if (state.phases.length !== reparsed.phases.length) return false;
+  for (let i = 0; i < state.phases.length; i++) {
+    if (state.phases[i].number !== reparsed.phases[i].number) return false;
+  }
+  if ((state.features?.length ?? 0) !== reparsed.features.length) return false;
+  for (let i = 0; i < reparsed.features.length; i++) {
+    const sf = state.features?.[i];
+    if (!sf || sf.number !== reparsed.features[i].number) return false;
+  }
+  return true;
+}
+
+/**
  * Reconcile state.phases against a freshly re-parsed plan after the
  * orchestrator mutates the plan mid-run (FEATURE_NEEDS_PHASES verdict
  * path). The plan-mutator inserts new phase headings under the named
@@ -269,8 +300,13 @@ export function backfillKindFromPlan(
  * corrupting the downstream feature's runtime state.
  *
  * The fix is to rebuild state.phases by joining against reparsed.phases
- * on phase number (PhaseState.number, Phase.number — both are unique
- * within a plan because the parser rejects duplicate headings).
+ * on phase number (PhaseState.number, Phase.number). The parser does NOT
+ * dedupe headings, so the reconciler defends here: duplicate numbers in
+ * either side throw before any mutation. Without that defense, a `Map`
+ * keyed by `.number` would silently last-write-wins on one side and
+ * orphan the loser, and on the parser side it would alias the same
+ * PhaseState into two array slots so a status write on one would mutate
+ * both.
  *
  *   - Existing phases: keep their PhaseState (status, gemini/codex
  *     iteration counts, etc.) and re-key the in-memory `index` to the
@@ -278,6 +314,9 @@ export function backfillKindFromPlan(
  *   - New phases: append a fresh `{status: "pending"}` PhaseState.
  *   - Dropped phases: fail closed. The plan was edited out-of-band
  *     and continuing would silently lose runtime state.
+ *   - Duplicate numbers (either side): fail closed. Whoever produced
+ *     them (LLM verdict, hand-edited plan, malformed state.json) needs
+ *     to fix it before we touch state.
  *
  * Also rebuilds every `feature.phaseIndexes` from the reparsed Feature
  * objects so downstream readers (the inner phase loop, parallel
@@ -294,6 +333,44 @@ export function reconcileStatePhasesAfterReparse(
   reparsedPhases: Phase[],
   reparsedFeatures: Feature[],
 ): { addedNumbers: string[] } {
+  // Defend against duplicate phase numbers on the parser side. The parser
+  // does not dedupe — if an LLM verdict emits `### Phase 1.review-1` twice
+  // or a hand-edited plan introduces a duplicate, the by-number Map below
+  // would alias the same PhaseState into two array slots and a status
+  // write on one would silently mutate both. Fail fast.
+  const parserSeen = new Set<string>();
+  for (const p of reparsedPhases) {
+    if (parserSeen.has(p.number)) {
+      throw new Error(
+        `reconcileStatePhasesAfterReparse: re-parsed plan contains duplicate ` +
+          `phase number "${p.number}". The parser does not dedupe headings — ` +
+          `look for two "### Phase ${p.number}" entries in the plan and fix one ` +
+          `(rename to a unique number or delete the duplicate).`,
+      );
+    }
+    parserSeen.add(p.number);
+  }
+
+  // Defend against duplicate phase numbers on the state side. A pre-fix
+  // gstack version's slice-tail merge could push a duplicate of the
+  // actually-last phase onto state.phases. `byNumber.set` would
+  // last-write-wins and silently drop the earlier entry's runtime
+  // state (status, gemini outputs, committedAt). Refuse to recover
+  // — the caller's BLOCKED-feature-N.md path can surface the
+  // corruption to a human.
+  const stateSeen = new Set<string>();
+  for (const ps of state.phases) {
+    if (stateSeen.has(ps.number)) {
+      throw new Error(
+        `reconcileStatePhasesAfterReparse: state.phases contains duplicate ` +
+          `phase number "${ps.number}". This usually means state.json was ` +
+          `written by a pre-fix gstack version. Refusing to merge — inspect ` +
+          `state.json or rerun with --no-resume.`,
+      );
+    }
+    stateSeen.add(ps.number);
+  }
+
   const byNumber = new Map<string, PhaseState>();
   for (const ps of state.phases) {
     byNumber.set(ps.number, ps);
