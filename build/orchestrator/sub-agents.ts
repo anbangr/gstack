@@ -2,7 +2,7 @@
  * Sub-agent invocation wrappers for gstack-build.
  *
  * Three callable subagents, all spawned as fresh CLI processes (no MCP):
- *   - runGemini(opts)       implements a phase
+ *   - runRoleTask(opts)     implements a phase via Gemini (renamed from runGemini in v1.40)
  *   - runCodexReview(opts)  reviews an implementation
  *   - runShip(opts)         final ship + land-and-deploy
  *
@@ -61,6 +61,84 @@ function geminiBin(): string {
 
 function kimiBin(): string {
   return process.env.KIMI_BIN || KIMI_BIN;
+}
+
+/**
+ * Resolve effective timeouts and retry policy for a role.
+ *
+ * Precedence for primary timeout: callerTimeoutMs > role.timeoutMs > provider default.
+ * Backup timeout: role.backupTimeoutMs > max(60s, floor(primaryMs/2)). The 60s floor
+ * keeps backup viable when primary is configured very small (gemini CLI cold start
+ * alone is ~3-5s; anything below 60s leaves no room for actual work).
+ *
+ * "claude" provider has no key in BUILD_DEFAULTS.timeoutsMs today; we reuse the
+ * codex default for parity with existing call sites that fall through to CODEX_TIMEOUT_MS.
+ */
+export function resolveRoleTimeouts(
+  role: RoleConfig,
+  callerTimeoutMs?: number,
+): {
+  primaryMs: number;
+  backupMs: number;
+  retryOnTimeout: boolean;
+} {
+  const providerDefault =
+    role.provider === "gemini"
+      ? GEMINI_TIMEOUT_MS
+      : role.provider === "kimi"
+        ? KIMI_TIMEOUT_MS
+        : CODEX_TIMEOUT_MS; // codex and claude both fall through here
+  const primaryMs = callerTimeoutMs ?? role.timeoutMs ?? providerDefault;
+  const backupMs =
+    role.backupTimeoutMs ?? Math.max(60000, Math.floor(primaryMs / 2));
+  const retryOnTimeout = role.retryOnTimeout !== false; // default true
+  return { primaryMs, backupMs, retryOnTimeout };
+}
+
+/**
+ * Detect oversized phase prompts before they spawn a sub-agent.
+ *
+ * Returns ok=false when the prompt exceeds either char-count or file-path-count
+ * thresholds (overridable via GSTACK_BUILD_MAX_PROMPT_CHARS / GSTACK_BUILD_MAX_FILES_PER_PHASE).
+ * Caller is expected to fail the phase fast with the reason, saving the 15-min
+ * primary-impl wait on a prompt that can't fit anyway.
+ *
+ * Missing inputFilePath returns ok:true — we don't break the caller for a
+ * missing file; the spawn path will surface a real error.
+ */
+export interface PhaseScopeCheck {
+  ok: boolean;
+  reason?: string;
+  promptChars: number;
+  filePathMentions: number;
+}
+
+const FILE_PATH_RE = /[\w./-]+\.(?:ts|tsx|js|jsx|md|json|cm|yml|yaml|sh|py)\b/g;
+
+export function checkPhaseScope(inputFilePath: string): PhaseScopeCheck {
+  let content = "";
+  try {
+    content = fs.readFileSync(inputFilePath, "utf8");
+  } catch {
+    return { ok: true, promptChars: 0, filePathMentions: 0 };
+  }
+  const maxChars = envNumberOrDefault("GSTACK_BUILD_MAX_PROMPT_CHARS", 10000);
+  const maxFiles = envNumberOrDefault("GSTACK_BUILD_MAX_FILES_PER_PHASE", 4);
+  const promptChars = content.length;
+  const matches = content.match(FILE_PATH_RE) ?? [];
+  const filePathMentions = new Set(matches).size;
+  if (promptChars > maxChars || filePathMentions > maxFiles) {
+    return {
+      ok: false,
+      reason:
+        `phase prompt is ${promptChars} chars / ${filePathMentions} distinct file paths; ` +
+        `exceeds budget (max ${maxChars} chars or ${maxFiles} files). ` +
+        `Decompose this phase, or raise GSTACK_BUILD_MAX_PROMPT_CHARS / GSTACK_BUILD_MAX_FILES_PER_PHASE.`,
+      promptChars,
+      filePathMentions,
+    };
+  }
+  return { ok: true, promptChars, filePathMentions };
 }
 
 export type Verdict = "pass" | "fail" | "unclear";
@@ -311,81 +389,6 @@ function stageCodexIO(opts: {
  * Universal rule: never pass content inline. Always file paths in, file paths
  * out. See ~/.claude/projects/.../memory/feedback_llm_file_io.md.
  */
-export async function runGemini(opts: {
-  /** Path to the file containing the full prompt body. Caller must write it first. */
-  inputFilePath: string;
-  /** Path where Gemini will write its output summary. Caller decides the path. */
-  outputFilePath: string;
-  cwd: string;
-  slug: string;
-  phaseNumber: string;
-  iteration: number;
-  model?: string;
-  logPrefix?: string;
-}): Promise<SubAgentResult> {
-  ensureLogDir(opts.slug);
-
-  const {
-    stagedInput,
-    stagedOutput,
-    cleanup: cleanupStaged,
-  } = stageGeminiIO({
-    slug: opts.slug,
-    phaseNumber: opts.phaseNumber,
-    iteration: opts.iteration,
-    suffix: opts.logPrefix ?? "impl",
-    inputFilePath: opts.inputFilePath,
-    outputFilePath: opts.outputFilePath,
-  });
-
-  const shellPrompt = [
-    `Read instructions at ${stagedInput}.`,
-    `Do the work autonomously using your --yolo file tools.`,
-    `When done, write your output summary (what files changed, what tests pass, what was committed) to ${stagedOutput}.`,
-    `Return ONLY the output file path. No narrative.`,
-  ].join(" ");
-
-  const argv = ["-p", shellPrompt];
-  if (opts.model) argv.push("-m", opts.model);
-  argv.push("--yolo");
-
-  const prefix = opts.logPrefix ?? "gemini";
-  const logPath = path.join(
-    logDir(opts.slug),
-    `phase-${opts.phaseNumber}-${prefix}-${opts.iteration}.log`,
-  );
-
-  let result = await spawnCaptured({
-    bin: geminiBin(),
-    argv,
-    cwd: opts.cwd,
-    timeoutMs: GEMINI_TIMEOUT_MS,
-    logPath,
-    closeStdin: false,
-  });
-
-  // Single retry on timeout only.
-  if (result.timedOut) {
-    const retryLog = path.join(
-      logDir(opts.slug),
-      `phase-${opts.phaseNumber}-gemini-${opts.iteration}-retry.log`,
-    );
-    const retryResult = await spawnCaptured({
-      bin: geminiBin(),
-      argv,
-      cwd: opts.cwd,
-      timeoutMs: GEMINI_TIMEOUT_MS,
-      logPath: retryLog,
-      closeStdin: false,
-    });
-    retryResult.retries = 1;
-    cleanupStaged();
-    return mergeOutputFile(retryResult, opts.outputFilePath);
-  }
-  cleanupStaged();
-  return mergeOutputFile(result, opts.outputFilePath);
-}
-
 export function buildKimiTaskArgv(opts: {
   workDir: string;
   addDir: string;
@@ -437,6 +440,7 @@ export async function runKimi(opts: {
   command?: string;
   gate?: boolean;
   timeoutMs?: number;
+  retryOnTimeout?: boolean;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
 
@@ -479,7 +483,9 @@ export async function runKimi(opts: {
     closeStdin: false,
   });
 
-  if (result.timedOut) {
+  // retryOnTimeout gates ONLY the time-budget retry; non-timeout failures
+  // fall through to the caller's fallback path.
+  if (result.timedOut && opts.retryOnTimeout !== false) {
     const retryLog = path.join(
       logDir(opts.slug),
       `phase-${opts.phaseNumber}-kimi-${opts.iteration}-retry.log`,
@@ -646,6 +652,7 @@ export async function runCodexReview(opts: {
   gate?: boolean;
   logPrefix?: string;
   timeoutMs?: number;
+  retryOnTimeout?: boolean;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
 
@@ -686,7 +693,9 @@ export async function runCodexReview(opts: {
     closeStdin: true, // codex exec hangs without this
   });
 
-  if (result.timedOut) {
+  // retryOnTimeout gates ONLY the time-budget retry. Transport-failure retry
+  // below is a separate failure mode and stays enabled regardless.
+  if (result.timedOut && opts.retryOnTimeout !== false) {
     const retryLog = path.join(
       logDir(opts.slug),
       `phase-${opts.phaseNumber}-${opts.logPrefix ?? "codex"}-${opts.iteration}-retry.log`,
@@ -802,6 +811,7 @@ export async function runRoleTask(opts: {
   model?: string;
   gate?: boolean;
   timeoutMs?: number;
+  retryOnTimeout?: boolean;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
   const {
@@ -839,7 +849,7 @@ export async function runRoleTask(opts: {
     closeStdin: false,
   });
 
-  if (result.timedOut) {
+  if (result.timedOut && opts.retryOnTimeout !== false) {
     const retryLog = logPath.replace(/\.log$/, "-retry.log");
     const retryResult = await spawnCaptured({
       bin: geminiBin(),
@@ -870,6 +880,7 @@ export async function runClaudeTask(opts: {
   reasoning?: RoleReasoning;
   gate?: boolean;
   timeoutMs?: number;
+  retryOnTimeout?: boolean;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
   const argv = buildClaudeTaskArgv(opts);
@@ -887,7 +898,7 @@ export async function runClaudeTask(opts: {
     logPath,
     closeStdin: true,
   });
-  if (result.timedOut) {
+  if (result.timedOut && opts.retryOnTimeout !== false) {
     const retryLog = logPath.replace(/\.log$/, "-retry.log");
     const retryResult = await spawnCaptured({
       bin: CLAUDE_BIN,
@@ -923,6 +934,9 @@ export async function runShip(opts: {
     command: string;
     backupProvider?: RoleProvider;
     backupModel?: string;
+    timeoutMs?: number;
+    backupTimeoutMs?: number;
+    retryOnTimeout?: boolean;
   };
   land: {
     provider: RoleProvider;
@@ -931,6 +945,9 @@ export async function runShip(opts: {
     command: string;
     backupProvider?: RoleProvider;
     backupModel?: string;
+    timeoutMs?: number;
+    backupTimeoutMs?: number;
+    retryOnTimeout?: boolean;
   };
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
@@ -949,7 +966,9 @@ export async function runShip(opts: {
     slug: opts.slug,
     logPrefix: "ship",
     role: opts.ship,
-    timeoutMs: SHIP_TIMEOUT_MS,
+    // role.timeoutMs (set by configure.cm or env) takes precedence inside
+    // runConfiguredRoleTask via resolveRoleTimeouts; caller default stays SHIP_TIMEOUT_MS.
+    timeoutMs: opts.ship.timeoutMs ?? SHIP_TIMEOUT_MS,
     gate: false,
   });
 
@@ -972,7 +991,7 @@ export async function runShip(opts: {
     slug: opts.slug,
     logPrefix: "land-and-deploy",
     role: opts.land,
-    timeoutMs: SHIP_TIMEOUT_MS,
+    timeoutMs: opts.land.timeoutMs ?? SHIP_TIMEOUT_MS,
     gate: false,
   });
 }
@@ -992,6 +1011,9 @@ export async function runSlashCommand(opts: {
     command: string;
     backupProvider?: RoleProvider;
     backupModel?: string;
+    timeoutMs?: number;
+    backupTimeoutMs?: number;
+    retryOnTimeout?: boolean;
   };
   timeoutMs?: number;
   gate?: boolean;
@@ -1003,7 +1025,7 @@ export async function runSlashCommand(opts: {
   });
 }
 
-export async function runConfiguredRoleTask(opts: {
+export interface RunConfiguredRoleTaskOpts {
   inputFilePath: string;
   outputFilePath: string;
   cwd: string;
@@ -1016,7 +1038,117 @@ export async function runConfiguredRoleTask(opts: {
   gate?: boolean;
   sandbox?: CodexSandbox;
   codexDefaultCommand?: string;
-}): Promise<SubAgentResult> {
+}
+
+/**
+ * Build the recursive runConfiguredRoleTask opts for the backup fallback path.
+ *
+ * Explicitly clears codexDefaultCommand (caller-specific) and sets retryOnTimeout:false
+ * on the backup role so the backup is single-shot. Backup uses resolved.backupMs as
+ * its timeout (half of effective primary, floored at 60s) — caller-passed opts.timeoutMs
+ * is intentionally NOT propagated; the backup gets its own budget.
+ */
+export function resolveFallbackForConfigured(
+  parentOpts: RunConfiguredRoleTaskOpts,
+  resolved: ReturnType<typeof resolveRoleTimeouts>,
+): RunConfiguredRoleTaskOpts {
+  const backupProvider = parentOpts.role.backupProvider!;
+  return {
+    ...parentOpts,
+    timeoutMs: resolved.backupMs,
+    logPrefix: `${parentOpts.logPrefix}-backup-${backupProvider}`,
+    codexDefaultCommand: undefined,
+    role: {
+      provider: backupProvider,
+      // Empty string when backupModel is absent: argv builders use falsy check
+      // (e.g. `opts.model ? ["-m", opts.model] : []`), so "" suppresses the flag
+      // and the provider uses its configured default.
+      model: parentOpts.role.backupModel ?? "",
+      reasoning: parentOpts.role.reasoning,
+      command: parentOpts.role.command,
+      // Backup is single-shot. The primary already ate at least one full retry
+      // worth of time on the same prompt; doing it again on the backup just
+      // burns more wall time.
+      retryOnTimeout: false,
+    },
+  };
+}
+
+// Roles whose prompts span multiple files and benefit from oversized-phase
+// fail-fast. Matched on opts.logPrefix because that's the canonical role tag
+// the orchestrator passes through (kimi-impl, primary-impl, test-fixer, etc.).
+const ENFORCE_SCOPE_ROLES = new Set(["primary-impl", "test-fixer"]);
+
+/**
+ * Opts shape for the CLI's internal phase dispatcher (cli.ts::runRoleTask).
+ * Mirrors RunConfiguredRoleTaskOpts but without codexDefaultCommand/sandbox —
+ * the CLI dispatcher uses runCodexImpl (not runCodexReview), so codex-specific
+ * review opts don't apply.
+ */
+export interface RunRoleTaskOpts {
+  role: RoleConfig;
+  inputFilePath: string;
+  outputFilePath: string;
+  cwd: string;
+  slug: string;
+  phaseNumber: string;
+  iteration: number;
+  logPrefix: string;
+  timeoutMs?: number;
+  retryOnTimeout?: boolean;
+}
+
+/**
+ * Build the recursive cli.ts::runRoleTask opts for the backup fallback path.
+ * Parallel to resolveFallbackForConfigured but for cli.ts::runRoleTask's narrower
+ * opts shape (no codexDefaultCommand, no sandbox).
+ */
+export function resolveFallbackForRoleTask(
+  parentOpts: RunRoleTaskOpts,
+  resolved: ReturnType<typeof resolveRoleTimeouts>,
+): RunRoleTaskOpts {
+  const backupProvider = parentOpts.role.backupProvider!;
+  return {
+    ...parentOpts,
+    timeoutMs: resolved.backupMs,
+    retryOnTimeout: false,
+    logPrefix: `${parentOpts.logPrefix}-backup-${backupProvider}`,
+    role: {
+      provider: backupProvider,
+      model: parentOpts.role.backupModel ?? "",
+      reasoning: parentOpts.role.reasoning,
+      command: parentOpts.role.command,
+      retryOnTimeout: false,
+    },
+  };
+}
+
+export async function runConfiguredRoleTask(
+  opts: RunConfiguredRoleTaskOpts,
+): Promise<SubAgentResult> {
+  const resolved = resolveRoleTimeouts(opts.role, opts.timeoutMs);
+  const effectiveTimeoutMs = resolved.primaryMs;
+  const retryOnTimeout = resolved.retryOnTimeout;
+
+  // Oversized-phase fail-fast for implementation roles. Saves 15min of wasted
+  // primary spawn when the prompt obviously can't fit. Operator overrides via
+  // GSTACK_BUILD_MAX_PROMPT_CHARS / GSTACK_BUILD_MAX_FILES_PER_PHASE.
+  if (ENFORCE_SCOPE_ROLES.has(opts.logPrefix)) {
+    const check = checkPhaseScope(opts.inputFilePath);
+    if (!check.ok) {
+      fs.writeFileSync(opts.outputFilePath, "");
+      return {
+        stdout: "",
+        stderr: `phase_oversized: ${check.reason}`,
+        exitCode: 1,
+        timedOut: false,
+        logPath: "",
+        durationMs: 0,
+        retries: 0,
+      };
+    }
+  }
+
   let result: SubAgentResult;
 
   if (opts.role.provider === "claude") {
@@ -1032,7 +1164,8 @@ export async function runConfiguredRoleTask(opts: {
       model: opts.role.model,
       reasoning: opts.role.reasoning,
       gate: opts.gate,
-      timeoutMs: opts.timeoutMs,
+      timeoutMs: effectiveTimeoutMs,
+      retryOnTimeout,
     });
   } else if (opts.role.provider === "gemini") {
     result = await runRoleTask({
@@ -1046,7 +1179,8 @@ export async function runConfiguredRoleTask(opts: {
       command: opts.role.command,
       model: opts.role.model,
       gate: opts.gate,
-      timeoutMs: opts.timeoutMs,
+      timeoutMs: effectiveTimeoutMs,
+      retryOnTimeout,
     });
   } else if (opts.role.provider === "kimi") {
     result = await runKimi({
@@ -1060,7 +1194,8 @@ export async function runConfiguredRoleTask(opts: {
       command: opts.role.command,
       model: opts.role.model,
       gate: opts.gate,
-      timeoutMs: opts.timeoutMs,
+      timeoutMs: effectiveTimeoutMs,
+      retryOnTimeout,
     });
   } else {
     result = await runCodexReview({
@@ -1079,39 +1214,25 @@ export async function runConfiguredRoleTask(opts: {
       gate: opts.gate,
       sandbox: opts.sandbox,
       logPrefix: opts.logPrefix,
-      timeoutMs: opts.timeoutMs,
+      timeoutMs: effectiveTimeoutMs,
+      retryOnTimeout,
     });
   }
 
-  // MIRROR: cli.ts::runRoleTask contains an identical fallback block for the
-  // CLI's internal phase dispatcher. Any change to this logic (log format,
-  // clear-before-backup, role shape) must also be applied there.
+  // MIRROR: cli.ts::runRoleTask runs an identical fallback via
+  // resolveFallbackForRoleTask. The two functions exist because the CLI's
+  // internal phase dispatcher and this slash-command dispatcher accept
+  // different opt shapes (codexDefaultCommand, sandbox).
   if ((result.timedOut || result.exitCode !== 0) && opts.role.backupProvider) {
     console.warn(
       `[gstack-build] ${opts.logPrefix}: primary ${opts.role.provider} failed ` +
         `(exit=${result.exitCode ?? "null"}, timedOut=${result.timedOut}); ` +
-        `falling back to ${opts.role.backupProvider}`,
+        `falling back to ${opts.role.backupProvider} with timeout ${resolved.backupMs}ms (single-shot)`,
     );
     // Zero stale primary output before backup runs. If backup also fails, the
     // caller gets an empty outputFilePath plus the backup's non-zero exit code.
     fs.writeFileSync(opts.outputFilePath, "");
-    return runConfiguredRoleTask({
-      ...opts,
-      logPrefix: `${opts.logPrefix}-backup-${opts.role.backupProvider}`,
-      // codexDefaultCommand must not propagate — it is caller-specific (e.g.
-      // runSlashCommand passes "/gstack-review"). An implementation-role backup
-      // with provider "codex" and no command must not inherit a review command.
-      codexDefaultCommand: undefined,
-      role: {
-        provider: opts.role.backupProvider,
-        // Empty string when backupModel is absent: all argv builders use a falsy
-        // check (e.g. `opts.model ? ["-m", opts.model] : []`), so "" suppresses
-        // the flag and lets the provider use its configured default.
-        model: opts.role.backupModel ?? "",
-        reasoning: opts.role.reasoning,
-        command: opts.role.command,
-      },
-    });
+    return runConfiguredRoleTask(resolveFallbackForConfigured(opts, resolved));
   }
 
   return result;
@@ -1943,7 +2064,7 @@ export function buildCodexImplArgv(opts: {
 
 /**
  * Run the Codex implementation pass for one half of a dual-impl tournament.
- * Mirrors runGemini's structure: file-path I/O, captured output, single retry
+ * Mirrors runRoleTask's structure: file-path I/O, captured output, single retry
  * on timeout. Default sandbox is workspace-write because git worktrees share
  * .git/remotes with the parent repo — danger-full-access would allow Codex to
  * push or delete remote branches. Override via GSTACK_BUILD_CODEX_IMPL_SANDBOX.
@@ -1960,6 +2081,8 @@ export async function runCodexImpl(opts: {
   model?: string;
   /** Optional prefix for log filenames — used by fix-loop passes to avoid overwriting the initial impl log. */
   logPrefix?: string;
+  timeoutMs?: number;
+  retryOnTimeout?: boolean;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
 
@@ -1989,16 +2112,20 @@ export async function runCodexImpl(opts: {
     `phase-${opts.phaseNumber}-${logName}-${opts.iteration}.log`,
   );
 
+  const timeoutMs = opts.timeoutMs ?? CODEX_TIMEOUT_MS;
+
   let result = await spawnCaptured({
     bin: CODEX_BIN,
     argv,
     cwd: opts.cwd,
-    timeoutMs: CODEX_TIMEOUT_MS,
+    timeoutMs,
     logPath,
     closeStdin: true,
   });
 
-  if (result.timedOut) {
+  // retryOnTimeout gates ONLY the time-budget retry; codex transport
+  // retries (TLS / stream disconnect) are not handled here and stay separate.
+  if (result.timedOut && opts.retryOnTimeout !== false) {
     const retryLog = path.join(
       logDir(opts.slug),
       `phase-${opts.phaseNumber}-${logName}-${opts.iteration}-retry.log`,
@@ -2007,7 +2134,7 @@ export async function runCodexImpl(opts: {
       bin: CODEX_BIN,
       argv,
       cwd: opts.cwd,
-      timeoutMs: CODEX_TIMEOUT_MS,
+      timeoutMs,
       logPath: retryLog,
       closeStdin: true,
     });
