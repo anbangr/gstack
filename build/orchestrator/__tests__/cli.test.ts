@@ -3146,6 +3146,258 @@ describe("markPhaseCommittedAfterManualRecovery", () => {
     expect(unchangedPlan).toContain("- [ ] **Implementation");
     expect(unchangedPlan).toContain("- [ ] **Review");
   });
+
+  describe("dirty-tree guard", () => {
+    // Stand up a real git repo so captureGitSnapshot can run. The dirty-tree
+    // guard was the recovery anti-pattern the 2026-05-18 mitosis faults all
+    // triggered: --mark-phase-committed silently force-marked over the dirty
+    // tree, leaving the next phase to start on an inconsistent state.
+    function setupDirtyWorktreeFixture(): {
+      tmpDir: string;
+      planFile: string;
+      phase: Phase;
+      state: BuildState;
+    } {
+      const dir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "gstack-dirty-guard-"),
+      );
+      // Init a real git repo so `git status --porcelain` runs.
+      spawnSync("git", ["init", "-q", "-b", "main", dir], { encoding: "utf8" });
+      spawnSync("git", ["-C", dir, "config", "user.email", "t@t"], {
+        encoding: "utf8",
+      });
+      spawnSync("git", ["-C", dir, "config", "user.name", "t"], {
+        encoding: "utf8",
+      });
+      spawnSync("git", ["-C", dir, "config", "commit.gpgsign", "false"], {
+        encoding: "utf8",
+      });
+      // Write the plan file BEFORE seed commit so it's tracked and doesn't
+      // show up as untracked in the "clean tree" tests.
+      const planFile = path.join(dir, "plan.md");
+      fs.writeFileSync(
+        planFile,
+        [
+          "# Plan",
+          "",
+          "### Phase 1.1: Foo",
+          "- [ ] **Implementation**: impl",
+          "- [ ] **Review**: review",
+          "",
+        ].join("\n"),
+      );
+      fs.writeFileSync(path.join(dir, "seed.txt"), "seed\n");
+      spawnSync("git", ["-C", dir, "add", "seed.txt", "plan.md"], {
+        encoding: "utf8",
+      });
+      spawnSync("git", ["-C", dir, "commit", "-q", "-m", "seed"], {
+        encoding: "utf8",
+      });
+      const phase: Phase = {
+        ...basePhase,
+        number: "1.1",
+        name: "Foo",
+        testSpecCheckboxLine: -1,
+        implementationCheckboxLine: 4,
+        reviewCheckboxLine: 5,
+      };
+      const state: BuildState = {
+        planFile,
+        planBasename: "plan",
+        slug: "build-plan",
+        branch: "main",
+        startedAt: "2026-05-19T00:00:00.000Z",
+        lastUpdatedAt: "2026-05-19T00:00:00.000Z",
+        currentPhaseIndex: 0,
+        currentFeatureIndex: 0,
+        features: [],
+        phases: [
+          {
+            index: 0,
+            number: "1.1",
+            name: "Foo",
+            status: "failed",
+            error: "old hygiene failure",
+          },
+        ],
+        completed: false,
+      };
+      return { tmpDir: dir, planFile, phase, state };
+    }
+
+    it("refuses to mark when worktree is dirty and no flag is passed", () => {
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      // Dirty the tree.
+      fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: dir,
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toContain("worktree is dirty");
+        expect(result.error).toContain("--commit-dirty");
+        expect(result.error).toContain("--force-dirty");
+        expect(result.dirtyFiles).toBeDefined();
+        expect(result.dirtyFiles?.some((f) => f.includes("dirty.txt"))).toBe(
+          true,
+        );
+      }
+      // State must NOT have advanced.
+      expect(state.phases[0].status).toBe("failed");
+      const unchangedPlan = fs.readFileSync(planFile, "utf8");
+      expect(unchangedPlan).toContain("- [ ] **Implementation");
+
+      fs.rmSync(dir, { recursive: true });
+    });
+
+    it("--force-dirty marks anyway, preserves the dirty state (warn-only)", () => {
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: dir,
+        forceDirty: true,
+      });
+      expect(result).toEqual({ ok: true, phaseIndex: 0 });
+      expect(state.phases[0].status).toBe("committed");
+      // Dirty file must still be on disk and uncommitted.
+      expect(fs.existsSync(path.join(dir, "dirty.txt"))).toBe(true);
+      const statusAfter = spawnSync(
+        "git",
+        ["-C", dir, "status", "--porcelain"],
+        { encoding: "utf8" },
+      );
+      expect(statusAfter.stdout).toContain("dirty.txt");
+
+      fs.rmSync(dir, { recursive: true });
+    });
+
+    it("--commit-dirty stages + commits dirty files before marking", () => {
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: dir,
+        commitDirty: true,
+      });
+      expect(result).toEqual({ ok: true, phaseIndex: 0 });
+      expect(state.phases[0].status).toBe("committed");
+      // `dirty.txt` (agent-left) must be committed and out of the dirty list.
+      // The orchestrator's subsequent checkbox flip dirties plan.md — that's
+      // expected and not the guard's responsibility.
+      const statusAfter = spawnSync(
+        "git",
+        ["-C", dir, "status", "--porcelain"],
+        { encoding: "utf8" },
+      );
+      expect(statusAfter.stdout).not.toContain("dirty.txt");
+      // The auto-commit must exist with the recovery message prefix.
+      const logAfter = spawnSync(
+        "git",
+        ["-C", dir, "log", "-1", "--format=%s"],
+        { encoding: "utf8" },
+      );
+      expect(logAfter.stdout).toContain("fix(recovery): 1.1 auto-commit");
+      // dirty.txt must be part of the committed tree now.
+      const showAfter = spawnSync(
+        "git",
+        ["-C", dir, "show", "--stat", "--format=", "HEAD"],
+        { encoding: "utf8" },
+      );
+      expect(showAfter.stdout).toContain("dirty.txt");
+
+      fs.rmSync(dir, { recursive: true });
+    });
+
+    it("--force-dirty and --commit-dirty are mutually exclusive", () => {
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: dir,
+        forceDirty: true,
+        commitDirty: true,
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toContain("mutually exclusive");
+      }
+      expect(state.phases[0].status).toBe("failed");
+      fs.rmSync(dir, { recursive: true });
+    });
+
+    it("clean tree marks without invoking the guard (no flags needed)", () => {
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      // No dirty file — tree is clean from setup.
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: dir,
+      });
+      expect(result).toEqual({ ok: true, phaseIndex: 0 });
+      expect(state.phases[0].status).toBe("committed");
+      fs.rmSync(dir, { recursive: true });
+    });
+
+    it("skips the dirty-tree guard when cwd is omitted (legacy callers)", () => {
+      // No cwd passed → no git inspection → no refusal. This preserves
+      // backward compat for existing tests that exercise the state-only
+      // transition without setting up a real git fixture.
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        // cwd intentionally omitted
+      });
+      expect(result).toEqual({ ok: true, phaseIndex: 0 });
+      expect(state.phases[0].status).toBe("committed");
+      fs.rmSync(dir, { recursive: true });
+    });
+
+    it("dryRun skips the dirty-tree guard (preview mode never inspects worktree)", () => {
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: dir,
+        dryRun: true,
+      });
+      // Dry-run preview must succeed even on dirty trees; the operator can
+      // see what would happen before deciding whether to add --commit-dirty.
+      expect(result).toEqual({ ok: true, phaseIndex: 0 });
+      // No state mutation in dry-run.
+      expect(state.phases[0].status).toBe("failed");
+      fs.rmSync(dir, { recursive: true });
+    });
+  });
 });
 
 describe("ensureFeatureBranch", () => {

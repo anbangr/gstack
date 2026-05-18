@@ -649,6 +649,10 @@ export interface Args {
   allowSubmoduleRecovery: string[];
   /** Mark a phase committed after manual recovery without rerunning earlier phase steps. */
   markPhaseCommitted?: string;
+  /** With --mark-phase-committed, proceed even if the worktree is dirty (preserve dirty state, warn-only). Mutually exclusive with --commit-dirty. */
+  forceDirty?: boolean;
+  /** With --mark-phase-committed, stage and commit dirty files before marking. Mutually exclusive with --force-dirty. */
+  commitDirty?: boolean;
   /** Stop a running gstack-build daemon by run-id. SIGTERM with 30s graceful timeout. */
   stopRun?: string;
   /**
@@ -814,6 +818,8 @@ export function parseArgs(argv: string[]): Args {
     allowWorkspaceRoot: false,
     allowSubmoduleRecovery: [],
     markPhaseCommitted: undefined,
+    forceDirty: false,
+    commitDirty: false,
     stopRun: undefined,
     skipFeatureReview: false,
     featureReviewMaxIter: DEFAULT_FEATURE_REVIEW_MAX_ITER,
@@ -912,6 +918,10 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.markPhaseCommitted = next;
+    } else if (a === "--force-dirty") {
+      args.forceDirty = true;
+    } else if (a === "--commit-dirty") {
+      args.commitDirty = true;
     } else if (a === "--stop-run") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
@@ -2621,7 +2631,12 @@ Flags:
                        Mark a manually recovered phase committed without rerunning
                        test-spec, implementation, tests, or review steps. Accepts
                        either "<phase>" (dot-numbered plans) or "<feature>.<phase>"
-                       (per-feature plans).
+                       (per-feature plans). When the worktree is dirty, refuses by
+                       default; pair with one of:
+  --force-dirty        Mark anyway, preserve the dirty state (warn-only).
+  --commit-dirty       Stage + commit dirty files before marking. Pre-commit hooks
+                       still run; if a hook fails, the commit fails. Mutually
+                       exclusive with --force-dirty.
   --stop-run <run-id>  Stop a running gstack-build daemon by run-id. Reads the PID
                        from the active-runs registry, signals SIGTERM, waits up to
                        30s for graceful exit, then verifies the lock is gone.
@@ -5412,7 +5427,37 @@ export function markPhaseCommittedAfterManualRecovery(args: {
   phaseNumber: string;
   planFile: string;
   dryRun?: boolean;
-}): { ok: true; phaseIndex: number } | { ok: false; error: string } {
+  /**
+   * Worktree to inspect for dirty files before marking. When omitted, the
+   * dirty-tree guard is skipped (preserves the pre-guard behavior for
+   * legacy callers and unit tests that exercise state-only transitions).
+   * Production callers in cli.ts ALWAYS pass projectRoot.
+   */
+  cwd?: string;
+  /**
+   * When true, proceed even if the worktree is dirty — preserves the dirty
+   * files (no commit) and emits a WARN listing them. Use when the operator
+   * has reviewed the dirty state and wants it kept on disk.
+   */
+  forceDirty?: boolean;
+  /**
+   * When true, stage all dirty files and commit them with a standard
+   * recovery message before marking the phase. Mutually exclusive with
+   * forceDirty. Bypasses git pre-commit hooks ONLY if the operator also
+   * passes --no-verify at git level (we do not pass it implicitly).
+   */
+  commitDirty?: boolean;
+}):
+  | { ok: true; phaseIndex: number }
+  | { ok: false; error: string; dirtyFiles?: string[] } {
+  if (args.forceDirty && args.commitDirty) {
+    return {
+      ok: false,
+      error:
+        "--force-dirty and --commit-dirty are mutually exclusive; pick one",
+    };
+  }
+
   const phase = resolvePhaseByMarkArg(args.phases, args.phaseNumber);
   if (!phase) {
     return { ok: false, error: `phase not found: ${args.phaseNumber}` };
@@ -5429,6 +5474,84 @@ export function markPhaseCommittedAfterManualRecovery(args: {
       ok: false,
       error: `state/plan phase mismatch at index ${phase.index}: plan has ${phase.number}, state has ${phaseState.number}`,
     };
+  }
+
+  // Dirty-tree guard: three of the four 2026-05-18 PREMATURE_COMPLETION
+  // faults were rescued by `--mark-phase-committed` AFTER an agent had left
+  // the worktree dirty. The original behavior silently force-marked over
+  // the dirty state, leaving the next phase to start on an inconsistent
+  // tree (mitosis-prototype-v3.1 fault report §"Recovery Performed" notes
+  // the worktree dirty files were not committed but state was advanced).
+  //
+  // Now: refuse to mark when dirty unless the operator explicitly chose a
+  // policy. --force-dirty preserves the dirty state with a warning;
+  // --commit-dirty stages and commits with a standard recovery message.
+  if (args.cwd && !args.dryRun) {
+    const snap = captureGitSnapshot(args.cwd);
+    const dirtyFiles = snap.status.filter(
+      (line) => !line.startsWith("<git error:"),
+    );
+    if (dirtyFiles.length > 0) {
+      if (args.commitDirty) {
+        // Stage everything and commit. We do NOT pass --no-verify — pre-commit
+        // hooks are a real quality signal; if they fail, the operator sees
+        // the hook output and can decide whether to fix or fall back to
+        // --force-dirty.
+        const stageR = spawnSync(
+          "git",
+          ["-C", args.cwd, "add", "--", "."],
+          { encoding: "utf8" },
+        );
+        if (stageR.status !== 0) {
+          return {
+            ok: false,
+            error: `--commit-dirty: git add failed: ${(stageR.stderr || "").trim()}`,
+            dirtyFiles,
+          };
+        }
+        const commitMsg = `fix(recovery): ${phase.number} auto-commit of agent-left changes during --mark-phase-committed\n\nAuto-committed by gstack-build because --commit-dirty was passed.\nDirty files at mark time:\n${dirtyFiles.map((p) => `  ${p}`).join("\n")}`;
+        const commitR = spawnSync(
+          "git",
+          ["-C", args.cwd, "commit", "-m", commitMsg],
+          { encoding: "utf8" },
+        );
+        if (commitR.status !== 0) {
+          return {
+            ok: false,
+            error: `--commit-dirty: git commit failed (pre-commit hook? empty diff?): ${(commitR.stderr || commitR.stdout || "").trim()}`,
+            dirtyFiles,
+          };
+        }
+        console.log(
+          `  ✓ --commit-dirty: committed ${dirtyFiles.length} dirty path(s) before marking phase ${phase.number}`,
+        );
+      } else if (args.forceDirty) {
+        console.warn(
+          `  ⚠ --force-dirty: marking phase ${phase.number} committed over a dirty worktree (${dirtyFiles.length} path(s)):`,
+        );
+        for (const f of dirtyFiles) console.warn(`    ${f}`);
+        console.warn(
+          `  ⚠ next phase will start on this dirty tree — review carefully.`,
+        );
+      } else {
+        return {
+          ok: false,
+          dirtyFiles,
+          error: [
+            `worktree is dirty (${dirtyFiles.length} path(s)) — refusing to mark phase ${phase.number} committed.`,
+            ``,
+            `Dirty files:`,
+            ...dirtyFiles.map((p) => `  ${p}`),
+            ``,
+            `Re-run with one of:`,
+            `  --commit-dirty    stage + commit the dirty files, then mark`,
+            `  --force-dirty     keep the dirty state, mark anyway (warn-only)`,
+            ``,
+            `Or manually resolve the dirty tree before retrying.`,
+          ].join("\n"),
+        };
+      }
+    }
   }
 
   if (!args.dryRun) {
@@ -9024,6 +9147,9 @@ async function main() {
         phaseNumber: args.markPhaseCommitted,
         planFile: args.planFile,
         dryRun: args.dryRun,
+        cwd: projectRoot,
+        forceDirty: args.forceDirty,
+        commitDirty: args.commitDirty,
       });
       if (!marked.ok) {
         console.error(`\n✗ --mark-phase-committed failed: ${marked.error}\n`);
