@@ -4081,6 +4081,7 @@ async function runReviewGates(opts: {
       cwd: opts.cwd,
       label: `${name} gate`,
       parentWorkspace: opts.parentWorkspace,
+      phaseRef: { phaseNumber: opts.phaseNumber },
     });
     outputs.push(result);
     combined.push(
@@ -4105,6 +4106,7 @@ async function runReviewGates(opts: {
         cwd: opts.cwd,
         label: `${name} sandbox retry gate`,
         parentWorkspace: opts.parentWorkspace,
+        phaseRef: { phaseNumber: opts.phaseNumber },
       });
       outputs.push(checkedRetryResult);
       combined.push(
@@ -4210,7 +4212,7 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
   label: string;
   dirtyLines: string[];
   globs?: string[];
-}): { committed: boolean; reason: string } {
+}): { committed: boolean; reason: string; nonTestPaths?: string[] } {
   if (process.env.GSTACK_QA_NO_AUTO_COMMIT === "1") {
     return { committed: false, reason: "GSTACK_QA_NO_AUTO_COMMIT=1" };
   }
@@ -4226,6 +4228,7 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
       reason: `non-test paths present: ${nonTest.slice(0, 3).join(", ")}${
         nonTest.length > 3 ? ` (+${nonTest.length - 3} more)` : ""
       }`,
+      nonTestPaths: nonTest,
     };
   }
   // All paths test-only → auto-commit.
@@ -4268,6 +4271,10 @@ function applyGateHygiene(opts: {
     workspaceRoot: string | null;
     snapshot: GitSnapshot | null;
   };
+  /** When set, a failed test-only auto-commit (blocked by non-test paths)
+   *  prints the exact `--mark-phase-committed` recovery command. Omit when
+   *  the gate fires outside a phase context (e.g. merge review). */
+  phaseRef?: { featureNumber?: string; phaseNumber: string };
 }): SubAgentResult {
   if (opts.result.timedOut || opts.result.exitCode !== 0) return opts.result;
   let checks = [
@@ -4324,11 +4331,54 @@ function applyGateHygiene(opts: {
         errors = checks.flatMap((check) => check.errors);
       } else {
         console.warn(`  ⚠ ${opts.label} auto-commit skipped: ${auto.reason}`);
+        if (auto.nonTestPaths && auto.nonTestPaths.length > 0) {
+          const recoveryHint = formatGateHygieneRecoveryHint({
+            phaseRef: opts.phaseRef,
+            nonTestPaths: auto.nonTestPaths,
+          });
+          if (recoveryHint) {
+            console.warn(recoveryHint);
+            // Also fold into the hygiene error so the BLOCKED.md / merged
+            // report captures the same advice; otherwise the recovery
+            // command only lives in stdout and a re-reading agent loses it.
+            errors.push(recoveryHint);
+          }
+        }
       }
     }
   }
   if (errors.length === 0) return opts.result;
   return hygieneFailureResult(errors.join("\n"), opts.result.logPath);
+}
+
+export function formatGateHygieneRecoveryHint(opts: {
+  phaseRef?: { featureNumber?: string; phaseNumber: string };
+  nonTestPaths: string[];
+}): string {
+  const phaseRef = opts.phaseRef;
+  const paths = opts.nonTestPaths;
+  if (paths.length === 0) return "";
+  const sample = paths.slice(0, 5);
+  const more =
+    paths.length > sample.length
+      ? ` (+${paths.length - sample.length} more)`
+      : "";
+  const phaseArg = phaseRef
+    ? phaseRef.featureNumber
+      ? `${phaseRef.featureNumber}.${phaseRef.phaseNumber}`
+      : phaseRef.phaseNumber
+    : "<feature>.<phase>";
+  return [
+    `  Recovery: a review/QA gate touched non-test source files. The hygiene gate`,
+    `  cannot auto-commit those changes (they need a human eye). To accept the`,
+    `  changes and continue:`,
+    `    1. Inspect: git -C <worktree> status`,
+    `    2. Commit: git -C <worktree> add <paths> && git -C <worktree> commit -m "..."`,
+    `    3. Mark the phase committed: gstack-build --mark-phase-committed ${phaseArg}`,
+    `  Non-test paths blocking auto-commit:`,
+    ...sample.map((p) => `    - ${p}`),
+    ...(more ? [`    ...${more}`] : []),
+  ].join("\n");
 }
 
 export function applyMutableAgentHygiene(opts: {
