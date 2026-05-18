@@ -823,6 +823,10 @@ export function parseArgs(argv: string[]): Args {
   };
   const positional: string[] = [];
   const roleFlags = buildRoleFlagMap();
+  // Tracks whether the user explicitly passed --max-wall-ms. When false,
+  // the post-loop Claude-Code wall-time cap can safely override the default
+  // without trampling an operator's intent.
+  let userSetMaxWallMs = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--print-only") args.printOnly = true;
@@ -941,6 +945,7 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.monitorMaxWallMs = n;
+      userSetMaxWallMs = true;
     } else if (a === "--feature-review-max-iter") {
       const next = argv[++i];
       const n = Number(next);
@@ -1352,7 +1357,43 @@ export function parseArgs(argv: string[]): Args {
     console.error(providerErrors.join("\n"));
     process.exit(2);
   }
+  // Claude Code's Bash tool auto-backgrounds commands that run past ~10 min,
+  // breaking the monitor's synchronous re-entry contract. When we detect we
+  // are running inside Claude Code, cap the monitor wall-time at 9 min so
+  // every cycle exits with MONITOR_REENTER before the host backgrounds us.
+  // Explicit --max-wall-ms wins so power users can opt out.
+  const cap = resolveClaudeCodeMonitorWallMsCap({
+    env: process.env,
+    userSetMaxWallMs,
+    currentMaxWallMs: args.monitorMaxWallMs,
+  });
+  if (cap !== null) {
+    args.monitorMaxWallMs = cap;
+  }
   return args;
+}
+
+/**
+ * Returns the wall-time cap to apply when running inside Claude Code, or
+ * null when no cap should be applied. Exported for unit testing — see
+ * __tests__/claude-code-wall-cap.test.ts.
+ *
+ * Rules:
+ *  - User explicitly set --max-wall-ms ⟹ no cap (respect intent).
+ *  - CLAUDECODE env var unset ⟹ no cap.
+ *  - Current value already at or below 540000 ⟹ no cap (idempotent).
+ *  - Otherwise return 540000 (9 minutes, below the ~10 min Bash limit).
+ */
+export function resolveClaudeCodeMonitorWallMsCap(opts: {
+  env: NodeJS.ProcessEnv;
+  userSetMaxWallMs: boolean;
+  currentMaxWallMs: number;
+}): number | null {
+  if (opts.userSetMaxWallMs) return null;
+  if (!opts.env.CLAUDECODE) return null;
+  const CLAUDE_CODE_CAP_MS = 540_000;
+  if (opts.currentMaxWallMs <= CLAUDE_CODE_CAP_MS) return null;
+  return CLAUDE_CODE_CAP_MS;
 }
 
 export function validateRoleProviders(
@@ -4127,6 +4168,7 @@ async function runReviewGates(opts: {
       cwd: opts.cwd,
       label: `${name} gate`,
       parentWorkspace: opts.parentWorkspace,
+      phaseRef: { phaseNumber: opts.phaseNumber },
     });
     outputs.push(result);
     combined.push(
@@ -4151,6 +4193,7 @@ async function runReviewGates(opts: {
         cwd: opts.cwd,
         label: `${name} sandbox retry gate`,
         parentWorkspace: opts.parentWorkspace,
+        phaseRef: { phaseNumber: opts.phaseNumber },
       });
       outputs.push(checkedRetryResult);
       combined.push(
@@ -4256,7 +4299,7 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
   label: string;
   dirtyLines: string[];
   globs?: string[];
-}): { committed: boolean; reason: string } {
+}): { committed: boolean; reason: string; nonTestPaths?: string[] } {
   if (process.env.GSTACK_QA_NO_AUTO_COMMIT === "1") {
     return { committed: false, reason: "GSTACK_QA_NO_AUTO_COMMIT=1" };
   }
@@ -4272,6 +4315,7 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
       reason: `non-test paths present: ${nonTest.slice(0, 3).join(", ")}${
         nonTest.length > 3 ? ` (+${nonTest.length - 3} more)` : ""
       }`,
+      nonTestPaths: nonTest,
     };
   }
   // All paths test-only → auto-commit.
@@ -4314,6 +4358,10 @@ function applyGateHygiene(opts: {
     workspaceRoot: string | null;
     snapshot: GitSnapshot | null;
   };
+  /** When set, a failed test-only auto-commit (blocked by non-test paths)
+   *  prints the exact `--mark-phase-committed` recovery command. Omit when
+   *  the gate fires outside a phase context (e.g. merge review). */
+  phaseRef?: { featureNumber?: string; phaseNumber: string };
 }): SubAgentResult {
   if (opts.result.timedOut || opts.result.exitCode !== 0) return opts.result;
   // Review/QA gates run Codex under workspace-write and the subagent writes
@@ -4374,11 +4422,54 @@ function applyGateHygiene(opts: {
         errors = checks.flatMap((check) => check.errors);
       } else {
         console.warn(`  ⚠ ${opts.label} auto-commit skipped: ${auto.reason}`);
+        if (auto.nonTestPaths && auto.nonTestPaths.length > 0) {
+          const recoveryHint = formatGateHygieneRecoveryHint({
+            phaseRef: opts.phaseRef,
+            nonTestPaths: auto.nonTestPaths,
+          });
+          if (recoveryHint) {
+            console.warn(recoveryHint);
+            // Also fold into the hygiene error so the BLOCKED.md / merged
+            // report captures the same advice; otherwise the recovery
+            // command only lives in stdout and a re-reading agent loses it.
+            errors.push(recoveryHint);
+          }
+        }
       }
     }
   }
   if (errors.length === 0) return opts.result;
   return hygieneFailureResult(errors.join("\n"), opts.result.logPath);
+}
+
+export function formatGateHygieneRecoveryHint(opts: {
+  phaseRef?: { featureNumber?: string; phaseNumber: string };
+  nonTestPaths: string[];
+}): string {
+  const phaseRef = opts.phaseRef;
+  const paths = opts.nonTestPaths;
+  if (paths.length === 0) return "";
+  const sample = paths.slice(0, 5);
+  const more =
+    paths.length > sample.length
+      ? ` (+${paths.length - sample.length} more)`
+      : "";
+  const phaseArg = phaseRef
+    ? phaseRef.featureNumber
+      ? `${phaseRef.featureNumber}.${phaseRef.phaseNumber}`
+      : phaseRef.phaseNumber
+    : "<feature>.<phase>";
+  return [
+    `  Recovery: a review/QA gate touched non-test source files. The hygiene gate`,
+    `  cannot auto-commit those changes (they need a human eye). To accept the`,
+    `  changes and continue:`,
+    `    1. Inspect: git -C <worktree> status`,
+    `    2. Commit: git -C <worktree> add <paths> && git -C <worktree> commit -m "..."`,
+    `    3. Mark the phase committed: gstack-build --mark-phase-committed ${phaseArg}`,
+    `  Non-test paths blocking auto-commit:`,
+    ...sample.map((p) => `    - ${p}`),
+    ...(more ? [`    ...${more}`] : []),
+  ].join("\n");
 }
 
 export function applyMutableAgentHygiene(opts: {

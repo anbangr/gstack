@@ -33,6 +33,30 @@ export interface SkillFault {
   };
 }
 
+/**
+ * Composite identity for a SkillFault. Used by the monitor's active-fault
+ * registry to diff DETECTED → RESOLVED across ticks. Two faults sharing a
+ * category but at different phases (e.g. PREMATURE_COMPLETION on phase 1 AND
+ * phase 2) must resolve independently — so the id keys on
+ * (category, phaseIndex, first sourceFile).
+ *
+ * The second+ entries of sourceFiles are additional evidence, not different
+ * "faults," so they don't contribute to identity. Missing phaseIndex
+ * collapses to "all"; missing sourceFiles collapses to "*". Both placeholders
+ * are stable strings that round-trip through JSON without surprises.
+ */
+export function faultId(fault: SkillFault): string {
+  const phase =
+    typeof fault.evidence?.phaseIndex === "number"
+      ? String(fault.evidence.phaseIndex)
+      : "all";
+  const src =
+    Array.isArray(fault.sourceFiles) && fault.sourceFiles.length > 0
+      ? fault.sourceFiles[0]
+      : "*";
+  return `${fault.category}:${phase}:${src}`;
+}
+
 export type LearnedMatcherKind =
   | "stdout_contains"
   | "stdout_regex"
