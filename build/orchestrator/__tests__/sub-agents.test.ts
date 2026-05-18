@@ -830,6 +830,152 @@ describe("buildCodexReviewArgv (codex review invocation shape)", () => {
   });
 });
 
+describe("runCodexReview no-verdict retry (broader transient class)", () => {
+  // Fix A from the Codex-review-recurring-failure investigation: a non-zero
+  // exit with NO GATE PASS/FAIL marker in the output is "no verdict" — a
+  // transport-layer artifact, not a real review verdict. Common shape: HTTP
+  // 403 / 429 / 5xx blips, crashes mid-write, the well-known "stream
+  // disconnected" string is one specific case the existing regex catches,
+  // but the broader class (any non-zero with no verdict) was failing every
+  // time without retry. Pre-fix: phase 1.2 in the AGNT2 build dropped to
+  // failed on Codex 403. Post-fix: retries once with cleared staged output;
+  // second attempt's GATE PASS advances the phase.
+  it("retries once when Codex exits non-zero without writing a verdict", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-noverdict-"));
+    const slug = `codex-noverdict-${process.pid}-${Date.now()}`;
+    const oldPath = process.env.PATH;
+    try {
+      const fakeCodex = path.join(tmpDir, "codex");
+      const callsPath = path.join(tmpDir, "calls.txt");
+      // First call: exit 1 with a 403-shaped error in stderr, NO verdict in
+      // output file (the failure mode from AGNT2 phase 1.2). Second call:
+      // succeeds with GATE PASS — proves retry is wired and clears stale
+      // output.
+      fs.writeFileSync(
+        fakeCodex,
+        `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const prompt = args[1] || "";
+const match = prompt.match(/Write your full review report to (.+?\\.md)\\./);
+if (!match) {
+  console.error("missing output path in prompt");
+  process.exit(2);
+}
+const outputPath = match[1];
+const callCount = fs.existsSync("${callsPath}") ? Number(fs.readFileSync("${callsPath}", "utf8")) : 0;
+fs.writeFileSync("${callsPath}", String(callCount + 1));
+if (callCount === 0) {
+  // No verdict in output. Stderr names a 403, which the existing
+  // transport-failure regex does NOT match. The fix detects this via
+  // "non-zero exit + no verdict in output."
+  fs.writeFileSync(outputPath, "Connection failed.\\n");
+  console.error("ERROR: HTTP 403 Forbidden from codex backend (auth refresh in flight)");
+  process.exit(1);
+}
+if (fs.readFileSync(outputPath, "utf8") !== "") {
+  console.error("staged output was not cleared before retry");
+  process.exit(3);
+}
+fs.writeFileSync(outputPath, "GATE PASS\\n");
+process.stdout.write(outputPath);
+`,
+      );
+      fs.chmodSync(fakeCodex, 0o755);
+      process.env.PATH = `${tmpDir}${path.delimiter}${oldPath ?? ""}`;
+
+      const inputFilePath = path.join(tmpDir, "input.md");
+      const outputFilePath = path.join(tmpDir, "output.md");
+      fs.writeFileSync(inputFilePath, "review context");
+      fs.writeFileSync(outputFilePath, "");
+
+      const result = await runCodexReview({
+        inputFilePath,
+        outputFilePath,
+        cwd: tmpDir,
+        slug,
+        phaseNumber: "1",
+        iteration: 1,
+        command: "/review",
+        logPrefix: "review",
+        gate: true,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.retries).toBe(1);
+      expect(result.stdout).toBe("GATE PASS\n");
+      expect(fs.readFileSync(callsPath, "utf8")).toBe("2");
+      expect(fs.readFileSync(outputFilePath, "utf8")).toBe("GATE PASS\n");
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(path.join(os.homedir(), ".gstack", "build-state", slug), {
+        recursive: true,
+        force: true,
+      });
+    }
+  });
+
+  it("does NOT retry when Codex exits non-zero WITH a verdict (real review failure)", async () => {
+    // Guardrail: a real GATE FAIL must not be retried — that's the agent
+    // doing its job. Only no-verdict failures retry.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-realfail-"));
+    const slug = `codex-realfail-${process.pid}-${Date.now()}`;
+    const oldPath = process.env.PATH;
+    try {
+      const fakeCodex = path.join(tmpDir, "codex");
+      const callsPath = path.join(tmpDir, "calls.txt");
+      fs.writeFileSync(
+        fakeCodex,
+        `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const prompt = args[1] || "";
+const match = prompt.match(/Write your full review report to (.+?\\.md)\\./);
+if (!match) process.exit(2);
+const callCount = fs.existsSync("${callsPath}") ? Number(fs.readFileSync("${callsPath}", "utf8")) : 0;
+fs.writeFileSync("${callsPath}", String(callCount + 1));
+fs.writeFileSync(match[1], "Review found a real bug.\\nGATE FAIL\\n");
+process.exit(1);
+`,
+      );
+      fs.chmodSync(fakeCodex, 0o755);
+      process.env.PATH = `${tmpDir}${path.delimiter}${oldPath ?? ""}`;
+
+      const inputFilePath = path.join(tmpDir, "input.md");
+      const outputFilePath = path.join(tmpDir, "output.md");
+      fs.writeFileSync(inputFilePath, "review context");
+      fs.writeFileSync(outputFilePath, "");
+
+      const result = await runCodexReview({
+        inputFilePath,
+        outputFilePath,
+        cwd: tmpDir,
+        slug,
+        phaseNumber: "1",
+        iteration: 1,
+        command: "/review",
+        logPrefix: "review",
+        gate: true,
+      });
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.retries ?? 0).toBe(0);
+      expect(fs.readFileSync(callsPath, "utf8")).toBe("1");
+      expect(result.stdout).toContain("GATE FAIL");
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(path.join(os.homedir(), ".gstack", "build-state", slug), {
+        recursive: true,
+        force: true,
+      });
+    }
+  });
+});
+
 describe("runCodexReview transport retry", () => {
   it("retries once on transient Codex transport failure using the same output protocol", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-review-"));
