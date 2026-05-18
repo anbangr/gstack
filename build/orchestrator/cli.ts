@@ -41,10 +41,12 @@ import {
   saveState as persistBuildState,
   backfillKindFromPlan,
   reconcileStatePhasesAfterReparse,
+  arePhasesAligned,
   acquireLock,
   releaseLock,
   readLockInfo,
   lockPath,
+  statePath,
   ensureLogDir,
   deriveStateSlug,
   logDir,
@@ -8862,6 +8864,47 @@ async function main() {
           // kind to disk so state-only consumers (fault detectors,
           // drain-faults) can read kind without re-parsing.
           backfillKindFromPlan(state, phases);
+          // Resume-time alignment guard: refuse to resume when state.phases
+          // or state.features disagrees with the parsed plan. The in-run
+          // FEATURE_NEEDS_PHASES path uses reconcileStatePhasesAfterReparse
+          // to merge by `number`, but on resume that's unsafe — runtime
+          // artifacts (gemini outputs, codexReview records, committedAt)
+          // on shifted slots belong to the work that physically ran at
+          // that slot, not to the phase whose `number` was stored there
+          // in corrupted JSON. By-number merge on resume would silently
+          // re-attribute those artifacts to the wrong phase, and a
+          // downstream --mark-phase-committed would mark the wrong
+          // phase done — exactly the silent-corruption shape PR #42
+          // fixed. So we fail closed and let the user decide.
+          if (!arePhasesAligned(state, { phases, features })) {
+            console.error(
+              `\n✗ state/plan desync detected on resume.\n\n` +
+                `  state.phases length:    ${state.phases.length}\n` +
+                `  parsed plan phases:     ${phases.length}\n` +
+                `  state.features length:  ${state.features?.length ?? 0}\n` +
+                `  parsed plan features:   ${features.length}\n\n` +
+                `This usually means state.json was written by a pre-fix gstack ` +
+                `version (see release notes for the FEATURE_NEEDS_PHASES merge ` +
+                `fix in v1.40.2.0) or the plan markdown was hand-edited between ` +
+                `runs.\n\n` +
+                `gstack-build refuses to auto-merge on resume because the on-disk ` +
+                `state may have runtime artifacts (gemini outputs, codex reviews, ` +
+                `committedAt timestamps) attached to phase numbers that no longer ` +
+                `match the parsed plan. Silently merging by number would ` +
+                `re-attribute that work to the wrong phase.\n\n` +
+                `To recover:\n` +
+                `  1. Re-run with --no-resume to rebuild state from the current plan ` +
+                `(loses runtime artifacts, restarts phases from scratch).\n` +
+                `  2. Or delete the state file and run again from scratch:\n` +
+                `       rm ${statePath(slug)}\n` +
+                `  3. Or inspect state.json and the plan markdown side by side, ` +
+                `manually realign the phase numbers, then re-run.\n`,
+            );
+            exitCode = 2;
+            setupFailed = true;
+          }
+        }
+        if (!setupFailed) {
           if (
             JSON.stringify(loaded.roleConfigs) !== JSON.stringify(args.roles)
           ) {
