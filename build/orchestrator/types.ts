@@ -261,6 +261,13 @@ export interface PhaseState {
   number: string;
   name: string;
   status: PhaseStatus;
+  /**
+   * Cached from the parsed `Phase` at `freshState` time. Read by state-only
+   * consumers (fault detectors, drain-faults, future tooling) when the parsed
+   * plan is not available. The state machine itself reads `phase.kind` from
+   * the parsed `Phase` object, not this field.
+   */
+  kind?: PhaseKind;
   gemini?: SubAgentInvocation;
   /** Invocation record for the test-specification Gemini call. */
   geminiTestSpec?: SubAgentInvocation;

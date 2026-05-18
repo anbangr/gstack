@@ -24,7 +24,11 @@ import type {
   PhaseState,
 } from "./types";
 import type { SubAgentResult, Verdict } from "./sub-agents";
-import { parseVerdict, parseCoveragePercent, extractCoverageTarget } from "./sub-agents";
+import {
+  parseVerdict,
+  parseCoveragePercent,
+  extractCoverageTarget,
+} from "./sub-agents";
 import { BUILD_DEFAULTS, envNumberOrDefault } from "./build-config";
 
 /** Maximum recursive Codex review iterations before giving up. */
@@ -173,6 +177,20 @@ export function decideNextAction(
 ): Action {
   switch (phaseState.status) {
     case "pending":
+      // Non-code phases ([writing], [experiment], [research], [manual]) skip
+      // the test-spec / verify-red / dual-impl pipeline. They run a single
+      // primary-impl call with kind-specific instructions (see
+      // buildKindInstructions in cli.ts), then go to review (or, for
+      // [manual], directly to MARK_COMPLETE at impl_done). Guard on
+      // phase?.kind so legacy test fixtures that omit kind still take the
+      // existing code path.
+      if (phase?.kind && phase.kind !== "code") {
+        return {
+          type: "RUN_GEMINI",
+          phaseIndex: phaseState.index,
+          iteration: (phaseState.gemini?.retries ?? 0) + 1,
+        };
+      }
       if (phase && !phase.testSpecDone) {
         return {
           type: "RUN_GEMINI_TEST_SPEC",
@@ -246,6 +264,28 @@ export function decideNextAction(
       };
 
     case "impl_done":
+      // [manual] phases ship the agent's prepared-action note directly without
+      // a Codex review. The deliverable is "a note describing outstanding
+      // human work" — a reviewer cannot verify human work that hasn't
+      // happened yet, and the non-code rubric would keep returning GATE FAIL
+      // trying to make the agent automate the manual action. The Gemini
+      // hygiene check at gemini-result-apply still requires a new commit, so
+      // the failure mode is "committed something useless," not "committed
+      // nothing." See plan decision 1B in this-issue-replicated-lagoon.md.
+      if (phase?.kind === "manual") {
+        return { type: "MARK_COMPLETE", phaseIndex: phaseState.index };
+      }
+      // [writing], [experiment], [research] keep their Codex review with the
+      // deliverable-completeness rubric (cli.ts:3009) — reviewers DO verify
+      // artifacts exist and are non-empty. Skip the RUN_TESTS branch because
+      // non-code phases have no tests to run.
+      if (phase?.kind && phase.kind !== "code") {
+        return {
+          type: "RUN_CODEX_REVIEW",
+          phaseIndex: phaseState.index,
+          iteration: (phaseState.codexReview?.iterations ?? 0) + 1,
+        };
+      }
       // For TDD phases (testSpecDone=false) or prewritten-testspec+dual-impl phases,
       // run tests to verify the adopted code on main cwd.
       // For legacy phases (testSpecDone=true, !dualImpl), go straight to Codex review.
@@ -705,8 +745,7 @@ export function applyResult(
     }
 
     const primaryPass = primary.testExitCode === 0 && !primary.timedOut;
-    const secondaryPass =
-      secondary.testExitCode === 0 && !secondary.timedOut;
+    const secondaryPass = secondary.testExitCode === 0 && !secondary.timedOut;
 
     let selectedImplementor: DualImplCandidateKey | undefined;
     let nextStatus: PhaseState["status"];
@@ -741,8 +780,7 @@ export function applyResult(
         return next;
       }
       const primaryFails = primary.failureCount ?? Number.MAX_SAFE_INTEGER;
-      const secondaryFails =
-        secondary.failureCount ?? Number.MAX_SAFE_INTEGER;
+      const secondaryFails = secondary.failureCount ?? Number.MAX_SAFE_INTEGER;
       // Ties intentionally pick primary — documented preference.
       selectedImplementor =
         secondaryFails < primaryFails ? "secondary" : "primary";

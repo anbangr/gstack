@@ -38,6 +38,7 @@ import {
   freshState,
   loadState,
   saveState as persistBuildState,
+  backfillKindFromPlan,
   acquireLock,
   releaseLock,
   readLockInfo,
@@ -7612,6 +7613,13 @@ async function main() {
         }
         if (!setupFailed) {
           state = loaded;
+          // Hydrate PhaseState.kind from the freshly parsed plan when the
+          // loaded state was written before kind persistence (every phase has
+          // kind: null / undefined). Non-destructive — existing kind values
+          // are never overwritten. The next saveState writes the populated
+          // kind to disk so state-only consumers (fault detectors,
+          // drain-faults) can read kind without re-parsing.
+          backfillKindFromPlan(state, phases);
           if (
             JSON.stringify(loaded.roleConfigs) !== JSON.stringify(args.roles)
           ) {
