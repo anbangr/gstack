@@ -4734,6 +4734,173 @@ describe("monitor emits RUN_FAILED when failureReason set (regression)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// monitor regression: stale failedAtPhase after manual recovery must NOT
+// re-emit RUN_FAILED while the run is alive and progressing past it.
+// Spec: docs/orchestrator-state-machine.md §1.3 says `failed` is recoverable,
+// not terminal. Inv A pairs failedAtPhase with phases[N].status === "failed".
+// ---------------------------------------------------------------------------
+
+describe("monitor does NOT emit RUN_FAILED on stale failedAtPhase (Bug 7)", () => {
+  function buildRecoveredRunFixture(runId: string) {
+    const stateSlug = `build-${runId}`;
+    const worktreePath = path.join(tmpDir!, "worktree");
+    const repoPath = worktreePath;
+    const livingPlanPath = path.join(tmpDir!, "plan.md");
+    const manifestPath = path.join(tmpDir!, "manifest.json");
+    const registryDir = path.join(tmpDir!, "registry");
+    const pidFile = path.join(tmpDir!, "pid");
+    const stdoutLog = path.join(tmpDir!, "stdout.log");
+
+    fs.mkdirSync(worktreePath, { recursive: true });
+    fs.mkdirSync(registryDir, { recursive: true });
+    fs.mkdirSync(path.join(tmpStateDir!, stateSlug), { recursive: true });
+    // committedPhaseCount(state) will be 2 (phases[0] and phases[1]).
+    // Match so the HOST_CONTEXT_SAVE_REQUIRED short-circuit doesn't fire
+    // before the snapshot.failed check we're actually testing.
+    fs.writeFileSync(
+      path.join(tmpStateDir!, stateSlug, ".host-context-save-count"),
+      "2\n",
+    );
+
+    // Live process: use the test runner's own PID. isPidAlive(process.pid) is true.
+    fs.writeFileSync(pidFile, `${process.pid}\n`);
+    // Recent stdout activity so the monitor doesn't treat the run as stale.
+    fs.writeFileSync(stdoutLog, "phase 2 running\n");
+
+    const freshTs = new Date().toISOString();
+    const stateData: Record<string, unknown> = {
+      planFile: livingPlanPath,
+      planBasename: "plan",
+      slug: stateSlug,
+      branch: "main",
+      startedAt: freshTs,
+      lastUpdatedAt: freshTs,
+      launch: {
+        argv: [livingPlanPath],
+        projectRoot: worktreePath,
+        baseProjectRoot: repoPath,
+        runId,
+        stateSlug,
+        activeRunRegistry: registryDir,
+        dryRun: false,
+        skipShip: false,
+        skipFeatureReview: true,
+        launchedAt: freshTs,
+      },
+      // Recovery happened: currentPhaseIndex advanced past the failed phase.
+      currentPhaseIndex: 2,
+      currentFeatureIndex: 0,
+      features: [
+        {
+          index: 0,
+          number: "1",
+          name: "Test",
+          phaseIndexes: [0, 1, 2],
+          status: "running",
+          branch: "main",
+        },
+      ],
+      // Phase 1 is committed (recovered via --mark-phase-committed or manual
+      // edit). Per Inv A, this means failedAtPhase=1 is now stale metadata.
+      phases: [
+        { index: 0, number: "1", name: "Phase 1", status: "committed" },
+        {
+          index: 1,
+          number: "2",
+          name: "Phase 2",
+          status: "committed",
+          committedAt: freshTs,
+        },
+        { index: 2, number: "3", name: "Phase 3", status: "tests_red" },
+      ],
+      completed: false,
+      // Stale recovery metadata that the buggy predicate trips on.
+      failedAtPhase: 1,
+      failureReason:
+        "phase 2 failed earlier; recovered by --mark-phase-committed",
+    };
+
+    fs.writeFileSync(
+      path.join(tmpStateDir!, `${stateSlug}.json`),
+      JSON.stringify(stateData),
+    );
+    fs.writeFileSync(
+      manifestPath,
+      JSON.stringify({
+        manifestId: "m",
+        runGroupId: "g",
+        tmpDir: tmpDir!,
+        runs: [
+          {
+            runId,
+            repoPath,
+            repoSlug: "repo",
+            livingPlanPath,
+            worktreePath,
+            stateSlug,
+            branchPrefix: `repo-${runId}`,
+            pidFile,
+            stdoutLog,
+            launchCommand: [
+              "/bin/sh",
+              "-c",
+              "echo resume",
+              "--active-run-registry",
+              registryDir,
+            ],
+            launchEnv: {},
+          },
+        ],
+      }),
+    );
+
+    // Active-run registry entry so registryRunInfo reports the run as live.
+    // Must match ActiveRunRecord shape: readActiveRunRecords drops records
+    // missing runId, stateSlug, or branches (array). normalizeRepoIdentity
+    // is invoked on baseProjectRoot/repoPath, so both must resolve to
+    // run.repoPath for identityOk to be true.
+    fs.writeFileSync(
+      path.join(registryDir, `${runId}.json`),
+      JSON.stringify({
+        runId,
+        stateSlug,
+        repoPath,
+        worktreePath,
+        baseProjectRoot: repoPath,
+        planFile: livingPlanPath,
+        branchPrefix: `repo-${runId}`,
+        pid: process.pid,
+        status: "running",
+        startedAt: freshTs,
+        lastUpdatedAt: freshTs,
+        branches: ["main"],
+      }),
+    );
+
+    return manifestPath;
+  }
+
+  it("Bug 7: alive process + currentPhaseIndex past stale failedAtPhase → NOT RUN_FAILED", () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-monitor-bug7-"));
+    const runId = `monitor-bug7-${process.pid}`;
+    const manifestPath = buildRecoveredRunFixture(runId);
+
+    const result = evaluateMonitorOnce({
+      manifestPath,
+      pollMs: 1,
+      now: new Date(),
+      spawnResume: false,
+    });
+
+    // The run is alive (live PID), progressing past the failed phase
+    // (currentPhaseIndex=2, phases[1].status=committed). failedAtPhase=1 is
+    // stale recovery metadata. Per spec, this is NOT a terminal failure;
+    // the monitor must not emit RUN_FAILED.
+    expect(result.terminalEvent?.event).not.toBe("RUN_FAILED");
+  });
+});
+
 describe("buildKindInstructions — non-code phase prompts", () => {
   function makePhase(kind: Phase["kind"]): Phase {
     return {
