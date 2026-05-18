@@ -29,6 +29,7 @@
  */
 
 import { installSignalHandlers, spawnSync } from "./child-registry";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1426,6 +1427,27 @@ function hasImmediateChildGitRepos(dir: string): boolean {
 export interface GitSnapshot {
   head: string | null;
   status: string[];
+  /**
+   * sha256 hex of each dirty path's WORKTREE content at capture time. Used by
+   * `contentHashDelta` to distinguish agent-introduced changes from
+   * idempotent rewrites (e.g. Foundry's `forge test` re-emitting tracked
+   * deployment artifacts with identical bytes). Missing entries indicate the
+   * file couldn't be hashed (deleted, permission denied, etc.); the consumer
+   * conservatively counts those as real changes.
+   *
+   * Plan ref: inbox/build-implementor-hygiene-hardening-20260517.md D5
+   * (replaces round-1 D3 which compared against HEAD blob — wrong: misreports
+   * user's pre-existing dirty as agent-modified).
+   */
+  workTreeHashes: Map<string, string>;
+  /**
+   * Optional: raw bytes for each dirty path's WORKTREE content. Populated
+   * only when `captureGitSnapshot` is called with `captureContents: true`.
+   * Used by `discardBlindExecutionChanges` (D6) to restore pre-existing
+   * dirty bytes when discarding a blind-execution agent's changes. Without
+   * captured contents the discard helper fails closed.
+   */
+  workTreeContents?: Map<string, Buffer>;
 }
 
 export interface HygieneVerdict {
@@ -1433,7 +1455,10 @@ export interface HygieneVerdict {
   errors: string[];
 }
 
-export function captureGitSnapshot(cwd: string): GitSnapshot {
+export function captureGitSnapshot(
+  cwd: string,
+  opts?: { captureContents?: boolean },
+): GitSnapshot {
   const headR = spawnSync("git", ["rev-parse", "HEAD"], {
     cwd,
     encoding: "utf8",
@@ -1443,15 +1468,165 @@ export function captureGitSnapshot(cwd: string): GitSnapshot {
     ["status", "--porcelain", "--untracked-files=all"],
     { cwd, encoding: "utf8" },
   );
+
+  const head = headR.status === 0 ? headR.stdout.trim() || null : null;
+  const statusLines: string[] =
+    statusR.status === 0
+      ? (statusR.stdout || "").split("\n").filter(Boolean).sort()
+      : [
+          `<git error: ${(statusR.stderr || "").trim() || "git status failed"}>`,
+        ];
+
+  // D5: hash each dirty path's worktree content. Deleted entries (status
+  // codes containing 'D') have no worktree file — skip silently. Other
+  // read errors are best-effort: omit from the map and log; the consumer
+  // treats missing hashes as conservatively-counted real changes.
+  const workTreeHashes = new Map<string, string>();
+  const workTreeContents = opts?.captureContents
+    ? new Map<string, Buffer>()
+    : undefined;
+
+  if (statusR.status === 0) {
+    for (const line of statusLines) {
+      if (line.startsWith("<git error:")) continue;
+      const code = line.slice(0, 2);
+      // Deletion (worktree or staged D) — no on-disk file to hash.
+      if (code.includes("D")) continue;
+      const filePath = parsePorcelainPath(line);
+      if (!filePath) continue;
+      try {
+        const abs = path.join(cwd, filePath);
+        const stat = fs.statSync(abs);
+        if (!stat.isFile()) continue;
+        const buf = fs.readFileSync(abs);
+        const hash = crypto.createHash("sha256").update(buf).digest("hex");
+        workTreeHashes.set(filePath, hash);
+        if (workTreeContents) workTreeContents.set(filePath, buf);
+      } catch (err) {
+        // Best-effort: omit from map. Consumer counts as a real change.
+        // Don't spam logs during normal capture; the hygiene check will
+        // emit a single warning if the missing-hash branch fires.
+      }
+    }
+  }
+
   return {
-    head: headR.status === 0 ? headR.stdout.trim() || null : null,
-    status:
-      statusR.status === 0
-        ? (statusR.stdout || "").split("\n").filter(Boolean).sort()
-        : [
-            `<git error: ${(statusR.stderr || "").trim() || "git status failed"}>`,
-          ],
+    head,
+    status: statusLines,
+    workTreeHashes,
+    ...(workTreeContents ? { workTreeContents } : {}),
   };
+}
+
+/**
+ * D5 — content-hash delta. Returns the subset of `after.status` lines that
+ * represent REAL agent changes (vs idempotent rewrites of pre-existing
+ * dirty or clean tracked files).
+ *
+ * Rules:
+ *  - Path is `?? <path>` (untracked) in after AND matches an untracked hash
+ *    in `before.workTreeHashes` → idempotent untracked rewrite, drop.
+ *  - Path is deleted (`D ` or ` D ` codes) → always count.
+ *  - Path was dirty before AND dirty after with same workTreeHashes →
+ *    idempotent rewrite (Foundry case); drop.
+ *  - Path was clean before (NOT in before.status) AND dirty after → check
+ *    HEAD blob hash via `git show <before.head>:<path>` and compare. Match
+ *    + non-null head → idempotent rewrite of clean tracked file; drop.
+ *    Mismatch or null head → real change, count.
+ *  - Missing after-hash (read error during capture) → conservatively count
+ *    and log a warning.
+ */
+export function contentHashDelta(
+  before: GitSnapshot,
+  after: GitSnapshot,
+  cwd: string,
+): string[] {
+  const beforePaths = new Set<string>(
+    before.status
+      .filter((line) => !line.startsWith("<git error:"))
+      .map((line) => parsePorcelainPath(line))
+      .filter((p): p is string => !!p),
+  );
+  const realChanges: string[] = [];
+
+  for (const line of after.status) {
+    if (line.startsWith("<git error:")) {
+      realChanges.push(line);
+      continue;
+    }
+    const code = line.slice(0, 2);
+    const filePath = parsePorcelainPath(line);
+    if (!filePath) {
+      realChanges.push(line);
+      continue;
+    }
+
+    // Deletion: always count.
+    if (code.includes("D")) {
+      realChanges.push(line);
+      continue;
+    }
+
+    const afterHash = after.workTreeHashes.get(filePath);
+
+    // Missing after-hash → conservative count + warn.
+    if (!afterHash) {
+      console.warn(
+        `  ⚠ contentHashDelta: missing worktree hash for ${filePath} — counting as real change`,
+      );
+      realChanges.push(line);
+      continue;
+    }
+
+    if (beforePaths.has(filePath)) {
+      // Path was dirty before too. Compare hashes.
+      const beforeHash = before.workTreeHashes.get(filePath);
+      if (beforeHash && beforeHash === afterHash) {
+        // Idempotent rewrite — drop.
+        continue;
+      }
+      // Different bytes → agent changed it. Count.
+      realChanges.push(line);
+      continue;
+    }
+
+    // Path was clean before AND dirty after. If null head, conservatively
+    // count (no HEAD blob to compare against).
+    if (!before.head) {
+      realChanges.push(line);
+      continue;
+    }
+
+    // Untracked path with no HEAD blob → real change (new file).
+    if (code === "??") {
+      realChanges.push(line);
+      continue;
+    }
+
+    // Tracked path: compare against HEAD blob.
+    const showResult = spawnSync(
+      "git",
+      ["show", `${before.head}:${filePath}`],
+      { cwd, encoding: "buffer" },
+    );
+    if (showResult.status !== 0) {
+      // No HEAD blob exists for this path → newly tracked file the agent added; count.
+      realChanges.push(line);
+      continue;
+    }
+    const headHash = crypto
+      .createHash("sha256")
+      .update(showResult.stdout as unknown as Buffer)
+      .digest("hex");
+    if (headHash === afterHash) {
+      // Idempotent rewrite of a clean tracked file (e.g. Foundry rewrites
+      // a deployment artifact with same bytes). Drop.
+      continue;
+    }
+    realChanges.push(line);
+  }
+
+  return realChanges;
 }
 
 export function validatePostAgentHygiene(opts: {
@@ -1485,8 +1660,16 @@ export function validatePostAgentHygiene(opts: {
     errors.push(`${opts.label} did not create a new commit`);
   }
 
+  // D5: filter using contentHashDelta so pre-existing dirty + idempotent
+  // rewrites are not misattributed to the agent. The allowedStatus regex
+  // continues to allow `.llm-tmp/` untracked entries (orchestrator
+  // sub-agent staging directory).
   const allowedStatus = /^\?\? \.llm-tmp(\/|$)/;
-  const dirty = after.status.filter((line) => !allowedStatus.test(line));
+  const filteredAfter: GitSnapshot = {
+    ...after,
+    status: after.status.filter((line) => !allowedStatus.test(line)),
+  };
+  const dirty = contentHashDelta(opts.before, filteredAfter, opts.cwd);
   if (dirty.length > 0) {
     errors.push(
       `${opts.label} left the working tree dirty:\n${dirty.map((line) => `  ${line}`).join("\n")}`,
@@ -1494,6 +1677,193 @@ export function validatePostAgentHygiene(opts: {
   }
 
   return { ok: errors.length === 0, errors };
+}
+
+// ---------------------------------------------------------------------------
+// Feature 4: blind-execution detection + path-preserving discard (D2 + D6)
+// ---------------------------------------------------------------------------
+
+export type BlindExecutionAgent = "gemini" | "kimi" | "codex";
+
+/**
+ * Per-agent marker strings that indicate the agent failed to read its own
+ * input file due to a sandbox violation, then proceeded to make blind
+ * inference-based edits. Gemini patterns are observed (T111646 fault report,
+ * agnt2-prototype-plan4 build 2026-05-17). Kimi/Codex patterns are
+ * speculative — refined on first real failure.
+ */
+const BLIND_EXECUTION_MARKERS: Record<BlindExecutionAgent, string[]> = {
+  gemini: [
+    "Path not in workspace:",
+    "resolves outside the allowed workspace directories:",
+  ],
+  // Speculative — refined on first observed Kimi blind failure.
+  kimi: ["workspace path not allowed:", "outside --add-dir scope:"],
+  // Speculative — refined on first observed Codex blind failure.
+  codex: ["sandbox denied", "workspace-write violation:"],
+};
+
+/**
+ * Scan a captured agent log for sandbox-violation markers. Returns
+ * `{ok: false, violation, agent}` if any marker matches, else `{ok: true}`.
+ * Missing log files are treated as ok (probe shouldn't escalate on missing
+ * logs).
+ */
+export function detectBlindExecution(logPath: string): {
+  ok: boolean;
+  violation?: string;
+  agent?: BlindExecutionAgent;
+} {
+  let content = "";
+  try {
+    content = fs.readFileSync(logPath, "utf8");
+  } catch {
+    return { ok: true };
+  }
+  for (const [agent, markers] of Object.entries(BLIND_EXECUTION_MARKERS)) {
+    for (const marker of markers) {
+      if (content.includes(marker)) {
+        return {
+          ok: false,
+          violation: marker,
+          agent: agent as BlindExecutionAgent,
+        };
+      }
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * D6: path-by-path restore that PRESERVES pre-existing dirty + untracked
+ * state. Replaces the round-1 design's `git reset --hard + clean -fd` which
+ * erased the user's uncommitted work.
+ *
+ * For each path the agent touched (after.status \ matching before snapshot):
+ *  - If the path was dirty before AND we captured its bytes → restore
+ *    pre-agent bytes from `before.workTreeContents`.
+ *  - Else if the path was tracked-and-clean before (exists in `before.head`)
+ *    → `git checkout <before.head> -- <path>`.
+ *  - Else (path was untracked AND absent before) → delete what the agent
+ *    created.
+ *
+ * Paths whose before/after hashes match are skipped (nothing to discard).
+ *
+ * Guards (carry-over from round-1 D1):
+ *  - `before.head` must be non-null.
+ *  - `cwd` must resolve under `$HOME/.gstack/build-worktrees/`.
+ *  - `before.workTreeContents` must be present (caller must capture with
+ *    `captureContents: true`).
+ */
+export function discardBlindExecutionChanges(
+  cwd: string,
+  before: GitSnapshot,
+): {
+  ok: boolean;
+  error?: string;
+  restored?: string[];
+  deleted?: string[];
+} {
+  if (!before.head) {
+    return { ok: false, error: "before.head is null; refusing to discard" };
+  }
+  // Compute worktree root at call time (NOT at module load) so tests that
+  // override $HOME via useIsolatedGstackHome see their tempdir, not the
+  // real home (gpt-5.5 plan-review IMPORTANT objection).
+  const worktreeRoot = path.join(
+    process.env.HOME ?? os.homedir(),
+    ".gstack",
+    "build-worktrees",
+  );
+  const resolved = path.resolve(cwd);
+  if (!resolved.startsWith(worktreeRoot + path.sep)) {
+    return {
+      ok: false,
+      error: `cwd ${resolved} is outside ${worktreeRoot}; refusing to discard`,
+    };
+  }
+  if (!before.workTreeContents) {
+    return {
+      ok: false,
+      error:
+        "before.workTreeContents not captured; refusing to discard without it",
+    };
+  }
+
+  const after = captureGitSnapshot(resolved);
+  const beforePaths = new Set<string>(
+    before.status
+      .filter((line) => !line.startsWith("<git error:"))
+      .map((line) => parsePorcelainPath(line))
+      .filter((p): p is string => !!p),
+  );
+  const restored: string[] = [];
+  const deleted: string[] = [];
+
+  for (const line of after.status) {
+    if (line.startsWith("<git error:")) continue;
+    const filePath = parsePorcelainPath(line);
+    if (!filePath) continue;
+
+    const beforeHash = before.workTreeHashes.get(filePath);
+    const afterHash = after.workTreeHashes.get(filePath);
+
+    // File is unchanged from pre-agent state — nothing to discard.
+    if (beforeHash && afterHash && beforeHash === afterHash) continue;
+
+    if (beforePaths.has(filePath) && before.workTreeContents.has(filePath)) {
+      // Path was dirty before; restore exact pre-agent bytes.
+      const target = path.join(resolved, filePath);
+      try {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        // Agent may have replaced regular file ↔ directory; normalize first.
+        try {
+          const stat = fs.statSync(target);
+          if (stat.isDirectory()) {
+            fs.rmSync(target, { recursive: true, force: true });
+          }
+        } catch {}
+        fs.writeFileSync(target, before.workTreeContents.get(filePath)!);
+        restored.push(filePath);
+      } catch (err) {
+        return {
+          ok: false,
+          error: `failed to restore ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    } else if (existsInCommit(resolved, before.head, filePath)) {
+      // Path was tracked + clean before; restore HEAD blob.
+      const r = spawnSync("git", ["checkout", before.head, "--", filePath], {
+        cwd: resolved,
+        encoding: "utf8",
+      });
+      if (r.status === 0) restored.push(filePath);
+    } else {
+      // Path was untracked + absent before; delete what the agent created.
+      try {
+        const target = path.join(resolved, filePath);
+        const stat = fs.statSync(target);
+        if (stat.isDirectory()) {
+          fs.rmSync(target, { recursive: true, force: true });
+        } else {
+          fs.unlinkSync(target);
+        }
+        deleted.push(filePath);
+      } catch {
+        // Best-effort: agent may have already moved/deleted the file.
+      }
+    }
+  }
+
+  return { ok: true, restored, deleted };
+}
+
+function existsInCommit(cwd: string, commit: string, p: string): boolean {
+  const r = spawnSync("git", ["cat-file", "-e", `${commit}:${p}`], {
+    cwd,
+    encoding: "utf8",
+  });
+  return r.status === 0;
 }
 
 function parsePorcelainPath(line: string): string {
@@ -3751,7 +4121,7 @@ function applyGateHygiene(opts: {
   return hygieneFailureResult(errors.join("\n"), opts.result.logPath);
 }
 
-function applyMutableAgentHygiene(opts: {
+export function applyMutableAgentHygiene(opts: {
   result: SubAgentResult;
   before: GitSnapshot | null;
   cwd: string;
@@ -3765,7 +4135,42 @@ function applyMutableAgentHygiene(opts: {
     snapshot: GitSnapshot | null;
   };
 }): SubAgentResult {
-  if (!opts.before || opts.result.timedOut || opts.result.exitCode !== 0) {
+  if (!opts.before) {
+    return opts.result;
+  }
+  // D6: blind-execution probe runs BEFORE the timedOut/nonzero early-return
+  // (gpt-5.5 plan-review IMPORTANT #6) so blind agents that crashed or hit
+  // a timeout still get their pre-existing dirty + untracked state restored
+  // path-by-path, not nuked by a `git reset --hard`.
+  const blind = detectBlindExecution(opts.result.logPath);
+  if (!blind.ok) {
+    console.warn(
+      `  ⚠ BLIND_EXECUTION_DETECTED (${blind.agent}): ${blind.violation}`,
+    );
+    const discard = discardBlindExecutionChanges(opts.cwd, opts.before);
+    if (!discard.ok) {
+      console.warn(
+        `  ⚠ discardBlindExecutionChanges failed: ${discard.error}`,
+      );
+    } else {
+      if (discard.restored?.length) {
+        console.warn(
+          `  ↺ restored pre-existing files: ${discard.restored.join(", ")}`,
+        );
+      }
+      if (discard.deleted?.length) {
+        console.warn(
+          `  ✗ deleted agent-created files: ${discard.deleted.join(", ")}`,
+        );
+      }
+    }
+    return hygieneFailureResult(
+      `${opts.label}: blind execution — input file unreachable; changes discarded`,
+      opts.result.logPath,
+    );
+  }
+  // Original early-return for timeouts and nonzero exits (no blind signal).
+  if (opts.result.timedOut || opts.result.exitCode !== 0) {
     return opts.result;
   }
   const preCleaned = cleanupGeneratedCacheChanges(opts.cwd);

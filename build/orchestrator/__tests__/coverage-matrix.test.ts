@@ -24,6 +24,8 @@ const MODULE_TEST_OWNERS: Record<string, string[]> = {
     "cli-security.test.ts",
     "integration.test.ts",
     "startup.test.ts",
+    "hygiene-delta.test.ts",
+    "blind-execution-detect.test.ts",
   ],
   "feature-review-prompt.ts": ["feature-review-prompt.test.ts"],
   "feature-review.ts": ["feature-review.test.ts"],
