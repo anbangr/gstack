@@ -181,6 +181,33 @@ A feature in `paused`/`failed` typically has at least one phase that
 also failed, but the orchestrator does NOT enforce this — manual
 recovery can leave a feature paused with all phases committed.
 
+**Inv F — Phases-array alignment with parsed plan:**
+At every point where the orchestrator reads `state.phases[i]` or
+`state.features[j]` to decide what to run next, the array MUST agree
+with the freshly parsed plan on both length and per-index `number`.
+The predicate `arePhasesAligned(state, reparsed)` (`state.ts:287`)
+encodes the contract: equal `state.phases.length`, equal `state.phases[i].number`
+for every i, equal feature count, and equal `state.features[i].number`
+for every i.
+
+Two paths can violate this:
+
+1. **In-run**: `FEATURE_NEEDS_PHASES` triggers `appendFeaturePhases`,
+   which splices new `### Phase N.review-K` headings under the named
+   feature heading — not at end-of-file. When the inserted feature is
+   not the last one, every downstream phase index shifts. The pre-fix
+   merge used `reparsed.phases.slice(oldPhaseCount)` which captured
+   the wrong tail. The current path calls `mergeReparsedPhases`
+   (`state.ts:341`) which rebuilds `state.phases` in parser order
+   by `number`, preserving identity (status, codexReview, gemini
+   outputs, committedAt) and rewriting per-phase `.index` to match
+   parser order. See §10.
+2. **Across runs**: a state file written by pre-fix gstack
+   versions (or a hand-edited plan markdown) can persist a desynced
+   `state.phases` to disk. On resume, the orchestrator checks
+   `arePhasesAligned`. Disagreement is fail-closed: exit code 2 with
+   a remediation block. See §11.
+
 ---
 
 ## 4. Projection contract (Bug 1)
@@ -320,23 +347,121 @@ message. No state.json write, no plan file write.
 
 ---
 
-## 9. Glossary of source pointers
+## 9. `mergeReparsedPhases` contract (in-run, FEATURE_NEEDS_PHASES path)
+
+When feature review returns `FEATURE_NEEDS_PHASES`, the orchestrator
+calls `appendFeaturePhases` to splice new review phases into the plan
+markdown under the named feature heading, re-parses the plan, then
+calls `mergeReparsedPhases(state, reparsed)` (`state.ts:341`) to
+re-align `state.phases` and `state.features[i].phaseIndexes` to the
+new parser view.
+
+Strategy: rebuild `state.phases` in parser order, keyed by phase
+`number`. For each `reparsed.phases[i]`:
+
+- if a `PhaseState` with that number already exists, reuse it and
+  rewrite `.index = i`. Status, `codexReview`, gemini outputs,
+  `committedAt`, and `error` are preserved verbatim.
+- otherwise, create a fresh `pending` PhaseState at index `i` with
+  `kind` defaulted to `"code"` when the parser supplies none.
+
+Then sync features: per-feature `phaseIndexes` are taken from the
+parser. Top-level features added or removed surface as
+`addedFeatures` / `orphanedFeatures` in `MergeReparsedPhasesReport`.
+
+**Last-write-wins on duplicate phase numbers in `state.phases`:**
+if two pre-existing `PhaseState` entries share a `number`, the
+later one wins. This protects against corruption from pre-fix runs
+that may have stored two entries with the same number; runtime
+state on the loser is dropped (irrecoverable artifacts).
+
+**Parser-side duplicate rejection:** if the reparsed plan itself
+contains two phases with the same `number`, the merge throws. This
+defends against aliasing — two same-numbered phases pointing at one
+PhaseState across two array slots would silently corrupt downstream
+work.
+
+**Hands-off cursor:** `currentPhaseIndex` and `currentFeatureIndex`
+are NOT touched by the merge. The main loop owns cursor advancement
+and reads the fresh phase numbers at the same slot the cursor
+already points at.
+
+**Wired only on the in-run `phases_added` path.** Resume never
+invokes the merge — see §11.
+
+The contract is enforced by
+`build/orchestrator/__tests__/phases-added-merge.test.ts`, including:
+
+- mid-array splice with downstream PhaseState identity preserved;
+- append at last feature (the old `slice()` math also handled this;
+  the new math must too);
+- multiple review phases inserted from one verdict;
+- orphan detection and drop;
+- duplicate-number rejection;
+- cursor preservation.
+
+---
+
+## 10. Resume-time alignment guard (fail-closed)
+
+On every resume, `cli.ts` calls `arePhasesAligned(state, reparsed)`
+(`cli.ts:~8607`) after `loadState` and `backfillKindFromPlan`. Two
+paths reach this gate:
+
+1. State written by a pre-fix gstack version whose mid-array
+   `phases_added` math captured the wrong slice — `state.phases`
+   ends with a duplicate of the previously-last phase and downstream
+   `.number` fields are stale.
+2. The plan markdown was hand-edited between runs.
+
+**On disagreement, the resume is fail-closed** — exit code 2 with a
+remediation block listing the four counts (state vs parsed, phases
+and features), the likely root cause, and three recovery paths:
+
+1. Re-run with `--no-resume` (rebuilds state from the current plan,
+   loses runtime artifacts, restarts phases from scratch);
+2. Delete the state file at `~/.gstack/build-state/<slug>.json` and
+   re-run;
+3. Inspect state.json and the plan markdown side by side, manually
+   realign the phase numbers, then re-run.
+
+**Why fail-closed and not auto-merge.** `mergeReparsedPhases` reuses
+existing `PhaseState` entries by `number`. On in-run mutation that
+works: state.phases[i] genuinely holds the prior phase's runtime
+state because the splice hasn't been re-parsed yet. On resume after
+pre-fix corruption, it doesn't: runtime artifacts at index k
+(`gemini.outputFilePath`, `codexReview`, `committedAt`) describe
+the work that physically ran at that slot, not the phase whose
+`number` is persisted there. A by-number merge would re-attribute
+those artifacts to the wrong phase, and a downstream
+`--mark-phase-committed` could mark the wrong phase done — same
+silent-corruption shape as the bug being fixed. The user has the
+context to decide which artifacts to keep; the orchestrator does
+not.
+
+---
+
+## 11. Glossary of source pointers
 
 For each contract above, the canonical implementation lives at:
 
-- `phaseGateProjection`: `cli.ts:262`
-- `featureGateProjection`: `cli.ts:323`
-- `reconcilePhaseVisibleGates`: `cli.ts:374`
-- `reconcileFeatureVisibleGates`: `cli.ts:410`
-- `reconcileVisiblePlanState` (entry point): `cli.ts:439`
-- `markPhaseCommittedAfterManualRecovery`: `cli.ts:4304`
-- `resolvePhaseByMarkArg`: `cli.ts:4281`
-- `applyGateHygiene`: `cli.ts:3950`
-- `applyMutableAgentHygiene`: `cli.ts:3895`
-- `maybeAutoCommitTestOnlyDirty`: `cli.ts:3910`
-- `validatePostAgentHygiene`: `cli.ts:1501`
-- `runStopRun`: `cli.ts:7649`
+- `logMergeReport`: `cli.ts:262`
+- `phaseGateProjection`: `cli.ts:307`
+- `featureGateProjection`: `cli.ts:368`
+- `reconcilePhaseVisibleGates`: `cli.ts:372`
+- `reconcileFeatureVisibleGates`: `cli.ts:413`
+- `reconcileVisiblePlanState` (entry point): `cli.ts:495`
+- `markPhaseCommittedAfterManualRecovery`: `cli.ts:5052`
+- `resolvePhaseByMarkArg`: `cli.ts:4990`
+- `applyGateHygiene`: `cli.ts:4372`
+- `applyMutableAgentHygiene`: `cli.ts:4537`
+- `maybeAutoCommitTestOnlyDirty`: `cli.ts:4359`
+- `validatePostAgentHygiene`: `cli.ts:1780`
+- `runStopRun`: `cli.ts:8182`
 - `markCommitted`: `phase-runner.ts:818`
+- `arePhasesAligned`: `state.ts:287`
+- `mergeReparsedPhases`: `state.ts:341`
+- resume-time alignment guard: `cli.ts:~8607`
 - `decideNextAction`: `phase-runner.ts:166`
 - `acquireLock`: `state.ts:382`
 - `isPidAlive`: `active-runs.ts:51`

@@ -366,6 +366,26 @@ Most failures are terminal for the current run but resumable after repair:
 The logs under the phase directory are the first place to inspect. After fixing
 the root cause, re-run the same `gstack-build` command to resume.
 
+**Resume-time state/plan desync (exit 2).** On every resume, the orchestrator
+re-parses the plan markdown and checks that `state.phases` and `state.features`
+still agree with the parser on length and per-index `number`. If they don't
+(state file written by a pre-fix gstack version, or the plan markdown was
+hand-edited between runs), the resume is fail-closed: exit code 2 with a
+remediation block listing the four counts. Recovery options printed alongside
+the error:
+
+1. Re-run with `--no-resume` to rebuild state from the current plan (loses
+   runtime artifacts, restarts phases from scratch).
+2. Delete the state file at `~/.gstack/build-state/<slug>.json` and re-run.
+3. Inspect state.json and the plan markdown side by side, manually realign
+   the phase numbers, then re-run.
+
+Why the orchestrator refuses to auto-heal here: on disk, runtime artifacts
+(`gemini.outputFilePath`, `codexReview`, `committedAt`) describe the work
+that physically ran at that slot, not the phase whose `number` is persisted
+there. A by-number auto-merge would re-attribute those artifacts to the
+wrong phase. See `docs/orchestrator-state-machine.md` §10.
+
 ## Important Flags
 
 | Flag                           | Effect                                                                                                                                          |
