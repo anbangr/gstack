@@ -2178,6 +2178,75 @@ describe("post-agent hygiene helpers", () => {
     });
     expect(verdict).toEqual({ ok: true, errors: [] });
   });
+
+  // ------------------------------------------------------------------
+  // Fix B: review-gate hygiene whitelist (Codex scratch tolerance)
+  // ------------------------------------------------------------------
+  // Codex CLI's review subagent runs under workspace-write sandbox and
+  // writes session metadata to `.codex/` in the worktree. Pre-fix this
+  // tripped the post-review hygiene check, the gate failed, and the
+  // operator ran --mark-phase-committed manually because the actual code
+  // was fine. Fix B: for the REVIEW gate only, ignore the known Codex
+  // scratch dir. The existing `contentHashDelta` already handles same-
+  // content rewrites (snapshot-diff fallback), and `.llm-tmp/` is already
+  // whitelisted broadly. Only `.codex/` was the gap.
+
+  it("review gate: ignores .codex/ scratch dir created during review", () => {
+    const before = captureGitSnapshot(tmpDir!);
+    fs.mkdirSync(path.join(tmpDir!, ".codex"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir!, ".codex", "session.json"),
+      '{"id": "x"}',
+    );
+    const verdict = validatePostAgentHygiene({
+      cwd: tmpDir!,
+      before,
+      requireNewCommit: false,
+      label: "review",
+      reviewGate: true,
+    });
+    expect(verdict).toEqual({ ok: true, errors: [] });
+  });
+
+  it("review gate: STILL trips on real source-file drift (not over-permissive)", () => {
+    // Guardrail: review gate must NOT become a no-op. Real source changes
+    // a read-only review left behind are real problems.
+    const before = captureGitSnapshot(tmpDir!);
+    fs.writeFileSync(
+      path.join(tmpDir!, "src.ts"),
+      "// review should not have written this\n",
+    );
+    const verdict = validatePostAgentHygiene({
+      cwd: tmpDir!,
+      before,
+      requireNewCommit: false,
+      label: "review",
+      reviewGate: true,
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.errors.join("\n")).toMatch(/src\.ts/);
+  });
+
+  it("review gate: default mode (no reviewGate flag) keeps strict scrutiny", () => {
+    // Backwards-compat guard: callers that don't opt in get the old
+    // semantics. Only when the call site explicitly passes reviewGate:true
+    // does the Codex scratch whitelist engage.
+    const before = captureGitSnapshot(tmpDir!);
+    fs.mkdirSync(path.join(tmpDir!, ".codex"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir!, ".codex", "session.json"),
+      '{"id": "x"}',
+    );
+    const verdict = validatePostAgentHygiene({
+      cwd: tmpDir!,
+      before,
+      requireNewCommit: false,
+      label: "primary implementor",
+      // no reviewGate flag — strict default.
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.errors.join("\n")).toMatch(/\.codex/);
+  });
 });
 
 describe("plan storage helpers", () => {
