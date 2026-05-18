@@ -24,6 +24,7 @@ import {
   runShip,
   runSlashCommand,
   mergeOutputFile,
+  stageGeminiIO,
 } from "../sub-agents";
 import fs from "node:fs";
 import os from "node:os";
@@ -86,8 +87,8 @@ describe("mergeOutputFile strict artifact mode", () => {
 
     const result = mergeOutputFile(
       {
-        stdout: "TaskOutput task: \"bulk-tool-output\"\nGATE PASS\n",
-        stderr: "TaskOutput stderr task: \"bulk-tool-output\"\nGATE FAIL\n",
+        stdout: 'TaskOutput task: "bulk-tool-output"\nGATE PASS\n',
+        stderr: 'TaskOutput stderr task: "bulk-tool-output"\nGATE FAIL\n',
         exitCode: 0,
         timedOut: false,
         logPath: path.join(tmpDir, "review.log"),
@@ -116,8 +117,8 @@ describe("mergeOutputFile strict artifact mode", () => {
 
     const result = mergeOutputFile(
       {
-        stdout: "TaskOutput task: \"bulk-tool-output\"\nGATE PASS\n",
-        stderr: "TaskOutput stderr task: \"bulk-tool-output\"\nGATE FAIL\n",
+        stdout: 'TaskOutput task: "bulk-tool-output"\nGATE PASS\n',
+        stderr: 'TaskOutput stderr task: "bulk-tool-output"\nGATE FAIL\n',
         exitCode: 0,
         timedOut: false,
         logPath: path.join(tmpDir, "review.log"),
@@ -1127,15 +1128,9 @@ process.stdout.write(match[1]);
       );
       expect(fs.existsSync(result.logPath)).toBe(true);
       expect(fs.readFileSync(result.logPath, "utf8")).toContain(
-        path.join(".gemini", "tmp", "gstack", slug),
+        path.join(".gemini", "tmp", slug),
       );
-      const stagingDir = path.join(
-        os.homedir(),
-        ".gemini",
-        "tmp",
-        "gstack",
-        slug,
-      );
+      const stagingDir = path.join(os.homedir(), ".gemini", "tmp", slug);
       const leftovers = fs.existsSync(stagingDir)
         ? fs.readdirSync(stagingDir)
         : [];
@@ -1459,8 +1454,6 @@ process.stdout.write(match[1]);
     }
   });
 });
-
-
 
 // ============================================================================
 // Test framework detection (v1.40.1.0)
@@ -1856,5 +1849,104 @@ describe("buildGeminiTestSpecPrompt — framework hint", () => {
     } as any;
     const out = buildGeminiTestSpecPrompt(fakePhase, "/tmp/plan.md");
     expect(out).not.toContain("Detected test framework");
+  });
+});
+
+describe("stageGeminiIO", () => {
+  // Regression for T111646 / Phase 1.1 attempt 3 failure: stageGeminiIO used to
+  // write Gemini I/O files at ~/.gemini/tmp/gstack/<slug>/, but Gemini's --yolo
+  // sandbox only allows ~/.gemini/tmp/<slug>/. The `gstack/` segment made every
+  // backup-Gemini invocation fail with "Path not in workspace" and the agent
+  // ran blind. The fix drops the `gstack/` segment so the path matches the
+  // sandbox shape exactly.
+
+  let stagedPaths: string[] = [];
+
+  afterEach(() => {
+    for (const p of stagedPaths) {
+      try {
+        fs.unlinkSync(p);
+      } catch {}
+      try {
+        const dir = path.dirname(p);
+        fs.rmdirSync(dir);
+      } catch {}
+    }
+    stagedPaths = [];
+  });
+
+  it("writes staged files under ~/.gemini/tmp/<slug>/ with no `gstack/` segment", () => {
+    // Create a fake input file to copy from
+    const inputFile = path.join(
+      os.tmpdir(),
+      `gstack-test-input-${Date.now()}.md`,
+    );
+    fs.writeFileSync(inputFile, "test input\n");
+    stagedPaths.push(inputFile);
+
+    const slug = `smoke-test-${Date.now()}`;
+    const outputFile = path.join(os.tmpdir(), `out-${slug}.md`);
+    stagedPaths.push(outputFile);
+
+    const r = stageGeminiIO({
+      slug,
+      phaseNumber: "1.1",
+      iteration: 1,
+      suffix: "primary-impl",
+      inputFilePath: inputFile,
+      outputFilePath: outputFile,
+    });
+    stagedPaths.push(r.stagedInput, r.stagedOutput);
+
+    // Path must match the Gemini sandbox-allowed shape.
+    const home = os.homedir();
+    const expectedPrefix = path.join(home, ".gemini", "tmp", slug);
+    expect(r.stagedInput.startsWith(expectedPrefix)).toBe(true);
+    expect(r.stagedOutput.startsWith(expectedPrefix)).toBe(true);
+
+    // CRITICAL: path must NOT contain `/gstack/` between `/tmp/` and `/<slug>/`.
+    // This is the exact T111646 regression. Gemini's sandbox rejects paths
+    // that traverse outside `~/.gemini/tmp/<slug>/`.
+    expect(r.stagedInput).not.toContain("/.gemini/tmp/gstack/");
+    expect(r.stagedOutput).not.toContain("/.gemini/tmp/gstack/");
+
+    // Verify the file actually exists at the new location.
+    expect(fs.existsSync(r.stagedInput)).toBe(true);
+    expect(fs.existsSync(r.stagedOutput)).toBe(true);
+
+    // Cleanup should remove the staged files.
+    r.cleanup();
+    expect(fs.existsSync(r.stagedInput)).toBe(false);
+    expect(fs.existsSync(r.stagedOutput)).toBe(false);
+  });
+
+  it("copies output content back to outputFilePath on cleanup", () => {
+    const inputFile = path.join(
+      os.tmpdir(),
+      `gstack-test-input-${Date.now()}.md`,
+    );
+    fs.writeFileSync(inputFile, "test input\n");
+    stagedPaths.push(inputFile);
+
+    const slug = `smoke-copyback-${Date.now()}`;
+    const outputFile = path.join(os.tmpdir(), `out-${slug}.md`);
+    stagedPaths.push(outputFile);
+
+    const r = stageGeminiIO({
+      slug,
+      phaseNumber: "2.1",
+      iteration: 1,
+      suffix: "review",
+      inputFilePath: inputFile,
+      outputFilePath: outputFile,
+    });
+
+    // Simulate the agent writing to stagedOutput.
+    fs.writeFileSync(r.stagedOutput, "agent wrote this");
+
+    r.cleanup();
+
+    // After cleanup, outputFilePath should hold the agent's content.
+    expect(fs.readFileSync(outputFile, "utf8")).toBe("agent wrote this");
   });
 });

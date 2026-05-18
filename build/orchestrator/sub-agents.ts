@@ -152,9 +152,19 @@ function quote(s: string): string {
 }
 
 /**
- * Stage Gemini I/O files in ~/.gemini/tmp/gstack/<slug>/ — a path Gemini's
- * --yolo file tools accept, and one that never lives inside the user's project
- * repo (so crash-surviving leftovers can't be accidentally committed).
+ * Stage Gemini I/O files in ~/.gemini/tmp/<slug>/ — Gemini's `--yolo`
+ * sandbox allows that path AND the project temp dir keyed on `<slug>`.
+ *
+ * NOTE: This used to write to ~/.gemini/tmp/gstack/<slug>/ but Gemini's
+ * workspace policy only whitelists ~/.gemini/tmp/<slug>/ (no `gstack/`
+ * subdirectory). The `gstack/` segment made every Gemini sub-agent run
+ * blind — its `read_file` call failed with "Path not in workspace" and
+ * the agent fell back to inference, dirtying the worktree with
+ * unintended changes. Observed 2026-05-17 on agnt2-prototype-plan4
+ * (T111646 fault report) and again 2026-05-18 on this very build.
+ *
+ * Exporting this helper so build/orchestrator/__tests__/sub-agents.test.ts
+ * can pin the path shape (gpt-5.5 plan-review IMPORTANT objection).
  *
  * Returns { stagedInput, stagedOutput, cleanup }.
  * Call cleanup() after spawnCaptured returns; it copies the output back to
@@ -162,7 +172,7 @@ function quote(s: string): string {
  * in separate try/catch blocks so a copy failure surfaces (instead of being
  * swallowed) and the delete still runs regardless.
  */
-function stageGeminiIO(opts: {
+export function stageGeminiIO(opts: {
   slug: string;
   phaseNumber: string;
   iteration: number;
@@ -174,7 +184,6 @@ function stageGeminiIO(opts: {
     process.env.HOME ?? "~",
     ".gemini",
     "tmp",
-    "gstack",
     opts.slug,
   );
   fs.mkdirSync(stagingDir, { recursive: true });
@@ -1313,7 +1322,9 @@ export function inspectProject(
   if (fs.existsSync(path.join(cwd, "pyproject.toml"))) {
     const toml = safeReadFile(path.join(cwd, "pyproject.toml"));
     if (toml.includes("[tool.pytest.ini_options]")) {
-      evidence.push("framework-config: pyproject.toml [tool.pytest.ini_options]");
+      evidence.push(
+        "framework-config: pyproject.toml [tool.pytest.ini_options]",
+      );
       return { runner: "pytest", framework: "pytest", evidence };
     }
   }
@@ -1415,10 +1426,11 @@ export function inspectProject(
           framework: null,
           evidence,
         };
-      if (hasGo)
-        return { runner: "go test ./...", framework: "go", evidence };
-      if (hasCargo) return { runner: "cargo test", framework: "cargo", evidence };
-      if (hasPyproject) return { runner: "pytest", framework: "pytest", evidence };
+      if (hasGo) return { runner: "go test ./...", framework: "go", evidence };
+      if (hasCargo)
+        return { runner: "cargo test", framework: "cargo", evidence };
+      if (hasPyproject)
+        return { runner: "pytest", framework: "pytest", evidence };
     }
     const winner = pickMajority(counts);
     if (winner === "ts") {
@@ -1428,7 +1440,8 @@ export function inspectProject(
       // framework. The LLM falls back to repo-inspection.
       return { runner, framework: null, evidence };
     }
-    if (winner === "py") return { runner: "pytest", framework: "pytest", evidence };
+    if (winner === "py")
+      return { runner: "pytest", framework: "pytest", evidence };
     if (winner === "go")
       return { runner: "go test ./...", framework: "go", evidence };
     if (winner === "rs")
@@ -1485,7 +1498,7 @@ function pickMajority(counts: {
   go: number;
   rs: number;
 }): "ts" | "py" | "go" | "rs" | null {
-  const arr: Array<[("ts" | "py" | "go" | "rs"), number]> = [
+  const arr: Array<["ts" | "py" | "go" | "rs", number]> = [
     ["ts", counts.ts],
     ["py", counts.py],
     ["go", counts.go],
@@ -1557,7 +1570,9 @@ export function countTestFiles(
       if (!entry.isFile()) continue;
       if (
         counts.ts < TIE_BREAK_PER_LANG_CAP &&
-        (/\.test\.tsx?$/.test(name) || /\.test\.js$/.test(name) || /\.spec\.tsx?$/.test(name))
+        (/\.test\.tsx?$/.test(name) ||
+          /\.test\.js$/.test(name) ||
+          /\.spec\.tsx?$/.test(name))
       ) {
         counts.ts += 1;
         continue;
