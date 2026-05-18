@@ -1755,6 +1755,12 @@ export function contentHashDelta(
   return realChanges;
 }
 
+/** Suffix of the error pushed by validatePostAgentHygiene when requireNewCommit
+ *  is set and HEAD is unchanged. Kept as a shared constant so the
+ *  NO_CHANGES_NEEDED intercept in applyMutableAgentHygiene can match the sole
+ *  remaining error precisely instead of substring-sniffing free-form prose. */
+const NO_NEW_COMMIT_ERROR_SUFFIX = " did not create a new commit";
+
 export function validatePostAgentHygiene(opts: {
   cwd: string;
   before: GitSnapshot;
@@ -1792,7 +1798,7 @@ export function validatePostAgentHygiene(opts: {
   }
 
   if (opts.requireNewCommit && after.head === opts.before.head) {
-    errors.push(`${opts.label} did not create a new commit`);
+    errors.push(`${opts.label}${NO_NEW_COMMIT_ERROR_SUFFIX}`);
   }
 
   // D5: filter using contentHashDelta so pre-existing dirty + idempotent
@@ -4927,7 +4933,7 @@ export function applyMutableAgentHygiene(opts: {
   if (
     opts.allowNoChangesSentinel &&
     errors.length === 1 &&
-    errors[0].includes("did not create a new commit") &&
+    errors[0].endsWith(NO_NEW_COMMIT_ERROR_SUFFIX) &&
     opts.outputFilePath
   ) {
     let summary = "";
