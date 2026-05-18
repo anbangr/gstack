@@ -1,5 +1,9 @@
 import { describe, it, expect } from "bun:test";
-import { findNextFeatureIndex, isFeatureTerminal } from "../cli";
+import {
+  findNextFeatureIndex,
+  isFeatureTerminal,
+  allFeaturesReachedPhasesDone,
+} from "../cli";
 import type { BuildState, FeatureState } from "../types";
 
 function feature(overrides: Partial<FeatureState> = {}): FeatureState {
@@ -125,6 +129,91 @@ describe("findNextFeatureIndex", () => {
       feature({ index: 1, number: "2", status: "pending" }),
     ]);
     expect(findNextFeatureIndex(s)).toBe(0);
+  });
+
+  it("skips phases_done features when skipPhasesDone is true (--ship-on-plan-complete defer path)", () => {
+    const s = state([
+      feature({ index: 0, status: "phases_done" }),
+      feature({ index: 1, number: "2", status: "pending" }),
+    ]);
+    expect(findNextFeatureIndex(s, { skipPhasesDone: true })).toBe(1);
+    // Default behavior: don't skip phases_done (so the ship gate can fire).
+    expect(findNextFeatureIndex(s)).toBe(0);
+  });
+
+  it("returns -1 when every feature is phases_done AND skipPhasesDone is true", () => {
+    // Once allFeaturesReachedPhasesDone() flips true the caller stops
+    // passing skipPhasesDone, so this case re-surfaces feature 0 for ship.
+    // But while skipPhasesDone is still true (mid-loop), -1 means "nothing
+    // left with phase work" — which is exactly what we want to terminate
+    // the phase-execution loop and fall through to the ship pass.
+    const s = state([
+      feature({ index: 0, status: "phases_done" }),
+      feature({ index: 1, number: "2", status: "phases_done" }),
+    ]);
+    expect(findNextFeatureIndex(s, { skipPhasesDone: true })).toBe(-1);
+    expect(findNextFeatureIndex(s)).toBe(0);
+  });
+});
+
+describe("allFeaturesReachedPhasesDone", () => {
+  it("returns false when any feature is still pending", () => {
+    const s = state([
+      feature({ index: 0, status: "phases_done" }),
+      feature({ index: 1, number: "2", status: "pending" }),
+    ]);
+    expect(allFeaturesReachedPhasesDone(s)).toBe(false);
+  });
+
+  it("returns false when any feature is running", () => {
+    const s = state([
+      feature({ index: 0, status: "phases_done" }),
+      feature({ index: 1, number: "2", status: "running" }),
+    ]);
+    expect(allFeaturesReachedPhasesDone(s)).toBe(false);
+  });
+
+  it("returns false when any feature is in feature-review limbo", () => {
+    const s = state([
+      feature({ index: 0, status: "phases_done" }),
+      feature({ index: 1, number: "2", status: "feature_review_running" }),
+    ]);
+    expect(allFeaturesReachedPhasesDone(s)).toBe(false);
+  });
+
+  it("returns true when every feature reached phases_done", () => {
+    const s = state([
+      feature({ index: 0, status: "phases_done" }),
+      feature({ index: 1, number: "2", status: "phases_done" }),
+    ]);
+    expect(allFeaturesReachedPhasesDone(s)).toBe(true);
+  });
+
+  it("returns true when features are mixed phases_done / shipping / landed (all past gate)", () => {
+    const s = state([
+      feature({ index: 0, status: "landed" }),
+      feature({ index: 1, number: "2", status: "shipping" }),
+      feature({ index: 2, number: "3", status: "phases_done" }),
+    ]);
+    expect(allFeaturesReachedPhasesDone(s)).toBe(true);
+  });
+
+  it("treats failed features as done so siblings can still ship", () => {
+    // A hard failure shouldn't keep its siblings hostage; the user
+    // re-runs /build for the failed feature separately.
+    const s = state([
+      feature({ index: 0, status: "failed" }),
+      feature({ index: 1, number: "2", status: "phases_done" }),
+    ]);
+    expect(allFeaturesReachedPhasesDone(s)).toBe(true);
+  });
+
+  it("returns false for an empty feature list", () => {
+    // Defensive: no features means there's nothing to ship anyway, but
+    // returning true would risk firing the deferred-ship pass on a
+    // genuinely empty plan. Stay false.
+    const s = state([]);
+    expect(allFeaturesReachedPhasesDone(s)).toBe(false);
   });
 });
 

@@ -607,6 +607,8 @@ export interface Args {
   skipShip: boolean;
   /** When true, all features share one feat/<prefix> branch; /ship + /land-and-deploy run once after all features complete. */
   singleBranch: boolean;
+  /** When true, keep per-feature branches but defer /ship + /land-and-deploy until ALL features reach phases_done. Then ship in feature order. */
+  shipOnPlanComplete: boolean;
   releaseMode: "queued" | "auto-land";
   maxCodexIter: number;
   testCmd?: string;
@@ -769,6 +771,7 @@ export function parseArgs(argv: string[]): Args {
     noGbrain: false,
     skipShip: false,
     singleBranch: false,
+    shipOnPlanComplete: false,
     releaseMode: "queued",
     maxCodexIter: DEFAULT_MAX_CODEX_ITERATIONS,
     projectRoot: undefined,
@@ -835,6 +838,7 @@ export function parseArgs(argv: string[]): Args {
     else if (a === "--no-gbrain") args.noGbrain = true;
     else if (a === "--skip-ship") args.skipShip = true;
     else if (a === "--single-branch") args.singleBranch = true;
+    else if (a === "--ship-on-plan-complete") args.shipOnPlanComplete = true;
     else if (a === "--release-mode") {
       const next = argv[++i];
       if (next !== "queued" && next !== "auto-land") {
@@ -2503,6 +2507,14 @@ Flags:
                        /land-and-deploy runs once after all features complete
                        instead of after each feature. Auto-selected by the
                        driver agent based on plan cohesion.
+  --ship-on-plan-complete
+                       Keep per-feature branches (default multi-branch mode)
+                       but defer /ship + /land-and-deploy for every feature
+                       until ALL features reach phases_done. Then PRs open in
+                       feature order. Use for bundle-style multi-feature
+                       plans where each feature is independently revertable
+                       but you want to review the whole bundle before any
+                       PR lands.
   --release-mode <m>   queued (default) runs /ship then queues PR for the
                        release daemon. auto-land preserves legacy /ship +
                        /land-and-deploy behavior.
@@ -3146,16 +3158,60 @@ export function isFeatureTerminal(f: FeatureState): boolean {
 
 export function findNextFeatureIndex(
   state: BuildState,
-  opts: { skipOriginVerified?: boolean } = {},
+  opts: {
+    skipOriginVerified?: boolean;
+    /**
+     * When set, also skip features stuck at phases_done — used by
+     * --ship-on-plan-complete to move past deferred-ship features and
+     * keep iterating to the next feature with phase work to do.
+     */
+    skipPhasesDone?: boolean;
+  } = {},
 ): number {
   const features = state.features ?? [];
   for (let i = 0; i < features.length; i++) {
     const f = features[i];
     if (opts.skipOriginVerified && f.status === "origin_verified") continue;
+    if (opts.skipPhasesDone && f.status === "phases_done") continue;
     if (isFeatureTerminal(f)) continue;
     return i;
   }
   return -1;
+}
+
+/**
+ * For `--ship-on-plan-complete`: returns true only when every feature in
+ * the plan has finished its phase work (status >= phases_done in the
+ * lifecycle), used to defer per-feature shipping until the whole plan is
+ * ready. Features still doing phase work (pending, running, paused,
+ * feature-review states, redo, blocked) block; features past the ship
+ * gate (shipping onward) count as done.
+ *
+ * `failed` does NOT block, by design: a feature that hit a hard failure
+ * shouldn't keep its siblings from shipping. The user can re-run /build
+ * for the failed feature separately.
+ */
+export function allFeaturesReachedPhasesDone(state: BuildState): boolean {
+  const features = state.features ?? [];
+  if (features.length === 0) return false;
+  for (const f of features) {
+    switch (f.status) {
+      case "phases_done":
+      case "shipping":
+      case "release_queued":
+      case "landed":
+      case "origin_verifying":
+      case "origin_verified":
+      case "committed":
+      case "failed":
+        continue;
+      // pending, running, feature_review_pending, feature_review_running,
+      // feature_redo_pending, feature_blocked — phase work still outstanding
+      default:
+        return false;
+    }
+  }
+  return true;
 }
 
 function featureReviewAlreadySatisfied(feature: FeatureState): boolean {
@@ -8688,8 +8744,15 @@ async function main() {
         while (true) {
           const skipUnshippedVerified =
             args.skipShip || args.singleBranch || args.dryRun;
+          // --ship-on-plan-complete: defer per-feature ship by routing
+          // findNextFeatureIndex past phases_done features until every
+          // feature has reached phases_done; THEN fall through and ship
+          // them in order.
+          const deferPerFeatureShip =
+            args.shipOnPlanComplete && !allFeaturesReachedPhasesDone(state);
           const featureIndex = findNextFeatureIndex(state, {
             skipOriginVerified: skipUnshippedVerified,
+            skipPhasesDone: deferPerFeatureShip,
           });
           if (featureIndex === -1) break;
           const featureState = state.features![featureIndex];
@@ -9134,6 +9197,21 @@ async function main() {
             // through to the existing ship logic below.
             featureState.status = "phases_done";
             saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+          }
+
+          // --ship-on-plan-complete: defer this feature's ship if any
+          // sibling still has phase work to do. The feature stays at
+          // phases_done; the outer loop's findNextFeatureIndex with
+          // skipPhasesDone:true will move past it to the next pending
+          // feature. When the last feature's phases finish,
+          // allFeaturesReachedPhasesDone() flips true, skipPhasesDone
+          // becomes false, the deferred features re-surface in feature
+          // order, and the ship gate below fires for each in turn.
+          if (args.shipOnPlanComplete && !allFeaturesReachedPhasesDone(state)) {
+            console.log(
+              `\n▶ Feature ${featureState.number} phases complete — deferring ship (--ship-on-plan-complete).`,
+            );
+            continue;
           }
 
           if (

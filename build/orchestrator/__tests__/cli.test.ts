@@ -423,6 +423,36 @@ describe("--single-branch flag wiring", () => {
   });
 });
 
+describe("--ship-on-plan-complete flag wiring", () => {
+  it("parseArgs default -> shipOnPlanComplete=false", () => {
+    const args = parseArgs(["plan.md"]);
+    expect(args.shipOnPlanComplete).toBe(false);
+  });
+
+  it("parseArgs([plan, --ship-on-plan-complete]) sets shipOnPlanComplete=true", () => {
+    const args = parseArgs(["plan.md", "--ship-on-plan-complete"]);
+    expect(args.shipOnPlanComplete).toBe(true);
+  });
+
+  it("--ship-on-plan-complete is independent of --single-branch (different modes)", () => {
+    // The flags don't conflict at the parser level, but the runtime
+    // wiring treats --single-branch as taking precedence (the
+    // single-branch deferred-ship path already exists). Both can be
+    // set without parse error.
+    const args = parseArgs([
+      "plan.md",
+      "--single-branch",
+      "--ship-on-plan-complete",
+    ]);
+    expect(args.singleBranch).toBe(true);
+    expect(args.shipOnPlanComplete).toBe(true);
+  });
+
+  it("--ship-on-plan-complete is documented in --help", () => {
+    expect(HELP_TEXT).toContain("--ship-on-plan-complete");
+  });
+});
+
 describe("release-daemon CLI", () => {
   it("parses release-daemon run defaults", () => {
     const args = parseArgs(["release-daemon", "run"]);
