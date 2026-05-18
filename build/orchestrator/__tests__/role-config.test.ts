@@ -11,6 +11,7 @@ import {
 import {
   BUILD_DEFAULTS,
   DEFAULT_BUILD_CONFIG_FILE,
+  envNumberOrDefault,
   loadBuildDefaults,
 } from "../build-config";
 import fs from "node:fs";
@@ -24,7 +25,7 @@ describe("role config defaults", () => {
     expect(loaded.roles.primaryImpl.model).toBeTruthy();
     expect(loaded.limits.codexMaxIterations).toBe(5);
     expect(loaded.timeoutsMs.gemini).toBe(900000);
-    expect(loaded.timeoutsMs.kimi).toBe(900000);
+    expect(loaded.timeoutsMs.kimi).toBe(1500000);
     expect(BUILD_DEFAULTS.roles.primaryImpl.model).toBe(
       loaded.roles.primaryImpl.model,
     );
@@ -136,7 +137,7 @@ describe("role config precedence helpers", () => {
         DEFAULT_ROLE_CONFIGS.monitorAgent,
       );
       expect(loaded.limits.featureReviewMaxIterations).toBe(3);
-      expect(loaded.timeoutsMs.kimi).toBe(900000);
+      expect(loaded.timeoutsMs.kimi).toBe(1500000);
       expect(loaded.timeoutsMs.featureReview).toBe(1200000);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -312,5 +313,62 @@ describe("role config precedence helpers", () => {
     expect(roles.primaryImpl.model).toBe("legacy-primary-model");
     expect(roles.secondaryImpl.model).toBe("legacy-secondary-model");
     expect(roles.reviewSecondary.model).toBe("legacy-review-model");
+  });
+});
+
+// T1.1, T1.2, T1.3 — kimi timeout bump to 1500000ms (25 min)
+describe("kimi timeout bump (phase 1.1)", () => {
+  it("T1.1 configure.cm default kimi timeout is 1500000ms", () => {
+    // Fails (red) until configure.cm is updated from 900000 to 1500000.
+    const loaded = loadBuildDefaults(DEFAULT_BUILD_CONFIG_FILE);
+    expect(loaded.timeoutsMs.kimi).toBe(1500000);
+  });
+
+  it("T1.1b configure.cm.template kimi timeout is also 1500000ms", () => {
+    // Fresh installs copy from the template; it must carry the same bump.
+    // Fails (red) until configure.cm.template is updated.
+    const templatePath = path.join(
+      path.dirname(DEFAULT_BUILD_CONFIG_FILE),
+      "configure.cm.template",
+    );
+    const raw = JSON.parse(fs.readFileSync(templatePath, "utf8")) as {
+      timeoutsMs: Record<string, number>;
+    };
+    expect(raw.timeoutsMs.kimi).toBe(1500000);
+  });
+
+  it("T1.2 GSTACK_BUILD_KIMI_TIMEOUT env var overrides the kimi default", () => {
+    // Env override must win over the file default regardless of what value
+    // configure.cm carries. Tests the envNumberOrDefault plumbing used by
+    // KIMI_TIMEOUT_MS in sub-agents.ts.
+    const prev = process.env.GSTACK_BUILD_KIMI_TIMEOUT;
+    process.env.GSTACK_BUILD_KIMI_TIMEOUT = "1800000";
+    try {
+      const resolved = envNumberOrDefault(
+        "GSTACK_BUILD_KIMI_TIMEOUT",
+        BUILD_DEFAULTS.timeoutsMs.kimi,
+      );
+      expect(resolved).toBe(1800000);
+      // Env override must not equal the file default (1500000 post-impl).
+      expect(resolved).not.toBe(BUILD_DEFAULTS.timeoutsMs.kimi);
+    } finally {
+      if (prev === undefined) delete process.env.GSTACK_BUILD_KIMI_TIMEOUT;
+      else process.env.GSTACK_BUILD_KIMI_TIMEOUT = prev;
+    }
+  });
+
+  it("T1.3 other timeouts are unchanged by the kimi bump", () => {
+    // Regression guard: only timeoutsMs.kimi should change; every other
+    // field must retain its pre-existing default from configure.cm.
+    const loaded = loadBuildDefaults(DEFAULT_BUILD_CONFIG_FILE);
+    expect(loaded.timeoutsMs.gemini).toBe(900000);
+    expect(loaded.timeoutsMs.codex).toBe(900000);
+    expect(loaded.timeoutsMs.ship).toBe(1800000);
+    expect(loaded.timeoutsMs.test).toBe(900000);
+    expect(loaded.timeoutsMs.judge).toBe(600000);
+    expect(loaded.timeoutsMs.featureReview).toBe(1200000);
+    expect(loaded.timeoutsMs.planReview).toBe(300000);
+    // kimi must be the bumped value, not the old 900000
+    expect(loaded.timeoutsMs.kimi).not.toBe(900000);
   });
 });
