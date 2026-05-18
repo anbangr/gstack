@@ -782,23 +782,41 @@ export async function runCodexReview(opts: {
     cleanup();
     return mergeOutputFile(retryResult, opts.outputFilePath);
   }
-  if (result.exitCode !== 0 && isLikelyCodexTransportFailure(result)) {
-    const retryLog = path.join(
-      logDir(opts.slug),
-      `phase-${opts.phaseNumber}-${opts.logPrefix ?? "codex"}-${opts.iteration}-transport-retry.log`,
-    );
-    fs.writeFileSync(stagedOutput, "");
-    const retryResult = await spawnCaptured({
-      bin: CODEX_BIN,
-      argv,
-      cwd: opts.cwd,
-      timeoutMs,
-      logPath: retryLog,
-      closeStdin: true,
-    });
-    retryResult.retries = 1;
-    cleanup();
-    return mergeOutputFile(retryResult, opts.outputFilePath);
+  // Broad "no-verdict" retry: any non-zero exit where the staged output
+  // file has no GATE PASS/FAIL marker is treated as a transient. Catches
+  // 403/429/5xx, stream disconnects (already matched by
+  // isLikelyCodexTransportFailure), and any future transport-layer
+  // failure that doesn't get a chance to write the verdict line. A real
+  // review failure writes GATE FAIL into the output and is NOT retried.
+  // One-shot retry; if the second attempt also dies without a verdict,
+  // fail honestly.
+  if (result.exitCode !== 0) {
+    let stagedOutputContent = "";
+    try {
+      stagedOutputContent = fs.readFileSync(stagedOutput, "utf8");
+    } catch {
+      // Empty path counts as no verdict.
+    }
+    const noVerdict = parseVerdict(stagedOutputContent) === "unclear";
+    const transportShape = isLikelyCodexTransportFailure(result);
+    if (noVerdict || transportShape) {
+      const retryLog = path.join(
+        logDir(opts.slug),
+        `phase-${opts.phaseNumber}-${opts.logPrefix ?? "codex"}-${opts.iteration}-transport-retry.log`,
+      );
+      fs.writeFileSync(stagedOutput, "");
+      const retryResult = await spawnCaptured({
+        bin: CODEX_BIN,
+        argv,
+        cwd: opts.cwd,
+        timeoutMs,
+        logPath: retryLog,
+        closeStdin: true,
+      });
+      retryResult.retries = 1;
+      cleanup();
+      return mergeOutputFile(retryResult, opts.outputFilePath);
+    }
   }
   cleanup();
   return mergeOutputFile(result, opts.outputFilePath);

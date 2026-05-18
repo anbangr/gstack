@@ -298,6 +298,64 @@ describe("applyResult — Codex review", () => {
     expect(next.status).toBe("failed");
     expect(next.error).toMatch(/GATE PASS or GATE FAIL/);
   });
+
+  // ----------------------------------------------------------------------
+  // Fix C: failure-classifier prefixes
+  // ----------------------------------------------------------------------
+  // Operator UX: when Codex review fails, the error message currently looks
+  // the same for transient failures (retry-and-go), hygiene-whitelisted
+  // failures (mark-phase-committed), and real review verdicts (fix the
+  // code). Add a [class: ...] prefix so the operator knows which recovery
+  // to run without re-reading the log.
+
+  it("classifier: retried-and-still-failed gets [transient: ...] prefix", () => {
+    // A Codex run that retried once (Fix A) and STILL failed — almost
+    // certainly a persistent transient (e.g. backend out, real 403). The
+    // operator should retry or wait, not edit code.
+    const initial = basePhase({ status: "tests_green" });
+    const action = decideNextAction(initial);
+    const next = applyResult(initial, action as any, {
+      ...codexPass(),
+      exitCode: 1,
+      stdout: "",
+      stderr: "HTTP 403 Forbidden after retry",
+      retries: 1,
+    });
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/^\[transient:/);
+    expect(next.error).toMatch(/retried/);
+  });
+
+  it("classifier: timeout gets [timeout] prefix", () => {
+    const initial = basePhase({ status: "tests_green" });
+    const action = decideNextAction(initial);
+    const next = applyResult(initial, action as any, codexTimeout());
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/^\[timeout/);
+  });
+
+  it("classifier: no-verdict (without retry) gets [verdict: no-marker] prefix", () => {
+    // First-attempt no-verdict before Fix A retry runs (shouldn't happen
+    // in production once Fix A is wired, but classifier should still cover
+    // the case where retry is disabled or both attempts came back empty).
+    const initial = basePhase({ status: "tests_green" });
+    const action = decideNextAction(initial);
+    const next = applyResult(initial, action as any, codexUnclear());
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/^\[verdict: no-marker\]/);
+  });
+
+  it("classifier: real GATE FAIL stays in codex_running, no failure prefix", () => {
+    // GATE FAIL is a normal review iteration outcome, not a "failed"
+    // phase. Status goes to codex_running for re-iteration. Don't slap
+    // a classifier prefix on iteration errors.
+    const initial = basePhase({ status: "tests_green" });
+    const action = decideNextAction(initial);
+    const next = applyResult(initial, action as any, codexFail());
+    expect(next.status).toBe("codex_running");
+    // No error set when iterating; classifier doesn't fire here.
+    expect(next.error).toBeUndefined();
+  });
 });
 
 describe("markCommitted", () => {

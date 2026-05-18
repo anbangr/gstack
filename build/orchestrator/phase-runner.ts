@@ -531,15 +531,24 @@ export function applyResult(
         ? [...prevFilePaths, extra.outputFilePath]
         : prevFilePaths,
     };
+    // Fix C: classifier prefixes on phase failureReason. Operator UX —
+    // the prefix names the recovery: [timeout] = wait/retry,
+    // [transient: retried once] = transient blip already retried (try
+    // again or mark-phase-committed), [verdict: no-marker] = Codex
+    // didn't emit a verdict (rare after Fix A; mark-phase-committed),
+    // [verdict: GATE FAIL] = real review verdict on a re-iteration path
+    // (only when status stays codex_running; no classifier here).
     if (result.timedOut) {
       next.codexReview.finalVerdict = "TIMEOUT";
       next.status = "failed";
-      next.error = `Codex review timed out after ${result.retries} retry${result.retries === 1 ? "" : "es"}`;
+      next.error = `[timeout] Codex review timed out after ${result.retries} retry${result.retries === 1 ? "" : "es"}`;
       return next;
     }
     if (result.exitCode !== 0) {
       next.status = "failed";
-      next.error = `Codex exited ${result.exitCode}; see ${result.logPath}`;
+      const retriedOnce = (result.retries ?? 0) > 0;
+      const prefix = retriedOnce ? "[transient: retried once] " : "[other] ";
+      next.error = `${prefix}Codex exited ${result.exitCode}; see ${result.logPath}`;
       return next;
     }
     const verdict: Verdict = parseVerdict(result.stdout);
@@ -556,7 +565,7 @@ export function applyResult(
     // verdict === 'unclear'
     next.status = "failed";
     next.error =
-      "Codex output did not contain GATE PASS or GATE FAIL — cannot determine review outcome";
+      "[verdict: no-marker] Codex output did not contain GATE PASS or GATE FAIL — cannot determine review outcome";
     return next;
   }
 

@@ -1722,6 +1722,15 @@ export function validatePostAgentHygiene(opts: {
   requireNonEmptyOutput?: boolean;
   requireNewCommit?: boolean;
   label: string;
+  /**
+   * When true, tolerate Codex CLI scratch directories that the review
+   * subagent writes under workspace-write sandbox. Specifically `.codex/`,
+   * which Codex uses for session metadata. Without this flag, the strict
+   * default treats every dirty path as a real change — that's right for
+   * implementor agents but wrong for review agents that shouldn't touch
+   * source but DO touch their own scratch.
+   */
+  reviewGate?: boolean;
 }): HygieneVerdict {
   const after = captureGitSnapshot(opts.cwd);
   const errors: string[] = [];
@@ -1748,9 +1757,13 @@ export function validatePostAgentHygiene(opts: {
 
   // D5: filter using contentHashDelta so pre-existing dirty + idempotent
   // rewrites are not misattributed to the agent. The allowedStatus regex
-  // continues to allow `.llm-tmp/` untracked entries (orchestrator
-  // sub-agent staging directory).
-  const allowedStatus = /^\?\? \.llm-tmp(\/|$)/;
+  // allows `.llm-tmp/` untracked entries (orchestrator sub-agent staging
+  // directory), and — when reviewGate is true — `.codex/` (Codex CLI's
+  // session-metadata scratch dir that the review subagent writes under
+  // workspace-write).
+  const allowedStatus = opts.reviewGate
+    ? /^\?\? (?:\.llm-tmp|\.codex)(\/|$)/
+    : /^\?\? \.llm-tmp(\/|$)/;
   const filteredAfter: GitSnapshot = {
     ...after,
     status: after.status.filter((line) => !allowedStatus.test(line)),
@@ -4351,11 +4364,19 @@ function applyGateHygiene(opts: {
   phaseRef?: { featureNumber?: string; phaseNumber: string };
 }): SubAgentResult {
   if (opts.result.timedOut || opts.result.exitCode !== 0) return opts.result;
+  // Review/QA gates run Codex under workspace-write and the subagent writes
+  // session metadata to `.codex/`. Treat those scratch dirs as ignorable
+  // for the hygiene check on review-shaped roles.
+  const isGateRole =
+    opts.label.startsWith("qa") ||
+    opts.label.startsWith("review") ||
+    opts.label.startsWith("reviewSecondary");
   let checks = [
     validatePostAgentHygiene({
       cwd: opts.cwd,
       before: opts.before,
       label: opts.label,
+      reviewGate: isGateRole,
     }),
     validateParentWorkspaceUnchanged({
       before: opts.parentWorkspace?.snapshot ?? null,
@@ -4369,10 +4390,6 @@ function applyGateHygiene(opts: {
   // the ONLY hygiene problem is the dirty tree (no parent-workspace mutation,
   // no other validator errors). Re-check hygiene after committing so the
   // gate result still includes the cleaner verdict.
-  const isGateRole =
-    opts.label.startsWith("qa") ||
-    opts.label.startsWith("review") ||
-    opts.label.startsWith("reviewSecondary");
   if (errors.length > 0 && isGateRole) {
     const after = captureGitSnapshot(opts.cwd);
     const allowedStatus = /^\?\? \.llm-tmp(\/|$)/;
