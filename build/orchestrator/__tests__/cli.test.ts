@@ -46,8 +46,11 @@ import {
   chooseMergePath,
   extractCoverageTarget,
   resolvePhaseBody,
+  maybeAutoCommitTestOnlyDirty,
+  runStopRun,
   HELP_TEXT,
 } from "../cli";
+import { writeActiveRunRecord, activeRunRecordPath } from "../active-runs";
 import type {
   BuildState,
   FeatureState,
@@ -3123,9 +3126,7 @@ describe("ensureFeatureBranch", () => {
   // existing ref the function can't recover via the fallback `git checkout
   // <branch>` path), feature.branch must also remain unset.
   it("does NOT save feature.branch when the checkout step fails", () => {
-    tmpDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), "gstack-checkout-fail-"),
-    );
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-checkout-fail-"));
     const bare = path.join(tmpDir, "origin.git");
     const repo = path.join(tmpDir, "repo");
     expect(spawnSync("git", ["init", "--bare", bare]).status).toBe(0);
@@ -3456,8 +3457,19 @@ describe("phaseGateProjection", () => {
     }
   });
 
-  it("returns empty for failed", () => {
-    expect(phaseGateProjection("failed")).toEqual({});
+  it("returns undefined for failed (Bug 1: no-opinion semantics)", () => {
+    // Bug 1 fix: `failed` now means "I have no opinion, leave the plan alone"
+    // (returns undefined) rather than "no gates are done" (returned {}).
+    // The reconciler in reconcilePhaseVisibleGates treats undefined as a
+    // no-op, which is what stops the reconciler from un-checking [x] when
+    // a phase is in `failed` and the user is mid-recovery.
+    expect(phaseGateProjection("failed")).toBeUndefined();
+  });
+
+  it("returns undefined for featureGateProjection('failed') too (Bug 1 mirror)", () => {
+    // Bug 1 mirror: same fix applied to featureGateProjection so the
+    // feature-level reconciler is consistent with the phase-level one.
+    expect(featureGateProjection("failed")).toBeUndefined();
   });
 });
 
@@ -3812,6 +3824,307 @@ describe("reconcileVisiblePlanState", () => {
     expect(() =>
       reconcileVisiblePlanState(planFile, [feature], [phase], stateNoFeatures),
     ).not.toThrow();
+  });
+
+  // Regression tests for the recovery-scenario bug (plan
+  // ~/.claude/plans/this-issue-smooth-coral.md Bugs 1 + 2). REGRESSION RULE
+  // applies — these are mandatory.
+
+  it("Bug 1+2: reconciler does NOT un-check [x] when phase is failed", () => {
+    // The recovery-scenario bug: user manually edited [x] on a phase whose
+    // runtime status is `failed`; the reconciler then flipped them back to
+    // [ ] on every saveState tick. After Bug 1 fix (projection returns
+    // undefined) + Bug 2 fix (reconciler early-returns on undefined), the
+    // plan content stays bit-identical to its pre-call content.
+    const plan =
+      [
+        "## Feature 1: Auth",
+        "### Phase 1: Skeleton",
+        "- [x] **Test Specification (COMPLETE)**",
+        "- [x] **Verify Red (COMPLETE)**",
+        "- [x] **Implementation (COMPLETE)**",
+        "- [x] **Review & QA (COMPLETE)**",
+      ].join("\n") + "\n";
+
+    const planFile = _testWritePlan(plan);
+    const before = fs.readFileSync(planFile, "utf8");
+    const phase = makePhase({
+      gates: {
+        test_spec: { done: true, line: 3 },
+        verify_red: { done: true, line: 4 },
+        implementation: { done: true, line: 5 },
+        review_qa: { done: true, line: 6 },
+      },
+    });
+    const feature = makeFeature({ gates: {} });
+    const state = makeState("failed");
+
+    reconcileVisiblePlanState(planFile, [feature], [phase], state);
+
+    const after = fs.readFileSync(planFile, "utf8");
+    expect(after).toBe(before);
+  });
+
+  it("Bug 2 mirror: feature reconciler does NOT un-check [x] when feature is failed", () => {
+    const plan =
+      [
+        "## Feature 1: Auth",
+        "- [x] **Feature Review (COMPLETE)**",
+        "- [x] **Ship/Land (COMPLETE)**",
+        "### Phase 1: Skeleton",
+        "- [ ] **Test Specification**",
+      ].join("\n") + "\n";
+
+    const planFile = _testWritePlan(plan);
+    const before = fs.readFileSync(planFile, "utf8");
+    const phase = makePhase({
+      testSpecCheckboxLine: 5,
+      gates: {},
+    });
+    const feature = makeFeature({
+      gates: {
+        feature_review: { done: true, line: 2 },
+        ship_land: { done: true, line: 3 },
+      },
+    });
+    const state = makeState("pending", "failed");
+
+    reconcileVisiblePlanState(planFile, [feature], [phase], state);
+
+    const after = fs.readFileSync(planFile, "utf8");
+    expect(after).toBe(before);
+  });
+
+  it("Bug 2 defense: reconciler never un-checks even when projection wants false", () => {
+    // The blanket "never un-check" defense kicks in for any non-failed
+    // status whose projection legitimately returns false for some gate.
+    // We construct a tests_red phase whose plan shows [x] on the
+    // implementation gate — the projection wants implementation=false
+    // (tests_red hasn't passed yet), but the reconciler must NOT un-check
+    // the [x] the user manually placed.
+    const plan =
+      [
+        "## Feature 1: Auth",
+        "### Phase 1: Skeleton",
+        "- [ ] **Test Specification**",
+        "- [ ] **Verify Red**",
+        "- [x] **Implementation (manually marked)**",
+        "- [ ] **Review & QA**",
+      ].join("\n") + "\n";
+
+    const planFile = _testWritePlan(plan);
+    const phase = makePhase({
+      gates: {
+        test_spec: { done: false, line: 3 },
+        verify_red: { done: false, line: 4 },
+        implementation: { done: true, line: 5 },
+        review_qa: { done: false, line: 6 },
+      },
+    });
+    const feature = makeFeature({ gates: {} });
+    const state = makeState("tests_red");
+
+    reconcileVisiblePlanState(planFile, [feature], [phase], state);
+
+    const after = fs.readFileSync(planFile, "utf8").split("\n");
+    // test_spec + verify_red should flip up (projection wants them true).
+    expect(after[2]).toMatch(/\[x\].*Test Specification/);
+    expect(after[3]).toMatch(/\[x\].*Verify Red/);
+    // implementation MUST stay [x] (defense-in-depth never-un-check).
+    expect(after[4]).toMatch(/\[x\].*Implementation/);
+    expect(after[5]).toMatch(/\[ \].*Review/);
+  });
+});
+
+describe("--mark-phase-committed feature-relative notation (Bug 3)", () => {
+  let tmpDir: string;
+  afterEach(() => {
+    if (tmpDir) {
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
+  it("resolves '<feat>.<phase>' against per-feature-numbered plans", () => {
+    // Mitosis plan style: phase.number is just the within-feature stem,
+    // featureNumber is separate. The old lookup phases.find(p =>
+    // p.number === input) errored "phase not found: 2.1" because no phase
+    // has number = "2.1". After Bug 3 fix, the input is split as
+    // <feat>="2", <phase>="1" and matched via featureNumber+number.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-bug3-relnum-"));
+    const planFile = path.join(tmpDir, "plan.md");
+    fs.writeFileSync(
+      planFile,
+      [
+        "# Plan",
+        "",
+        "## Feature 2: Backend",
+        "### Phase 1: Schema",
+        "- [ ] **Test Specification (Codex)**: tests",
+        "- [ ] **Implementation (Codex)**: impl",
+        "- [ ] **Review (Codex)**: review",
+        "",
+      ].join("\n"),
+    );
+
+    const feature: Feature = {
+      index: 0,
+      number: "2",
+      name: "Backend",
+      body: "",
+      phaseIndexes: [0],
+    };
+    const phase: Phase = {
+      index: 0,
+      number: "1",
+      name: "Schema",
+      featureIndex: 0,
+      featureNumber: "2",
+      featureName: "Backend",
+      implementationDone: false,
+      reviewDone: false,
+      testSpecDone: false,
+      body: "",
+      implementationCheckboxLine: 6,
+      reviewCheckboxLine: 7,
+      testSpecCheckboxLine: 5,
+      dualImpl: false,
+      kind: "code",
+    };
+
+    const state: BuildState = {
+      planFile,
+      planBasename: "plan",
+      slug: "test",
+      branch: "main",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      lastUpdatedAt: "2026-01-01T00:00:00.000Z",
+      currentPhaseIndex: 0,
+      currentFeatureIndex: 0,
+      completed: false,
+      phases: [
+        {
+          index: 0,
+          number: "1",
+          name: "Schema",
+          status: "failed",
+          error: "old hygiene failure",
+        },
+      ],
+      features: [feature as any],
+      failedAtPhase: 0,
+    };
+
+    const result = markPhaseCommittedAfterManualRecovery({
+      state,
+      phases: [phase],
+      phaseNumber: "2.1", // feature-relative form — the previously-broken case
+      planFile,
+    });
+
+    expect(result).toEqual({ ok: true, phaseIndex: 0 });
+    expect(state.phases[0].status).toBe("committed");
+    expect(state.phases[0].error).toBeUndefined();
+    expect(state.failedAtPhase).toBeUndefined();
+  });
+});
+
+describe("--mark-phase-committed --dry-run is actually dry (Bug 4)", () => {
+  let tmpDir: string;
+  afterEach(() => {
+    if (tmpDir) {
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
+  it("dry-run does NOT mutate state.phases, state.failedAtPhase, or the plan file", () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-bug4-dryrun-"));
+    const planFile = path.join(tmpDir, "plan.md");
+    const planContent = [
+      "# Plan",
+      "",
+      "### Phase 1.1: First",
+      "- [ ] **Test Specification (Codex Sub-agent)**: tests",
+      "- [ ] **Implementation (Codex Sub-agent)**: Implement.",
+      "- [ ] **Review (Codex Sub-agent)**: Review.",
+      "",
+    ].join("\n");
+    fs.writeFileSync(planFile, planContent);
+    const planMtimeBefore = fs.statSync(planFile).mtimeMs;
+
+    const feature: Feature = {
+      index: 0,
+      number: "1",
+      name: "F1",
+      body: "",
+      phaseIndexes: [0],
+    };
+    const phase: Phase = {
+      index: 0,
+      number: "1.1",
+      name: "First",
+      featureIndex: 0,
+      featureNumber: "1",
+      featureName: "F1",
+      implementationDone: false,
+      reviewDone: false,
+      testSpecDone: false,
+      body: "",
+      implementationCheckboxLine: 5,
+      reviewCheckboxLine: 6,
+      testSpecCheckboxLine: 4,
+      dualImpl: false,
+      kind: "code",
+    };
+
+    const stateBefore = {
+      planFile,
+      planBasename: "plan",
+      slug: "test",
+      branch: "main",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      lastUpdatedAt: "2026-01-01T00:00:00.000Z",
+      currentPhaseIndex: 0,
+      currentFeatureIndex: 0,
+      completed: false,
+      phases: [
+        {
+          index: 0,
+          number: "1.1",
+          name: "First",
+          status: "failed" as const,
+          error: "old hygiene failure",
+        },
+      ],
+      features: [feature as any],
+      failedAtPhase: 0,
+      failureReason: "old hygiene failure",
+    };
+    const stateSnapshot = JSON.parse(JSON.stringify(stateBefore));
+
+    const result = markPhaseCommittedAfterManualRecovery({
+      state: stateBefore as any as BuildState,
+      phases: [phase],
+      phaseNumber: "1.1",
+      planFile,
+      dryRun: true,
+    });
+
+    expect(result).toEqual({ ok: true, phaseIndex: 0 });
+
+    // State must NOT be mutated.
+    expect(stateBefore).toEqual(stateSnapshot);
+    expect(stateBefore.phases[0].status).toBe("failed");
+    expect(stateBefore.phases[0].error).toBe("old hygiene failure");
+    expect(stateBefore.failedAtPhase).toBe(0);
+
+    // Plan file must NOT be touched.
+    const planMtimeAfter = fs.statSync(planFile).mtimeMs;
+    expect(planMtimeAfter).toBe(planMtimeBefore);
+    expect(fs.readFileSync(planFile, "utf8")).toBe(planContent);
   });
 });
 
@@ -4582,5 +4895,219 @@ describe("ownedFeatureBranch", () => {
     expect(ownedFeatureBranch(state, feature, { singleBranch: true })).toBe(
       "feat/my-prefix",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T8 — Bug 5: QA hygiene gate auto-commits test-only dirty trees
+// ---------------------------------------------------------------------------
+
+describe("maybeAutoCommitTestOnlyDirty (Bug 5)", () => {
+  let repoDir: string;
+
+  beforeEach(() => {
+    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-bug5-"));
+    // Init a real git repo so the auto-commit's `git add -A` + `git commit`
+    // can run end-to-end.
+    spawnSync("git", ["init", "-q"], { cwd: repoDir });
+    spawnSync(
+      "git",
+      [
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=test",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "init",
+      ],
+      { cwd: repoDir },
+    );
+  });
+
+  afterEach(() => {
+    try {
+      fs.rmSync(repoDir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  it("auto-commits when ALL dirty paths match test-path globs", () => {
+    // Write a new test file under __tests__/ (matches default globs).
+    fs.mkdirSync(path.join(repoDir, "server", "__tests__"), {
+      recursive: true,
+    });
+    const testPath = "server/__tests__/foo.test.ts";
+    fs.writeFileSync(path.join(repoDir, testPath), "// new coverage test\n");
+    const headBefore = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout.trim();
+
+    const result = maybeAutoCommitTestOnlyDirty({
+      cwd: repoDir,
+      label: "qa gate",
+      dirtyLines: [`?? ${testPath}`],
+    });
+
+    expect(result.committed).toBe(true);
+    expect(result.reason).toMatch(/committed 1 test path/);
+    const headAfter = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout.trim();
+    expect(headAfter).not.toBe(headBefore);
+    const lastMsg = spawnSync("git", ["log", "-1", "--pretty=%B"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout;
+    expect(lastMsg).toContain("chore(qa): expand coverage via qa gate");
+    expect(lastMsg).toContain("(auto-committed)");
+  });
+
+  it("refuses to commit when ANY dirty path is non-test (e.g. server/routes.ts)", () => {
+    fs.mkdirSync(path.join(repoDir, "server", "__tests__"), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(repoDir, "server", "__tests__", "bar.test.ts"),
+      "// test\n",
+    );
+    fs.writeFileSync(path.join(repoDir, "server", "routes.ts"), "// src\n");
+    const headBefore = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout.trim();
+
+    const result = maybeAutoCommitTestOnlyDirty({
+      cwd: repoDir,
+      label: "qa gate",
+      dirtyLines: ["?? server/__tests__/bar.test.ts", "?? server/routes.ts"],
+    });
+
+    expect(result.committed).toBe(false);
+    expect(result.reason).toContain("non-test paths present");
+    expect(result.reason).toContain("server/routes.ts");
+    const headAfter = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout.trim();
+    expect(headAfter).toBe(headBefore);
+  });
+
+  it("GSTACK_QA_NO_AUTO_COMMIT=1 reverts to old behavior (no auto-commit)", () => {
+    const old = process.env.GSTACK_QA_NO_AUTO_COMMIT;
+    process.env.GSTACK_QA_NO_AUTO_COMMIT = "1";
+    try {
+      fs.mkdirSync(path.join(repoDir, "tests"), { recursive: true });
+      fs.writeFileSync(path.join(repoDir, "tests", "baz.test.ts"), "// t\n");
+      const result = maybeAutoCommitTestOnlyDirty({
+        cwd: repoDir,
+        label: "qa gate",
+        dirtyLines: ["?? tests/baz.test.ts"],
+      });
+      expect(result.committed).toBe(false);
+      expect(result.reason).toContain("GSTACK_QA_NO_AUTO_COMMIT");
+    } finally {
+      if (old === undefined) delete process.env.GSTACK_QA_NO_AUTO_COMMIT;
+      else process.env.GSTACK_QA_NO_AUTO_COMMIT = old;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T8 — Bug 6: --stop-run subcommand
+// ---------------------------------------------------------------------------
+
+describe("runStopRun (Bug 6)", () => {
+  let registryDir: string;
+  let spawnedPids: number[] = [];
+
+  beforeEach(() => {
+    registryDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-bug6-runs-"));
+    spawnedPids = [];
+  });
+
+  afterEach(() => {
+    // Best-effort: kill any sleep processes we left running.
+    for (const pid of spawnedPids) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    }
+    try {
+      fs.rmSync(registryDir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  it("reports already-stopped (exit 0) when the registered PID is dead", async () => {
+    const record = {
+      runId: "fake-run",
+      stateSlug: "fake-run",
+      repoPath: "/tmp/repo",
+      planFile: "/tmp/plan.md",
+      pid: 999999, // very unlikely to be alive
+      status: "running" as const,
+      startedAt: "2026-01-01T00:00:00.000Z",
+      lastUpdatedAt: "2026-01-01T00:00:00.000Z",
+      branches: [],
+    };
+    writeActiveRunRecord(registryDir, record);
+    const exitCode = await runStopRun("fake-run", registryDir);
+    expect(exitCode).toBe(0);
+  });
+
+  it("exits 1 when the active-run record doesn't exist", async () => {
+    const exitCode = await runStopRun("missing-run", registryDir);
+    expect(exitCode).toBe(1);
+  });
+
+  it("refuses to signal a PID whose command line is not gstack-build (PID-reuse guard)", async () => {
+    // Spawn a long-running sleep — its command line is "sleep 600",
+    // NOT gstack-build. runStopRun must refuse to signal it (exit 2).
+    const child = spawnSync("sh", ["-c", "sleep 600 & echo $!"], {
+      encoding: "utf8",
+    });
+    const pidStr = (child.stdout || "").trim();
+    const pid = Number(pidStr);
+    expect(Number.isInteger(pid)).toBe(true);
+    spawnedPids.push(pid);
+
+    const record = {
+      runId: "guard-run",
+      stateSlug: "guard-run",
+      repoPath: "/tmp/repo",
+      planFile: "/tmp/plan.md",
+      pid,
+      status: "running" as const,
+      startedAt: "2026-01-01T00:00:00.000Z",
+      lastUpdatedAt: "2026-01-01T00:00:00.000Z",
+      branches: [],
+    };
+    writeActiveRunRecord(registryDir, record);
+
+    const exitCode = await runStopRun("guard-run", registryDir);
+    expect(exitCode).toBe(2);
+
+    // Confirm the sleep was NOT killed.
+    const stillAlive = spawnSync("ps", ["-p", String(pid)], {
+      encoding: "utf8",
+    });
+    expect(stillAlive.status).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T8 — help text + skill-md sentinel updates
+// ---------------------------------------------------------------------------
+
+describe("HELP_TEXT mentions --stop-run (Bug 6)", () => {
+  it("includes --stop-run <run-id> documentation", () => {
+    expect(HELP_TEXT).toContain("--stop-run <run-id>");
+    expect(HELP_TEXT).toContain("PID reuse");
+  });
+
+  it("--mark-phase-committed help mentions feature-relative form (Bug 3)", () => {
+    expect(HELP_TEXT).toContain("<feature>.<phase>");
   });
 });

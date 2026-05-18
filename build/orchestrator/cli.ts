@@ -3868,7 +3868,7 @@ function isTestOnlyPath(filePath: string, globs: string[]): boolean {
  * test files dirty" complaint while keeping the safety property for any
  * non-test change.
  */
-function maybeAutoCommitTestOnlyDirty(opts: {
+export function maybeAutoCommitTestOnlyDirty(opts: {
   cwd: string;
   label: string;
   dirtyLines: string[];
