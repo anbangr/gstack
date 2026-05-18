@@ -4349,23 +4349,30 @@ export function markPhaseCommittedAfterManualRecovery(args: {
     }
   }
 
-  const clearsBuildFailure =
-    args.state.failedAtPhase === phase.index ||
-    (args.state.failedAtPhase == null && phaseState.status === "failed");
-  args.state.phases[phase.index] = markCommitted(phaseState);
-  args.state.currentPhaseIndex = findNextPhaseIndex(args.state.phases);
-  if (args.state.failedAtPhase === phase.index) {
-    delete args.state.failedAtPhase;
-  }
-  if (clearsBuildFailure) {
-    delete args.state.failureReason;
-  }
-  const feature = args.state.features?.[phase.featureIndex];
-  if (feature && clearsBuildFailure) {
-    if (feature.status === "paused" || feature.status === "failed") {
-      feature.status = "running";
+  // Bug 4: gate the in-memory state mutations on !dryRun. The CLI caller's
+  // trailing saveState (cli.ts ~7769) writes whatever state object we leave
+  // here, so if we mutate it during a dry-run preview, the next save flushes
+  // the "preview" to disk — the opposite of what --dry-run promises.
+  // Plan-file flips above are already gated on !args.dryRun (line 4328+).
+  if (!args.dryRun) {
+    const clearsBuildFailure =
+      args.state.failedAtPhase === phase.index ||
+      (args.state.failedAtPhase == null && phaseState.status === "failed");
+    args.state.phases[phase.index] = markCommitted(phaseState);
+    args.state.currentPhaseIndex = findNextPhaseIndex(args.state.phases);
+    if (args.state.failedAtPhase === phase.index) {
+      delete args.state.failedAtPhase;
     }
-    delete feature.error;
+    if (clearsBuildFailure) {
+      delete args.state.failureReason;
+    }
+    const feature = args.state.features?.[phase.featureIndex];
+    if (feature && clearsBuildFailure) {
+      if (feature.status === "paused" || feature.status === "failed") {
+        feature.status = "running";
+      }
+      delete feature.error;
+    }
   }
   return { ok: true, phaseIndex: phase.index };
 }
@@ -7749,6 +7756,13 @@ async function main() {
         console.error(`\n✗ --mark-phase-committed failed: ${marked.error}\n`);
         exitCode = 2;
         setupFailed = true;
+      } else if (args.dryRun) {
+        // Bug 4: --dry-run must NOT persist state. Honor the flag by skipping
+        // the trailing saveState. Tell the user what would have changed so the
+        // preview is meaningful.
+        console.log(
+          `\n✓ [DRY RUN] Would mark phase ${args.markPhaseCommitted} committed (state NOT written).`,
+        );
       } else {
         console.log(
           `\n✓ Marked phase ${args.markPhaseCommitted} committed after manual recovery.`,
