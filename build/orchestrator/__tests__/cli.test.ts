@@ -25,6 +25,7 @@ import {
   buildOriginVerificationBody,
   ensureFeatureBranch,
   ownedFeatureBranch,
+  safeBranchPart,
   detectRemoteBaseRef,
   syncLandedBase,
   syncFeatureBranchWithBase,
@@ -295,6 +296,83 @@ describe("extractCoverageTarget", () => {
   });
 });
 
+describe("safeBranchPart", () => {
+  it("returns sanitized input unchanged when under 72 chars", () => {
+    const out = safeBranchPart("mitosis-oasis-2026-05-18-b0bf5c19");
+    expect(out).toBe("mitosis-oasis-2026-05-18-b0bf5c19");
+    expect(out.length).toBeLessThanOrEqual(72);
+  });
+
+  it("lowercases and replaces unsafe chars", () => {
+    expect(safeBranchPart("Feature/Auth Setup!")).toBe("feature-auth-setup");
+  });
+
+  it("returns 'run' for empty or all-unsafe input", () => {
+    expect(safeBranchPart("")).toBe("run");
+    expect(safeBranchPart("!@#$%^&*")).toBe("run");
+  });
+
+  it("preserves the tail hash when input exceeds 72 chars (head+tail strategy)", () => {
+    // This is the regression case: the mitosis-oasis Bundle 0 run had a
+    // sanitized branchPrefix 80+ chars long, and the old .slice(0, 72)
+    // truncation dropped the unique b0bf5c19 hash, breaking recovery
+    // branch lookup. See plan: 2026-05-18-build-orchestrator-four-failures.md.
+    const long =
+      "mitosis-oasis-2026-05-18-bundle-0-bug-fix-20260518-180025-b0bf5c19-extra-padding";
+    // Assert the test fixture itself exercises the truncation branch.
+    // Otherwise a future edit could shrink it under 72 and silently
+    // skip the path it's named for.
+    expect(long.length).toBeGreaterThan(72);
+    const out = safeBranchPart(long);
+    expect(out.length).toBeLessThanOrEqual(72);
+    // Head preserved for readability
+    expect(out.startsWith("mitosis-oasis-2026-05-18-bundle")).toBe(true);
+    // Tail preserved so unique suffix survives — load-bearing for identity
+    expect(out.endsWith("padding")).toBe(true);
+  });
+
+  it("preserves the b0bf5c19 hash when it's the actual tail", () => {
+    const long =
+      "mitosis-oasis-mitosis-oasis-2026-05-18-bundle-0-bug-fix-20260518-180025-b0bf5c19";
+    const out = safeBranchPart(long);
+    expect(out.length).toBeLessThanOrEqual(72);
+    expect(out.endsWith("b0bf5c19")).toBe(true);
+  });
+
+  it("collapses leading/trailing dashes after sanitization", () => {
+    expect(safeBranchPart("---foo-bar---")).toBe("foo-bar");
+  });
+
+  it("collapses double-dot patterns (git-ref invalid)", () => {
+    // git check-ref-format rejects `..` in branch names. Sanitization
+    // must produce a valid ref, not a cryptic-error-shaped one.
+    expect(safeBranchPart("foo..bar")).toBe("foo.bar");
+    expect(safeBranchPart("foo....bar")).toBe("foo.bar");
+    // After collapse, also strip leading/trailing dots
+    expect(safeBranchPart("..escape..")).toBe("escape");
+  });
+
+  it("strips trailing '.lock' suffix (git-ref invalid)", () => {
+    // git reserves <ref>.lock for its internal locking.
+    expect(safeBranchPart("foo.lock")).toBe("foo");
+    expect(safeBranchPart("hash-b0bf5c19.lock")).toBe("hash-b0bf5c19");
+  });
+
+  it("does not produce a trailing-dash head when truncation lands on a dash", () => {
+    // Adversarial appendix finding: head ending in `-` then `-tail`
+    // produces `--` (cosmetically ugly, semantically OK but a smell).
+    // After hardening, the head's trailing dash is stripped before join.
+    // Pad input so the first 60 chars end on a dash.
+    const padTo59 = "a".repeat(59); // 59 chars
+    const input = `${padTo59}-tail-hash-padding-extra`; // total 81+
+    expect(input.length).toBeGreaterThan(72);
+    expect(input[59]).toBe("-");
+    const out = safeBranchPart(input);
+    // No `--` (double dash) in the output:
+    expect(out.includes("--")).toBe(false);
+  });
+});
+
 describe("--dual-impl flag wiring", () => {
   it("--help text mentions --dual-impl", () => {
     expect(HELP_TEXT).toContain("--dual-impl");
@@ -375,6 +453,38 @@ describe("--single-branch flag wiring", () => {
     const args = parseArgs(["plan.md", "--single-branch", "--dry-run"]);
     expect(args.singleBranch).toBe(true);
     expect(args.dryRun).toBe(true);
+  });
+});
+
+describe("--ship-on-plan-complete flag wiring", () => {
+  it("parseArgs default -> shipOnPlanComplete=false", () => {
+    const args = parseArgs(["plan.md"]);
+    expect(args.shipOnPlanComplete).toBe(false);
+  });
+
+  it("parseArgs([plan, --ship-on-plan-complete]) sets shipOnPlanComplete=true", () => {
+    const args = parseArgs(["plan.md", "--ship-on-plan-complete"]);
+    expect(args.shipOnPlanComplete).toBe(true);
+  });
+
+  it("--ship-on-plan-complete + --single-branch is rejected as mutually exclusive", () => {
+    // Previously the parser accepted both; runtime semantics were
+    // undefined (deferred-ship continue fired alongside the
+    // single-branch end-of-loop ship). Now parseArgs hard-fails so
+    // callers can't synthesize an undefined combination by accident.
+    expectParseArgsExit(
+      ["plan.md", "--single-branch", "--ship-on-plan-complete"],
+      "mutually exclusive",
+    );
+    // Order doesn't matter.
+    expectParseArgsExit(
+      ["plan.md", "--ship-on-plan-complete", "--single-branch"],
+      "mutually exclusive",
+    );
+  });
+
+  it("--ship-on-plan-complete is documented in --help", () => {
+    expect(HELP_TEXT).toContain("--ship-on-plan-complete");
   });
 });
 
@@ -5297,15 +5407,102 @@ describe("maybeAutoCommitTestOnlyDirty (Bug 5)", () => {
     expect(lastMsg).toContain("(auto-committed)");
   });
 
-  it("refuses to commit when ANY dirty path is non-test (e.g. server/routes.ts)", () => {
+  it("auto-splits mixed test+production diff into two commits (default behavior)", () => {
+    // Failure 3 from the mitosis-oasis incident: a review/qa role
+    // produced a mixed diff. Previously the gate refused entirely and
+    // required manual --mark-phase-committed recovery. The auto-split
+    // path puts test changes in one commit and production fixes in a
+    // second, both attributed to gstack-build (qa auto-commit).
     fs.mkdirSync(path.join(repoDir, "server", "__tests__"), {
       recursive: true,
     });
     fs.writeFileSync(
       path.join(repoDir, "server", "__tests__", "bar.test.ts"),
-      "// test\n",
+      "// new coverage\n",
     );
+    fs.writeFileSync(path.join(repoDir, "server", "routes.ts"), "// fix\n");
+
+    const result = maybeAutoCommitTestOnlyDirty({
+      cwd: repoDir,
+      label: "Codex review",
+      dirtyLines: ["?? server/__tests__/bar.test.ts", "?? server/routes.ts"],
+    });
+
+    expect(result.committed).toBe(true);
+    expect(result.reason).toContain("auto-split");
+    expect(result.reason).toContain("1 test path");
+    expect(result.reason).toContain("1 production path");
+
+    // Verify two commits landed with the right messages, in the right
+    // order. The test-only commit should be FIRST (older), production
+    // SECOND (newer/HEAD).
+    const log = spawnSync(
+      "git",
+      ["log", "-2", "--pretty=format:%s%n%b%n---END---"],
+      { cwd: repoDir, encoding: "utf8" },
+    ).stdout;
+    expect(log).toContain("chore(qa): expand coverage via Codex review");
+    expect(log).toContain("chore(qa): production fixes from Codex review");
+    expect(log).toContain("(auto-split)");
+
+    // HEAD~1 should be the test-only commit (older).
+    const head1Msg = spawnSync("git", ["log", "-1", "--pretty=%s", "HEAD~1"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout;
+    expect(head1Msg).toContain("expand coverage");
+    // HEAD should be the production commit (newer).
+    const headMsg = spawnSync("git", ["log", "-1", "--pretty=%s"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout;
+    expect(headMsg).toContain("production fixes");
+  });
+
+  it("GSTACK_QA_NO_AUTO_SPLIT=1 disables auto-split, falls back to manual recovery on mixed diff", () => {
+    const old = process.env.GSTACK_QA_NO_AUTO_SPLIT;
+    process.env.GSTACK_QA_NO_AUTO_SPLIT = "1";
+    try {
+      fs.mkdirSync(path.join(repoDir, "server", "__tests__"), {
+        recursive: true,
+      });
+      fs.writeFileSync(
+        path.join(repoDir, "server", "__tests__", "bar.test.ts"),
+        "// test\n",
+      );
+      fs.writeFileSync(path.join(repoDir, "server", "routes.ts"), "// src\n");
+      const headBefore = spawnSync("git", ["rev-parse", "HEAD"], {
+        cwd: repoDir,
+        encoding: "utf8",
+      }).stdout.trim();
+
+      const result = maybeAutoCommitTestOnlyDirty({
+        cwd: repoDir,
+        label: "qa gate",
+        dirtyLines: ["?? server/__tests__/bar.test.ts", "?? server/routes.ts"],
+      });
+
+      expect(result.committed).toBe(false);
+      expect(result.reason).toContain("non-test paths present");
+      expect(result.reason).toContain("server/routes.ts");
+      const headAfter = spawnSync("git", ["rev-parse", "HEAD"], {
+        cwd: repoDir,
+        encoding: "utf8",
+      }).stdout.trim();
+      expect(headAfter).toBe(headBefore);
+    } finally {
+      if (old === undefined) delete process.env.GSTACK_QA_NO_AUTO_SPLIT;
+      else process.env.GSTACK_QA_NO_AUTO_SPLIT = old;
+    }
+  });
+
+  it("refuses to commit when ALL paths are production (no test paths to split with)", () => {
+    // The auto-split path requires BOTH layers to fire. A pure
+    // production-only diff from a review/qa role still bails to manual
+    // recovery — we never auto-commit production-only changes.
+    fs.mkdirSync(path.join(repoDir, "server"), { recursive: true });
     fs.writeFileSync(path.join(repoDir, "server", "routes.ts"), "// src\n");
+    fs.writeFileSync(path.join(repoDir, "server", "auth.ts"), "// src\n");
     const headBefore = spawnSync("git", ["rev-parse", "HEAD"], {
       cwd: repoDir,
       encoding: "utf8",
@@ -5314,12 +5511,11 @@ describe("maybeAutoCommitTestOnlyDirty (Bug 5)", () => {
     const result = maybeAutoCommitTestOnlyDirty({
       cwd: repoDir,
       label: "qa gate",
-      dirtyLines: ["?? server/__tests__/bar.test.ts", "?? server/routes.ts"],
+      dirtyLines: ["?? server/routes.ts", "?? server/auth.ts"],
     });
 
     expect(result.committed).toBe(false);
     expect(result.reason).toContain("non-test paths present");
-    expect(result.reason).toContain("server/routes.ts");
     const headAfter = spawnSync("git", ["rev-parse", "HEAD"], {
       cwd: repoDir,
       encoding: "utf8",
@@ -5344,6 +5540,116 @@ describe("maybeAutoCommitTestOnlyDirty (Bug 5)", () => {
       if (old === undefined) delete process.env.GSTACK_QA_NO_AUTO_COMMIT;
       else process.env.GSTACK_QA_NO_AUTO_COMMIT = old;
     }
+  });
+
+  it("GSTACK_QA_NO_AUTO_COMMIT accepts true / yes / TRUE (case-insensitive)", () => {
+    // Regression: pre-fix code did literal `=== "1"` equality, so
+    // GSTACK_QA_NO_AUTO_COMMIT=true silently failed to disable.
+    const old = process.env.GSTACK_QA_NO_AUTO_COMMIT;
+    fs.mkdirSync(path.join(repoDir, "tests"), { recursive: true });
+    try {
+      for (const v of ["true", "yes", "TRUE", "1", "True"]) {
+        process.env.GSTACK_QA_NO_AUTO_COMMIT = v;
+        fs.writeFileSync(
+          path.join(repoDir, "tests", `tv-${v}.test.ts`),
+          "// t\n",
+        );
+        const result = maybeAutoCommitTestOnlyDirty({
+          cwd: repoDir,
+          label: "qa gate",
+          dirtyLines: [`?? tests/tv-${v}.test.ts`],
+        });
+        expect(result.committed).toBe(false);
+        expect(result.reason).toContain("GSTACK_QA_NO_AUTO_COMMIT");
+      }
+    } finally {
+      if (old === undefined) delete process.env.GSTACK_QA_NO_AUTO_COMMIT;
+      else process.env.GSTACK_QA_NO_AUTO_COMMIT = old;
+    }
+  });
+
+  it("auto-split rollback: if production commit fails, test commit is undone (HEAD restored)", () => {
+    // Regression test for the CRITICAL adversarial finding: without
+    // rollback, a failing prod commit leaves the test commit stranded.
+    // Simulate the failure via a pre-commit hook that rejects any
+    // path that is NOT under __tests__. This simulates a realistic
+    // hook (e.g., a Jira-id-on-src/-only hook or a lint-only-on-prod
+    // hook): the test-only commit passes; the production commit fails.
+    const hooksDir = path.join(repoDir, ".git", "hooks");
+    fs.mkdirSync(hooksDir, { recursive: true });
+    const hookPath = path.join(hooksDir, "pre-commit");
+    fs.writeFileSync(
+      hookPath,
+      "#!/bin/sh\n" +
+        "# Reject staged paths under src/ that are NOT under __tests__.\n" +
+        "if git diff --cached --name-only | grep -E '^src/' | grep -v '__tests__' | grep -q .; then\n" +
+        '  echo "hook: production path rejected" >&2\n' +
+        "  exit 1\n" +
+        "fi\n" +
+        "exit 0\n",
+    );
+    fs.chmodSync(hookPath, 0o755);
+
+    fs.mkdirSync(path.join(repoDir, "src"), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, "src", "__tests__"), { recursive: true });
+    fs.writeFileSync(
+      path.join(repoDir, "src", "__tests__", "x.test.ts"),
+      "// t\n",
+    );
+    fs.writeFileSync(path.join(repoDir, "src", "x.ts"), "// p\n");
+
+    const headBefore = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout.trim();
+
+    const result = maybeAutoCommitTestOnlyDirty({
+      cwd: repoDir,
+      label: "qa gate",
+      dirtyLines: ["?? src/__tests__/x.test.ts", "?? src/x.ts"],
+    });
+
+    expect(result.committed).toBe(false);
+    expect(result.reason).toContain("auto-split production commit failed");
+    expect(result.reason).toMatch(/rolled back test commit [0-9a-f]{7}/);
+    expect(result.nonTestPaths).toContain("src/x.ts");
+
+    // HEAD must be back where it started — no stranded test commit.
+    const headAfter = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout.trim();
+    expect(headAfter).toBe(headBefore);
+  });
+
+  it("aborts cleanly on porcelain-parse-unsafe paths (quoted special chars / escapes)", () => {
+    // Adversarial 2b/2c: porcelain v1 quotes paths containing
+    // newlines, tabs, or non-ASCII. The bare parser leaves backslash
+    // escapes literal and can mishandle internal " -> " in rename
+    // names. The gate must refuse rather than pass a misparsed path
+    // to `git add --` and risk half-shipping.
+    const headBefore = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout.trim();
+
+    const result = maybeAutoCommitTestOnlyDirty({
+      cwd: repoDir,
+      label: "qa gate",
+      // Path with a backslash escape (porcelain quoting for non-ASCII):
+      dirtyLines: ["?? tests/caf\\303\\251.test.ts"],
+    });
+
+    expect(result.committed).toBe(false);
+    expect(result.reason).toContain("porcelain parse unsafe");
+    expect(result.nonTestPaths).toBeDefined();
+    expect(result.nonTestPaths?.length).toBeGreaterThan(0);
+
+    const headAfter = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout.trim();
+    expect(headAfter).toBe(headBefore);
   });
 });
 

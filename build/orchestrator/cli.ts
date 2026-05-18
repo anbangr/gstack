@@ -607,6 +607,8 @@ export interface Args {
   skipShip: boolean;
   /** When true, all features share one feat/<prefix> branch; /ship + /land-and-deploy run once after all features complete. */
   singleBranch: boolean;
+  /** When true, keep per-feature branches but defer /ship + /land-and-deploy until ALL features reach phases_done. Then ship in feature order. */
+  shipOnPlanComplete: boolean;
   releaseMode: "queued" | "auto-land";
   maxCodexIter: number;
   testCmd?: string;
@@ -789,6 +791,7 @@ export function parseArgs(argv: string[]): Args {
     noGbrain: false,
     skipShip: false,
     singleBranch: false,
+    shipOnPlanComplete: false,
     releaseMode: "queued",
     maxCodexIter: DEFAULT_MAX_CODEX_ITERATIONS,
     projectRoot: undefined,
@@ -855,6 +858,7 @@ export function parseArgs(argv: string[]): Args {
     else if (a === "--no-gbrain") args.noGbrain = true;
     else if (a === "--skip-ship") args.skipShip = true;
     else if (a === "--single-branch") args.singleBranch = true;
+    else if (a === "--ship-on-plan-complete") args.shipOnPlanComplete = true;
     else if (a === "--release-mode") {
       const next = argv[++i];
       if (next !== "queued" && next !== "auto-land") {
@@ -1375,6 +1379,21 @@ export function parseArgs(argv: string[]): Args {
   const providerErrors = validateRoleProviders(args);
   if (providerErrors.length > 0) {
     console.error(providerErrors.join("\n"));
+    process.exit(2);
+  }
+  // --single-branch and --ship-on-plan-complete are mutually exclusive.
+  // Single-branch already defers all shipping to the end of the plan
+  // (after the per-feature ship gate is skipped); --ship-on-plan-complete
+  // adds a parallel deferral path on top of multi-branch mode. Stacking
+  // them was previously accepted at the parser but undefined at runtime
+  // (the deferred-ship continue would fire alongside the single-branch
+  // end-of-loop ship). Refuse explicitly.
+  if (args.singleBranch && args.shipOnPlanComplete) {
+    console.error(
+      "--single-branch and --ship-on-plan-complete are mutually exclusive. " +
+        "--single-branch already defers shipping until all features complete; " +
+        "--ship-on-plan-complete is the per-branch equivalent. Pick one.",
+    );
     process.exit(2);
   }
   // Claude Code's Bash tool auto-backgrounds commands that run past ~10 min,
@@ -2523,6 +2542,14 @@ Flags:
                        /land-and-deploy runs once after all features complete
                        instead of after each feature. Auto-selected by the
                        driver agent based on plan cohesion.
+  --ship-on-plan-complete
+                       Keep per-feature branches (default multi-branch mode)
+                       but defer /ship + /land-and-deploy for every feature
+                       until ALL features reach phases_done. Then PRs open in
+                       feature order. Use for bundle-style multi-feature
+                       plans where each feature is independently revertable
+                       but you want to review the whole bundle before any
+                       PR lands.
   --release-mode <m>   queued (default) runs /ship then queues PR for the
                        release daemon. auto-land preserves legacy /ship +
                        /land-and-deploy behavior.
@@ -2864,14 +2891,47 @@ function featureSlug(feature: FeatureState): string {
   );
 }
 
-function safeBranchPart(value: string): string {
-  return (
-    value
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 72) || "run"
-  );
+// Identity-preserving truncation. When sanitized input exceeds the
+// 72-char ceiling we keep the head (for human readability) and the tail
+// (which carries the unique run hash) so recovery-branch lookup still
+// works. Plain .slice would drop the hash and break identity.
+//
+// Also normalizes for git-ref validity (git check-ref-format rules):
+//   - collapses `..` to `.` (git forbids `..` in ref names)
+//   - strips leading/trailing `.` (forbidden by git)
+//   - strips `.lock` suffix (git treats it as the ref-lock file)
+// These rules used to surface as cryptic `fatal: '...' is not a valid
+// branch name` errors deep in the orchestrator. Doing the
+// normalization here keeps the error visible at the source.
+export function safeBranchPart(value: string): string {
+  let sanitized = value
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  // Git-ref hardening: collapse `..` → `.`, drop edge `.`, drop `.lock`
+  // suffix. Loop the `..` replacement because a string like `....` would
+  // otherwise leave `..` after one pass.
+  while (sanitized.includes("..")) {
+    sanitized = sanitized.replace(/\.\.+/g, ".");
+  }
+  sanitized = sanitized.replace(/^\.+|\.+$/g, "");
+  if (sanitized.endsWith(".lock")) {
+    sanitized = sanitized.slice(0, -".lock".length).replace(/\.+$/, "");
+  }
+  // After hardening, edges may have new leading/trailing dashes. Strip again.
+  sanitized = sanitized.replace(/^-+|-+$/g, "");
+  if (sanitized.length === 0) return "run";
+  if (sanitized.length <= 72) return sanitized;
+  // Head+tail truncation. Strip trailing dash from the head so we don't
+  // produce `xxx--tail` when the head boundary falls on a dash.
+  const headRaw = sanitized.slice(0, 60);
+  const head = headRaw.replace(/-+$/, "");
+  const tailRaw = sanitized.slice(-8);
+  const tail = tailRaw.replace(/^-+/, "");
+  // Defensive: if either side collapses to empty (shouldn't happen
+  // after the edge-trim above, but guard anyway), fall back to the
+  // non-trimmed slice so we never return "".
+  return `${head || headRaw}-${tail || tailRaw}`;
 }
 
 export function ownedFeatureBranch(
@@ -3162,16 +3222,75 @@ export function isFeatureTerminal(f: FeatureState): boolean {
 
 export function findNextFeatureIndex(
   state: BuildState,
-  opts: { skipOriginVerified?: boolean } = {},
+  opts: {
+    skipOriginVerified?: boolean;
+    /**
+     * When set, also skip features stuck at phases_done — used by
+     * --ship-on-plan-complete to move past deferred-ship features and
+     * keep iterating to the next feature with phase work to do.
+     */
+    skipPhasesDone?: boolean;
+  } = {},
 ): number {
   const features = state.features ?? [];
   for (let i = 0; i < features.length; i++) {
     const f = features[i];
     if (opts.skipOriginVerified && f.status === "origin_verified") continue;
+    if (opts.skipPhasesDone && f.status === "phases_done") continue;
     if (isFeatureTerminal(f)) continue;
     return i;
   }
   return -1;
+}
+
+/**
+ * For `--ship-on-plan-complete`: returns true only when every feature
+ * in the plan has finished phase work AND there's nothing alive that
+ * would contaminate sibling worktrees if we proceeded to ship.
+ *
+ * Statuses that pass the gate:
+ *   - phases_done (ready to ship)
+ *   - shipping / release_queued / landed / origin_verifying /
+ *     origin_verified / committed (already past the gate; siblings can
+ *     ride on top)
+ *
+ * Statuses that BLOCK the gate (so deferred ships don't fire while
+ * something else might still mutate the working tree or branch state):
+ *   - pending, running — phase work still outstanding
+ *   - feature_review_pending, feature_review_running,
+ *     feature_redo_pending, feature_blocked — feature-review lifecycle
+ *     hasn't resolved
+ *   - paused — a ship attempt failed mid-batch; ordering invariant
+ *     would be violated if we let later features ship while an earlier
+ *     one is stuck. User must triage before deferred-ship resumes.
+ *   - failed — adversarial review flagged: a failed feature can leave
+ *     the worktree dirty, and pretending it's "done" lets that dirt
+ *     leak into sibling ships. Blocking failed means the user
+ *     investigates before any deferred ship fires. Features INDEXED
+ *     BEFORE a failed/paused feature can still ship via the outer
+ *     loop's per-feature pass; features INDEXED AFTER will not, which
+ *     is the safe default.
+ */
+export function allFeaturesReachedPhasesDone(state: BuildState): boolean {
+  const features = state.features ?? [];
+  if (features.length === 0) return false;
+  for (const f of features) {
+    switch (f.status) {
+      case "phases_done":
+      case "shipping":
+      case "release_queued":
+      case "landed":
+      case "origin_verifying":
+      case "origin_verified":
+      case "committed":
+        continue;
+      // pending, running, feature_review_pending, feature_review_running,
+      // feature_redo_pending, feature_blocked — phase work still outstanding
+      default:
+        return false;
+    }
+  }
+  return true;
 }
 
 function featureReviewAlreadySatisfied(feature: FeatureState): boolean {
@@ -4301,18 +4420,78 @@ function isTestOnlyPath(filePath: string, globs: string[]): boolean {
 }
 
 /**
- * Bug 5: when a review/qa gate leaves the working tree dirty AND every dirty
- * path matches a test-path glob, auto-commit the changes with attribution.
- * Returns true if the auto-commit fired (caller should re-check hygiene as
- * clean), false otherwise (caller falls through to the normal fail path).
+ * Detect porcelain v1 status lines that cannot be unambiguously parsed
+ * back to a single on-disk path. Two known unsafe shapes:
  *
- * Backout knob: `GSTACK_QA_NO_AUTO_COMMIT=1` reverts to pre-fix behavior.
+ *  1. A surviving leading or trailing `"` after `porcelainStatusToPath`
+ *     strips the outer quotes — means the original was an internally-
+ *     quoted rename target (e.g. `R  "old -> name" -> "new -> name"`)
+ *     and the parser took the wrong half.
+ *  2. A backslash escape (`\n`, `\t`, `\"`, octal like `\303\251`) —
+ *     git porcelain v1 emits these for paths with non-ASCII or control
+ *     bytes; we'd need `-z` mode to decode them safely.
  *
- * The auto-commit is intentionally narrow: source-code changes still require
- * human review. Only test-only expansions get the auto-commit pass. Matches
- * the screenshot's "Codex genuinely wants to expand coverage and leaves
- * test files dirty" complaint while keeping the safety property for any
- * non-test change.
+ * When either shape is seen, the auto-commit caller MUST bail rather
+ * than pass the path to `git add --`. The pathspec would fail to match
+ * and (in the auto-split path) leave a half-shipped commit on the
+ * branch. Routing to manual recovery is the safe default.
+ *
+ * Long-term fix: have the caller capture porcelain via `git status -z`
+ * and remove this guard. For now, fail closed.
+ */
+function isPorcelainParseUnsafe(path: string): boolean {
+  if (path.includes('"')) return true; // unbalanced quote after strip
+  if (/\\/.test(path)) return true; // escape sequence survived
+  return false;
+}
+
+/** Parse env-var booleans permissively. Accepts "1", "true", "yes" in
+ *  any case (with trailing whitespace tolerated). Empty / unset / any
+ *  other value returns false. Used for GSTACK_QA_NO_AUTO_COMMIT and
+ *  GSTACK_QA_NO_AUTO_SPLIT — users expect idiomatic boolean semantics
+ *  rather than literal "1" string equality. */
+function parseBooleanEnv(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
+/** Read current HEAD SHA for the given worktree. Returns the full SHA
+ *  on success, empty string on any failure (so callers can detect with
+ *  a falsy check). Used by maybeAutoCommitTestOnlyDirty to pin a
+ *  rollback point before the auto-split. */
+function captureHeadSha(cwd: string): string {
+  const r = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" });
+  if (r.status !== 0) return "";
+  return (r.stdout || "").trim();
+}
+
+/**
+ * Bug 5: when a review/qa gate leaves the working tree dirty, auto-commit
+ * the changes with attribution. Two paths:
+ *
+ *   (a) All paths test-only → single commit with the standard
+ *       "expand coverage" message (legacy behavior).
+ *   (b) Mixed test + production paths → split into TWO commits when
+ *       `--qa-auto-split` is enabled (default ON, opt-out via
+ *       GSTACK_QA_NO_AUTO_SPLIT=1): first commit stages only test
+ *       paths with the standard message, second commit stages
+ *       production paths with a "production fixes" message that
+ *       makes the role's intent legible in `git log`.
+ *
+ * Splitting matters because the skill template tells synthesizer
+ * agents to keep Review & QA test-only (see SKILL.md.tmpl Phase A
+ * fix), but live runs still sometimes produce mixed diffs (e.g. a
+ * reviewer finds a real bug and fixes inline). Without auto-split,
+ * the user has to manually `--mark-phase-committed` to recover.
+ *
+ * Backout knobs:
+ *   - GSTACK_QA_NO_AUTO_COMMIT=1 — disable both paths entirely.
+ *   - GSTACK_QA_NO_AUTO_SPLIT=1 — disable (b) only, leaving (a).
+ *
+ * The split is intentionally clear in git log: two commits with
+ * different messages. A future bisect on the production-fixes commit
+ * isolates the inline fix from the coverage expansion.
  */
 export function maybeAutoCommitTestOnlyDirty(opts: {
   cwd: string;
@@ -4320,15 +4499,102 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
   dirtyLines: string[];
   globs?: string[];
 }): { committed: boolean; reason: string; nonTestPaths?: string[] } {
-  if (process.env.GSTACK_QA_NO_AUTO_COMMIT === "1") {
-    return { committed: false, reason: "GSTACK_QA_NO_AUTO_COMMIT=1" };
+  if (parseBooleanEnv(process.env.GSTACK_QA_NO_AUTO_COMMIT)) {
+    return { committed: false, reason: "GSTACK_QA_NO_AUTO_COMMIT enabled" };
   }
   const globs = opts.globs ?? DEFAULT_QA_TEST_PATH_GLOBS;
   const paths = opts.dirtyLines.map(porcelainStatusToPath);
   if (paths.length === 0) {
     return { committed: false, reason: "no dirty paths" };
   }
+  // Porcelain parse safety: if any path indicates the parser couldn't
+  // unambiguously recover the on-disk path (rename with literal " -> "
+  // in name, escape-quoted special chars), abort the auto-commit
+  // entirely and route to manual recovery. Half-shipping a misparsed
+  // path is worse than blocking.
+  const unsafe = paths.filter(isPorcelainParseUnsafe);
+  if (unsafe.length > 0) {
+    return {
+      committed: false,
+      reason: `porcelain parse unsafe paths (special chars or escape sequences): ${unsafe.slice(0, 3).join(", ")}${unsafe.length > 3 ? ` (+${unsafe.length - 3} more)` : ""}`,
+      nonTestPaths: unsafe,
+    };
+  }
   const nonTest = paths.filter((p) => !isTestOnlyPath(p, globs));
+  const testOnly = paths.filter((p) => isTestOnlyPath(p, globs));
+
+  // Mixed diff path: auto-split, gated on GSTACK_QA_NO_AUTO_SPLIT for
+  // opt-out. The skill template warns synthesizers off mixed diffs,
+  // but the gate stays permissive as defense in depth.
+  //
+  // Rollback safety: between the test commit and the prod commit, we
+  // pin HEAD via a sentinel ref. If the prod commit fails, we
+  // reset --soft to the sentinel so HEAD goes back to the pre-split
+  // state with both layers' changes back in the index. Without this,
+  // a failing pre-commit hook on prod paths would leave the test
+  // commit stranded on the branch with no automatic recovery.
+  if (
+    nonTest.length > 0 &&
+    testOnly.length > 0 &&
+    !parseBooleanEnv(process.env.GSTACK_QA_NO_AUTO_SPLIT)
+  ) {
+    // Pin pre-split HEAD for rollback.
+    const headBefore = captureHeadSha(opts.cwd);
+    if (!headBefore) {
+      return {
+        committed: false,
+        reason: "auto-split aborted: could not read HEAD before split",
+      };
+    }
+    // First commit: test paths only.
+    const testCommit = commitPathsByList({
+      cwd: opts.cwd,
+      paths: testOnly,
+      message: buildTestOnlyAutoCommitMessage(opts.label, testOnly),
+    });
+    if (!testCommit.ok) {
+      return {
+        committed: false,
+        reason: `auto-split test commit failed: ${testCommit.error}`,
+      };
+    }
+    // Second commit: production paths.
+    const prodCommit = commitPathsByList({
+      cwd: opts.cwd,
+      paths: nonTest,
+      message: buildProductionFixesAutoCommitMessage(opts.label, nonTest),
+    });
+    if (!prodCommit.ok) {
+      // Rollback: undo the test commit so we return to pre-split state.
+      // We use `reset --soft <sha>` rather than --hard so the user
+      // doesn't lose their dirty changes. Stages stay populated, working
+      // tree unchanged. If rollback itself fails (extremely rare —
+      // means the worktree is mid-corruption), surface BOTH errors so
+      // the user knows manual cleanup is required.
+      const rollback = spawnSync("git", ["reset", "--soft", headBefore], {
+        cwd: opts.cwd,
+        encoding: "utf8",
+      });
+      const rollbackNote =
+        rollback.status === 0
+          ? `rolled back test commit ${testCommit.testSha?.slice(0, 7) ?? "(sha unknown)"}`
+          : `ROLLBACK FAILED — repo at ${headBefore}; manual reset needed: ${(rollback.stderr || "").trim()}`;
+      return {
+        committed: false,
+        reason: `auto-split production commit failed: ${prodCommit.error} (${rollbackNote})`,
+        nonTestPaths: nonTest,
+      };
+    }
+    return {
+      committed: true,
+      reason: `auto-split: committed ${testOnly.length} test path(s) + ${nonTest.length} production path(s)`,
+    };
+  }
+
+  // Pure non-test diff (no test paths at all) — opt-out path:
+  // bail to manual recovery. We don't auto-commit production-only
+  // changes from a review/qa role; that would skip the whole point of
+  // human review on source code.
   if (nonTest.length > 0) {
     return {
       committed: false,
@@ -4338,15 +4604,50 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
       nonTestPaths: nonTest,
     };
   }
-  // All paths test-only → auto-commit.
-  const addR = spawnSync("git", ["add", "-A"], { cwd: opts.cwd });
-  if (addR.status !== 0) {
+
+  // All paths test-only → single auto-commit (legacy behavior).
+  const single = commitPathsByList({
+    cwd: opts.cwd,
+    paths,
+    message: buildTestOnlyAutoCommitMessage(opts.label, paths),
+    stageMode: "addAll",
+  });
+  if (!single.ok) {
     return {
       committed: false,
-      reason: `git add failed: ${(addR.stderr?.toString() || "").trim()}`,
+      reason: single.error ?? "commit failed",
     };
   }
-  const message = `chore(qa): expand coverage via ${opts.label} (auto-committed)\n\nAuto-committed by gstack-build because the ${opts.label} role left only\ntest-path changes dirty. The hygiene gate previously failed in this case\neven when Codex/Gemini did legitimate coverage expansion. To revert this\nbehavior set GSTACK_QA_NO_AUTO_COMMIT=1.\n\nFiles:\n${paths.map((p) => `  ${p}`).join("\n")}`;
+  return { committed: true, reason: `committed ${paths.length} test path(s)` };
+}
+
+/**
+ * Stage and commit a specific list of paths. Helper for
+ * maybeAutoCommitTestOnlyDirty's auto-split path. Uses identity
+ * "gstack-build (qa auto-commit)" so both halves of a split are
+ * grep-able in git log.
+ *
+ * stageMode="byPath" (default): stage exactly the listed paths.
+ * stageMode="addAll": stage every dirty path (`git add -A`). Used by
+ * the legacy single-commit path to preserve byte-for-byte behavior on
+ * the all-test-paths case.
+ */
+function commitPathsByList(opts: {
+  cwd: string;
+  paths: string[];
+  message: string;
+  stageMode?: "byPath" | "addAll";
+}): { ok: true; testSha: string } | { ok: false; error: string } {
+  const stageMode = opts.stageMode ?? "byPath";
+  const stageArgs =
+    stageMode === "addAll" ? ["add", "-A"] : ["add", "--", ...opts.paths];
+  const addR = spawnSync("git", stageArgs, { cwd: opts.cwd, encoding: "utf8" });
+  if (addR.status !== 0) {
+    return {
+      ok: false,
+      error: `git add failed: ${(addR.stderr || "").trim()}`,
+    };
+  }
   const commitR = spawnSync(
     "git",
     [
@@ -4356,17 +4657,35 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
       "user.email=gstack-build+qa@local",
       "commit",
       "-m",
-      message,
+      opts.message,
     ],
     { cwd: opts.cwd, encoding: "utf8" },
   );
   if (commitR.status !== 0) {
     return {
-      committed: false,
-      reason: `git commit failed: ${(commitR.stderr || "").trim()}`,
+      ok: false,
+      error: `git commit failed: ${(commitR.stderr || "").trim()}`,
     };
   }
-  return { committed: true, reason: `committed ${paths.length} test path(s)` };
+  // Capture the newly-created commit's SHA so callers (auto-split
+  // rollback) can cite which commit they undid. Failure to read the
+  // SHA isn't itself a failure of the commit — return empty string so
+  // the caller can still log generically.
+  return { ok: true, testSha: captureHeadSha(opts.cwd) };
+}
+
+function buildTestOnlyAutoCommitMessage(
+  label: string,
+  paths: string[],
+): string {
+  return `chore(qa): expand coverage via ${label} (auto-committed)\n\nAuto-committed by gstack-build because the ${label} role left only\ntest-path changes dirty. The hygiene gate previously failed in this case\neven when Codex/Gemini did legitimate coverage expansion. To revert this\nbehavior set GSTACK_QA_NO_AUTO_COMMIT=1.\n\nFiles:\n${paths.map((p) => `  ${p}`).join("\n")}`;
+}
+
+function buildProductionFixesAutoCommitMessage(
+  label: string,
+  paths: string[],
+): string {
+  return `chore(qa): production fixes from ${label} (auto-split)\n\nAuto-committed by gstack-build via the hygiene gate's auto-split path:\nthe ${label} role left a mixed test + production diff dirty, so the\ngate split it into two commits (this one, plus a preceding test-only\ncommit). The split makes the role's intent legible in git log and\nallows independent bisect of production vs test changes.\n\nThe skill template tells synthesizer agents to keep Review & QA\nlimited to test paths and to emit follow-up [code] phases for real\nbugs; this commit is the safety net for when that contract isn't met.\nTo disable splitting (and fall back to manual recovery) set\nGSTACK_QA_NO_AUTO_SPLIT=1. To disable all auto-commits set\nGSTACK_QA_NO_AUTO_COMMIT=1.\n\nFiles:\n${paths.map((p) => `  ${p}`).join("\n")}`;
 }
 
 function applyGateHygiene(opts: {
@@ -8704,8 +9023,15 @@ async function main() {
         while (true) {
           const skipUnshippedVerified =
             args.skipShip || args.singleBranch || args.dryRun;
+          // --ship-on-plan-complete: defer per-feature ship by routing
+          // findNextFeatureIndex past phases_done features until every
+          // feature has reached phases_done; THEN fall through and ship
+          // them in order.
+          const deferPerFeatureShip =
+            args.shipOnPlanComplete && !allFeaturesReachedPhasesDone(state);
           const featureIndex = findNextFeatureIndex(state, {
             skipOriginVerified: skipUnshippedVerified,
+            skipPhasesDone: deferPerFeatureShip,
           });
           if (featureIndex === -1) break;
           const featureState = state.features![featureIndex];
@@ -9150,6 +9476,21 @@ async function main() {
             // through to the existing ship logic below.
             featureState.status = "phases_done";
             saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+          }
+
+          // --ship-on-plan-complete: defer this feature's ship if any
+          // sibling still has phase work to do. The feature stays at
+          // phases_done; the outer loop's findNextFeatureIndex with
+          // skipPhasesDone:true will move past it to the next pending
+          // feature. When the last feature's phases finish,
+          // allFeaturesReachedPhasesDone() flips true, skipPhasesDone
+          // becomes false, the deferred features re-surface in feature
+          // order, and the ship gate below fires for each in turn.
+          if (args.shipOnPlanComplete && !allFeaturesReachedPhasesDone(state)) {
+            console.log(
+              `\n▶ Feature ${featureState.number} phases complete — deferring ship (--ship-on-plan-complete).`,
+            );
+            continue;
           }
 
           if (

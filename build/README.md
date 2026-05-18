@@ -368,30 +368,32 @@ the root cause, re-run the same `gstack-build` command to resume.
 
 ## Important Flags
 
-| Flag                           | Effect                                                                                                                                          |
-| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--print-only`                 | Parse the plan and print the phase table.                                                                                                       |
-| `--dry-run`                    | Walk the state machine without spawning sub-agents or shipping.                                                                                 |
-| `--skip-ship`                  | Complete phases but skip final ship and deploy.                                                                                                 |
-| `--no-resume`                  | Ignore existing state and start fresh.                                                                                                          |
-| `--no-gbrain`                  | Use only local JSON state.                                                                                                                      |
-| `--dual-impl`                  | Run configured primary and secondary implementations in parallel worktrees.                                                                     |
-| `--test-writer-model <m>`      | Override failing-test writer model.                                                                                                             |
-| `--primary-impl-model <m>`     | Override primary implementor model.                                                                                                             |
-| `--test-fixer-model <m>`       | Override test-fixer model.                                                                                                                      |
-| `--secondary-impl-model <m>`   | Override dual-impl secondary model.                                                                                                             |
-| `--review-model <m>`           | Override primary review model.                                                                                                                  |
-| `--review-secondary-model <m>` | Override secondary review model.                                                                                                                |
-| `--qa-model <m>`               | Override QA model.                                                                                                                              |
-| `--ship-model <m>`             | Override ship model.                                                                                                                            |
-| `--land-model <m>`             | Override land model.                                                                                                                            |
-| `--<role>-provider <p>`        | Override role provider (`claude`, `codex`, `gemini`, `kimi`) where supported. Dual-impl primary, secondary, and judge roles are model-agnostic. |
-| `--<role>-reasoning <r>`       | Override role reasoning (`low`, `medium`, `high`, `xhigh`).                                                                                     |
-| `--<role>-command <cmd>`       | Override review, QA, ship, or land command.                                                                                                     |
-| `--test-cmd <cmd>`             | Override automatic test command detection.                                                                                                      |
-| `--origin-plan <file>`         | Source plan to verify after each feature and archive after final completion.                                                                    |
-| `--max-codex-iter N`           | Override the review gate loop cap.                                                                                                              |
-| `--skip-clean-check`           | Bypass tracked dirty-file preflight.                                                                                                            |
+| Flag                           | Effect                                                                                                                                                                                 |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--print-only`                 | Parse the plan and print the phase table.                                                                                                                                              |
+| `--dry-run`                    | Walk the state machine without spawning sub-agents or shipping.                                                                                                                        |
+| `--skip-ship`                  | Complete phases but skip final ship and deploy.                                                                                                                                        |
+| `--single-branch`              | All features share one `feat/<prefix>` branch; `/ship` + `/land-and-deploy` runs once after all features complete.                                                                     |
+| `--ship-on-plan-complete`      | Keep per-feature branches but defer `/ship` + `/land-and-deploy` until every feature reaches `phases_done`. Then PRs open in feature order. Mutually exclusive with `--single-branch`. |
+| `--no-resume`                  | Ignore existing state and start fresh.                                                                                                                                                 |
+| `--no-gbrain`                  | Use only local JSON state.                                                                                                                                                             |
+| `--dual-impl`                  | Run configured primary and secondary implementations in parallel worktrees.                                                                                                            |
+| `--test-writer-model <m>`      | Override failing-test writer model.                                                                                                                                                    |
+| `--primary-impl-model <m>`     | Override primary implementor model.                                                                                                                                                    |
+| `--test-fixer-model <m>`       | Override test-fixer model.                                                                                                                                                             |
+| `--secondary-impl-model <m>`   | Override dual-impl secondary model.                                                                                                                                                    |
+| `--review-model <m>`           | Override primary review model.                                                                                                                                                         |
+| `--review-secondary-model <m>` | Override secondary review model.                                                                                                                                                       |
+| `--qa-model <m>`               | Override QA model.                                                                                                                                                                     |
+| `--ship-model <m>`             | Override ship model.                                                                                                                                                                   |
+| `--land-model <m>`             | Override land model.                                                                                                                                                                   |
+| `--<role>-provider <p>`        | Override role provider (`claude`, `codex`, `gemini`, `kimi`) where supported. Dual-impl primary, secondary, and judge roles are model-agnostic.                                        |
+| `--<role>-reasoning <r>`       | Override role reasoning (`low`, `medium`, `high`, `xhigh`).                                                                                                                            |
+| `--<role>-command <cmd>`       | Override review, QA, ship, or land command.                                                                                                                                            |
+| `--test-cmd <cmd>`             | Override automatic test command detection.                                                                                                                                             |
+| `--origin-plan <file>`         | Source plan to verify after each feature and archive after final completion.                                                                                                           |
+| `--max-codex-iter N`           | Override the review gate loop cap.                                                                                                                                                     |
+| `--skip-clean-check`           | Bypass tracked dirty-file preflight.                                                                                                                                                   |
 
 ## Environment Variables
 
@@ -400,29 +402,31 @@ Edit that file when the built-in defaults change; use the env vars below for
 per-run overrides. Set `GSTACK_BUILD_CONFIG_FILE` to point at a different
 config file.
 
-| Variable                            | Purpose                                                                            |
-| ----------------------------------- | ---------------------------------------------------------------------------------- |
-| `GEMINI_BIN`                        | Gemini CLI path.                                                                   |
-| `CODEX_BIN`                         | Codex CLI path.                                                                    |
-| `CLAUDE_BIN`                        | Claude CLI path.                                                                   |
-| `GBRAIN_BIN`                        | Optional gbrain CLI path.                                                          |
-| `GSTACK_BUILD_CONFIG_FILE`          | Alternate build config file.                                                       |
-| `GSTACK_BUILD_DEFAULTS_FILE`        | Legacy alias for `GSTACK_BUILD_CONFIG_FILE`.                                       |
-| `GSTACK_BUILD_<ROLE>_PROVIDER`      | Role provider override where supported.                                            |
-| `GSTACK_BUILD_<ROLE>_MODEL`         | Role model override.                                                               |
-| `GSTACK_BUILD_<ROLE>_REASONING`     | Role reasoning override.                                                           |
-| `GSTACK_BUILD_<ROLE>_COMMAND`       | Command override for review, QA, ship, and land roles.                             |
-| `GSTACK_BUILD_GEMINI_TIMEOUT`       | Gemini call timeout in milliseconds.                                               |
-| `GSTACK_BUILD_CODEX_TIMEOUT`        | Codex call timeout in milliseconds.                                                |
-| `GSTACK_BUILD_SHIP_TIMEOUT`         | Final ship/deploy timeout in milliseconds.                                         |
-| `GSTACK_BUILD_CODEX_MAX_ITER`       | Review gate loop cap.                                                              |
-| `GSTACK_BUILD_TEST_TIMEOUT`         | Test command timeout in milliseconds.                                              |
-| `GSTACK_BUILD_TEST_MAX_ITER`        | Gemini test-fix loop cap.                                                          |
-| `GSTACK_BUILD_RED_MAX_ITER`         | Test-spec rewrite cap when tests pass too early.                                   |
-| `GSTACK_BUILD_JUDGE_TIMEOUT`        | Dual-impl judge timeout in milliseconds.                                           |
-| `GSTACK_BUILD_JUDGE_MODEL`          | Claude model used for tournament judging.                                          |
-| `GSTACK_BUILD_CODEX_IMPL_SANDBOX`   | Codex implementor sandbox override.                                                |
-| `GSTACK_BUILD_CODEX_REVIEW_SANDBOX` | Codex review/QA sandbox override; explicit values disable automatic sandbox retry. |
+| Variable                            | Purpose                                                                                                                                                                         |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GEMINI_BIN`                        | Gemini CLI path.                                                                                                                                                                |
+| `CODEX_BIN`                         | Codex CLI path.                                                                                                                                                                 |
+| `CLAUDE_BIN`                        | Claude CLI path.                                                                                                                                                                |
+| `GBRAIN_BIN`                        | Optional gbrain CLI path.                                                                                                                                                       |
+| `GSTACK_BUILD_CONFIG_FILE`          | Alternate build config file.                                                                                                                                                    |
+| `GSTACK_BUILD_DEFAULTS_FILE`        | Legacy alias for `GSTACK_BUILD_CONFIG_FILE`.                                                                                                                                    |
+| `GSTACK_BUILD_<ROLE>_PROVIDER`      | Role provider override where supported.                                                                                                                                         |
+| `GSTACK_BUILD_<ROLE>_MODEL`         | Role model override.                                                                                                                                                            |
+| `GSTACK_BUILD_<ROLE>_REASONING`     | Role reasoning override.                                                                                                                                                        |
+| `GSTACK_BUILD_<ROLE>_COMMAND`       | Command override for review, QA, ship, and land roles.                                                                                                                          |
+| `GSTACK_BUILD_GEMINI_TIMEOUT`       | Gemini call timeout in milliseconds.                                                                                                                                            |
+| `GSTACK_BUILD_CODEX_TIMEOUT`        | Codex call timeout in milliseconds.                                                                                                                                             |
+| `GSTACK_BUILD_SHIP_TIMEOUT`         | Final ship/deploy timeout in milliseconds.                                                                                                                                      |
+| `GSTACK_BUILD_CODEX_MAX_ITER`       | Review gate loop cap.                                                                                                                                                           |
+| `GSTACK_BUILD_TEST_TIMEOUT`         | Test command timeout in milliseconds.                                                                                                                                           |
+| `GSTACK_BUILD_TEST_MAX_ITER`        | Gemini test-fix loop cap.                                                                                                                                                       |
+| `GSTACK_BUILD_RED_MAX_ITER`         | Test-spec rewrite cap when tests pass too early.                                                                                                                                |
+| `GSTACK_BUILD_JUDGE_TIMEOUT`        | Dual-impl judge timeout in milliseconds.                                                                                                                                        |
+| `GSTACK_BUILD_JUDGE_MODEL`          | Claude model used for tournament judging.                                                                                                                                       |
+| `GSTACK_BUILD_CODEX_IMPL_SANDBOX`   | Codex implementor sandbox override.                                                                                                                                             |
+| `GSTACK_BUILD_CODEX_REVIEW_SANDBOX` | Codex review/QA sandbox override; explicit values disable automatic sandbox retry.                                                                                              |
+| `GSTACK_QA_NO_AUTO_COMMIT`          | When truthy (`1`/`true`/`yes`), disables the hygiene gate's auto-commit path for test-only dirty diffs left by Review/QA roles. Recovery is manual.                             |
+| `GSTACK_QA_NO_AUTO_SPLIT`           | When truthy (`1`/`true`/`yes`), disables the hygiene gate's auto-split for mixed test+production diffs from Review/QA roles. The single test-only auto-commit path still fires. |
 
 Role env vars use `GSTACK_BUILD_<ROLE>_<FIELD>`, where role is
 `TEST_WRITER`, `PRIMARY_IMPL`, `TEST_FIXER`, `SECONDARY_IMPL`, `REVIEW`,

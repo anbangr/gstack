@@ -1,7 +1,7 @@
 ---
 name: build
 preamble-tier: 4
-version: 1.22.2
+version: 1.23.0
 description: |
   gstack autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -446,7 +446,12 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
        code. Do NOT change test assertions. After this checkbox runs, the CLI runs the Green
        tests gate and invokes the configured test-fixer role until tests pass or the cap is hit.
      - [ ] **Review & QA (review roles)**: Run primary /review, optional secondary review
-       if configured, and /qa; all required gates must pass.
+       if configured, and /qa; all required gates must pass. Review & QA roles MUST
+       limit their diff to test paths (`test/**`, `**/__tests__/**`, `**/*.test.*`,
+       `**/*.spec.*`). If a reviewer finds a real bug in production code, do NOT fix
+       it inline — emit a follow-up `[code]` phase that runs through the full TDD
+       lifecycle. The CLI's hygiene gate rejects mixed test+production diffs from
+       Review & QA roles and the recovery path is manual.
 
      [Phase description prose — what this phase builds, inputs, outputs, constraints]
 
@@ -709,7 +714,7 @@ prior commit.
          "originPlanPath": "<absolute source plan path>",
          "worktreePath": "<expanded home directory>/.gstack/build-worktrees/<repoSlug>/<runId>",
          "stateSlug": "build-<runId>",
-         "branchPrefix": "<repoSlug>-<runId>",
+         "branchPrefix": "<runId>",
          "pidFile": "<absolute $BUILD_TMP_DIR>/<runId>/gstack-build.pid",
          "stdoutLog": "<absolute $BUILD_TMP_DIR>/<runId>/agent-stdout.log",
          "launchCommand": ["<filled by Step M2 before launch>"],
@@ -899,9 +904,19 @@ prior commit.
       ❌ If a late feature breaks badly, rollback affects all prior work
 
    B) Multi-branch — separate `feat/<prefix>-<feature>` branch per feature, /ship +
-      /land-and-deploy after each feature completes
+      /land-and-deploy fires AS SOON AS each feature's phases complete (even
+      while other features are still running)
       ✅ Each feature is independently revertable
       ❌ Multiple PRs, multiple CI runs, more merge noise
+      ❌ Feature 1 may ship before Features 2-N even start; no way to bundle
+         them into one PR later without rebasing
+
+   C) Multi-branch + deferred ship — separate `feat/<prefix>-<feature>` branch
+      per feature, but /ship + /land-and-deploy is deferred until ALL features
+      reach phases_done. PRs are then opened in feature order.
+      ✅ Each feature is independently revertable
+      ✅ No early ship: review all features together before any lands
+      ❌ Multiple PRs, multiple CI runs (same as B)
    ```
 
    Where [N] is a sequential decision number for this session.
@@ -909,6 +924,8 @@ prior commit.
    If the user picks **A (single-branch)**: add `--single-branch` to `_FLAGS` before Step M2 launches `gstack-build`.
 
    If the user picks **B (multi-branch)**: leave `_FLAGS` unchanged.
+
+   If the user picks **C (multi-branch + deferred ship)**: add `--ship-on-plan-complete` to `_FLAGS` before Step M2 launches `gstack-build`.
 
    Make your recommendation holistically — reason about coupling, shared data models, independent shipping value, and plan coherence. No fixed thresholds.
 
@@ -930,6 +947,8 @@ This check is skipped when `--dry-run` or `--skip-ship` is active.
 ### Manual Recovery and Submodule Boundaries
 
 If a `[code]` phase was manually repaired after a hygiene failure, use `gstack-build <plan> --mark-phase-committed <phase>` to mark that phase committed without rerunning Test Specification, Implementation, Green tests, or Review/QA. This is for build-state recovery on code phases only — for `[manual]` / `[writing]` / `[experiment]` / `[research]` phases the orchestrator already handles the happy path with a single primary-impl call, so the recovery flag is rarely needed there. Do not use `--reset-phase` when the phase artifacts are already valid.
+
+**Ship side effect.** `--mark-phase-committed` advances state and then falls through to the main loop. In multi-branch mode (Step 5.7 option B), if the marked phase was the last phase of a feature, the orchestrator will set that feature to `phases_done` and immediately trigger `/ship` + `/land-and-deploy` for that feature alone. If you want to mark the phase committed without triggering ship, pass `--skip-ship` alongside `--mark-phase-committed`. In `--single-branch` (option A) and `--ship-on-plan-complete` (option C) modes the orchestrator already defers shipping until all features finish, so this side effect doesn't apply.
 
 Mutable-agent recovery is parent-repo first. If an agent reports files inside a git submodule, the CLI fails closed by default and preserves the worktree. Only after verifying the submodule commit is intended, rerun with `--allow-submodule-recovery <submodule-path>`; the CLI stages only the submodule gitlink in the parent repo, not submodule-internal files. Do not edit target-repo cache history or dependency submodules as part of build-skill recovery unless the plan explicitly scopes that target repo work.
 
@@ -1840,7 +1859,31 @@ Release daemon lifecycle:
    ```
    If it outputs `GUARDRAIL: FAIL: <reason>`, STOP and surface the error.
 
-   After `GUARDRAIL: PASS`, print the following status block **immediately, without waiting for user input**:
+   After `GUARDRAIL: PASS`, check for leaked subprocesses from this run before printing the report:
+   ```bash
+   # Look for kimi/gemini/codex impl processes still running with this run's runId
+   # in their command line. If any are found, surface them — the user will need to
+   # decide whether to kill or wait. See bug #2 in
+   # docs/superpowers/plans/2026-05-18-build-orchestrator-four-failures.md.
+   #
+   # pgrep -f matches as a regex. Escape regex metacharacters in $runId
+   # so a `.` (or any other special char) in the runId doesn't widen the
+   # match and reap unrelated processes from OTHER runs. Don't suggest
+   # `pkill -f '$runId'` to the user either — same regex hazard.
+   _ZOMBIE_RUNID_RE=$(printf '%s' "$runId" | sed 's/[.[\^$*?+(){}|]/\\&/g')
+   _ZOMBIE_PIDS=$(pgrep -lf "(kimi|gemini|codex).*${_ZOMBIE_RUNID_RE}" 2>/dev/null || true)
+   if [ -n "$_ZOMBIE_PIDS" ]; then
+     echo "⚠ Subprocesses from this run are still alive:" >&2
+     echo "$_ZOMBIE_PIDS" >&2
+     # Use the escaped form in the suggested command too — `pkill -f`
+     # has the same regex semantics, so a naive `pkill -f '<runId>'`
+     # with a `.` in runId would kill processes from other runs.
+     echo "  To clean up, kill the listed PIDs directly (e.g. \`kill <pid>\`)" >&2
+     echo "  or run: pkill -f \"${_ZOMBIE_RUNID_RE}\"" >&2
+   fi
+   ```
+
+   Then print the following status block **immediately, without waiting for user input**:
    ```
    ╔══════════════════════════════════════════════════════╗
    ║  FEATURE COMPLETE — EXECUTION REPORT                 ║
@@ -1852,6 +1895,7 @@ Release daemon lifecycle:
    ║  Working tree:     clean ✅                          ║
    ║  Ship:             ✅ /ship completed                ║
    ║  Land:             ✅ /land-and-deploy completed     ║
+   ║  Subprocesses:     ✅ clean (or ⚠ N leaked — see log)║
    ╚══════════════════════════════════════════════════════╝
    ```
 

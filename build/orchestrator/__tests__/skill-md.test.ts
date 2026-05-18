@@ -8,7 +8,11 @@ test("SKILL.md.tmpl contains TDD changes", () => {
   const content = fs.readFileSync(tmplPath, "utf-8");
 
   expect(content.includes("**Test Specification")).toBe(true);
-  expect(content.includes("version: 1.22.2")).toBe(true);
+  // Frontmatter must declare a semver-shaped version. Don't hardcode the
+  // value — every legitimate skill bump would break this test. The
+  // version: 1.22.2 → 1.23.0 bump that surfaced this issue is the
+  // proof point.
+  expect(/^version: \d+\.\d+\.\d+/m.test(content)).toBe(true);
   expect(content.includes("tests_red")).toBe(true);
   expect(content.includes("Test Specification (test-writer role)")).toBe(true);
   expect(content.includes("exactly this durable sub-checkbox structure")).toBe(
@@ -30,7 +34,9 @@ test("generated SKILL.md reflects TDD changes", () => {
   const content = fs.readFileSync(skillPath, "utf-8");
 
   expect(content.includes("**Test Specification")).toBe(true);
-  expect(content.includes("version: 1.22.2")).toBe(true);
+  // Same regex check as the .tmpl test — the generated SKILL.md must
+  // carry through whatever version the template declares.
+  expect(/^version: \d+\.\d+\.\d+/m.test(content)).toBe(true);
   expect(content.includes("tests_red")).toBe(true);
   expect(content.includes("*-gstack/inbox/living-plan")).toBe(true);
   expect(content.includes('--project-root "$worktreePath"')).toBe(true);
