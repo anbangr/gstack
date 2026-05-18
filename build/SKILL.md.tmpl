@@ -1085,6 +1085,46 @@ for i in $(seq 0 $((_RUN_COUNT - 1))); do
   echo "PROJECT_ROOT: $worktreePath"
   echo "STATE: $_STATE_FILE"
 
+  # Preflight active-run record. Closes the race where a concurrent
+  # `gstack-build` startup sweep would reap this worktree as "Shape Z"
+  # (on-disk worktree with no active-run record) between worktree creation
+  # above and the orchestrator's first writeActiveRunRecord call below.
+  # Schema must match ActiveRunRecord in build/orchestrator/active-runs.ts:
+  # the sweep validates runId / stateSlug / branches: array, then reads
+  # worktreePath + pid + lastUpdatedAt to classify the run as live.
+  # __tests__/preflight-active-run-record.test.ts pins the round-trip.
+  _ACTIVE_RUNS_DIR="$HOME/.gstack/build-state/active-runs"
+  mkdir -p "$_ACTIVE_RUNS_DIR"
+  _PREFLIGHT_RECORD="$_ACTIVE_RUNS_DIR/${runId}.json"
+  _PREFLIGHT_TMP="$_PREFLIGHT_RECORD.tmp.$$"
+  _NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq -n \
+    --arg runId "$runId" \
+    --arg stateSlug "$_SLUG" \
+    --arg repoPath "$repoPath" \
+    --arg worktreePath "$worktreePath" \
+    --arg planFile "$livingPlanPath" \
+    --arg branchPrefix "$branchPrefix" \
+    --arg firstBranch "$_FIRST_BRANCH" \
+    --argjson pid "$$" \
+    --arg startedAt "$_NOW_ISO" \
+    --arg lastUpdatedAt "$_NOW_ISO" \
+    '{
+       runId: $runId,
+       stateSlug: $stateSlug,
+       repoPath: $repoPath,
+       worktreePath: $worktreePath,
+       baseProjectRoot: $repoPath,
+       planFile: $planFile,
+       branchPrefix: $branchPrefix,
+       pid: $pid,
+       status: "running",
+       startedAt: $startedAt,
+       lastUpdatedAt: $lastUpdatedAt,
+       branches: [ $firstBranch ]
+     }' > "$_PREFLIGHT_TMP"
+  mv "$_PREFLIGHT_TMP" "$_PREFLIGHT_RECORD"
+
   _LAUNCH_COMMAND=(
     "$_GSTACK_BUILD_CLI" "$livingPlanPath"
     --project-root "$worktreePath"
