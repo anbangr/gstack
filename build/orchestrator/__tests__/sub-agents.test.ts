@@ -2780,7 +2780,11 @@ process.stdout.write(match[1]);
         cwd: tmpDir,
         slug,
         logPrefix: "ship-retry-skip",
-        timeoutMs: 800,
+        // 2000ms (not 800) so the spawned shell has enough budget to flush
+        // its `echo call >> $callsPath` write under parallel test-suite load
+        // before execFile's timeout sends SIGTERM. Verified flaky at 800ms
+        // when the orchestrator suite runs 50+ test files concurrently.
+        timeoutMs: 2000,
         role: {
           provider: "kimi",
           model: "kimi-x",
@@ -2858,7 +2862,13 @@ process.stdout.write(match[1]);
         cwd: tmpDir,
         slug,
         logPrefix: "ship-retry-default",
-        timeoutMs: 500,
+        // 2000ms (not 500) so the spawned shell has enough budget to flush
+        // its `echo call >> $callsPath` write under parallel test-suite load
+        // before execFile's timeout sends SIGTERM. At 500ms this test failed
+        // 4/5 runs under `bun test build/orchestrator/__tests__/`. The retry
+        // doubles wall-clock to ~4s but eliminates the race. Verified by
+        // running the orchestrator suite 5x in a row green at 2000ms.
+        timeoutMs: 2000,
         role: {
           provider: "kimi",
           model: "kimi-x",

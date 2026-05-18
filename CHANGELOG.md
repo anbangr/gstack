@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.40.4.0] - 2026-05-19
+
+**Feature-review now sees which `Phase N.review-K` numbers are already taken before issuing FEATURE_NEEDS_PHASES, and the kimi retry/no-retry timeout tests stop flaking under load.**
+
+Two follow-ups on the v1.40.3.0 hardening. The feature-review prompt builder now lists every phase number already in use under the feature, with explicit "K MUST NOT collide" guidance. Without this, the reviewer model picked K with no feedback loop across cycles, and a duplicate would silently re-use a slot before the v1.40.3.0 reconciler dedup caught it. Better to prevent the collision upstream than to recover from it. Two new prompt-builder tests pin the rendered K-history block (existing phases listed in backticks; defensive `(none)` for the empty case).
+
+The two timeout-budget tests in `sub-agents.test.ts` ("retries on timeout by default", "skips retry when retryOnTimeout: false") had `timeoutMs: 500` and `timeoutMs: 800`. The spawned fake-kimi shell appended to a counter file before `sleep 10`, and the orchestrator suite asserted on that counter. Under parallel load (~50 test files), the shell's `echo` didn't always flush before SIGTERM landed. Measured 4/5 failures at 500ms in `bun test build/orchestrator/__tests__/`, 3/3 pass in isolation. Bumping both to 2000ms gives a 4x margin on the spawn+flush window. Verified 5x in a row green across the full orchestrator suite. Retry test wall-clock grows from ~1s to ~4s — acceptable for one test of 199 in the file.
+
+### Itemized changes
+
+#### Fixed
+
+- The kimi retry/no-retry timeout tests in `build/orchestrator/__tests__/sub-agents.test.ts` stop flaking under parallel test-suite load. Was timing out before the spawned shell could flush its `echo` write; now budgeted enough that the side-effect assertion is deterministic.
+
+#### Changed
+
+- Feature-review prompt builder (`build/orchestrator/feature-review.ts`) now lists existing phase numbers under the feature inside the `## Additional phases` block when issuing FEATURE_NEEDS_PHASES guidance. The reviewer model can no longer reuse a `K` value across cycles without seeing the conflict surface in its prompt.
+
+### For contributors
+
+The `buildPhaseNumberHistory` helper in `feature-review.ts` is private but is the natural place to extend if a future verdict path needs the same K-collision feedback. JSDoc explains the cross-cycle K-history rationale and ties back to the v1.40.3.0 reconciler dedup contract.
+
 ## [1.40.3.0] - 2026-05-18
 
 **Review re-runs that find the work already in HEAD now pass cleanly instead of forcing a manual `--mark-phase-committed` recovery. The hygiene gate honors an explicit `NO_CHANGES_NEEDED` sentinel from the agent — on review re-runs only.**
