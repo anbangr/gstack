@@ -2844,14 +2844,18 @@ function featureSlug(feature: FeatureState): string {
   );
 }
 
-function safeBranchPart(value: string): string {
-  return (
-    value
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 72) || "run"
-  );
+// Identity-preserving truncation. When sanitized input exceeds the
+// 72-char ceiling we keep the head (for human readability) and the tail
+// (which carries the unique run hash) so recovery-branch lookup still
+// works. Plain .slice would drop the hash and break identity.
+export function safeBranchPart(value: string): string {
+  const sanitized = value
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (sanitized.length === 0) return "run";
+  if (sanitized.length <= 72) return sanitized;
+  return `${sanitized.slice(0, 60)}-${sanitized.slice(-8)}`;
 }
 
 export function ownedFeatureBranch(

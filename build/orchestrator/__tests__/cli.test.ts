@@ -25,6 +25,7 @@ import {
   buildOriginVerificationBody,
   ensureFeatureBranch,
   ownedFeatureBranch,
+  safeBranchPart,
   detectRemoteBaseRef,
   syncLandedBase,
   syncFeatureBranchWithBase,
@@ -292,6 +293,50 @@ describe("extractCoverageTarget", () => {
 
   it("handles decimal coverage targets like ≥90.5%", () => {
     expect(extractCoverageTarget("**Coverage target: ≥90.5%**")).toBe(90.5);
+  });
+});
+
+describe("safeBranchPart", () => {
+  it("returns sanitized input unchanged when under 72 chars", () => {
+    const out = safeBranchPart("mitosis-oasis-2026-05-18-b0bf5c19");
+    expect(out).toBe("mitosis-oasis-2026-05-18-b0bf5c19");
+    expect(out.length).toBeLessThanOrEqual(72);
+  });
+
+  it("lowercases and replaces unsafe chars", () => {
+    expect(safeBranchPart("Feature/Auth Setup!")).toBe("feature-auth-setup");
+  });
+
+  it("returns 'run' for empty or all-unsafe input", () => {
+    expect(safeBranchPart("")).toBe("run");
+    expect(safeBranchPart("!@#$%^&*")).toBe("run");
+  });
+
+  it("preserves the tail hash when input exceeds 72 chars (head+tail strategy)", () => {
+    // This is the regression case: the mitosis-oasis Bundle 0 run had a
+    // sanitized branchPrefix 80+ chars long, and the old .slice(0, 72)
+    // truncation dropped the unique b0bf5c19 hash, breaking recovery
+    // branch lookup. See plan: 2026-05-18-build-orchestrator-four-failures.md.
+    const long =
+      "mitosis-oasis-2026-05-18-bundle-0-bug-fix-20260518-180025-b0bf5c19-extra";
+    const out = safeBranchPart(long);
+    expect(out.length).toBeLessThanOrEqual(72);
+    // Head preserved for readability
+    expect(out.startsWith("mitosis-oasis-2026-05-18-bundle")).toBe(true);
+    // Tail preserved so unique suffix survives — load-bearing for identity
+    expect(out.endsWith("19-extra")).toBe(true);
+  });
+
+  it("preserves the b0bf5c19 hash when it's the actual tail", () => {
+    const long =
+      "mitosis-oasis-mitosis-oasis-2026-05-18-bundle-0-bug-fix-20260518-180025-b0bf5c19";
+    const out = safeBranchPart(long);
+    expect(out.length).toBeLessThanOrEqual(72);
+    expect(out.endsWith("b0bf5c19")).toBe(true);
+  });
+
+  it("collapses leading/trailing dashes after sanitization", () => {
+    expect(safeBranchPart("---foo-bar---")).toBe("foo-bar");
   });
 });
 
