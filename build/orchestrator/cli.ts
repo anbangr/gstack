@@ -123,10 +123,10 @@ import { runReleaseDaemon, retryReleaseQueueRecord } from "./release-daemon";
 import {
   defaultReleaseQueueDir,
   markPrQueued,
-  parseShipOutput,
   prBaseAndHead,
   readReleaseQueueRecords,
   readVersion,
+  resolveShipPr,
   writeReleaseQueueRecord,
   type ReleaseQueueRecord,
 } from "./release-queue";
@@ -9084,10 +9084,33 @@ async function main() {
                   ? fs.readFileSync(result.outputFilePath, "utf8")
                   : "",
               ].join("\n");
-              const parsedShip = parseShipOutput(outputText);
-              if (!parsedShip.prNumber) {
+              const resolved = resolveShipPr({
+                outputText,
+                branch: branchForShip,
+                cwd,
+              });
+              if (!resolved.ok) {
+                // Dump the ship-output context next to the log so the next
+                // investigation starts with the actual prose the parser
+                // couldn't match, instead of grepping the whole transcript.
+                const sidecarPath = result.logPath
+                  ? path.join(
+                      path.dirname(result.logPath),
+                      "ship-parse-failure.txt",
+                    )
+                  : "";
+                if (sidecarPath) {
+                  try {
+                    fs.writeFileSync(sidecarPath, outputText);
+                  } catch {
+                    // Sidecar is forensic-only; don't let a write failure
+                    // mask the underlying ship failure.
+                  }
+                }
                 featureState.status = "paused";
-                featureState.error = `ship succeeded but PR number could not be parsed; see ${result.logPath}`;
+                featureState.error = `${resolved.error}; see ${result.logPath}${
+                  sidecarPath ? ` and ${sidecarPath}` : ""
+                }`;
                 state.failureReason = `Feature ${featureState.number}: ${featureState.error}`;
                 saveState(state, {
                   noGbrain: args.noGbrain,
@@ -9097,7 +9120,7 @@ async function main() {
                 exitCode = 1;
                 break;
               }
-              const prRefs = prBaseAndHead(cwd, parsedShip.prNumber);
+              const prRefs = prBaseAndHead(cwd, resolved.prNumber);
               const queuedAt = new Date().toISOString();
               const repoIdentity = canonicalRepoIdentity({
                 cwd: args.baseProjectRoot ?? cwd,
@@ -9109,9 +9132,9 @@ async function main() {
                 repoIdentity,
                 baseBranch: prRefs.baseBranch,
                 featureBranch: prRefs.featureBranch || branchForShip,
-                prNumber: parsedShip.prNumber,
-                prUrl: parsedShip.prUrl,
-                version: parsedShip.version ?? readVersion(cwd),
+                prNumber: resolved.prNumber,
+                prUrl: resolved.prUrl,
+                version: resolved.version ?? readVersion(cwd),
                 livingPlanPath: args.planFile,
                 ...(args.originPlan && { sourcePlanPath: args.originPlan }),
                 worktreePath: cwd,

@@ -4539,7 +4539,7 @@ describe("ship failure sets state.failureReason at paused paths", () => {
     expect(state.failureReason).toMatch(/Feature 1: ship failed/);
   }, 30_000);
 
-  it("Location C: unparseable PR → state.failureReason contains PR number could not be parsed", () => {
+  it("Location C: unparseable PR + no open PR on remote → state.failureReason names the branch", () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-ship-loc-c-"));
     const runId = `ship-loc-c-${process.pid}`;
     const repo = initRepoWithOrigin();
@@ -4551,11 +4551,21 @@ describe("ship failure sets state.failureReason at paused paths", () => {
     fs.writeFileSync(fakeKimi, "#!/bin/sh\nexit 0\n");
     fs.chmodSync(fakeKimi, 0o755);
 
-    const result = runShipCli(planFile, repo, runId, { KIMI_BIN: fakeKimi });
+    // fake gh that always fails: parser-fallback path is also a dead end,
+    // so resolveShipPr returns the "no open PR exists on remote" error.
+    const fakeGhDir = path.join(tmpDir!, "fake-gh");
+    fs.mkdirSync(fakeGhDir, { recursive: true });
+    fs.writeFileSync(path.join(fakeGhDir, "gh"), "#!/bin/sh\nexit 1\n");
+    fs.chmodSync(path.join(fakeGhDir, "gh"), 0o755);
+
+    const result = runShipCli(planFile, repo, runId, {
+      KIMI_BIN: fakeKimi,
+      PATH: `${fakeGhDir}:${process.env.PATH ?? ""}`,
+    });
 
     expect(result.status).toBe(1);
     const state = loadSavedState(runId);
-    expect(state.failureReason).toMatch(/PR number could not be parsed/);
+    expect(state.failureReason).toMatch(/no open PR exists on remote/);
   }, 30_000);
 
   it("Location D: markPrQueued failure → state.failureReason contains could not be marked queued", () => {
@@ -4651,7 +4661,8 @@ describe("monitor emits RUN_FAILED when failureReason set (regression)", () => {
           phaseIndexes: [0],
           status: "paused",
           branch: "main",
-          error: "ship succeeded but PR number could not be parsed",
+          error:
+            "ship reported success but no open PR exists on remote for branch main",
         },
       ],
       phases: [{ index: 0, number: "1", name: "Phase 1", status: "committed" }],
@@ -4720,7 +4731,7 @@ describe("monitor emits RUN_FAILED when failureReason set (regression)", () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-monitor-t6-"));
     const runId = `monitor-t6-${process.pid}`;
     const reason =
-      "Feature 1: ship succeeded but PR number could not be parsed; see /tmp/ship.log";
+      "Feature 1: ship reported success but no open PR exists on remote for branch main; see /tmp/ship.log";
     const manifestPath = buildMonitorFixture(runId, reason);
 
     const result = evaluateMonitorOnce({
