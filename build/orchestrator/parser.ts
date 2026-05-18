@@ -33,11 +33,15 @@ import type {
 } from "./types";
 
 const FEATURE_HEADING = /^##\s+Feature\s+(\d+(?:\.\d+)?)\s*:\s*(.+?)\s*$/i;
-// Phase number: integer, integer.integer, or integer.integer<letter> (e.g. 2.1a).
-// The optional [a-z] suffix supports sub-lettered phases that split a
-// previously-numbered phase without renumbering the rest of the plan.
+// Phase number: integer, integer.integer, integer.integer<letter> (e.g. 2.1a),
+// or integer.review-<digits> (e.g. 1.review-1). The [a-z] suffix supports
+// sub-lettered phases that split a previously-numbered phase without
+// renumbering the rest of the plan. The .review-N suffix is reserved for
+// phases inserted by the feature-review gate (see feature-review.ts and
+// plan-mutator.ts), which appends new gate-discovered phases under the
+// current feature without colliding with the user's numbering.
 const PHASE_HEADING =
-  /^###\s+Phase\s+(\d+(?:\.\d+)?[a-z]?)\s*(?:\[[^\]]*\])?\s*:\s*(.+?)\s*$/;
+  /^###\s+Phase\s+(\d+(?:\.\d+)?(?:[a-z]|\.review-\d+)?)\s*(?:\[[^\]]*\])?\s*:\s*(.+?)\s*$/;
 // Soft detector: any `### Phase ...` line that fails PHASE_HEADING. Used to
 // emit a warning so malformed phase headings don't disappear silently.
 const PHASE_HEADING_SOFT = /^###\s+Phase\b/i;

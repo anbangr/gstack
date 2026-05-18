@@ -42,6 +42,71 @@ describe("parsePlan — sublettered phase numbers", () => {
   });
 });
 
+describe("parsePlan — feature-review-inserted phases", () => {
+  // The feature-review gate (feature-review.ts) and plan-mutator
+  // (plan-mutator.ts) both prescribe `### Phase N.review-K: <title>` as the
+  // heading format for phases added by FEATURE_NEEDS_PHASES verdicts. The
+  // parser must accept these so the orchestrator can re-parse the plan after
+  // insertion and run the new phases.
+  it("accepts Phase N.review-K headings (single-digit K)", () => {
+    const md = `# Plan
+
+### Phase 1.review-1: Codex review of feature 1
+- [ ] **Implementation (Gemini Sub-agent)**: add missing migration
+- [ ] **Review & QA (Codex Sub-agent)**: verify migration applies cleanly
+`;
+    const { phases, warnings, droppedPhasesCount } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(droppedPhasesCount).toBe(0);
+    expect(phases).toHaveLength(1);
+    expect(phases[0].number).toBe("1.review-1");
+    expect(phases[0].name).toBe("Codex review of feature 1");
+  });
+
+  it("accepts Phase N.review-K with multi-digit K", () => {
+    const md = `# Plan
+
+### Phase 3.review-12: Twelfth review-inserted phase
+- [ ] **Implementation (Gemini Sub-agent)**: x
+- [ ] **Review & QA (Codex Sub-agent)**: y
+`;
+    const { phases, warnings } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(phases).toHaveLength(1);
+    expect(phases[0].number).toBe("3.review-12");
+  });
+
+  it("accepts review phases alongside plain and sublettered phases", () => {
+    const md = `# Plan
+
+### Phase 1: Original
+- [ ] **Implementation (Gemini Sub-agent)**: x
+- [ ] **Review & QA (Codex Sub-agent)**: y
+
+### Phase 2.1a: Split bootstrap
+- [ ] **Implementation (Gemini Sub-agent)**: x
+- [ ] **Review & QA (Codex Sub-agent)**: y
+
+### Phase 1.review-1: Inserted by feature review
+- [ ] **Implementation (Gemini Sub-agent)**: x
+- [ ] **Review & QA (Codex Sub-agent)**: y
+
+### Phase 1.review-2: Another inserted review phase
+- [ ] **Implementation (Gemini Sub-agent)**: x
+- [ ] **Review & QA (Codex Sub-agent)**: y
+`;
+    const { phases, warnings, droppedPhasesCount } = parsePlan(md);
+    expect(warnings).toEqual([]);
+    expect(droppedPhasesCount).toBe(0);
+    expect(phases.map((p) => p.number)).toEqual([
+      "1",
+      "2.1a",
+      "1.review-1",
+      "1.review-2",
+    ]);
+  });
+});
+
 describe("parsePlan — malformed phase headings warn instead of disappearing", () => {
   it("emits a warning when a phase heading has an unsupported number format", () => {
     const md = `# Plan
