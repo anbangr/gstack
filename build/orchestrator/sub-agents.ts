@@ -367,15 +367,28 @@ function spawnCaptured(args: {
     };
 
     let settled = false;
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
+    // Resolve on 'close', not 'exit'. Node fires 'exit' as soon as the child
+    // process ends, but stdio pipes may still have buffered data not yet
+    // delivered via 'data' events. 'close' fires only after all stdio
+    // streams have been fully drained. Resolving on 'exit' truncates the
+    // final stdout/stderr chunk (final tool-use JSON, Codex 403/429 line,
+    // test failure summary) and corrupts the captured log. The old execFile
+    // callback waited for close internally.
     child.once("exit", (code, signal) => {
+      exitCode = code;
+      exitSignal = signal;
+    });
+    child.once("close", () => {
       if (settled) return;
       settled = true;
-      finish(code, signal);
+      finish(exitCode, exitSignal);
     });
     child.once("error", (err) => {
       if (settled) return;
       settled = true;
-      // Spawn failure (ENOENT, EACCES, etc.) — no exit event will fire.
+      // Spawn failure (ENOENT, EACCES, etc.) — close may not fire.
       stderrBuf += `\n# spawn error: ${err.message}\n`;
       finish(null, null);
     });
