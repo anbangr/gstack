@@ -52,6 +52,7 @@ export function markPhaseFailed(
 ): string {
   if (state.phases[phaseIdx]) {
     state.phases[phaseIdx].status = "failed";
+    state.phases[phaseIdx].error = reason;
   }
   return emit("PHASE_FAILED", reason, ctx, state, phaseIdx, undefined, reason);
 }
