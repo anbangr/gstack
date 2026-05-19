@@ -171,9 +171,12 @@ import { BUILD_DEFAULTS, warnOnLargeStallWindows } from "./build-config";
 import { evaluateMonitorOnce, monitorExitCode } from "./monitor";
 import {
   drainFaults,
+  drainFaultsFromHaltEventsQueue,
   drainFaultsFromMonitor,
   type DrainFaultsResult,
+  type DrainHaltEventsResult,
 } from "./drain-faults";
+import type { HaltSeverity } from "./halt-events";
 import { runMarkShipped } from "./mark-shipped";
 import { buildMonitorAgentEscalation } from "./monitor-supervisor";
 import { startHeartbeat, type HeartbeatController } from "./heartbeat";
@@ -761,6 +764,19 @@ export interface Args {
   drainFaultsCatchAll?: boolean;
   /** Per-investigator timeout in ms for drain-faults mode. Default 10min. */
   drainFaultsInvestigatorTimeoutMs?: number;
+  /**
+   * Halt-events queue mode (PR 5 of the halt-events rollout). When true,
+   * drain-faults consumes ~/.gstack/skill-faults/pending-investigations/
+   * instead of monitor-output.log. Mutually exclusive with --manifest and
+   * --build-tmp-dir.
+   */
+  drainFaultsQueueMode?: boolean;
+  /** Max investigations per invocation (queue mode). Default 20. */
+  drainFaultsMax?: number;
+  /** Minimum severity filter (queue mode). Default MEDIUM. */
+  drainFaultsSeverityMin?: HaltSeverity;
+  /** Override the configure.cm investigator role's model. */
+  investigatorModel?: string;
   /** Feature number to mark shipped (mark-shipped mode). */
   markShippedFeature?: string;
   /** PR number override for mark-shipped (otherwise auto-resolved). */
@@ -882,6 +898,10 @@ export function parseArgs(argv: string[]): Args {
     drainFaultsBuildTmpDir: undefined,
     drainFaultsCatchAll: false,
     drainFaultsInvestigatorTimeoutMs: undefined,
+    drainFaultsQueueMode: false,
+    drainFaultsMax: undefined,
+    drainFaultsSeverityMin: undefined,
+    investigatorModel: undefined,
     markShippedFeature: undefined,
     markShippedPr: undefined,
     markShippedMergeSha: undefined,
@@ -989,6 +1009,37 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.drainFaultsInvestigatorTimeoutMs = n;
+    } else if (a === "--queue") {
+      args.drainFaultsQueueMode = true;
+    } else if (a === "--max") {
+      const next = argv[++i];
+      const n = Number(next);
+      if (!Number.isInteger(n) || n < 1) {
+        console.error(`--max expects an integer >= 1, got: ${next}`);
+        process.exit(2);
+      }
+      args.drainFaultsMax = n;
+    } else if (a === "--severity-min") {
+      const next = argv[++i];
+      if (
+        next !== "LOW" &&
+        next !== "MEDIUM" &&
+        next !== "HIGH" &&
+        next !== "CRITICAL"
+      ) {
+        console.error(
+          `--severity-min expects LOW|MEDIUM|HIGH|CRITICAL, got: ${next}`,
+        );
+        process.exit(2);
+      }
+      args.drainFaultsSeverityMin = next as HaltSeverity;
+    } else if (a === "--investigator-model") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--investigator-model requires a value");
+        process.exit(2);
+      }
+      args.investigatorModel = next;
     } else if (a === "--state") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
@@ -1334,20 +1385,25 @@ export function parseArgs(argv: string[]): Args {
   } else if (positional[0] === "drain-faults") {
     if (positional.length !== 1) {
       console.error(
-        "usage: gstack-build drain-faults --manifest <path> | --build-tmp-dir <path>   [--dry-run] [--catch-all] [--investigator-timeout-ms <N>]   (-h for help)",
+        "usage: gstack-build drain-faults --manifest <path> | --build-tmp-dir <path> | --queue   [--dry-run] [--catch-all] [--investigator-timeout-ms <N>] [--max <N>] [--severity-min LOW|MEDIUM|HIGH|CRITICAL] [--investigator-model <m>]   (-h for help)",
       );
       process.exit(2);
     }
     args.mode = "drain-faults";
-    if (!args.monitorManifest && !args.drainFaultsBuildTmpDir) {
+    const inputSources = [
+      args.monitorManifest ? "manifest" : null,
+      args.drainFaultsBuildTmpDir ? "build-tmp-dir" : null,
+      args.drainFaultsQueueMode ? "queue" : null,
+    ].filter((x) => x !== null);
+    if (inputSources.length === 0) {
       console.error(
-        "gstack-build drain-faults requires --manifest <path> OR --build-tmp-dir <path>",
+        "gstack-build drain-faults requires --manifest <path> OR --build-tmp-dir <path> OR --queue",
       );
       process.exit(2);
     }
-    if (args.monitorManifest && args.drainFaultsBuildTmpDir) {
+    if (inputSources.length > 1) {
       console.error(
-        "gstack-build drain-faults: provide only one of --manifest or --build-tmp-dir",
+        "gstack-build drain-faults: provide only one of --manifest, --build-tmp-dir, or --queue",
       );
       process.exit(2);
     }
@@ -7792,6 +7848,18 @@ function resetStreakFor(
  *   2 - usage error (caught in parseArgs; this function should not hit it)
  */
 async function runDrainFaultsMode(args: Args): Promise<number> {
+  if (args.drainFaultsQueueMode) {
+    const queueResult: DrainHaltEventsResult =
+      await drainFaultsFromHaltEventsQueue({
+        max: args.drainFaultsMax,
+        severityMin: args.drainFaultsSeverityMin,
+        investigatorModel: args.investigatorModel,
+        investigatorTimeoutMs: args.drainFaultsInvestigatorTimeoutMs,
+        dryRun: args.dryRun,
+      });
+    process.stdout.write(JSON.stringify(queueResult, null, 2) + "\n");
+    return queueResult.failed > 0 ? 1 : 0;
+  }
   const result: DrainFaultsResult = await drainFaults({
     manifestPath: args.monitorManifest,
     buildTmpDir: args.drainFaultsBuildTmpDir,
@@ -9074,7 +9142,8 @@ async function main() {
         (args.drainFaultsBuildTmpDir
           ? ` (build-tmp-dir=${args.drainFaultsBuildTmpDir})`
           : "") +
-        (args.monitorManifest ? ` (manifest=${args.monitorManifest})` : ""),
+        (args.monitorManifest ? ` (manifest=${args.monitorManifest})` : "") +
+        (args.drainFaultsQueueMode ? ` (queue)` : ""),
       pointers: {
         stateFile: args.planFile ? statePath(deriveStateSlug(args.planFile)) : "",
         stdoutLog: "",
