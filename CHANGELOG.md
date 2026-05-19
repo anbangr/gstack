@@ -1,5 +1,57 @@
 # Changelog
 
+## [build skill 1.25.0] — 2026-05-20
+
+**Plan review now brings you in at round 1, and it bails when it stalls.**
+The `/build` skill's planReviewer loop used to run autonomously for up to 3 rounds before asking you anything — and every round cost ~$1-2 of API spend. Now the loop runs in-process, asks you to triage each CRITICAL objection after the very first round, gives you up to 5 rounds when convergence is working, and bails early when the synth keeps failing to address the same concern.
+
+### The numbers that matter
+
+These are projections from the bundle-1 case study (real production build, 4 rounds, 5→3→2→0 trajectory) compared to what the new loop will do on the same shape. Verify by running `bin/gstack-convergence-stats` after 10+ builds with the new loop.
+
+| Metric                         | Before                 | After (projected)     | Δ                   |
+| ------------------------------ | ---------------------- | --------------------- | ------------------- |
+| User involvement               | Round 3 stalemate only | Round 1 onward        | 3x earlier          |
+| Per-round re-launch overhead   | ~5-10s                 | 0s (in-process)       | -100%               |
+| Max rounds (clean convergence) | 3                      | 5                     | +67%                |
+| Stuck-loop early exit          | Round 3 (cap)          | Round 2 (adaptive)    | 50% faster bail-out |
+| Cross-round reviewer memory    | None                   | Plan-file annotations | new                 |
+
+### What changed for you
+
+- After each round's reviewer call, you see each CRITICAL objection one at a time. Press `a` to accept, `r` to reject as a false positive, `d` to defer, `v` to see the reviewer's full prose, `A` / `R` to fast-path the rest, `s` to stop triage, or `q` to quit (state preserved, resume later).
+- Each decision can carry an optional one-line rationale — it gets annotated into the plan file so the next round's reviewer (and the synth) see what was already settled.
+- The synth honors your accepts and rejects via the new annotation contract. If the synth thinks your accept is wrong, it can mark the resolution `disputed — <reason>` and you'll see it in the next round's triage instead of the synth silently complying.
+- Stalemate at round 5 (or earlier adaptive bail) hands you four options: approve-as-is, continue one more round, drop to manual mode (exit 3, edit by hand, re-launch), or abort cleanly (exit 4, state preserved).
+- CI builds default to `auto-accept` (existing IMPORTANT-objection behavior extended to CRITICAL). Use `--plan-review-noninteractive=fail-fast` for stricter CI gating or `--plan-review-noninteractive=auto-reject` as an escape hatch.
+
+### Itemized changes
+
+**Added**
+
+- In-process plan-review loop in [build/orchestrator/plan-review-loop.ts](build/orchestrator/plan-review-loop.ts) — replaces the exit-3-and-re-launch cycle for CRITICAL-objection rounds
+- TTY triage gate with per-objection accept/reject/defer/view/accept-all/reject-all/stop/quit keys
+- Non-TTY triage modes: `auto-accept` (default), `fail-fast`, `auto-reject`
+- Plan-file annotation contract: `<!-- ROUND N CRITICAL [...] -->` blocks above each `### Phase N` heading carry triage decisions and synth resolutions; top-of-plan `<!-- gstack-plan-review-history -->` block carries the per-round summary
+- Set-aware adaptive cap: bails when re-raises > 0 AND new objections == 0, or when accepted count regresses
+- New exit code 4 (user abort)
+- New CLI flags: `--plan-review-max-rounds=N`, `--plan-review-no-adaptive-cap`, `--plan-review-noninteractive=<mode>`
+- Per-build history at `~/.gstack/build-state/<slug>/plan-review-history.jsonl`
+- Cross-build aggregate at `~/.gstack/analytics/convergence.jsonl`
+
+**Changed**
+
+- Default max rounds: 3 → 5
+- `build/SKILL.md.tmpl` Step 5.5 shrinks to handle exit codes only; the synthesizer revision prompt moves to a TypeScript constant `SYNTH_REVISION_PROMPT` exported from [build/orchestrator/plan-reviewer.ts](build/orchestrator/plan-reviewer.ts)
+- `PLAN_REVIEW_PROMPT` extended with a paragraph teaching the reviewer to read prior-round annotations and not re-raise settled concerns
+
+**For contributors**
+
+- New tests: `plan-reviewer-loop.test.ts`, `plan-reviewer-triage-tty.test.ts`, `plan-reviewer-triage-non-tty.test.ts`, `plan-annotation-round-trip.test.ts`, `plan-review-history-jsonl.test.ts`, `adaptive-cap-set-aware.test.ts`, `convergence-jsonl.test.ts`, `plan-review-prompts.test.ts` (snapshot)
+- Integration tests in `build/orchestrator/__tests__/integration/`: bundle-1 trajectory, adaptive bail on re-raises, synth disputes path
+- Layer 4 E2E in `test/skill-e2e-build-convergence.test.ts` (gate tier, ~$0.50/run with real Codex)
+- Design spec: [docs/superpowers/specs/2026-05-19-build-plan-review-convergence-design.md](docs/superpowers/specs/2026-05-19-build-plan-review-convergence-design.md)
+
 ## [1.40.4.2] - 2026-05-19
 
 **Gemini staging-path fix now matches Gemini's actual `projects.json` key sanitization. Worktrees with `_`, `.`, or uppercase in the basename no longer fall through the same hole the v1.40.4.1 fix tried to plug.**
@@ -8,13 +60,13 @@ v1.40.4.1 keyed the Gemini staging dir on `path.basename(opts.cwd)` raw. Gemini'
 
 ### The numbers that matter
 
-| Basename observed in projects.json | Raw `basename(cwd)` (v1.40.4.1) | Gemini's actual key | Match? |
-| --- | --- | --- | --- |
-| `socc26-v022a-schema-v3_1-behavior-subtree-...` | `...v3_1...` | `...v3-1...` | NO |
-| `MyObs` | `MyObs` | `myobs` | NO |
-| `AGIL-paper` | `AGIL-paper` | `agil-paper` | NO |
-| `the-Big-Paper` | `the-Big-Paper` | `the-big-paper` | NO |
-| `mitosis-control-plane-impl-plan-anbang-20260518-...` | (same) | (same) | yes (accidental) |
+| Basename observed in projects.json                    | Raw `basename(cwd)` (v1.40.4.1) | Gemini's actual key | Match?           |
+| ----------------------------------------------------- | ------------------------------- | ------------------- | ---------------- |
+| `socc26-v022a-schema-v3_1-behavior-subtree-...`       | `...v3_1...`                    | `...v3-1...`        | NO               |
+| `MyObs`                                               | `MyObs`                         | `myobs`             | NO               |
+| `AGIL-paper`                                          | `AGIL-paper`                    | `agil-paper`        | NO               |
+| `the-Big-Paper`                                       | `the-Big-Paper`                 | `the-big-paper`     | NO               |
+| `mitosis-control-plane-impl-plan-anbang-20260518-...` | (same)                          | (same)              | yes (accidental) |
 
 Four out of five real worktrees on this machine produce divergent staging vs allowlist paths under v1.40.4.1. Only the v1.40.4.1 happy-path case (already-lowercase, alphanumeric+hyphen) matches.
 
@@ -51,10 +103,10 @@ When kimi (primary implementor) failed and the orchestrator fell back to Gemini,
 
 Observed on `mitosis-control-plane-impl-plan-anbang-20260518-154933-bee3aea0` Phase 3.3 (`streamPodLogs`), 2026-05-18. Both directories exist on disk after the failing run:
 
-| Path | Contents | Used by |
-| --- | --- | --- |
-| `~/.gemini/tmp/build-mitosis-control-plane-impl-plan-anbang-.../` | empty (orchestrator cleanup ran) | orchestrator stage write |
-| `~/.gemini/tmp/mitosis-control-plane-impl-plan-anbang-.../` | `chats/`, `.project_root` | Gemini's actual workspace |
+| Path                                                              | Contents                         | Used by                   |
+| ----------------------------------------------------------------- | -------------------------------- | ------------------------- |
+| `~/.gemini/tmp/build-mitosis-control-plane-impl-plan-anbang-.../` | empty (orchestrator cleanup ran) | orchestrator stage write  |
+| `~/.gemini/tmp/mitosis-control-plane-impl-plan-anbang-.../`       | `chats/`, `.project_root`        | Gemini's actual workspace |
 
 Same regression observed 2026-05-17 on `agnt2-prototype-plan4` (T111646 fault report). Commit `67480efe` dropped a `gstack/` segment in the same helper but kept `opts.slug` as the directory key, so the `build-` prefix from `deriveSlug` still mismatched. This release closes the remaining gap. The concurrent-collision path was caught by adversarial review (both Claude subagent and Codex independently flagged it as the most exploitable finding in the original patch).
 
