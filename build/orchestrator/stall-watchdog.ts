@@ -27,7 +27,7 @@
  */
 
 import * as fs from "node:fs";
-import type { ChildProcess } from "node:child_process";
+import type { ChildProcess } from "./child-registry";
 
 export type Provider = "claude" | "gemini" | "codex" | "kimi" | "shell";
 
