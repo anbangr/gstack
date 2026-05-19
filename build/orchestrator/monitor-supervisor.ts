@@ -16,6 +16,8 @@ const BLOCKING_SUPERVISOR_EVENTS = new Set([
 ]);
 
 const DEFAULT_LOG_TAIL_CHARS = 16_000;
+// Stall window for the supervisor sub-agent (max ms of silence before kill,
+// not wall-clock budget). See build/orchestrator/stall-watchdog.ts.
 const MONITOR_AGENT_TIMEOUT_MS = envNumberOrDefault(
   "GSTACK_BUILD_MONITOR_AGENT_TIMEOUT_MS",
   600_000,
