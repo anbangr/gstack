@@ -184,7 +184,12 @@ import {
   streakSurfaceMessage,
 } from "./escalation-streak";
 import { renderPlanStatusTable, resolvePlanSelection } from "./plan-selection";
-import { markFeatureFailed, markPhaseFailed } from "./halt-event-helpers";
+import {
+  markFeatureFailed,
+  markPhaseFailed,
+  recordRetryCapHit,
+} from "./halt-event-helpers";
+import { buildHaltSnapshot, emitHaltEvent, severityFor } from "./halt-events";
 
 /**
  * Builds the HelperContext that halt-event helpers (markPhaseFailed,
@@ -6049,6 +6054,13 @@ async function runPhase(args: {
       console.error(
         `✗ Phase ${phase.number} (${phase.name}) failed: ${action.reason}`,
       );
+      recordRetryCapHit(
+        state,
+        phaseState.index,
+        "codex",
+        phaseState.codexReview?.iterations ?? 0,
+        helperCtxFor(state),
+      );
       return "failed";
     }
 
@@ -6792,6 +6804,21 @@ async function runPhase(args: {
               maxFixIter: DEFAULT_MAX_TEST_ITERATIONS,
               allowSubmoduleRecovery: args.allowSubmoduleRecovery,
             });
+          // Emit RETRY_CAP_HIT (kind=testfix) when the fix loop exhausted its
+          // budget but tests are still red. Emit-only — the caller continues
+          // to score this candidate and the judge/auto-select logic decides.
+          if (
+            fixIterations === DEFAULT_MAX_TEST_ITERATIONS &&
+            testResult.testExitCode !== 0
+          ) {
+            recordRetryCapHit(
+              state,
+              phaseState.index,
+              "testfix",
+              fixIterations,
+              helperCtxFor(state),
+            );
+          }
           const headResult = spawnSync(
             "git",
             ["-C", candidateState.worktreePath, "rev-parse", "HEAD"],
@@ -6940,6 +6967,22 @@ async function runPhase(args: {
             selectedBy: "auto",
           };
           phaseState.status = "dual_winner_pending";
+          // secondary auto-selected because primary did not commit
+          const ctxAuto = helperCtxFor(state);
+          emitHaltEvent({
+            kind: "DUAL_IMPL_SWAP",
+            runId: ctxAuto.runId,
+            stateSlug: ctxAuto.stateSlug,
+            severity: severityFor("DUAL_IMPL_SWAP"),
+            message: `dual-impl: secondary auto-selected (primary did not commit)`,
+            pointers: ctxAuto.pointers,
+            snapshot: buildHaltSnapshot({
+              state,
+              stdoutLogPath: ctxAuto.pointers.stdoutLog,
+              worktreePath: ctxAuto.pointers.worktreePath,
+              phaseIndex: phaseState.index,
+            }),
+          });
         }
         // else: both committed — normal flow → dual_impl_done → RUN_DUAL_TESTS
 
@@ -7504,6 +7547,24 @@ async function runPhase(args: {
         );
         saveState(state, { noGbrain, log: console.warn });
         continue;
+      }
+
+      if (action.winner === "secondary") {
+        const ctx = helperCtxFor(state);
+        emitHaltEvent({
+          kind: "DUAL_IMPL_SWAP",
+          runId: ctx.runId,
+          stateSlug: ctx.stateSlug,
+          severity: severityFor("DUAL_IMPL_SWAP"),
+          message: `dual-impl: secondary implementor won the judge verdict (primary did not deliver)`,
+          pointers: ctx.pointers,
+          snapshot: buildHaltSnapshot({
+            state,
+            stdoutLogPath: ctx.pointers.stdoutLog,
+            worktreePath: ctx.pointers.worktreePath,
+            phaseIndex: phaseState.index,
+          }),
+        });
       }
 
       let applyOk = true;
