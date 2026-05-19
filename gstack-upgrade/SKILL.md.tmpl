@@ -1,6 +1,6 @@
 ---
 name: gstack-upgrade
-version: 1.1.0
+version: 1.2.0
 description: |
   Upgrade gstack to the latest version. Detects global vs vendored install,
   runs the upgrade, and shows what's new. Use when asked to "upgrade gstack",
@@ -138,7 +138,28 @@ migrations or cache clearing.
 
 **For fork-copy installs** (`INSTALL_TYPE=fork-copy`):
 
+**Fork-copy scope gate.** Before running any phases below, determine `FORK_SCOPE`:
+
+- **If Step 1 set `AUTO_UPGRADE=true`** (env `GSTACK_AUTO_UPGRADE=1` or `auto_upgrade=true` in config): set `FORK_SCOPE=full` silently. Tell the user "Auto-upgrading fork-copy gstack (full pipeline)..." and proceed. Do not call AskUserQuestion.
+- **Otherwise**, use AskUserQuestion:
+  - Question: "Fork-copy upgrade — which scope?"
+  - Options:
+    - "Full pipeline" → `FORK_SCOPE=full`. Upstream fetch+merge in fork, gen:skill-docs --host all, skill:check, bun test, rsync to install dir, ./setup for all detected hosts. Includes the test gate; takes a few minutes.
+    - "Skip tests" → `FORK_SCOPE=skip-tests`. Upstream fetch+merge, gen:skill-docs, skill:check, rsync, ./setup. Faster — no bun test gate.
+    - "Sync only (no upstream pull)" → `FORK_SCOPE=sync-only`. Skip upstream fetch entirely. Regenerate skill docs and run skill:check against the fork's current template state, then rsync the fork's working tree (including any uncommitted edits) into the install dir and run ./setup. Use when you've already pulled upstream manually, or when you just want the install dir to match the fork right now. Phase 2 (gen + skill:check) still runs so the installed SKILL.md files reflect the current .tmpl contents — without it, an edited .tmpl without a fresh regen would install stale generated skills.
+
+The selected `FORK_SCOPE` controls which phases run:
+
+| `FORK_SCOPE` | Phase 1 | Phase 2 | Phase 3 | Phase 4 | Phase 5 |
+|--------------|---------|---------|---------|---------|---------|
+| `full`       | run     | run     | run     | run     | run     |
+| `skip-tests` | run     | run     | SKIP    | run     | run     |
+| `sync-only`  | SKIP    | run     | SKIP    | run     | run     |
+
 **Phase 1 — Upstream pull (in fork)**
+
+Run Phase 1 only if `FORK_SCOPE` is `full` or `skip-tests`. Skip when `FORK_SCOPE=sync-only`.
+
 ```bash
 cd "$FORK_REPO"
 _UPSTREAM_REMOTE=""
@@ -160,6 +181,9 @@ fi
 ```
 
 **Phase 2 — Fork integrations**
+
+Phase 2 runs for all three `FORK_SCOPE` values. Even under `sync-only`, the fork's .tmpl may have been edited since the last regen, and the install dir must receive fresh generated SKILL.md outputs — not whatever stale .md was on disk.
+
 ```bash
 cd "$FORK_REPO"
 bun run gen:skill-docs --host all
@@ -167,6 +191,9 @@ bun run skill:check
 ```
 
 **Phase 3 — Integration tests (abort on failure)**
+
+Run Phase 3 only if `FORK_SCOPE=full`. Skip when `FORK_SCOPE` is `skip-tests` or `sync-only`.
+
 ```bash
 cd "$FORK_REPO"
 if ! bun test; then
@@ -499,6 +526,23 @@ Tell the user which hosts were synced (gemini, kimi) or "not found" if those dir
 
 ### Step 5: Write marker + clear cache
 
+Read the new installed version, then branch on whether an actual version change happened:
+
+```bash
+NEW_VERSION=$(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo "unknown")
+echo "OLD_VERSION=$OLD_VERSION NEW_VERSION=$NEW_VERSION"
+```
+
+**If `OLD_VERSION` and `NEW_VERSION` are equal** (typical for fork-copy `sync-only` re-deploys, or when the fork was already current): the install dir was refreshed but no version moved. Tell the user "Synced fork → install at v$NEW_VERSION (no version change)." Do NOT write `~/.gstack/just-upgraded-from`. Still clear stale update markers so the next check is honest:
+
+```bash
+mkdir -p ~/.gstack
+rm -f ~/.gstack/last-update-check
+rm -f ~/.gstack/update-snoozed
+```
+
+**If `OLD_VERSION` and `NEW_VERSION` differ:** a real upgrade happened. Write the marker and clear caches:
+
 ```bash
 mkdir -p ~/.gstack
 echo "$OLD_VERSION" > ~/.gstack/just-upgraded-from
@@ -508,7 +552,9 @@ rm -f ~/.gstack/update-snoozed
 
 ### Step 6: Show What's New
 
-Read `$INSTALL_DIR/CHANGELOG.md`. Find all version entries between the old version and the new version. Summarize as 5-7 bullets grouped by theme. Don't overwhelm — focus on user-facing changes. Skip internal refactors unless they're significant.
+**Skip Step 6 entirely if `OLD_VERSION == NEW_VERSION`.** The Step 5 "no version change" message is the user-facing summary in that case — there's nothing new to enumerate.
+
+**Otherwise** (real version change), read `$INSTALL_DIR/CHANGELOG.md`. Find all version entries between the old version and the new version. Summarize as 5-7 bullets grouped by theme. Don't overwhelm — focus on user-facing changes. Skip internal refactors unless they're significant.
 
 Format:
 ```
@@ -532,9 +578,20 @@ After showing What's New, continue with whatever skill the user originally invok
 
 When invoked directly as `/gstack-upgrade` (not from a preamble):
 
-**First, run the Step 2 detection block** to determine `INSTALL_TYPE`, `INSTALL_DIR`, and (for fork-copy) `FORK_REPO`.
+**First, compute `AUTO_UPGRADE` for use by downstream gates** (the inline Step 1 doesn't run in standalone mode, so the standalone entry must compute it itself):
 
-**If `INSTALL_TYPE=fork-copy`:** run the complete fork-copy upgrade path from Step 4 above (all five phases through the Step 4.9 Gemini/Kimi copies). This runs regardless of whether upstream has a new version — the standalone action for fork-copy is always "pull upstream into fork, gen, test, copy to install, set up all hosts." After completing Step 4.9, proceed to Step 5 (write marker + clear cache) and Step 6 (show what's new).
+```bash
+_AUTO=""
+[ "${GSTACK_AUTO_UPGRADE:-}" = "1" ] && _AUTO="true"
+[ -z "$_AUTO" ] && _AUTO=$("$HOME/.claude/skills/gstack/bin/gstack-config" get auto_upgrade 2>/dev/null || true)
+echo "AUTO_UPGRADE=$_AUTO"
+```
+
+Remember the printed `AUTO_UPGRADE` value — the fork-copy scope gate at Step 4 will reference it. If the value is `true` or `1`, treat the bypass as active.
+
+**Then run the Step 2 detection block** to determine `INSTALL_TYPE`, `INSTALL_DIR`, and (for fork-copy) `FORK_REPO`.
+
+**If `INSTALL_TYPE=fork-copy`:** run the fork-copy upgrade path from Step 4 above. The **Fork-copy scope gate** at the top of that path will ask which scope to run (`full` / `skip-tests` / `sync-only`) before any phases execute; `AUTO_UPGRADE=true` bypasses the question and runs `full` silently. After the phases complete, continue through Step 4.9 (Gemini/Kimi copies). This runs regardless of whether upstream has a new version — the standalone action for fork-copy always asks the scope question (or auto-selects `full`). After completing Step 4.9, proceed to Step 5 (write marker + clear cache) and Step 6 (show what's new).
 
 **For all other install types** (`global-git`, `local-git`, `vendored`, `vendored-global`), continue with the steps below:
 
