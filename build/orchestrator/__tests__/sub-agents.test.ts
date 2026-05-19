@@ -1436,10 +1436,9 @@ process.stdout.write(match[1]);
         cwd: tmpDir,
         slug,
         logPrefix: "ship-timeout",
-        // 2000ms: long enough for the backup Node.js gemini to start and
-        // complete (<500ms typically), short enough to kill the fake kimi that
-        // sleeps 10s. The timeout spreads to the backup call via ...opts, so
-        // it must accommodate BOTH the primary kill and the backup execution.
+        // 2000ms stall window: the fake kimi emits no stdout, so the watchdog
+        // kills it after 2000ms of silence. Primary is single-shot under
+        // liveness semantics; the fallback gemini then runs (<500ms).
         timeoutMs: 2000,
         role: {
           provider: "kimi",
@@ -1451,7 +1450,7 @@ process.stdout.write(match[1]);
       });
 
       expect(result.exitCode).toBe(0);
-      // Wall-clock: kimi retries once on timeout (~2×100ms) then backup runs (<500ms).
+      // Wall-clock: kimi stalls (~2000ms), then backup runs (<500ms).
       expect(fs.readFileSync(outputFilePath, "utf8")).toBe(
         "timeout fallback ok",
       );
@@ -2772,17 +2771,6 @@ describe("resolveRoleTimeouts", () => {
     expect(r.backupMs).toBe(300000);
   });
 
-  it("retryOnTimeout defaults true; false when role sets it", () => {
-    expect(resolveRoleTimeouts(baseRole).retryOnTimeout).toBe(true);
-    expect(
-      resolveRoleTimeouts({ ...baseRole, retryOnTimeout: false })
-        .retryOnTimeout,
-    ).toBe(false);
-    expect(
-      resolveRoleTimeouts({ ...baseRole, retryOnTimeout: true }).retryOnTimeout,
-    ).toBe(true);
-  });
-
   it("claude provider falls back to codex default (BuildTimeoutsMs has no claude key)", () => {
     const r = resolveRoleTimeouts({ ...baseRole, provider: "claude" });
     expect(r.primaryMs).toBe(900000); // codex default
@@ -2830,12 +2818,6 @@ describe("resolveFallbackForConfigured", () => {
     const resolved = resolveRoleTimeouts(baseOpts.role);
     const out = resolveFallbackForConfigured(baseOpts, resolved);
     expect(out.codexDefaultCommand).toBeUndefined();
-  });
-
-  it("sets retryOnTimeout:false on backup role (single-shot)", () => {
-    const resolved = resolveRoleTimeouts(baseOpts.role);
-    const out = resolveFallbackForConfigured(baseOpts, resolved);
-    expect(out.role.retryOnTimeout).toBe(false);
   });
 
   it("preserves sandbox setting for codex backup paths", () => {
@@ -2939,12 +2921,10 @@ describe("resolveFallbackForRoleTask", () => {
     expect(out.role.model).toBe("gemini-x");
   });
 
-  it("sets backup timeout + single-shot", () => {
+  it("sets backup timeout from resolved.backupMs", () => {
     const resolved = resolveRoleTimeouts(baseOpts.role);
     const out = resolveFallbackForRoleTask(baseOpts, resolved);
     expect(out.timeoutMs).toBe(750000); // half of 1500s kimi default
-    expect(out.retryOnTimeout).toBe(false);
-    expect(out.role.retryOnTimeout).toBe(false);
   });
 
   it("appends -backup-<provider> to the logPrefix", () => {
@@ -3053,12 +3033,11 @@ describe("checkPhaseScope", () => {
 });
 
 describe("runConfiguredRoleTask: timeout-fix integration", () => {
-  it("skips retry on timeout when role.retryOnTimeout is false", async () => {
-    // primary kimi sleeps past timeout (100ms). With retryOnTimeout:false,
-    // the runner spawns exactly once, then falls through to backup.
-    // We count spawns by having the fake kimi append to a counter file.
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "retry-skip-"));
-    const slug = `retry-skip-${process.pid}-${Date.now()}`;
+  it("stall kill spawns primary exactly once, then falls through to backup", async () => {
+    // Under liveness semantics, a stalled primary is NOT retried — same stall
+    // window will stall again. Caller's fallback path runs the backup instead.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "stall-once-"));
+    const slug = `stall-once-${process.pid}-${Date.now()}`;
     const oldKimiBin = process.env.KIMI_BIN;
     const oldGeminiBin = process.env.GEMINI_BIN;
     const callsPath = path.join(tmpDir, "kimi-calls.txt");
@@ -3098,11 +3077,10 @@ process.stdout.write(match[1]);
         outputFilePath,
         cwd: tmpDir,
         slug,
-        logPrefix: "ship-retry-skip",
-        // 2000ms (not 800) so the spawned shell has enough budget to flush
-        // its `echo call >> $callsPath` write under parallel test-suite load
-        // before execFile's timeout sends SIGTERM. Verified flaky at 800ms
-        // when the orchestrator suite runs 50+ test files concurrently.
+        logPrefix: "ship-stall-once",
+        // 2000ms stall window — long enough for the shell to flush its
+        // `echo call >> $callsPath` write under parallel test-suite load
+        // before the watchdog SIGTERMs.
         timeoutMs: 2000,
         role: {
           provider: "kimi",
@@ -3110,97 +3088,13 @@ process.stdout.write(match[1]);
           reasoning: "high",
           backupProvider: "gemini",
           backupModel: "gemini-x",
-          retryOnTimeout: false,
         },
       });
 
-      // Exactly one kimi spawn (no retry), then gemini backup ran.
+      // Exactly one kimi spawn (no retry under liveness), then gemini backup ran.
       const calls = fs.readFileSync(callsPath, "utf8").trim().split("\n");
       expect(calls.length).toBe(1);
       expect(fs.readFileSync(outputFilePath, "utf8")).toBe("backup ok");
-    } finally {
-      if (oldKimiBin === undefined) delete process.env.KIMI_BIN;
-      else process.env.KIMI_BIN = oldKimiBin;
-      if (oldGeminiBin === undefined) delete process.env.GEMINI_BIN;
-      else process.env.GEMINI_BIN = oldGeminiBin;
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-      fs.rmSync(path.join(os.homedir(), ".gstack", "build-state", slug), {
-        recursive: true,
-        force: true,
-      });
-      fs.rmSync(path.join(os.homedir(), ".kimi", "tmp", "gstack", slug), {
-        recursive: true,
-        force: true,
-      });
-      fs.rmSync(path.join(os.homedir(), ".gemini", "tmp", "gstack", slug), {
-        recursive: true,
-        force: true,
-      });
-    }
-  });
-
-  it("retries on timeout by default (backwards compat)", async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "retry-default-"));
-    const slug = `retry-default-${process.pid}-${Date.now()}`;
-    const oldKimiBin = process.env.KIMI_BIN;
-    const oldGeminiBin = process.env.GEMINI_BIN;
-    const callsPath = path.join(tmpDir, "kimi-calls.txt");
-    try {
-      const fakeKimi = path.join(tmpDir, "kimi");
-      fs.writeFileSync(
-        fakeKimi,
-        `#!/bin/sh\necho call >> ${callsPath}\nsleep 10\n`,
-      );
-      fs.chmodSync(fakeKimi, 0o755);
-      const fakeGemini = path.join(tmpDir, "gemini");
-      fs.writeFileSync(
-        fakeGemini,
-        `#!/usr/bin/env node
-const fs = require("node:fs");
-const args = process.argv.slice(2);
-const prompt = args[args.indexOf("-p") + 1] || "";
-const match = prompt.match(/Write your complete output to (.+?\\.md)\\./);
-if (!match) process.exit(2);
-fs.writeFileSync(match[1], "backup ok");
-process.stdout.write(match[1]);
-`,
-      );
-      fs.chmodSync(fakeGemini, 0o755);
-
-      process.env.KIMI_BIN = fakeKimi;
-      process.env.GEMINI_BIN = fakeGemini;
-
-      const inputFilePath = path.join(tmpDir, "input.md");
-      const outputFilePath = path.join(tmpDir, "output.md");
-      fs.writeFileSync(inputFilePath, "small");
-      fs.writeFileSync(outputFilePath, "");
-
-      await runConfiguredRoleTask({
-        inputFilePath,
-        outputFilePath,
-        cwd: tmpDir,
-        slug,
-        logPrefix: "ship-retry-default",
-        // 2000ms (not 500) so the spawned shell has enough budget to flush
-        // its `echo call >> $callsPath` write under parallel test-suite load
-        // before execFile's timeout sends SIGTERM. At 500ms this test failed
-        // 4/5 runs under `bun test build/orchestrator/__tests__/`. The retry
-        // doubles wall-clock to ~4s but eliminates the race. Verified by
-        // running the orchestrator suite 5x in a row green at 2000ms.
-        timeoutMs: 2000,
-        role: {
-          provider: "kimi",
-          model: "kimi-x",
-          reasoning: "high",
-          backupProvider: "gemini",
-          backupModel: "gemini-x",
-          // no retryOnTimeout → default true → kimi retries once before fallback
-        },
-      });
-
-      // Two kimi spawns (primary + retry), then gemini backup.
-      const calls = fs.readFileSync(callsPath, "utf8").trim().split("\n");
-      expect(calls.length).toBe(2);
     } finally {
       if (oldKimiBin === undefined) delete process.env.KIMI_BIN;
       else process.env.KIMI_BIN = oldKimiBin;

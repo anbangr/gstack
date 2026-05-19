@@ -34,7 +34,6 @@ export async function shipAndDeploy(args: {
       backupModel: args.shipRole.backupModel,
       timeoutMs: args.shipRole.timeoutMs,
       backupTimeoutMs: args.shipRole.backupTimeoutMs,
-      retryOnTimeout: args.shipRole.retryOnTimeout,
     },
     land: {
       provider: args.landRole.provider,
@@ -45,7 +44,6 @@ export async function shipAndDeploy(args: {
       backupModel: args.landRole.backupModel,
       timeoutMs: args.landRole.timeoutMs,
       backupTimeoutMs: args.landRole.backupTimeoutMs,
-      retryOnTimeout: args.landRole.retryOnTimeout,
     },
   });
 }

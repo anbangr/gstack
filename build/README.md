@@ -397,10 +397,19 @@ the root cause, re-run the same `gstack-build` command to resume.
 
 ## Environment Variables
 
-Default role routing, retry caps, and timeouts live in `build/configure.cm`.
-Edit that file when the built-in defaults change; use the env vars below for
-per-run overrides. Set `GSTACK_BUILD_CONFIG_FILE` to point at a different
-config file.
+Default role routing, iteration caps, and stall windows live in
+`build/configure.cm`. Edit that file when the built-in defaults change; use
+the env vars below for per-run overrides. Set `GSTACK_BUILD_CONFIG_FILE` to
+point at a different config file.
+
+**Liveness semantics for `*_TIMEOUT` variables.** Under the StallWatchdog
+model, every `GSTACK_BUILD_*_TIMEOUT` value is a **stall window** (max ms of
+silence on the sub-agent's stdout/stderr before SIGTERM), not a wall-clock
+budget. A sub-agent that keeps emitting tool-use events or status lines runs
+as long as it needs; only a genuinely silent process gets killed. Setting
+these env vars above 30 minutes triggers a one-line startup warning since
+those values almost certainly came from the pre-liveness model where users
+padded budgets to avoid mid-flight kills.
 
 | Variable                            | Purpose                                                                                                                                                                         |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -414,14 +423,17 @@ config file.
 | `GSTACK_BUILD_<ROLE>_MODEL`         | Role model override.                                                                                                                                                            |
 | `GSTACK_BUILD_<ROLE>_REASONING`     | Role reasoning override.                                                                                                                                                        |
 | `GSTACK_BUILD_<ROLE>_COMMAND`       | Command override for review, QA, ship, and land roles.                                                                                                                          |
-| `GSTACK_BUILD_GEMINI_TIMEOUT`       | Gemini call timeout in milliseconds.                                                                                                                                            |
-| `GSTACK_BUILD_CODEX_TIMEOUT`        | Codex call timeout in milliseconds.                                                                                                                                             |
-| `GSTACK_BUILD_SHIP_TIMEOUT`         | Final ship/deploy timeout in milliseconds.                                                                                                                                      |
-| `GSTACK_BUILD_CODEX_MAX_ITER`       | Review gate loop cap.                                                                                                                                                           |
-| `GSTACK_BUILD_TEST_TIMEOUT`         | Test command timeout in milliseconds.                                                                                                                                           |
+| `GSTACK_BUILD_GEMINI_TIMEOUT`       | Gemini call stall window in milliseconds (max silence before kill, not wall-clock).                                                                                             |
+| `GSTACK_BUILD_CODEX_TIMEOUT`        | Codex call stall window in milliseconds.                                                                                                                                        |
+| `GSTACK_BUILD_KIMI_TIMEOUT`         | Kimi call stall window in milliseconds.                                                                                                                                         |
+| `GSTACK_BUILD_SHIP_TIMEOUT`         | Final ship/deploy stall window in milliseconds.                                                                                                                                 |
+| `GSTACK_BUILD_CODEX_MAX_ITER`       | Review gate loop cap (default 10, bumped from 5 under liveness semantics).                                                                                                      |
+| `GSTACK_BUILD_TEST_TIMEOUT`         | Test command stall window in milliseconds.                                                                                                                                      |
 | `GSTACK_BUILD_TEST_MAX_ITER`        | Gemini test-fix loop cap.                                                                                                                                                       |
 | `GSTACK_BUILD_RED_MAX_ITER`         | Test-spec rewrite cap when tests pass too early.                                                                                                                                |
-| `GSTACK_BUILD_JUDGE_TIMEOUT`        | Dual-impl judge timeout in milliseconds.                                                                                                                                        |
+| `GSTACK_BUILD_FEATURE_REVIEW_TIMEOUT` | Feature-review stall window in milliseconds.                                                                                                                                  |
+| `GSTACK_BUILD_FEATURE_REVIEW_MAX_ITER` | Feature-review loop cap (default 5, bumped from 3 under liveness semantics).                                                                                                |
+| `GSTACK_BUILD_JUDGE_TIMEOUT`        | Dual-impl judge stall window in milliseconds.                                                                                                                                   |
 | `GSTACK_BUILD_JUDGE_MODEL`          | Claude model used for tournament judging.                                                                                                                                       |
 | `GSTACK_BUILD_CODEX_IMPL_SANDBOX`   | Codex implementor sandbox override.                                                                                                                                             |
 | `GSTACK_BUILD_CODEX_REVIEW_SANDBOX` | Codex review/QA sandbox override; explicit values disable automatic sandbox retry.                                                                                              |

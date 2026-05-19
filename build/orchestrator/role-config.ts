@@ -19,19 +19,12 @@ export interface RoleConfig {
    * Backup timeout override in ms. When unset, the backup defaults to
    * max(60000, floor(primaryMs / 2)). Operators with multi-file primary
    * prompts should set this explicitly to keep the backup viable.
+   *
+   * Under liveness semantics (v1.40.5+), `timeoutMs` and `backupTimeoutMs`
+   * are STALL WINDOWS, not wall-clock budgets — a sub-agent that keeps
+   * emitting stdout activity runs as long as it needs.
    */
   backupTimeoutMs?: number;
-  /**
-   * When false, the same-budget retry on timeout is skipped. Default true
-   * for backwards compat. configure.cm sets this to false on primaryImpl,
-   * testFixer, ship, and land — roles whose prompts span multiple files
-   * where a second 15-min attempt with the same budget rarely helps.
-   *
-   * IMPORTANT: this gates ONLY the time-budget retry (result.timedOut).
-   * Codex transport-failure retries (network hiccups, TLS resets) stay
-   * enabled regardless — those are a separate failure mode.
-   */
-  retryOnTimeout?: boolean;
 }
 
 export interface RoleConfigs {
@@ -91,8 +84,7 @@ export type RoleField =
   | "backupProvider"
   | "backupModel"
   | "timeoutMs"
-  | "backupTimeoutMs"
-  | "retryOnTimeout";
+  | "backupTimeoutMs";
 
 export const DEFAULT_ROLE_CONFIGS: RoleConfigs = BUILD_DEFAULTS.roles;
 
@@ -133,18 +125,12 @@ export function applyEnvRoleConfig(
     if (backupModel) next[key].backupModel = backupModel;
     const timeout = env[`${prefix}_TIMEOUT`];
     const backupTimeout = env[`${prefix}_BACKUP_TIMEOUT`];
-    const retryOnTimeout = env[`${prefix}_RETRY_ON_TIMEOUT`];
     if (timeout)
       next[key].timeoutMs = parsePositiveInt(timeout, `${prefix}_TIMEOUT`);
     if (backupTimeout)
       next[key].backupTimeoutMs = parsePositiveInt(
         backupTimeout,
         `${prefix}_BACKUP_TIMEOUT`,
-      );
-    if (retryOnTimeout)
-      next[key].retryOnTimeout = parseBoolean(
-        retryOnTimeout,
-        `${prefix}_RETRY_ON_TIMEOUT`,
       );
   }
   return next;
@@ -171,11 +157,6 @@ export function applyRoleOverride(
     roles[role].backupTimeoutMs = parsePositiveInt(
       value,
       `${role}.backupTimeoutMs`,
-    );
-  else if (field === "retryOnTimeout")
-    roles[role].retryOnTimeout = parseBoolean(
-      value,
-      `${role}.retryOnTimeout`,
     );
   else {
     // TypeScript narrows field to never here — adding a new RoleField without

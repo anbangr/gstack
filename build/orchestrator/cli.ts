@@ -167,7 +167,7 @@ import {
   type RoleField,
   type RoleKey,
 } from "./role-config";
-import { BUILD_DEFAULTS } from "./build-config";
+import { BUILD_DEFAULTS, warnOnLargeStallWindows } from "./build-config";
 import { evaluateMonitorOnce, monitorExitCode } from "./monitor";
 import {
   drainFaults,
@@ -4228,14 +4228,9 @@ export async function runRoleTask(opts: {
   iteration: number;
   logPrefix: string;
   timeoutMs?: number;
-  retryOnTimeout?: boolean;
 }): Promise<SubAgentResult> {
   const resolved = resolveRoleTimeouts(opts.role, opts.timeoutMs);
   const effectiveTimeoutMs = resolved.primaryMs;
-  const retryOnTimeout =
-    opts.retryOnTimeout !== undefined
-      ? opts.retryOnTimeout
-      : resolved.retryOnTimeout;
 
   let result: SubAgentResult;
 
@@ -4250,7 +4245,6 @@ export async function runRoleTask(opts: {
       logPrefix: opts.logPrefix,
       model: opts.role.model,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   } else if (opts.role.provider === "kimi") {
     result = await runKimi({
@@ -4263,7 +4257,6 @@ export async function runRoleTask(opts: {
       logPrefix: opts.logPrefix,
       model: opts.role.model,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   } else if (opts.role.provider === "codex") {
     result = await runCodexImpl({
@@ -4277,7 +4270,6 @@ export async function runRoleTask(opts: {
       model: opts.role.model,
       reasoning: opts.role.reasoning,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   } else {
     result = await runClaudeTask({
@@ -4291,7 +4283,6 @@ export async function runRoleTask(opts: {
       model: opts.role.model,
       reasoning: opts.role.reasoning,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   }
 
@@ -9014,6 +9005,11 @@ async function main() {
   // and terminal-disconnect (SIGHUP) paths are all clean now.
   // See orchestrator/README.md "Child process management".
   installSignalHandlers();
+
+  // One-shot nudge: timeout env vars set above 30min probably come from
+  // pre-liveness-semantics config where users padded the budget to avoid
+  // mid-flight kills. Under the new model these are stall windows.
+  warnOnLargeStallWindows();
 
   const rawArgv = process.argv.slice(2);
   const args = parseArgs(rawArgv);

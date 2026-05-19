@@ -36,13 +36,17 @@
  *   - Table-driven provider dispatch: one Record<Provider, ArgvBuilder> instead
  *     of 5 case branches.
  *
- *   - Per-investigator timeout (default 10min) via setTimeout + child.kill().
+ *   - Per-investigator stall watchdog (default 10min) via attachStallWatchdog
+ *     in mtime mode on the report file. An investigator that keeps writing to
+ *     its report runs as long as it needs; only a genuinely silent investigator
+ *     gets killed.
  */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, spawnSync, type ChildProcess } from "./child-registry";
+import { attachStallWatchdog, killProcessAndGroup } from "./stall-watchdog";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -550,6 +554,7 @@ async function spawnInvestigator(opts: SpawnOpts): Promise<"ok" | "failed"> {
     const settle = (verdict: "ok" | "failed") => {
       if (settled) return;
       settled = true;
+      watchdog.stop();
       try {
         fs.closeSync(out);
       } catch {
@@ -569,21 +574,43 @@ async function spawnInvestigator(opts: SpawnOpts): Promise<"ok" | "failed"> {
       resolve(verdict);
     };
 
-    const timer = setTimeout(() => {
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // already dead
-      }
-      settle("failed");
-    }, opts.timeoutMs);
+    // The investigator pipes stdout/stderr straight to a file descriptor
+    // (stdio: ['ignore', out, out]) so we can't tap the streams in Node.
+    // mtime-mode watchdog polls the report file at 1s — matches the
+    // monitor.ts:344-347 recentProcessActivity pattern. Same liveness
+    // semantics as the rest of the orchestrator: only kill if the
+    // investigator goes genuinely silent for opts.timeoutMs.
+    const watchdog = attachStallWatchdog(
+      { mode: "mtime", filePath: opts.reportPath },
+      {
+        stallMs: opts.timeoutMs,
+        provider: opts.config.provider as
+          | "claude"
+          | "codex"
+          | "gemini"
+          | "kimi",
+        onStallKill: () => {
+          // Investigator can be `bash -lc <user-string>` which spawns
+          // grandchildren. SIGTERM to the bash leader alone leaves the
+          // grandchildren orphaned to init. Signal the whole process
+          // group, then escalate to SIGKILL after gracePeriodMs (5s)
+          // to match the sub-agent stall-kill path in spawnCaptured.
+          const pid = child.pid;
+          if (typeof pid === "number" && pid > 0) {
+            killProcessAndGroup(pid, "SIGTERM");
+            setTimeout(() => {
+              killProcessAndGroup(pid, "SIGKILL");
+            }, 5000).unref();
+          }
+          settle("failed");
+        },
+      },
+    );
 
     child.on("error", () => {
-      clearTimeout(timer);
       settle("failed");
     });
     child.on("exit", (code) => {
-      clearTimeout(timer);
       settle(code === 0 ? "ok" : "failed");
     });
   });
