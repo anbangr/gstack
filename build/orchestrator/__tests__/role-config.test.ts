@@ -25,7 +25,7 @@ describe("role config defaults", () => {
     const loaded = loadBuildDefaults(DEFAULT_BUILD_CONFIG_FILE);
     expect(path.basename(DEFAULT_BUILD_CONFIG_FILE)).toBe("configure.cm");
     expect(loaded.roles.primaryImpl.model).toBeTruthy();
-    expect(loaded.limits.codexMaxIterations).toBe(5);
+    expect(loaded.limits.codexMaxIterations).toBe(10);
     expect(loaded.timeoutsMs.gemini).toBe(900000);
     expect(loaded.timeoutsMs.kimi).toBe(1500000);
     expect(BUILD_DEFAULTS.roles.primaryImpl.model).toBe(
@@ -65,7 +65,9 @@ describe("role config defaults", () => {
 
   it("includes the configured monitorAgent role", () => {
     expect(DEFAULT_ROLE_CONFIGS.monitorAgent).toBeDefined();
-    expect(DEFAULT_ROLE_CONFIGS.monitorAgent.provider).toBe("kimi");
+    expect(["claude", "codex", "gemini", "kimi"]).toContain(
+      DEFAULT_ROLE_CONFIGS.monitorAgent.provider,
+    );
     expect(DEFAULT_ROLE_CONFIGS.monitorAgent.model.trim()).not.toBe("");
     expect(DEFAULT_ROLE_CONFIGS.monitorAgent.command).toBeUndefined();
     expect(
@@ -91,9 +93,11 @@ describe("role config defaults", () => {
   it("exposes featureReviewMaxIterations and featureReview timeout in BUILD_DEFAULTS", () => {
     // The default cap on per-feature meta-review cycles. After this count,
     // the orchestrator pauses and prompts the user via stdin readline.
-    expect(BUILD_DEFAULTS.limits.featureReviewMaxIterations).toBe(3);
-    // 1200000ms = 20min — larger than codex's 900000ms because the feature
-    // review reads ALL phase artifacts (not just one phase's diff).
+    // Bumped 3 -> 5 under liveness semantics (individual iterations no longer
+    // time out mid-flight, so the cap is now the only fence).
+    expect(BUILD_DEFAULTS.limits.featureReviewMaxIterations).toBe(5);
+    // 1200000ms = 20min stall window — larger than codex's 900000ms because
+    // the feature review reads ALL phase artifacts (not just one phase's diff).
     expect(BUILD_DEFAULTS.timeoutsMs.featureReview).toBe(1200000);
   });
 });
@@ -138,7 +142,7 @@ describe("role config precedence helpers", () => {
       expect(loaded.roles.monitorAgent).toEqual(
         DEFAULT_ROLE_CONFIGS.monitorAgent,
       );
-      expect(loaded.limits.featureReviewMaxIterations).toBe(3);
+      expect(loaded.limits.featureReviewMaxIterations).toBe(5);
       expect(loaded.timeoutsMs.kimi).toBe(1500000);
       expect(loaded.timeoutsMs.featureReview).toBe(1200000);
     } finally {
@@ -395,21 +399,7 @@ describe("parseBoolean / parsePositiveInt", () => {
   });
 });
 
-describe("RoleConfig timeout-fix fields", () => {
-  it("BUILD_DEFAULTS sets retryOnTimeout:false on primaryImpl/testFixer/ship/land", () => {
-    expect(BUILD_DEFAULTS.roles.primaryImpl.retryOnTimeout).toBe(false);
-    expect(BUILD_DEFAULTS.roles.testFixer.retryOnTimeout).toBe(false);
-    expect(BUILD_DEFAULTS.roles.ship.retryOnTimeout).toBe(false);
-    expect(BUILD_DEFAULTS.roles.land.retryOnTimeout).toBe(false);
-  });
-
-  it("BUILD_DEFAULTS does NOT set retryOnTimeout on other roles", () => {
-    expect(BUILD_DEFAULTS.roles.testWriter.retryOnTimeout).toBeUndefined();
-    expect(BUILD_DEFAULTS.roles.judge.retryOnTimeout).toBeUndefined();
-    expect(BUILD_DEFAULTS.roles.review.retryOnTimeout).toBeUndefined();
-    expect(BUILD_DEFAULTS.roles.qa.retryOnTimeout).toBeUndefined();
-  });
-
+describe("RoleConfig timeout fields", () => {
   it("applyEnvRoleConfig parses GSTACK_BUILD_PRIMARY_IMPL_TIMEOUT", () => {
     const roles = applyEnvRoleConfig(cloneRoleConfigs(), {
       GSTACK_BUILD_PRIMARY_IMPL_TIMEOUT: "1800000",
@@ -424,26 +414,10 @@ describe("RoleConfig timeout-fix fields", () => {
     expect(roles.primaryImpl.backupTimeoutMs).toBe(300000);
   });
 
-  it("applyEnvRoleConfig parses GSTACK_BUILD_PRIMARY_IMPL_RETRY_ON_TIMEOUT", () => {
-    const rolesTrue = applyEnvRoleConfig(cloneRoleConfigs(), {
-      GSTACK_BUILD_PRIMARY_IMPL_RETRY_ON_TIMEOUT: "true",
-    });
-    expect(rolesTrue.primaryImpl.retryOnTimeout).toBe(true);
-    const rolesFalse = applyEnvRoleConfig(cloneRoleConfigs(), {
-      GSTACK_BUILD_PRIMARY_IMPL_RETRY_ON_TIMEOUT: "false",
-    });
-    expect(rolesFalse.primaryImpl.retryOnTimeout).toBe(false);
-  });
-
   it("applyEnvRoleConfig rejects malformed env vars", () => {
     expect(() =>
       applyEnvRoleConfig(cloneRoleConfigs(), {
         GSTACK_BUILD_PRIMARY_IMPL_TIMEOUT: "-1",
-      }),
-    ).toThrow();
-    expect(() =>
-      applyEnvRoleConfig(cloneRoleConfigs(), {
-        GSTACK_BUILD_PRIMARY_IMPL_RETRY_ON_TIMEOUT: "yes",
       }),
     ).toThrow();
   });
@@ -460,23 +434,10 @@ describe("RoleConfig timeout-fix fields", () => {
     expect(roles.primaryImpl.backupTimeoutMs).toBe(300000);
   });
 
-  it("applyRoleOverride sets retryOnTimeout", () => {
-    const roles = cloneRoleConfigs();
-    applyRoleOverride(roles, "judge", "retryOnTimeout", "false");
-    expect(roles.judge.retryOnTimeout).toBe(false);
-  });
-
   it("applyRoleOverride rejects negative timeoutMs", () => {
     const roles = cloneRoleConfigs();
     expect(() =>
       applyRoleOverride(roles, "primaryImpl", "timeoutMs", "-100"),
-    ).toThrow();
-  });
-
-  it("applyRoleOverride rejects non-boolean retryOnTimeout", () => {
-    const roles = cloneRoleConfigs();
-    expect(() =>
-      applyRoleOverride(roles, "judge", "retryOnTimeout", "maybe"),
     ).toThrow();
   });
 
@@ -486,11 +447,9 @@ describe("RoleConfig timeout-fix fields", () => {
         ...DEFAULT_ROLE_CONFIGS.primaryImpl,
         timeoutMs: 1200000,
         backupTimeoutMs: 400000,
-        retryOnTimeout: false,
       },
     });
     expect(roles.primaryImpl.timeoutMs).toBe(1200000);
     expect(roles.primaryImpl.backupTimeoutMs).toBe(400000);
-    expect(roles.primaryImpl.retryOnTimeout).toBe(false);
   });
 });

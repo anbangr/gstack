@@ -19,13 +19,14 @@
  *   - --yolo on Gemini for autonomous file edits
  */
 
-import { execFile } from "./child-registry";
+import { spawn as registeredSpawn } from "./child-registry";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { logDir, ensureLogDir, deriveGeminiTmpKey } from "./state";
 import type { RoleConfig, RoleProvider, RoleReasoning } from "./role-config";
 import { BUILD_DEFAULTS, envNumberOrDefault } from "./build-config";
 import type { DualImplCandidateKey } from "./types";
+import { attachStallWatchdog, type Provider } from "./stall-watchdog";
 
 export type CodexSandbox =
   | "read-only"
@@ -64,12 +65,16 @@ function kimiBin(): string {
 }
 
 /**
- * Resolve effective timeouts and retry policy for a role.
+ * Resolve effective timeouts for a role under liveness semantics.
  *
  * Precedence for primary timeout: callerTimeoutMs > role.timeoutMs > provider default.
  * Backup timeout: role.backupTimeoutMs > max(60s, floor(primaryMs/2)). The 60s floor
  * keeps backup viable when primary is configured very small (gemini CLI cold start
  * alone is ~3-5s; anything below 60s leaves no room for actual work).
+ *
+ * Under liveness semantics, these values are STALL WINDOWS (max ms of silence
+ * before kill), not wall-clock budgets — a sub-agent that keeps emitting stdout
+ * runs as long as it needs.
  *
  * "claude" provider has no key in BUILD_DEFAULTS.timeoutsMs today; we reuse the
  * codex default for parity with existing call sites that fall through to CODEX_TIMEOUT_MS.
@@ -80,7 +85,6 @@ export function resolveRoleTimeouts(
 ): {
   primaryMs: number;
   backupMs: number;
-  retryOnTimeout: boolean;
 } {
   const providerDefault =
     role.provider === "gemini"
@@ -91,8 +95,7 @@ export function resolveRoleTimeouts(
   const primaryMs = callerTimeoutMs ?? role.timeoutMs ?? providerDefault;
   const backupMs =
     role.backupTimeoutMs ?? Math.max(60000, Math.floor(primaryMs / 2));
-  const retryOnTimeout = role.retryOnTimeout !== false; // default true
-  return { primaryMs, backupMs, retryOnTimeout };
+  return { primaryMs, backupMs };
 }
 
 /**
@@ -211,8 +214,19 @@ export interface SubAgentResult {
   stderr: string;
   /** Exit code; null if process was killed by signal. */
   exitCode: number | null;
-  /** True if killed by the timeout, not a real exit. */
+  /**
+   * True if killed by the stall watchdog (no stdout/stderr activity for
+   * stallMs). Aliased to `timedOut` for backwards compatibility with
+   * call-site code that branches on `timedOut`; both flags carry the
+   * same meaning under liveness semantics.
+   */
   timedOut: boolean;
+  /**
+   * Explicit flag set when the stall watchdog fired. Disambiguates a stall
+   * kill (no activity) from a transport/crash failure. Always equal to
+   * `timedOut` today.
+   */
+  stallKilled: boolean;
   /** Absolute path to the log file written for this invocation. */
   logPath: string;
   /** Wall-clock duration in ms. */
@@ -222,8 +236,31 @@ export interface SubAgentResult {
 }
 
 /**
+ * Map a CLI binary name to a Provider for the stall watchdog's classifier.
+ * Falls back to "shell" for anything that isn't a known sub-agent CLI
+ * (tests, ship, git ops). The fallback uses any-non-empty-line activity,
+ * which is correct for shell-driven workflows that print progress to stdout
+ * but don't emit structured tool-use events.
+ */
+function pickProviderForBin(bin: string): Provider {
+  if (bin === CODEX_BIN) return "codex";
+  if (bin === CLAUDE_BIN) return "claude";
+  if (bin === KIMI_BIN) return "kimi";
+  if (bin === geminiBin()) return "gemini";
+  if (bin === process.env.GEMINI_BIN) return "gemini";
+  return "shell";
+}
+
+/**
  * Spawn a child, capture stdout+stderr to a log file, and resolve with
  * structured result. Closes stdin if `closeStdin` (Codex needs this).
+ *
+ * Liveness model: instead of passing `timeout` to execFile (which kills the
+ * child after N total ms regardless of activity), we attach a StallWatchdog
+ * that fires only after `stallMs` of silence on stdout+stderr. Same env-var
+ * names (GSTACK_BUILD_*_TIMEOUT), new semantics: the value is now a stall
+ * window, not a wall-clock budget. A sub-agent that keeps emitting tool-use
+ * or status lines runs as long as it needs.
  */
 function spawnCaptured(args: {
   bin: string;
@@ -236,52 +273,125 @@ function spawnCaptured(args: {
 }): Promise<SubAgentResult> {
   return new Promise((resolve) => {
     const startedAt = Date.now();
-    let timedOut = false;
-    const child = execFile(
-      args.bin,
-      args.argv,
+    let stallKilled = false;
+    let stallSilenceMs = 0;
+    let stdoutBuf = "";
+    let stderrBuf = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+
+    // Use spawn (not execFile) for two reasons:
+    //   1. We need real-time stream events for the StallWatchdog. execFile
+    //      callback only fires at completion.
+    //   2. child-registry.spawn reliably sets `detached: true` so the child
+    //      gets its own pgrp — `process.kill(-pid, signal)` then reaches the
+    //      full process tree (shell + grandchildren). Bun's execFile shim
+    //      doesn't always honor `detached: true`, so group signals miss the
+    //      grandchildren (e.g. a `sleep 10` under a shell script).
+    const child = registeredSpawn(args.bin, args.argv, {
+      cwd: args.cwd,
+      shell: args.shell,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    const truncate = (buf: string) => {
+      // Match execFile's maxBuffer behavior: drop everything past MAX_BUFFER
+      // and continue accumulating from the new tail. Keeps memory bounded.
+      if (buf.length > MAX_BUFFER) {
+        return buf.slice(buf.length - MAX_BUFFER);
+      }
+      return buf;
+    };
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      stdoutBytes += text.length;
+      stdoutBuf = truncate(stdoutBuf + text);
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      stderrBytes += text.length;
+      stderrBuf = truncate(stderrBuf + text);
+    });
+
+    const watchdog = attachStallWatchdog(
+      { mode: "stream", child },
       {
-        maxBuffer: MAX_BUFFER,
-        timeout: args.timeoutMs,
-        cwd: args.cwd,
-        shell: args.shell,
-      },
-      (err, stdout, stderr) => {
-        // Detect timeout via Node's own kill flag (fires before our +1000ms setTimeout).
-        if (err?.killed) timedOut = true;
-
-        // Persist captured output regardless of success.
-        try {
-          fs.writeFileSync(
-            args.logPath,
-            `# command: ${args.bin} ${args.argv.map(quote).join(" ")}\n` +
-              `# cwd: ${args.cwd || process.cwd()}\n` +
-              `# started: ${new Date(startedAt).toISOString()}\n` +
-              `# duration_ms: ${Date.now() - startedAt}\n` +
-              `# timed_out: ${timedOut}\n` +
-              `# exit: ${err ? ((err as any).code ?? "killed") : 0}\n` +
-              `\n# ---- stdout ----\n${stdout}\n# ---- stderr ----\n${stderr}\n`,
-          );
-        } catch {
-          // Log file write failures shouldn't sink the orchestrator.
-        }
-
-        const exitCode = err
-          ? (((err as any).code as number | null) ?? null)
-          : 0;
-        resolve({
-          stdout: String(stdout || ""),
-          stderr: String(stderr || ""),
-          exitCode,
-          timedOut,
-          logPath: args.logPath,
-          durationMs: Date.now() - startedAt,
-          retries: 0,
-        });
+        stallMs: args.timeoutMs,
+        provider: pickProviderForBin(args.bin),
+        onStallKill: (silenceMs) => {
+          stallKilled = true;
+          stallSilenceMs = silenceMs;
+        },
       },
     );
 
     if (args.closeStdin) child.stdin?.end();
+
+    const finish = (exitCode: number | null, signal: NodeJS.Signals | null) => {
+      watchdog.stop();
+      // If the watchdog killed us, treat as timedOut. Otherwise a SIGTERM/
+      // SIGKILL signal means an external killer (not the watchdog) — surface
+      // as a non-timeout failure.
+      const timedOut = stallKilled;
+
+      try {
+        fs.writeFileSync(
+          args.logPath,
+          `# command: ${args.bin} ${args.argv.map(quote).join(" ")}\n` +
+            `# cwd: ${args.cwd || process.cwd()}\n` +
+            `# started: ${new Date(startedAt).toISOString()}\n` +
+            `# duration_ms: ${Date.now() - startedAt}\n` +
+            `# timed_out: ${timedOut}\n` +
+            `# stall_killed: ${stallKilled}\n` +
+            `# stall_silence_ms: ${stallSilenceMs}\n` +
+            `# exit: ${exitCode ?? signal ?? "unknown"}\n` +
+            `# stdout_bytes: ${stdoutBytes}\n` +
+            `# stderr_bytes: ${stderrBytes}\n` +
+            `\n# ---- stdout ----\n${stdoutBuf}\n# ---- stderr ----\n${stderrBuf}\n`,
+        );
+      } catch {
+        // Log file write failures shouldn't sink the orchestrator.
+      }
+
+      resolve({
+        stdout: stdoutBuf,
+        stderr: stderrBuf,
+        exitCode,
+        timedOut,
+        stallKilled,
+        logPath: args.logPath,
+        durationMs: Date.now() - startedAt,
+        retries: 0,
+      });
+    };
+
+    let settled = false;
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
+    // Resolve on 'close', not 'exit'. Node fires 'exit' as soon as the child
+    // process ends, but stdio pipes may still have buffered data not yet
+    // delivered via 'data' events. 'close' fires only after all stdio
+    // streams have been fully drained. Resolving on 'exit' truncates the
+    // final stdout/stderr chunk (final tool-use JSON, Codex 403/429 line,
+    // test failure summary) and corrupts the captured log. The old execFile
+    // callback waited for close internally.
+    child.once("exit", (code, signal) => {
+      exitCode = code;
+      exitSignal = signal;
+    });
+    child.once("close", () => {
+      if (settled) return;
+      settled = true;
+      finish(exitCode, exitSignal);
+    });
+    child.once("error", (err) => {
+      if (settled) return;
+      settled = true;
+      // Spawn failure (ENOENT, EACCES, etc.) — close may not fire.
+      stderrBuf += `\n# spawn error: ${err.message}\n`;
+      finish(null, null);
+    });
   });
 }
 
@@ -541,7 +651,6 @@ export async function runKimi(opts: {
   command?: string;
   gate?: boolean;
   timeoutMs?: number;
-  retryOnTimeout?: boolean;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
 
@@ -575,7 +684,7 @@ export async function runKimi(opts: {
     `phase-${opts.phaseNumber}-${prefix}-${opts.iteration}.log`,
   );
 
-  let result = await spawnCaptured({
+  const result = await spawnCaptured({
     bin: kimiBin(),
     argv,
     cwd: opts.cwd,
@@ -584,25 +693,10 @@ export async function runKimi(opts: {
     closeStdin: false,
   });
 
-  // retryOnTimeout gates ONLY the time-budget retry; non-timeout failures
-  // fall through to the caller's fallback path.
-  if (result.timedOut && opts.retryOnTimeout !== false) {
-    const retryLog = path.join(
-      logDir(opts.slug),
-      `phase-${opts.phaseNumber}-kimi-${opts.iteration}-retry.log`,
-    );
-    const retryResult = await spawnCaptured({
-      bin: kimiBin(),
-      argv,
-      cwd: opts.cwd,
-      timeoutMs: opts.timeoutMs ?? KIMI_TIMEOUT_MS,
-      logPath: retryLog,
-      closeStdin: false,
-    });
-    retryResult.retries = 1;
-    cleanupStaged();
-    return mergeOutputFile(retryResult, opts.outputFilePath);
-  }
+  // Under liveness semantics, a stall-kill means the agent went silent —
+  // retrying with the same stall window is provably no improvement. Stalls
+  // surface to the caller's fallback path; transport failures (handled
+  // elsewhere) still retry.
   cleanupStaged();
   return mergeOutputFile(result, opts.outputFilePath);
 }
@@ -753,7 +847,6 @@ export async function runCodexReview(opts: {
   gate?: boolean;
   logPrefix?: string;
   timeoutMs?: number;
-  retryOnTimeout?: boolean;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
 
@@ -794,25 +887,10 @@ export async function runCodexReview(opts: {
     closeStdin: true, // codex exec hangs without this
   });
 
-  // retryOnTimeout gates ONLY the time-budget retry. Transport-failure retry
-  // below is a separate failure mode and stays enabled regardless.
-  if (result.timedOut && opts.retryOnTimeout !== false) {
-    const retryLog = path.join(
-      logDir(opts.slug),
-      `phase-${opts.phaseNumber}-${opts.logPrefix ?? "codex"}-${opts.iteration}-retry.log`,
-    );
-    const retryResult = await spawnCaptured({
-      bin: CODEX_BIN,
-      argv,
-      cwd: opts.cwd,
-      timeoutMs,
-      logPath: retryLog,
-      closeStdin: true,
-    });
-    retryResult.retries = 1;
-    cleanup();
-    return mergeOutputFile(retryResult, opts.outputFilePath);
-  }
+  // Stall kills are NOT retried — same stall window will stall again.
+  // Transport-failure retry below is a separate failure mode (Codex 403/429/
+  // stream-disconnect / TLS reset) and stays enabled.
+  //
   // Broad "no-verdict" retry: any non-zero exit where the staged output
   // file has no GATE PASS/FAIL marker is treated as a transient. Catches
   // 403/429/5xx, stream disconnects (already matched by
@@ -930,7 +1008,6 @@ export async function runRoleTask(opts: {
   model?: string;
   gate?: boolean;
   timeoutMs?: number;
-  retryOnTimeout?: boolean;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
   const {
@@ -960,7 +1037,7 @@ export async function runRoleTask(opts: {
       : `${opts.logPrefix}.log`,
   );
 
-  let result = await spawnCaptured({
+  const result = await spawnCaptured({
     bin: geminiBin(),
     argv,
     cwd: opts.cwd,
@@ -969,20 +1046,6 @@ export async function runRoleTask(opts: {
     closeStdin: false,
   });
 
-  if (result.timedOut && opts.retryOnTimeout !== false) {
-    const retryLog = logPath.replace(/\.log$/, "-retry.log");
-    const retryResult = await spawnCaptured({
-      bin: geminiBin(),
-      argv,
-      cwd: opts.cwd,
-      timeoutMs: opts.timeoutMs ?? GEMINI_TIMEOUT_MS,
-      logPath: retryLog,
-      closeStdin: false,
-    });
-    retryResult.retries = 1;
-    cleanupStaged();
-    return mergeOutputFile(retryResult, opts.outputFilePath);
-  }
   cleanupStaged();
   return mergeOutputFile(result, opts.outputFilePath);
 }
@@ -1000,7 +1063,6 @@ export async function runClaudeTask(opts: {
   reasoning?: RoleReasoning;
   gate?: boolean;
   timeoutMs?: number;
-  retryOnTimeout?: boolean;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
   const argv = buildClaudeTaskArgv(opts);
@@ -1010,7 +1072,7 @@ export async function runClaudeTask(opts: {
       ? `phase-${opts.phaseNumber}-${opts.logPrefix}-${opts.iteration ?? 1}.log`
       : `${opts.logPrefix}.log`,
   );
-  let result = await spawnCaptured({
+  const result = await spawnCaptured({
     bin: CLAUDE_BIN,
     argv,
     cwd: opts.cwd,
@@ -1018,22 +1080,6 @@ export async function runClaudeTask(opts: {
     logPath,
     closeStdin: true,
   });
-  if (result.timedOut && opts.retryOnTimeout !== false) {
-    const retryLog = logPath.replace(/\.log$/, "-retry.log");
-    const retryResult = await spawnCaptured({
-      bin: CLAUDE_BIN,
-      argv,
-      cwd: opts.cwd,
-      timeoutMs: opts.timeoutMs ?? CODEX_TIMEOUT_MS,
-      logPath: retryLog,
-      closeStdin: true,
-    });
-    retryResult.retries = 1;
-    return mergeOutputFile(retryResult, opts.outputFilePath, {
-      emptyFileIsError: true,
-      emptyFileErrorLabel: "Claude output file",
-    });
-  }
   return mergeOutputFile(result, opts.outputFilePath, {
     emptyFileIsError: true,
     emptyFileErrorLabel: "Claude output file",
@@ -1056,7 +1102,6 @@ export async function runShip(opts: {
     backupModel?: string;
     timeoutMs?: number;
     backupTimeoutMs?: number;
-    retryOnTimeout?: boolean;
   };
   land: {
     provider: RoleProvider;
@@ -1067,7 +1112,6 @@ export async function runShip(opts: {
     backupModel?: string;
     timeoutMs?: number;
     backupTimeoutMs?: number;
-    retryOnTimeout?: boolean;
   };
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
@@ -1156,7 +1200,6 @@ export async function runSlashCommand(opts: {
     backupModel?: string;
     timeoutMs?: number;
     backupTimeoutMs?: number;
-    retryOnTimeout?: boolean;
   };
   timeoutMs?: number;
   gate?: boolean;
@@ -1186,10 +1229,10 @@ export interface RunConfiguredRoleTaskOpts {
 /**
  * Build the recursive runConfiguredRoleTask opts for the backup fallback path.
  *
- * Explicitly clears codexDefaultCommand (caller-specific) and sets retryOnTimeout:false
- * on the backup role so the backup is single-shot. Backup uses resolved.backupMs as
- * its timeout (half of effective primary, floored at 60s) — caller-passed opts.timeoutMs
- * is intentionally NOT propagated; the backup gets its own budget.
+ * Explicitly clears codexDefaultCommand (caller-specific). Backup uses
+ * resolved.backupMs as its stall window (half of effective primary, floored
+ * at 60s) — caller-passed opts.timeoutMs is intentionally NOT propagated;
+ * the backup gets its own budget.
  */
 export function resolveFallbackForConfigured(
   parentOpts: RunConfiguredRoleTaskOpts,
@@ -1209,10 +1252,6 @@ export function resolveFallbackForConfigured(
       model: parentOpts.role.backupModel ?? "",
       reasoning: parentOpts.role.reasoning,
       command: parentOpts.role.command,
-      // Backup is single-shot. The primary already ate at least one full retry
-      // worth of time on the same prompt; doing it again on the backup just
-      // burns more wall time.
-      retryOnTimeout: false,
     },
   };
 }
@@ -1238,7 +1277,6 @@ export interface RunRoleTaskOpts {
   iteration: number;
   logPrefix: string;
   timeoutMs?: number;
-  retryOnTimeout?: boolean;
 }
 
 /**
@@ -1254,14 +1292,12 @@ export function resolveFallbackForRoleTask(
   return {
     ...parentOpts,
     timeoutMs: resolved.backupMs,
-    retryOnTimeout: false,
     logPrefix: `${parentOpts.logPrefix}-backup-${backupProvider}`,
     role: {
       provider: backupProvider,
       model: parentOpts.role.backupModel ?? "",
       reasoning: parentOpts.role.reasoning,
       command: parentOpts.role.command,
-      retryOnTimeout: false,
     },
   };
 }
@@ -1271,9 +1307,8 @@ export async function runConfiguredRoleTask(
 ): Promise<SubAgentResult> {
   const resolved = resolveRoleTimeouts(opts.role, opts.timeoutMs);
   const effectiveTimeoutMs = resolved.primaryMs;
-  const retryOnTimeout = resolved.retryOnTimeout;
 
-  // Oversized-phase fail-fast for implementation roles. Saves 15min of wasted
+  // Oversized-phase fail-fast for implementation roles. Saves a wasted
   // primary spawn when the prompt obviously can't fit. Operator overrides via
   // GSTACK_BUILD_MAX_PROMPT_CHARS / GSTACK_BUILD_MAX_FILES_PER_PHASE.
   if (ENFORCE_SCOPE_ROLES.has(opts.logPrefix)) {
@@ -1285,6 +1320,7 @@ export async function runConfiguredRoleTask(
         stderr: `phase_oversized: ${check.reason}`,
         exitCode: 1,
         timedOut: false,
+        stallKilled: false,
         logPath: "",
         durationMs: 0,
         retries: 0,
@@ -1308,7 +1344,6 @@ export async function runConfiguredRoleTask(
       reasoning: opts.role.reasoning,
       gate: opts.gate,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   } else if (opts.role.provider === "gemini") {
     result = await runRoleTask({
@@ -1323,7 +1358,6 @@ export async function runConfiguredRoleTask(
       model: opts.role.model,
       gate: opts.gate,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   } else if (opts.role.provider === "kimi") {
     result = await runKimi({
@@ -1338,7 +1372,6 @@ export async function runConfiguredRoleTask(
       model: opts.role.model,
       gate: opts.gate,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   } else {
     result = await runCodexReview({
@@ -1358,7 +1391,6 @@ export async function runConfiguredRoleTask(
       sandbox: opts.sandbox,
       logPrefix: opts.logPrefix,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   }
 
@@ -2209,7 +2241,7 @@ export async function runGeminiTestSpec(opts: {
     `phase-${opts.phaseNumber}-gemini-testspec-${opts.iteration}.log`,
   );
 
-  let result = await spawnCaptured({
+  const result = await spawnCaptured({
     bin: geminiBin(),
     argv,
     cwd: opts.cwd,
@@ -2218,23 +2250,8 @@ export async function runGeminiTestSpec(opts: {
     closeStdin: false,
   });
 
-  if (result.timedOut) {
-    const retryLog = path.join(
-      logDir(opts.slug),
-      `phase-${opts.phaseNumber}-gemini-testspec-${opts.iteration}-retry.log`,
-    );
-    const retryResult = await spawnCaptured({
-      bin: geminiBin(),
-      argv,
-      cwd: opts.cwd,
-      timeoutMs: GEMINI_TIMEOUT_MS,
-      logPath: retryLog,
-      closeStdin: false,
-    });
-    retryResult.retries = 1;
-    cleanupStaged();
-    return mergeOutputFile(retryResult, opts.outputFilePath);
-  }
+  // Stall kills aren't retried under liveness semantics — same stall window
+  // would just stall again. Caller can surface this via result.stallKilled.
   cleanupStaged();
   return mergeOutputFile(result, opts.outputFilePath);
 }
@@ -2430,7 +2447,6 @@ export async function runCodexImpl(opts: {
   /** Optional prefix for log filenames — used by fix-loop passes to avoid overwriting the initial impl log. */
   logPrefix?: string;
   timeoutMs?: number;
-  retryOnTimeout?: boolean;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
 
@@ -2462,7 +2478,7 @@ export async function runCodexImpl(opts: {
 
   const timeoutMs = opts.timeoutMs ?? CODEX_TIMEOUT_MS;
 
-  let result = await spawnCaptured({
+  const result = await spawnCaptured({
     bin: CODEX_BIN,
     argv,
     cwd: opts.cwd,
@@ -2471,25 +2487,6 @@ export async function runCodexImpl(opts: {
     closeStdin: true,
   });
 
-  // retryOnTimeout gates ONLY the time-budget retry; codex transport
-  // retries (TLS / stream disconnect) are not handled here and stay separate.
-  if (result.timedOut && opts.retryOnTimeout !== false) {
-    const retryLog = path.join(
-      logDir(opts.slug),
-      `phase-${opts.phaseNumber}-${logName}-${opts.iteration}-retry.log`,
-    );
-    const retryResult = await spawnCaptured({
-      bin: CODEX_BIN,
-      argv,
-      cwd: opts.cwd,
-      timeoutMs,
-      logPath: retryLog,
-      closeStdin: true,
-    });
-    cleanup();
-    retryResult.retries = 1;
-    return mergeOutputFile(retryResult, opts.outputFilePath);
-  }
   cleanup();
   return mergeOutputFile(result, opts.outputFilePath);
 }
@@ -2543,7 +2540,7 @@ export async function runJudge(opts: {
     `phase-${opts.phaseNumber}-judge.log`,
   );
 
-  let result = await spawnCaptured({
+  const result = await spawnCaptured({
     bin: CLAUDE_BIN,
     argv,
     cwd: opts.cwd,
@@ -2552,24 +2549,8 @@ export async function runJudge(opts: {
     closeStdin: false,
   });
 
-  if (result.timedOut) {
-    const retryLog = path.join(
-      logDir(opts.slug),
-      `phase-${opts.phaseNumber}-judge-retry.log`,
-    );
-    const retryResult = await spawnCaptured({
-      bin: CLAUDE_BIN,
-      argv,
-      cwd: opts.cwd,
-      timeoutMs: JUDGE_TIMEOUT_MS,
-      logPath: retryLog,
-      closeStdin: false,
-    });
-    retryResult.retries = 1;
-    return mergeOutputFile(retryResult, opts.outputFilePath, {
-      emptyFileIsError: true,
-    });
-  }
+  // Stall kills aren't retried under liveness semantics — same stall window
+  // would just stall again. The judge caller flags timedOut in the result.
   return mergeOutputFile(result, opts.outputFilePath, {
     emptyFileIsError: true,
   });

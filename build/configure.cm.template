@@ -81,11 +81,11 @@
     }
   },
   "limits": {
-    "codexMaxIterations": 5,
+    "codexMaxIterations": 10,
     "redSpecMaxIterations": 3,
     "testMaxIterations": 5,
     "originVerificationMaxIterations": 3,
-    "featureReviewMaxIterations": 3
+    "featureReviewMaxIterations": 5
   },
   "timeoutsMs": {
     "gemini": 600000,

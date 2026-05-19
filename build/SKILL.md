@@ -2732,4 +2732,4 @@ GSTACK_BUILD_PRIMARY_IMPL_BACKUP_MODEL=<backup-model-name>
 
 The default `configure.cm` sets a Gemini backup for `primaryImpl`, `testFixer`, `ship`, and `land`.
 
-**Timeout cost:** both the primary and backup runners have a built-in timeout retry. A primary timeout causes `primary → retry → backup → backup-retry`. At the 900s default, worst-case wait is ~60 min before the error surfaces. Adjust `timeoutMs` for roles with a backup if 60-min stalls are unacceptable.
+**Liveness model (no retry-on-timeout).** `timeoutMs` and `backupTimeoutMs` are STALL WINDOWS — max ms of stdout silence before the watchdog kills. A sub-agent that keeps emitting output runs as long as it needs. Same-budget retry on a stalled process is gone (it would just stall again on the same window); on stall the primary fails once and the backup takes over with `backupMs` (half of primary, floored at 60s). Transport-failure retries (Codex TLS / 429 / stream disconnect) still fire — those are a different failure mode and unaffected. Worst-case wait at 900s default: `primary stall window` + `backup stall window` ≈ 22.5 min, not 60 min.

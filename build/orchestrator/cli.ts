@@ -167,7 +167,7 @@ import {
   type RoleField,
   type RoleKey,
 } from "./role-config";
-import { BUILD_DEFAULTS } from "./build-config";
+import { BUILD_DEFAULTS, warnOnLargeStallWindows } from "./build-config";
 import { evaluateMonitorOnce, monitorExitCode } from "./monitor";
 import {
   drainFaults,
@@ -191,6 +191,7 @@ import {
   rewindPhase,
 } from "./halt-event-helpers";
 import { buildHaltSnapshot, emitHaltEvent, severityFor } from "./halt-events";
+import { installWrapConsole } from "./wrap-console";
 
 /**
  * Builds the HelperContext that halt-event helpers (markPhaseFailed,
@@ -4227,14 +4228,9 @@ export async function runRoleTask(opts: {
   iteration: number;
   logPrefix: string;
   timeoutMs?: number;
-  retryOnTimeout?: boolean;
 }): Promise<SubAgentResult> {
   const resolved = resolveRoleTimeouts(opts.role, opts.timeoutMs);
   const effectiveTimeoutMs = resolved.primaryMs;
-  const retryOnTimeout =
-    opts.retryOnTimeout !== undefined
-      ? opts.retryOnTimeout
-      : resolved.retryOnTimeout;
 
   let result: SubAgentResult;
 
@@ -4249,7 +4245,6 @@ export async function runRoleTask(opts: {
       logPrefix: opts.logPrefix,
       model: opts.role.model,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   } else if (opts.role.provider === "kimi") {
     result = await runKimi({
@@ -4262,7 +4257,6 @@ export async function runRoleTask(opts: {
       logPrefix: opts.logPrefix,
       model: opts.role.model,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   } else if (opts.role.provider === "codex") {
     result = await runCodexImpl({
@@ -4276,7 +4270,6 @@ export async function runRoleTask(opts: {
       model: opts.role.model,
       reasoning: opts.role.reasoning,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   } else {
     result = await runClaudeTask({
@@ -4290,7 +4283,6 @@ export async function runRoleTask(opts: {
       model: opts.role.model,
       reasoning: opts.role.reasoning,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   }
 
@@ -9014,6 +9006,11 @@ async function main() {
   // See orchestrator/README.md "Child process management".
   installSignalHandlers();
 
+  // One-shot nudge: timeout env vars set above 30min probably come from
+  // pre-liveness-semantics config where users padded the budget to avoid
+  // mid-flight kills. Under the new model these are stall windows.
+  warnOnLargeStallWindows();
+
   const rawArgv = process.argv.slice(2);
   const args = parseArgs(rawArgv);
 
@@ -9249,6 +9246,7 @@ async function main() {
   const FINALIZATION_REQUIRED = 13;
   let exitCode = 1;
   let heartbeat: HeartbeatController | null = null;
+  let uninstallWrap: (() => void) | null = null;
 
   try {
     ensureLogDir(slug);
@@ -9428,6 +9426,16 @@ async function main() {
     if (!setupFailed && state) {
       state.launch = launch;
       saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+
+      // Install the wrapConsole shim now that state is loaded and the build
+      // run loop is about to start. The shim classifies every console.warn /
+      // console.error line into a halt-event kind (SOFT_HALT_WARN /
+      // SOFT_HALT_ERROR / SILENT_STATE_MUTATION) and emits to the queue.
+      // Only the build run path gets the shim — drain-faults, mark-shipped,
+      // doctor, monitor, etc. all exit before this block. Uninstall happens
+      // in the outer finally so the shim is always removed on exit, even
+      // on uncaught errors.
+      uninstallWrap = installWrapConsole(helperCtxFor(state));
 
       // Reconcile plan-file checkboxes: any phase that reached `committed` via
       // direct JSON state patching (e.g., bypassing MARK_COMPLETE to escape a
@@ -10598,6 +10606,18 @@ async function main() {
       }
     }
   } finally {
+    // Uninstall the wrapConsole shim FIRST so registry / lock cleanup
+    // warnings below go through the real console.warn (not the wrapped
+    // version, which would queue them as halt events on a run that's
+    // already shutting down).
+    if (uninstallWrap) {
+      try {
+        uninstallWrap();
+      } catch {
+        // uninstall just restores console refs; defensive catch in case
+        // a future change makes it non-trivial.
+      }
+    }
     // Stop the stdout heartbeat first so we don't write any more lines
     // while the active-run registry / lock cleanup runs.
     if (heartbeat) {
