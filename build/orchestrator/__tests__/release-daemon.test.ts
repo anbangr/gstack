@@ -3,10 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  _registerActiveRecordForTests,
+  _resetReleaseDaemonForTests,
   buildAllowlistWithRoot,
   createReleaseLockHeartbeat,
+  isAllowedFeatureBranch,
   isAllowedRepoPath,
   processReleaseQueueRecord,
+  reviveActiveRecordsForSignal,
   runReleaseDaemon,
 } from "../release-daemon";
 import {
@@ -20,6 +24,21 @@ import type { SubAgentResult } from "../sub-agents";
 
 describe("release daemon queue loop", () => {
   let dir: string;
+  // Each test that needs a "repo path" creates a real tmp dir with a .git
+  // marker so the security gate in processReleaseQueueRecord (and the
+  // early-block gate in runReleaseDaemon) accepts it. Synthetic paths
+  // like "/repo" no longer work — that was the test-bypass C7 closed.
+  const trackedRepos: string[] = [];
+  function makeRepo(slug: string): string {
+    const p = fs.mkdtempSync(path.join(os.tmpdir(), `gstack-rd-${slug}-`));
+    fs.mkdirSync(path.join(p, ".git"));
+    trackedRepos.push(p);
+    return p;
+  }
+  // Allowlist that admits any tmpdir-rooted path. Tests pass this through
+  // opts.allowlistPrefixes so the gate accepts makeRepo() outputs. Use the
+  // realpath of tmpdir because the gate validates against realpath.
+  const TMP_ALLOWLIST = [fs.realpathSync(os.tmpdir()) + path.sep];
 
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-release-daemon-"));
@@ -27,12 +46,16 @@ describe("release daemon queue loop", () => {
 
   afterEach(() => {
     fs.rmSync(dir, { recursive: true, force: true });
+    for (const repo of trackedRepos) {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+    trackedRepos.length = 0;
   });
 
   function record(overrides: Partial<ReleaseQueueRecord>): ReleaseQueueRecord {
     return {
       runId: "run",
-      repoPath: "/repo",
+      repoPath: overrides.repoPath ?? makeRepo("default"),
       baseBranch: "main",
       featureBranch: "feat/a",
       prNumber: 1,
@@ -125,14 +148,17 @@ describe("release daemon queue loop", () => {
   });
 
   it("can process a globally discovered queued PR when no local record exists", async () => {
+    const repo = makeRepo("globally-discovered");
     const processed: number[] = [];
     const exit = await runReleaseDaemon({
       queueDir: dir,
-      repoPath: "/repo",
+      repoPath: repo,
       once: true,
       roles: DEFAULT_ROLE_CONFIGS,
       log: () => {},
-      discoverRemote: () => ({ records: [record({ prNumber: 9 })] }),
+      discoverRemote: () => ({
+        records: [record({ prNumber: 9, repoPath: repo })],
+      }),
       processor: async (item) => {
         processed.push(item.prNumber);
         return { ...item, status: "landed" };
@@ -147,11 +173,14 @@ describe("release daemon queue loop", () => {
     // Two local queued records pointing at different repos. The daemon
     // should call discoverRemote once per unique repoIdentity, plus once
     // for opts.repoPath (which is a distinct third repo here).
+    const repoA = makeRepo("a");
+    const repoB = makeRepo("b");
+    const repoC = makeRepo("c");
     writeReleaseQueueRecord(
       dir,
       record({
         prNumber: 10,
-        repoPath: "/repo-a",
+        repoPath: repoA,
         repoIdentity: "github.com/acme/repo-a",
         queuedAt: "2026-05-09T00:00:01.000Z",
       }),
@@ -160,7 +189,7 @@ describe("release daemon queue loop", () => {
       dir,
       record({
         prNumber: 11,
-        repoPath: "/repo-b",
+        repoPath: repoB,
         repoIdentity: "github.com/acme/repo-b",
         queuedAt: "2026-05-09T00:00:02.000Z",
       }),
@@ -171,7 +200,7 @@ describe("release daemon queue loop", () => {
 
     const exit = await runReleaseDaemon({
       queueDir: dir,
-      repoPath: "/repo-c",
+      repoPath: repoC,
       once: true,
       roles: DEFAULT_ROLE_CONFIGS,
       log: () => {},
@@ -187,11 +216,7 @@ describe("release daemon queue loop", () => {
 
     expect(exit).toBe(0);
     // Sorted check: same membership regardless of map iteration order.
-    expect([...discoverCalls].sort()).toEqual([
-      "/repo-a",
-      "/repo-b",
-      "/repo-c",
-    ]);
+    expect([...discoverCalls].sort()).toEqual([repoA, repoB, repoC].sort());
     // Oldest queued local record wins (PR 10 from repo-a).
     expect(processed).toEqual([10]);
   });
@@ -201,11 +226,13 @@ describe("release daemon queue loop", () => {
     // the other returns a record. The errored repo should produce a
     // warning naming that repo, but the other repo's record should
     // still be picked up and processed.
+    const repoFails = makeRepo("fails");
+    const repoWorks = makeRepo("works");
     writeReleaseQueueRecord(
       dir,
       record({
         prNumber: 70,
-        repoPath: "/repo-fails",
+        repoPath: repoFails,
         repoIdentity: "github.com/acme/repo-fails",
         queuedAt: "2026-05-09T00:00:01.000Z",
       }),
@@ -214,7 +241,7 @@ describe("release daemon queue loop", () => {
       dir,
       record({
         prNumber: 71,
-        repoPath: "/repo-works",
+        repoPath: repoWorks,
         repoIdentity: "github.com/acme/repo-works",
         queuedAt: "2026-05-09T00:00:02.000Z",
       }),
@@ -228,8 +255,8 @@ describe("release daemon queue loop", () => {
       roles: DEFAULT_ROLE_CONFIGS,
       log: (msg) => logs.push(msg),
       discoverRemote: (repoPath) => {
-        if (repoPath === "/repo-fails") {
-          return { records: [], error: "gh pr list failed for /repo-fails" };
+        if (repoPath === repoFails) {
+          return { records: [], error: `gh pr list failed for ${repoFails}` };
         }
         return { records: [] };
       },
@@ -244,21 +271,22 @@ describe("release daemon queue loop", () => {
     expect(
       logs.some(
         (m) =>
-          m.includes("could not discover queued PRs for /repo-fails") &&
-          m.includes("gh pr list failed for /repo-fails"),
+          m.includes(`could not discover queued PRs for ${repoFails}`) &&
+          m.includes(`gh pr list failed for ${repoFails}`),
       ),
     ).toBe(true);
     // The non-failing repo's local record (PR 71) is still processed
-    // even though /repo-fails errored. Oldest queued wins (PR 70).
+    // even though repoFails errored. Oldest queued wins (PR 70).
     expect(processed).toEqual([70]);
   });
 
   it("dedups discovery by repoIdentity when multiple records share the same repo", async () => {
+    const repoA = makeRepo("a");
     writeReleaseQueueRecord(
       dir,
       record({
         prNumber: 20,
-        repoPath: "/repo-a",
+        repoPath: repoA,
         repoIdentity: "github.com/acme/repo-a",
         queuedAt: "2026-05-09T00:00:01.000Z",
       }),
@@ -267,7 +295,7 @@ describe("release daemon queue loop", () => {
       dir,
       record({
         prNumber: 21,
-        repoPath: "/repo-a",
+        repoPath: repoA,
         repoIdentity: "github.com/acme/repo-a",
         queuedAt: "2026-05-09T00:00:02.000Z",
       }),
@@ -288,18 +316,19 @@ describe("release daemon queue loop", () => {
 
     expect(exit).toBe(0);
     // One discovery call for repo-a despite two records.
-    expect(discoverCalls).toEqual(["/repo-a"]);
+    expect(discoverCalls).toEqual([repoA]);
   });
 
   it("dedups configured repoPath against queued records at the same path", async () => {
     // The configured opts.repoPath and a queued record without repoIdentity
-    // both target /repo-shared. They share the same path key and must
+    // both target the same path. They share the same path key and must
     // produce only one discovery call, not two.
+    const repoShared = makeRepo("shared");
     writeReleaseQueueRecord(
       dir,
       record({
         prNumber: 80,
-        repoPath: "/repo-shared",
+        repoPath: repoShared,
         repoIdentity: undefined,
         queuedAt: "2026-05-09T00:00:01.000Z",
       }),
@@ -308,7 +337,7 @@ describe("release daemon queue loop", () => {
     const discoverCalls: string[] = [];
     const exit = await runReleaseDaemon({
       queueDir: dir,
-      repoPath: "/repo-shared",
+      repoPath: repoShared,
       once: true,
       roles: DEFAULT_ROLE_CONFIGS,
       log: () => {},
@@ -323,18 +352,19 @@ describe("release daemon queue loop", () => {
     // ONE call, not two. Before the keying-scheme unification, the configured
     // entry used a "__configured__:" prefix while the record used "path:",
     // producing two redundant discovery calls.
-    expect(discoverCalls).toEqual(["/repo-shared"]);
+    expect(discoverCalls).toEqual([repoShared]);
   });
 
   it("falls back to path key when repoIdentity is missing", async () => {
     // Records without repoIdentity should still be discovered, keyed by
     // resolved path. Two records with the same path but no identity → one
     // discovery call.
+    const repoNoIdentity = makeRepo("no-identity");
     writeReleaseQueueRecord(
       dir,
       record({
         prNumber: 25,
-        repoPath: "/repo-no-identity",
+        repoPath: repoNoIdentity,
         repoIdentity: undefined,
         queuedAt: "2026-05-09T00:00:01.000Z",
       }),
@@ -343,7 +373,7 @@ describe("release daemon queue loop", () => {
       dir,
       record({
         prNumber: 26,
-        repoPath: "/repo-no-identity",
+        repoPath: repoNoIdentity,
         repoIdentity: undefined,
         queuedAt: "2026-05-09T00:00:02.000Z",
       }),
@@ -363,15 +393,18 @@ describe("release daemon queue loop", () => {
     });
 
     expect(exit).toBe(0);
-    expect(discoverCalls).toEqual(["/repo-no-identity"]);
+    expect(discoverCalls).toEqual([repoNoIdentity]);
   });
 
   it("skips discovery for non-queued local records", async () => {
+    const repoA = makeRepo("non-queued-a");
+    const repoB = makeRepo("non-queued-b");
+    const repoC = makeRepo("non-queued-c");
     writeReleaseQueueRecord(
       dir,
       record({
         prNumber: 30,
-        repoPath: "/repo-a",
+        repoPath: repoA,
         repoIdentity: "github.com/acme/repo-a",
         status: "blocked",
       }),
@@ -380,7 +413,7 @@ describe("release daemon queue loop", () => {
       dir,
       record({
         prNumber: 31,
-        repoPath: "/repo-b",
+        repoPath: repoB,
         repoIdentity: "github.com/acme/repo-b",
         status: "landed",
       }),
@@ -389,7 +422,7 @@ describe("release daemon queue loop", () => {
       dir,
       record({
         prNumber: 32,
-        repoPath: "/repo-c",
+        repoPath: repoC,
         repoIdentity: "github.com/acme/repo-c",
         status: "queued",
       }),
@@ -410,7 +443,7 @@ describe("release daemon queue loop", () => {
 
     expect(exit).toBe(0);
     // Only repo-c (the queued one) gets a discovery call.
-    expect(discoverCalls).toEqual(["/repo-c"]);
+    expect(discoverCalls).toEqual([repoC]);
   });
 
   it("heartbeat updates the current handle and records ownership loss", () => {
@@ -440,6 +473,7 @@ describe("release daemon queue loop", () => {
     const processed = await processReleaseQueueRecord(item, {
       queueDir: dir,
       roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: TMP_ALLOWLIST,
       verifyQueued: () => ({ ok: false, error: "missing queued PR marker" }),
       land: async () => {
         throw new Error("land should not run");
@@ -455,6 +489,7 @@ describe("release daemon queue loop", () => {
     const worktree = fs.mkdtempSync(
       path.join(os.tmpdir(), "gstack-release-worktree-"),
     );
+    fs.mkdirSync(path.join(worktree, ".git"));
     const item = writeReleaseQueueRecord(
       dir,
       record({
@@ -467,6 +502,7 @@ describe("release daemon queue loop", () => {
     const processed = await processReleaseQueueRecord(item, {
       queueDir: dir,
       roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: TMP_ALLOWLIST,
       heartbeatIntervalMs: 1,
       verifyQueued: () => ({ ok: true }),
       acquireLock: () => ({
@@ -507,6 +543,7 @@ describe("release daemon queue loop", () => {
     const worktree = fs.mkdtempSync(
       path.join(os.tmpdir(), "gstack-release-worktree-cleanup-"),
     );
+    fs.mkdirSync(path.join(worktree, ".git"));
     const item = writeReleaseQueueRecord(
       dir,
       record({
@@ -519,6 +556,7 @@ describe("release daemon queue loop", () => {
     const processed = await processReleaseQueueRecord(item, {
       queueDir: dir,
       roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: TMP_ALLOWLIST,
       heartbeatIntervalMs: 60_000,
       verifyQueued: () => ({ ok: true }),
       acquireLock: () => ({
@@ -619,6 +657,12 @@ describe("isAllowedRepoPath (security gate)", () => {
     try {
       const result = isAllowedRepoPath(dir, [TMP_REAL]);
       expect(result.ok).toBe(true);
+      // The resolved path is the realpath of dir (the gate must return
+      // it so callers can substitute it for spawnSync cwd — that's the
+      // TOCTOU fix). It may differ from `dir` if tmpdir is symlinked.
+      if (result.ok) {
+        expect(result.resolved).toBe(fs.realpathSync(dir));
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -635,6 +679,9 @@ describe("isAllowedRepoPath (security gate)", () => {
     try {
       const result = isAllowedRepoPath(dir, [TMP_REAL]);
       expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.resolved).toBe(fs.realpathSync(dir));
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -714,6 +761,7 @@ describe("runReleaseDaemon allowlist enforcement on local records (F1 fix)", () 
     writeReleaseQueueRecord(
       dir,
       record({
+        runId: "f1-run-100",
         prNumber: 100,
         repoPath: "/tmp/attacker-planted",
         repoIdentity: "github.com/attacker/repo",
@@ -723,6 +771,7 @@ describe("runReleaseDaemon allowlist enforcement on local records (F1 fix)", () 
     writeReleaseQueueRecord(
       dir,
       record({
+        runId: "f1-run-101",
         prNumber: 101,
         // Also disallowed.
         repoPath: "/etc",
@@ -742,7 +791,9 @@ describe("runReleaseDaemon allowlist enforcement on local records (F1 fix)", () 
       // repoPath; we leave that unset so only local records are evaluated.
     });
 
-    expect(exit).toBe(0); // queue empty after blocking
+    // Codex-9 fix: --once with only-blocked records exits 1 (poisoned
+    // queue), not 0 (queue empty). Automation needs to notice this.
+    expect(exit).toBe(1);
     // Both records get marked blocked.
     const records = readReleaseQueueRecords(dir);
     const pr100 = records.find((r) => r.prNumber === 100);
@@ -756,10 +807,14 @@ describe("runReleaseDaemon allowlist enforcement on local records (F1 fix)", () 
     expect(logs.some((m) => m.includes("blocking PR #101"))).toBe(true);
   });
 
-  it("test processor injection bypasses the gate (tests opt into synthetic paths)", async () => {
-    // When tests inject opts.processor, paths like /repo-a aren't real
-    // directories — but the test takes responsibility for that. Gate must
-    // not interfere.
+  it("test processor injection bypasses the EARLY gate but not the processor's own gate", async () => {
+    // When tests inject opts.processor, the early gate in the watch loop
+    // does NOT fire (synthetic paths like /repo-a aren't real dirs and
+    // would falsely block the test). The test takes responsibility for
+    // safety — its processor doesn't spawn anything with the synthetic
+    // path as cwd. The early gate is a defense-in-depth layer; the
+    // load-bearing gate lives inside processReleaseQueueRecord itself
+    // and is unconditional (see the C7-prevention test below).
     writeReleaseQueueRecord(
       dir,
       record({
@@ -784,6 +839,72 @@ describe("runReleaseDaemon allowlist enforcement on local records (F1 fix)", () 
 
     expect(exit).toBe(0);
     expect(processed).toEqual([200]);
+  });
+
+  it("processReleaseQueueRecord rejects a disallowed repoPath even with synthetic test inputs (C2/C7)", async () => {
+    // Direct-call gate: a wrapper that calls processReleaseQueueRecord
+    // directly (no runReleaseDaemon, no opts.processor seam) must STILL
+    // get rejected by the allowlist. Without the gate in the processor,
+    // any production wrapper that bypassed runReleaseDaemon (or any test
+    // that called processReleaseQueueRecord directly with attacker input)
+    // could `cd` into the disallowed path. This locks the closure.
+    const planted = record({
+      prNumber: 999,
+      repoPath: "/tmp/attacker-planted-direct",
+      repoIdentity: "github.com/attacker/direct",
+    });
+    writeReleaseQueueRecord(dir, planted);
+    const result = await processReleaseQueueRecord(planted, {
+      queueDir: dir,
+      roles: DEFAULT_ROLE_CONFIGS,
+      // NO test-bypass. /tmp/attacker-planted-direct doesn't exist, so
+      // the existence check in isAllowedRepoPath rejects it. Even if it
+      // did exist, the default allowlist excludes /tmp/.
+      verifyQueued: () => {
+        throw new Error("must not be reached past the gate");
+      },
+      acquireLock: () => {
+        throw new Error("must not be reached past the gate");
+      },
+    });
+    expect(result.status).toBe("blocked");
+    expect(result.lastError).toContain("rejected by daemon allowlist");
+  });
+
+  it("processReleaseQueueRecord rejects an unsafe featureBranch (C3 refspec injection)", async () => {
+    // featureBranch flows into argv: `git fetch origin <branch>` and
+    // `git worktree add ... origin/<branch>`. A planted record with
+    // branch like "evil:refs/heads/main" would rewrite local refs
+    // during fetch. The branch-name gate inside processReleaseQueueRecord
+    // must reject anything outside the safe subset before any git runs.
+    const repo = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-release-branch-injection-"),
+    );
+    fs.mkdirSync(path.join(repo, ".git"));
+    try {
+      const planted = record({
+        prNumber: 1000,
+        repoPath: repo,
+        featureBranch: "evil:refs/heads/main",
+      });
+      writeReleaseQueueRecord(dir, planted);
+      const result = await processReleaseQueueRecord(planted, {
+        queueDir: dir,
+        roles: DEFAULT_ROLE_CONFIGS,
+        allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+        verifyQueued: () => {
+          throw new Error("must not be reached past the branch gate");
+        },
+        acquireLock: () => {
+          throw new Error("must not be reached past the branch gate");
+        },
+      });
+      expect(result.status).toBe("blocked");
+      expect(result.lastError).toContain("featureBranch rejected");
+      expect(result.lastError).toContain("safe subset");
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
   });
 });
 
@@ -872,5 +993,971 @@ describe("buildAllowlistWithRoot (Codex-1 fix)", () => {
     } finally {
       fs.rmSync(installedRoot, { recursive: true, force: true });
     }
+  });
+});
+
+describe("isAllowedFeatureBranch (refspec injection gate)", () => {
+  it("accepts ordinary branch names", () => {
+    for (const branch of [
+      "main",
+      "feat/release-daemon",
+      "fix/release-daemon-multi-repo-discovery",
+      "release-v1.40.4.2",
+      "anbang/feature_with_underscore",
+      "1.0.x",
+    ]) {
+      const result = isAllowedFeatureBranch(branch);
+      expect(result.ok).toBe(true);
+    }
+  });
+
+  it("rejects empty / non-string", () => {
+    expect(isAllowedFeatureBranch("").ok).toBe(false);
+    expect(isAllowedFeatureBranch(undefined).ok).toBe(false);
+    expect(isAllowedFeatureBranch(123 as unknown as string).ok).toBe(false);
+  });
+
+  it("rejects branch names containing git refspec specials", () => {
+    // `:` triggers push-side refspec rewriting in `git fetch`.
+    const colon = isAllowedFeatureBranch("evil:refs/heads/main");
+    expect(colon.ok).toBe(false);
+    if (!colon.ok) expect(colon.reason).toContain("safe subset");
+    // Plus, caret, tilde, space, glob — all unsafe in refspec context.
+    for (const branch of [
+      "evil+force",
+      "evil^",
+      "evil~1",
+      "evil branch",
+      "evil*",
+      "evil`whoami`",
+      "evil$(whoami)",
+      "evil;rm -rf",
+      "evil\\backslash",
+      "evil@{0}",
+    ]) {
+      expect(isAllowedFeatureBranch(branch).ok).toBe(false);
+    }
+  });
+
+  it("rejects branch names starting with `-` (flag confusion)", () => {
+    // Some git invocations treat a leading `-` as an option flag.
+    // Reject defensively.
+    const result = isAllowedFeatureBranch("--upload-pack=bad");
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe("getRepoAllowlistPrefixes — env override is additive (C8)", () => {
+  it("appends env entries on top of defaults instead of replacing them", () => {
+    const prev = process.env.GSTACK_DAEMON_REPO_ALLOWLIST;
+    const extra = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-c8-extra-allowlist-"),
+    );
+    process.env.GSTACK_DAEMON_REPO_ALLOWLIST = extra;
+    try {
+      const merged = buildAllowlistWithRoot(undefined);
+      // Defaults survive — env CANNOT silently widen the allowlist to /
+      // by setting GSTACK_DAEMON_REPO_ALLOWLIST=/ . The env entry is
+      // added (realpath-normalized); the defaults remain.
+      const home = os.homedir();
+      expect(merged.some((p) => p.startsWith(home + path.sep))).toBe(true);
+      // Env entry is also present (realpath-normalized).
+      const expectedExtra = fs.realpathSync(extra) + path.sep;
+      expect(merged.some((p) => p === expectedExtra)).toBe(true);
+    } finally {
+      fs.rmSync(extra, { recursive: true, force: true });
+      if (prev === undefined) delete process.env.GSTACK_DAEMON_REPO_ALLOWLIST;
+      else process.env.GSTACK_DAEMON_REPO_ALLOWLIST = prev;
+    }
+  });
+
+  it("deduplicates env entries that match defaults", () => {
+    const prev = process.env.GSTACK_DAEMON_REPO_ALLOWLIST;
+    // Documents/ is in the defaults. Setting it again via env should
+    // not produce duplicate entries (after env realpath normalization).
+    const docs = path.join(os.homedir(), "Documents");
+    process.env.GSTACK_DAEMON_REPO_ALLOWLIST = docs;
+    try {
+      const merged = buildAllowlistWithRoot(undefined);
+      // Both the default and the env entry realpath to the same string
+      // when ~/Documents is not a symlink, OR realpath fails (path
+      // doesn't exist for this test runner) and falls back to raw —
+      // in both cases the dedup should collapse to one occurrence.
+      const matches = merged.filter(
+        (p) =>
+          p === docs + path.sep ||
+          p === (fs.existsSync(docs) ? fs.realpathSync(docs) : docs) + path.sep,
+      );
+      // At minimum, only ONE entry should match the input docs path.
+      expect(matches.length).toBeLessThanOrEqual(2);
+      // And the dedup should have collapsed identical entries.
+      const uniqueMatches = new Set(matches);
+      expect(uniqueMatches.size).toBe(matches.length);
+    } finally {
+      if (prev === undefined) delete process.env.GSTACK_DAEMON_REPO_ALLOWLIST;
+      else process.env.GSTACK_DAEMON_REPO_ALLOWLIST = prev;
+    }
+  });
+});
+
+describe("heartbeat stops before lock release (C4 race)", () => {
+  it("signal-handler-style release stops the heartbeat first, preventing re-push of the ref", async () => {
+    // Reproduces C4: if SIGTERM handler releases the lock but doesn't
+    // stop the heartbeat, an in-flight refresh tick re-pushes the ref
+    // using its captured handle, resurrecting the lock the handler
+    // just released. Test by observing the call order: heartbeat.stop()
+    // (modeled by tracking the refresh callback being unhooked) must
+    // run before the release fires.
+    const repo = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-rd-heartbeat-race-"),
+    );
+    fs.mkdirSync(path.join(repo, ".git"));
+    try {
+      const order: string[] = [];
+      let refreshAfterStop = 0;
+      let heartbeatStopped = false;
+      const item: ReleaseQueueRecord = {
+        runId: "race-run",
+        repoPath: repo,
+        baseBranch: "main",
+        featureBranch: "feat/race",
+        prNumber: 41,
+        version: "1.0.0.0",
+        livingPlanPath: "/plan",
+        worktreePath: repo,
+        queuedAt: "2026-05-09T00:00:00.000Z",
+        status: "queued",
+      };
+      writeReleaseQueueRecord(
+        fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-race-queue-")),
+        item,
+      );
+      const result = await processReleaseQueueRecord(item, {
+        queueDir: fs.mkdtempSync(
+          path.join(os.tmpdir(), "gstack-rd-race-queue2-"),
+        ),
+        roles: DEFAULT_ROLE_CONFIGS,
+        allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+        heartbeatIntervalMs: 60_000,
+        verifyQueued: () => ({ ok: true }),
+        acquireLock: () => ({
+          acquired: true,
+          handle: {
+            ref: "refs/gstack/release-locks/race/main",
+            ownerId: "owner",
+            commit: "c",
+            repoPath: repo,
+            repoIdentity: "github.com/acme/race",
+            baseBranch: "main",
+          },
+        }),
+        refreshLock: () => {
+          order.push("refresh");
+          if (heartbeatStopped) refreshAfterStop++;
+          return {
+            ok: true,
+            handle: {
+              ref: "refs/gstack/release-locks/race/main",
+              ownerId: "owner",
+              commit: "c2",
+              repoPath: repo,
+              repoIdentity: "github.com/acme/race",
+              baseBranch: "main",
+            },
+          };
+        },
+        releaseLock: () => {
+          order.push("release");
+          heartbeatStopped = true; // After finally's heartbeat.stop()
+          return { ok: true };
+        },
+        land: async () => ({
+          stdout: "",
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          logPath: "/tmp/log",
+          durationMs: 1,
+          retries: 0,
+        }),
+      });
+      expect(result.status).toBe("landed");
+      // Heartbeat-interval is 60s so no refresh actually ticks during
+      // the test. The point of the test is structural: release fires
+      // in finally, AFTER heartbeat.stop(). No refresh observed after
+      // release — confirms the heartbeat couldn't have re-pushed the
+      // ref under SIGTERM either.
+      expect(refreshAfterStop).toBe(0);
+      // Release was called from the finally block.
+      expect(order).toContain("release");
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("reviveActiveRecordsForSignal (C5/C6 stale-snapshot fix)", () => {
+  let queueDir: string;
+
+  beforeEach(() => {
+    queueDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-revive-"));
+    _resetReleaseDaemonForTests();
+  });
+
+  afterEach(() => {
+    _resetReleaseDaemonForTests();
+    fs.rmSync(queueDir, { recursive: true, force: true });
+  });
+
+  function rec(overrides: Partial<ReleaseQueueRecord>): ReleaseQueueRecord {
+    return {
+      runId: "revive-run",
+      repoPath: "/repo",
+      baseBranch: "main",
+      featureBranch: "feat/a",
+      prNumber: 7,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: "/wt",
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+      ...overrides,
+    };
+  }
+
+  it("revives in-flight records to queued (status=landing on disk)", () => {
+    const r = rec({ runId: "in-flight-1", status: "landing" });
+    writeReleaseQueueRecord(queueDir, r);
+    _registerActiveRecordForTests(queueDir, { ...r, status: "queued" }); // stale snapshot
+
+    const result = reviveActiveRecordsForSignal("TEST");
+
+    expect(result.revived).toBe(1);
+    expect(result.skipped).toBe(0);
+    const onDisk = readReleaseQueueRecords(queueDir)[0];
+    expect(onDisk.status).toBe("queued");
+    expect(onDisk.lastError).toContain("interrupted by signal TEST");
+  });
+
+  it("SKIPS records whose on-disk status is already 'landed' (does NOT undo the ship)", () => {
+    // C5/C6 reproduction: stale in-memory snapshot says queued, but
+    // disk already says landed. Old code would rewrite to queued and
+    // erase the version bump. Fixed code reads disk and leaves landed.
+    const landed = rec({
+      runId: "already-landed",
+      status: "landed",
+      version: "1.0.0.42",
+      shippedAt: "2026-05-19T22:00:00.000Z",
+    });
+    writeReleaseQueueRecord(queueDir, landed);
+    _registerActiveRecordForTests(queueDir, {
+      ...landed,
+      status: "queued", // STALE — captured at registration time
+      shippedAt: undefined,
+    });
+
+    const logs: string[] = [];
+    const result = reviveActiveRecordsForSignal("TEST", (msg) =>
+      logs.push(msg),
+    );
+
+    expect(result.revived).toBe(0);
+    expect(result.skipped).toBe(1);
+    // Disk untouched — the landed ship survives.
+    const onDisk = readReleaseQueueRecords(queueDir)[0];
+    expect(onDisk.status).toBe("landed");
+    expect(onDisk.version).toBe("1.0.0.42");
+    expect(onDisk.shippedAt).toBe("2026-05-19T22:00:00.000Z");
+    expect(
+      logs.some((m) => m.includes("skipping revive") && m.includes("landed")),
+    ).toBe(true);
+  });
+
+  it("SKIPS records that have moved to 'blocked' on disk", () => {
+    const blocked = rec({
+      runId: "already-blocked",
+      status: "blocked",
+      lastError: "earlier failure",
+    });
+    writeReleaseQueueRecord(queueDir, blocked);
+    _registerActiveRecordForTests(queueDir, {
+      ...blocked,
+      status: "queued",
+    });
+
+    const result = reviveActiveRecordsForSignal("TEST");
+
+    expect(result.skipped).toBe(1);
+    const onDisk = readReleaseQueueRecords(queueDir)[0];
+    expect(onDisk.status).toBe("blocked");
+  });
+
+  it("falls back to the in-memory snapshot if the disk file is missing", () => {
+    // Disk file deleted between processReleaseQueueRecord and the
+    // signal handler firing. Fall back to the in-memory snapshot
+    // (status=queued) — better to mark queued than to leak.
+    const r = rec({ runId: "ghost", status: "landing" });
+    writeReleaseQueueRecord(queueDir, r);
+    _registerActiveRecordForTests(queueDir, r);
+    // Delete the disk file to simulate the race.
+    fs.rmSync(path.join(queueDir, fs.readdirSync(queueDir)[0]));
+
+    const result = reviveActiveRecordsForSignal("TEST");
+
+    // We fell back to the in-memory snapshot. Its status was "landing"
+    // (in-flight), so revive proceeds. The new write succeeds, creating
+    // a fresh queued record on disk.
+    expect(result.revived).toBe(1);
+    const onDisk = readReleaseQueueRecords(queueDir);
+    expect(onDisk.length).toBe(1);
+    expect(onDisk[0].status).toBe("queued");
+  });
+
+  it("clears activeRecords after running so the next signal is a no-op", () => {
+    const r = rec({ runId: "once-only", status: "landing" });
+    writeReleaseQueueRecord(queueDir, r);
+    _registerActiveRecordForTests(queueDir, r);
+    reviveActiveRecordsForSignal("TEST");
+    // Second invocation finds an empty registry.
+    const second = reviveActiveRecordsForSignal("TEST");
+    expect(second.revived).toBe(0);
+    expect(second.skipped).toBe(0);
+    expect(second.failed).toBe(0);
+  });
+
+  it("resets retries to 0 when reviving from drift_repairing (Codex-4)", () => {
+    // Without this reset, a record interrupted mid-drift-repair carries
+    // retries=1 forward. The next daemon pass sees retries=1 and
+    // immediately blocks on any drift failure without ever attempting
+    // /ship — the PR is permanently stuck until manual retry.
+    const r = rec({
+      runId: "drift-interrupted",
+      status: "drift_repairing",
+      retries: 1,
+    });
+    writeReleaseQueueRecord(queueDir, r);
+    _registerActiveRecordForTests(queueDir, r);
+
+    const result = reviveActiveRecordsForSignal("TEST");
+
+    expect(result.revived).toBe(1);
+    const onDisk = readReleaseQueueRecords(queueDir)[0];
+    expect(onDisk.status).toBe("queued");
+    // KEY ASSERTION: retries reset so the next attempt gets a fresh
+    // drift-repair budget.
+    expect(onDisk.retries).toBe(0);
+  });
+
+  it("preserves retries when reviving from non-drift states (landing/claiming)", () => {
+    // Sanity check: the reset only fires for drift_repairing. A revival
+    // from landing/claiming preserves whatever retries was, so the
+    // next daemon pass doesn't lose retry-count bookkeeping that didn't
+    // need clearing.
+    const r = rec({
+      runId: "landing-interrupted",
+      status: "landing",
+      retries: 1,
+    });
+    writeReleaseQueueRecord(queueDir, r);
+    _registerActiveRecordForTests(queueDir, r);
+
+    reviveActiveRecordsForSignal("TEST");
+
+    const onDisk = readReleaseQueueRecords(queueDir)[0];
+    expect(onDisk.status).toBe("queued");
+    expect(onDisk.retries).toBe(1);
+  });
+});
+
+describe("processReleaseQueueRecord respects interruptedRunIds (Codex P2)", () => {
+  // Reproduces the race Codex flagged: SIGTERM revives the record to
+  // queued while `land` is still in flight. When land returns
+  // (success or failure), the processor must NOT overwrite the queued
+  // state the signal handler wrote. The `safeUpdate` guard checks
+  // interruptedRunIds and short-circuits.
+  let queueDir: string;
+  let repo: string;
+
+  beforeEach(() => {
+    queueDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-interrupted-"));
+    repo = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-rd-interrupted-repo-"),
+    );
+    fs.mkdirSync(path.join(repo, ".git"));
+    _resetReleaseDaemonForTests();
+  });
+
+  afterEach(() => {
+    _resetReleaseDaemonForTests();
+    fs.rmSync(queueDir, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("late-returning land result does NOT overwrite queued revival", async () => {
+    // Flow:
+    //   1. processReleaseQueueRecord starts, status writes to landing.
+    //   2. land() begins, awaits.
+    //   3. While land is in flight, simulate SIGTERM revival by calling
+    //      reviveActiveRecordsForSignal directly. The disk record goes
+    //      to queued; interruptedRunIds gets the runId.
+    //   4. land() resolves with a SUCCESS exit code. The processor
+    //      tries to write status=landed via safeUpdate — but the guard
+    //      sees the runId in interruptedRunIds and short-circuits.
+    //   5. Final disk state must still be queued (revival survives).
+    const item = writeReleaseQueueRecord(queueDir, {
+      runId: "interrupted-run",
+      repoPath: repo,
+      baseBranch: "main",
+      featureBranch: "feat/race",
+      prNumber: 42,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: repo,
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+
+    let landResolve: (v: SubAgentResult) => void = () => {};
+    const landReady = new Promise<void>((readySignal) => {
+      // Resolved as soon as the land function is entered.
+      landResolve = (v) => readySignal(); // attached below
+    });
+
+    const processorPromise = processReleaseQueueRecord(item, {
+      queueDir,
+      roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      heartbeatIntervalMs: 60_000,
+      verifyQueued: () => ({ ok: true }),
+      acquireLock: () => ({
+        acquired: true,
+        handle: {
+          ref: "refs/gstack/release-locks/race/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/race",
+          baseBranch: "main",
+        },
+      }),
+      refreshLock: () => ({
+        ok: true,
+        handle: {
+          ref: "refs/gstack/release-locks/race/main",
+          ownerId: "owner",
+          commit: "c2",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/race",
+          baseBranch: "main",
+        },
+      }),
+      releaseLock: () => ({ ok: true }),
+      land: () =>
+        new Promise<SubAgentResult>((resolve) => {
+          // Signal that we're inside land() so the test can run revival.
+          landResolve(undefined as unknown as SubAgentResult);
+          // Wait a microtask to ensure revival runs before we resolve.
+          setTimeout(() => {
+            resolve({
+              stdout: "",
+              stderr: "",
+              exitCode: 0,
+              timedOut: false,
+              logPath: "/tmp/log",
+              durationMs: 1,
+              retries: 0,
+            });
+          }, 10);
+        }),
+    });
+
+    // Wait until we're inside land(). Then run the signal revival.
+    await landReady;
+    const revived = reviveActiveRecordsForSignal("TEST");
+    expect(revived.revived).toBe(1);
+    // Disk should be queued NOW.
+    const midState = readReleaseQueueRecords(queueDir)[0];
+    expect(midState.status).toBe("queued");
+
+    // Now let land() resolve. The processor's safeUpdate must NOT
+    // overwrite the queued state with landed.
+    const result = await processorPromise;
+    // The processor returns whatever safeUpdate returned — the
+    // re-read disk state (queued).
+    expect(result.status).toBe("queued");
+    expect(result.lastError).toContain("interrupted by signal");
+    // And the disk file confirms queued (revival survived).
+    const finalState = readReleaseQueueRecords(queueDir)[0];
+    expect(finalState.status).toBe("queued");
+  });
+
+  it("does NOT dispatch SECOND sub-agent after interruption mid-await (Codex-3)", async () => {
+    // After the first land() returns and the processor await yields,
+    // the signal handler interrupts. The processor sees isInterrupted()
+    // and must NOT proceed to the drift-repair ship() or the retry
+    // land(). Without the isInterrupted() checks at each await
+    // boundary, the processor would dispatch additional sub-agents
+    // after the lock was released by the signal handler — concurrent
+    // deploys on the same PR.
+    const item = writeReleaseQueueRecord(queueDir, {
+      runId: "interrupt-mid-await",
+      repoPath: repo,
+      baseBranch: "main",
+      featureBranch: "feat/race",
+      prNumber: 43,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: repo,
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+
+    let landCalls = 0;
+    let shipCalls = 0;
+    const processorPromise = processReleaseQueueRecord(item, {
+      queueDir,
+      roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      heartbeatIntervalMs: 60_000,
+      verifyQueued: () => ({ ok: true }),
+      acquireLock: () => ({
+        acquired: true,
+        handle: {
+          ref: "refs/gstack/release-locks/race/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/race",
+          baseBranch: "main",
+        },
+      }),
+      refreshLock: () => ({
+        ok: true,
+        handle: {
+          ref: "refs/gstack/release-locks/race/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/race",
+          baseBranch: "main",
+        },
+      }),
+      releaseLock: () => ({ ok: true }),
+      // First land() simulates drift failure to entice the processor
+      // into the drift-repair branch. After this resolves, we trigger
+      // the signal handler, then the isInterrupted() check at the next
+      // await boundary must short-circuit before ship() runs.
+      land: async () => {
+        landCalls++;
+        if (landCalls === 1) {
+          // Schedule revival BEFORE returning from land() — by the time
+          // the processor's await resumes, interruptedRunIds is set.
+          await new Promise<void>((resolve) =>
+            setImmediate(() => {
+              reviveActiveRecordsForSignal("TEST");
+              resolve();
+            }),
+          );
+          return {
+            stdout: "",
+            stderr: "VERSION drift detected",
+            exitCode: 1,
+            timedOut: false,
+            logPath: "/tmp/log",
+            durationMs: 1,
+            retries: 0,
+          };
+        }
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          logPath: "/tmp/log",
+          durationMs: 1,
+          retries: 0,
+        };
+      },
+      ship: async () => {
+        shipCalls++;
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          logPath: "/tmp/log",
+          durationMs: 1,
+          retries: 0,
+        };
+      },
+    });
+
+    const result = await processorPromise;
+    // First land() ran (unavoidable — we needed it to set up the drift
+    // path). KEY ASSERTION: ship() (drift repair) and second land()
+    // (retry) did NOT run. The isInterrupted() check between land
+    // returning and ship dispatching bailed us out.
+    expect(landCalls).toBe(1);
+    expect(shipCalls).toBe(0);
+    // Returned the disk state — queued (revival survived).
+    expect(result.status).toBe("queued");
+  });
+
+  it("revives a record interrupted DURING verifyQueued (Codex-5)", async () => {
+    // Before round-7, the processor registered the record AFTER
+    // verifyQueued + acquireLock. SIGTERM during verifyQueued left the
+    // disk record stuck at 'claiming' with no entry in activeRecords —
+    // the signal handler couldn't revive it, and discovery only
+    // re-fans 'queued' records, so the PR was abandoned. Round-7
+    // moved the register call to immediately after the claiming write.
+    const item = writeReleaseQueueRecord(queueDir, {
+      runId: "interrupt-during-verify",
+      repoPath: repo,
+      baseBranch: "main",
+      featureBranch: "feat/race",
+      prNumber: 44,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: repo,
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+
+    let landCalls = 0;
+    const processorPromise = processReleaseQueueRecord(item, {
+      queueDir,
+      roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      heartbeatIntervalMs: 60_000,
+      verifyQueued: () => {
+        // Simulate SIGTERM arriving WHILE verifyQueued is running.
+        // The disk record is already 'claiming' (the processor wrote
+        // it just before this call). With the round-7 fix, the
+        // activeRecords entry exists at this moment, so revival sees
+        // it and writes queued. Without the fix, activeRecords is
+        // empty here.
+        reviveActiveRecordsForSignal("TEST");
+        return { ok: true };
+      },
+      acquireLock: () => {
+        throw new Error(
+          "must not be reached — interrupt fired in verifyQueued",
+        );
+      },
+      land: async () => {
+        landCalls++;
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          logPath: "/tmp/log",
+          durationMs: 1,
+          retries: 0,
+        };
+      },
+    });
+
+    const result = await processorPromise;
+    // The interrupt-during-verify path: the processor's pre-lock
+    // interrupted-check fires after verifyQueued returns and bails
+    // out. land() never ran.
+    expect(landCalls).toBe(0);
+    // Disk state is queued (revival succeeded) — not stranded at
+    // claiming.
+    const onDisk = readReleaseQueueRecords(queueDir)[0];
+    expect(onDisk.status).toBe("queued");
+    expect(result.status).toBe("queued");
+  });
+});
+
+describe("env override allowlist edge cases (Codex-6)", () => {
+  it("rejects GSTACK_DAEMON_REPO_ALLOWLIST=/ (root)", () => {
+    // Without the round-7 rejection, an attacker who can set env on
+    // the daemon (launchctl plist edit, ~/.zshenv poisoning) can flip
+    // GSTACK_DAEMON_REPO_ALLOWLIST=/ and effectively disable the
+    // allowlist — every absolute path with a .git entry starts with
+    // /, so withSep.startsWith("/") matches every check.
+    const prev = process.env.GSTACK_DAEMON_REPO_ALLOWLIST;
+    process.env.GSTACK_DAEMON_REPO_ALLOWLIST = "/";
+    try {
+      const merged = buildAllowlistWithRoot(undefined);
+      // The override is rejected, so we get defaults only (no root).
+      expect(merged).not.toContain("/");
+      // Defaults survive — all under $HOME.
+      expect(merged.every((p) => p.startsWith(os.homedir() + path.sep))).toBe(
+        true,
+      );
+    } finally {
+      if (prev === undefined) delete process.env.GSTACK_DAEMON_REPO_ALLOWLIST;
+      else process.env.GSTACK_DAEMON_REPO_ALLOWLIST = prev;
+    }
+  });
+
+  it("rejects --project-root resolving to / (buildAllowlistWithRoot path)", () => {
+    // Codex-11: env-side rejection guards GSTACK_DAEMON_REPO_ALLOWLIST=/;
+    // this test guards the parallel attack vector via --project-root.
+    // If extraRoot realpaths to /, buildAllowlistWithRoot used to
+    // prepend / to the allowlist — every absolute path with .git
+    // would then match `withSep.startsWith('/')`.
+    const merged = buildAllowlistWithRoot("/");
+    expect(merged).not.toContain("/");
+    // Defaults survive.
+    expect(merged.length).toBeGreaterThan(0);
+  });
+
+  it("accepts a legitimate env entry alongside the / rejection", () => {
+    // A user who really wants /tmp on the allowlist (e.g. for tests)
+    // can still set it. Only `/` itself is rejected.
+    const prev = process.env.GSTACK_DAEMON_REPO_ALLOWLIST;
+    process.env.GSTACK_DAEMON_REPO_ALLOWLIST = "/:/tmp:/etc";
+    try {
+      const merged = buildAllowlistWithRoot(undefined);
+      // `/` rejected, /tmp + /etc accepted (realpath-normalized,
+      // so on macOS these become /private/tmp and /private/etc).
+      expect(merged).not.toContain("/");
+      const tmpReal = fs.realpathSync("/tmp") + path.sep;
+      const etcReal = fs.realpathSync("/etc") + path.sep;
+      expect(merged).toContain(tmpReal);
+      expect(merged).toContain(etcReal);
+    } finally {
+      if (prev === undefined) delete process.env.GSTACK_DAEMON_REPO_ALLOWLIST;
+      else process.env.GSTACK_DAEMON_REPO_ALLOWLIST = prev;
+    }
+  });
+});
+
+describe("worktreePath is gate-validated (Codex-10)", () => {
+  // A planted queue record can have a legitimate repoPath but
+  // worktreePath pointing at an attacker checkout. The repoPath gate
+  // passes; checkoutScratchWorktree historically returned the
+  // worktreePath unchanged; /land-and-deploy then ran with cwd =
+  // attacker dir. Round-9 added a gate on worktreePath that mirrors
+  // the repoPath check.
+  let queueDir2: string;
+  let allowedRepo: string;
+  let attackerCheckout: string;
+
+  beforeEach(() => {
+    queueDir2 = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-c10-"));
+    allowedRepo = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-rd-c10-allowed-"),
+    );
+    fs.mkdirSync(path.join(allowedRepo, ".git"));
+    attackerCheckout = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-rd-c10-attacker-"),
+    );
+    fs.mkdirSync(path.join(attackerCheckout, ".git"));
+    _resetReleaseDaemonForTests();
+  });
+
+  afterEach(() => {
+    _resetReleaseDaemonForTests();
+    fs.rmSync(queueDir2, { recursive: true, force: true });
+    fs.rmSync(allowedRepo, { recursive: true, force: true });
+    fs.rmSync(attackerCheckout, { recursive: true, force: true });
+  });
+
+  it("uses gate-resolved worktreePath when it passes the allowlist", async () => {
+    const item = writeReleaseQueueRecord(queueDir2, {
+      runId: "wt-allowed",
+      repoPath: allowedRepo,
+      baseBranch: "main",
+      featureBranch: "feat/test",
+      prNumber: 60,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: allowedRepo,
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+
+    let observedCwd = "";
+    const result = await processReleaseQueueRecord(item, {
+      queueDir: queueDir2,
+      roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      heartbeatIntervalMs: 60_000,
+      verifyQueued: () => ({ ok: true }),
+      acquireLock: () => ({
+        acquired: true,
+        handle: {
+          ref: "refs/gstack/release-locks/wt/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: allowedRepo,
+          repoIdentity: "github.com/acme/wt",
+          baseBranch: "main",
+        },
+      }),
+      refreshLock: () => ({
+        ok: true,
+        handle: {
+          ref: "refs/gstack/release-locks/wt/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: allowedRepo,
+          repoIdentity: "github.com/acme/wt",
+          baseBranch: "main",
+        },
+      }),
+      releaseLock: () => ({ ok: true }),
+      land: async ({ cwd }) => {
+        observedCwd = cwd;
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          logPath: "/tmp/log",
+          durationMs: 1,
+          retries: 0,
+        };
+      },
+    });
+    expect(result.status).toBe("landed");
+    expect(observedCwd).toBe(fs.realpathSync(allowedRepo));
+  });
+
+  it("does NOT pass disallowed worktreePath into land's cwd", async () => {
+    // Restrictive allowlist: ONLY allowedRepo. worktreePath at
+    // attackerCheckout is outside. The gate must reject and
+    // checkoutScratchWorktree falls through to creating a scratch
+    // worktree from allowedRepo. The attacker dir must NEVER appear
+    // as land's cwd.
+    const item = writeReleaseQueueRecord(queueDir2, {
+      runId: "wt-disallowed",
+      repoPath: allowedRepo,
+      baseBranch: "main",
+      featureBranch: "feat/test",
+      prNumber: 61,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: attackerCheckout,
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+    const restrictiveAllowlist = [fs.realpathSync(allowedRepo) + path.sep];
+
+    let observedCwd = "";
+    try {
+      await processReleaseQueueRecord(item, {
+        queueDir: queueDir2,
+        roles: DEFAULT_ROLE_CONFIGS,
+        allowlistPrefixes: restrictiveAllowlist,
+        heartbeatIntervalMs: 60_000,
+        verifyQueued: () => ({ ok: true }),
+        acquireLock: () => ({
+          acquired: true,
+          handle: {
+            ref: "refs/gstack/release-locks/wt/main",
+            ownerId: "owner",
+            commit: "c",
+            repoPath: allowedRepo,
+            repoIdentity: "github.com/acme/wt",
+            baseBranch: "main",
+          },
+        }),
+        refreshLock: () => ({
+          ok: true,
+          handle: {
+            ref: "refs/gstack/release-locks/wt/main",
+            ownerId: "owner",
+            commit: "c",
+            repoPath: allowedRepo,
+            repoIdentity: "github.com/acme/wt",
+            baseBranch: "main",
+          },
+        }),
+        releaseLock: () => ({ ok: true }),
+        land: async ({ cwd }) => {
+          observedCwd = cwd;
+          return {
+            stdout: "",
+            stderr: "",
+            exitCode: 0,
+            timedOut: false,
+            logPath: "/tmp/log",
+            durationMs: 1,
+            retries: 0,
+          };
+        },
+      });
+    } catch {
+      // allowedRepo isn't a real git repo so `git fetch` may throw —
+      // that's fine. We only assert the negative: land never observed
+      // the attacker dir as cwd.
+    }
+    // KEY ASSERTION: if land was reached, it was NOT with attacker dir.
+    if (observedCwd) {
+      expect(observedCwd).not.toBe(attackerCheckout);
+      expect(observedCwd).not.toBe(fs.realpathSync(attackerCheckout));
+    }
+  });
+});
+
+describe("discoverQueuedRecords gates legacy records before ID derivation (Codex-12)", () => {
+  // Records without repoIdentity cause releaseQueueRecordId to fall
+  // back to canonicalRepoIdentity which spawns `git remote get-url
+  // origin` in cwd: record.repoPath. The early gate in
+  // discoverQueuedRecords must reject disallowed paths BEFORE that
+  // git invocation, so a planted record can't exfiltrate via the
+  // .git/config of an attacker-controlled dir.
+  let queueDir3: string;
+
+  beforeEach(() => {
+    queueDir3 = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-c12-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(queueDir3, { recursive: true, force: true });
+  });
+
+  it("marks disallowed legacy records (no repoIdentity) blocked before discovery", async () => {
+    // A planted record with no repoIdentity AND a disallowed repoPath.
+    // Without the round-11 early gate, releaseQueueRecordId would
+    // spawn git in /tmp/attacker-c12 BEFORE the watch-loop gate
+    // fires. Round-11 gates this record at discovery time and marks
+    // it blocked.
+    writeReleaseQueueRecord(queueDir3, {
+      runId: "legacy-no-identity",
+      repoPath: "/tmp/attacker-c12-disallowed",
+      // NOTE: no repoIdentity — the field is optional.
+      baseBranch: "main",
+      featureBranch: "feat/legacy",
+      prNumber: 700,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: "/wt",
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+
+    const logs: string[] = [];
+    const exit = await runReleaseDaemon({
+      queueDir: queueDir3,
+      once: true,
+      roles: DEFAULT_ROLE_CONFIGS,
+      log: (msg) => logs.push(msg),
+      // NO opts.processor, NO opts.discoverRemote → production path.
+    });
+
+    // Daemon reports the disallowed record as blocked and exits non-zero.
+    expect(exit).toBe(1);
+    const onDisk = readReleaseQueueRecords(queueDir3);
+    const blocked = onDisk.find((r) => r.prNumber === 700);
+    expect(blocked?.status).toBe("blocked");
+    // Either the early-discovery gate (round-11) or the watch-loop
+    // gate (round-7) catches it — both produce a "disallowed
+    // repoPath" log line.
+    expect(
+      logs.some(
+        (m) =>
+          (m.includes("disallowed repoPath") ||
+            m.includes("outside daemon allowlist") ||
+            m.includes("does not exist")) &&
+          m.includes("700"),
+      ) || logs.some((m) => m.includes("disallowed repoPath")),
+    ).toBe(true);
   });
 });

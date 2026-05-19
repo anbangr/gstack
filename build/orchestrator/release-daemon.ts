@@ -10,9 +10,11 @@ import {
   type ReleaseLockHandle,
 } from "./release-lock";
 import {
+  blockReleaseQueueRecordByRunId,
   defaultReleaseQueueDir,
   discoverBuildQueuedPullRequests,
   releaseQueueRecordId,
+  releaseQueueRecordPath,
   readReleaseQueueRecords,
   updateReleaseQueueRecord,
   verifyPrQueued,
@@ -52,11 +54,88 @@ const DEFAULT_REPO_ALLOWLIST_PREFIXES = [
 function getRepoAllowlistPrefixes(): string[] {
   const override = process.env.GSTACK_DAEMON_REPO_ALLOWLIST;
   if (!override) return DEFAULT_REPO_ALLOWLIST_PREFIXES;
-  return override
+  // Env override is ADDITIVE on top of defaults, not a replacement. A
+  // replace-semantics design lets anyone who can set env on the daemon
+  // (launchctl plist edit, ~/.zshenv poisoning) silently widen the
+  // allowlist to / by setting GSTACK_DAEMON_REPO_ALLOWLIST=/ . With
+  // additive semantics, the attacker still has to add their path
+  // explicitly and the defaults stay enforced — a small mitigation but
+  // it removes the "one env var = no allowlist" failure mode.
+  //
+  // Codex P2 (round 7) fix: reject `/` (root) and any prefix shorter
+  // than 2 non-separator characters. Without this, setting
+  // GSTACK_DAEMON_REPO_ALLOWLIST=/ inserts `/` (well, `/` after
+  // endsWith-sep normalization stays `/`), and isAllowedRepoPath's
+  // `withSep.startsWith(prefix)` check accepts every absolute path —
+  // effectively disabling the allowlist. Reject root explicitly.
+  // Codex P2 (round 11) fix: realpath each env entry before storing.
+  // The gate uses fs.realpathSync(repoPath) to defeat symlinks; the
+  // allowlist must compare against realpaths too, or symlinked
+  // prefixes like macOS's /tmp (which realpaths to /private/tmp)
+  // silently reject every repo in the documented location. Fall back
+  // to the raw string when realpath fails — the user may want a
+  // prefix that doesn't exist yet (e.g. a future mount point).
+  const extra = override
     .split(":")
     .map((p) => p.trim())
     .filter((p) => p.length > 0)
-    .map((p) => (p.endsWith(path.sep) ? p : p + path.sep));
+    .map((p) => {
+      try {
+        return fs.realpathSync(p);
+      } catch {
+        return p;
+      }
+    })
+    .map((p) => (p.endsWith(path.sep) ? p : p + path.sep))
+    .filter((p) => {
+      // Reject root (`/` on POSIX, `\` on Win32) and any prefix that
+      // resolves to a single separator after trimming.
+      if (p === path.sep) return false;
+      // Reject any path whose pre-separator content is empty.
+      const trimmed = p.slice(0, -path.sep.length);
+      if (trimmed.length === 0) return false;
+      return true;
+    });
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const prefix of [...extra, ...DEFAULT_REPO_ALLOWLIST_PREFIXES]) {
+    if (seen.has(prefix)) continue;
+    seen.add(prefix);
+    merged.push(prefix);
+  }
+  return merged;
+}
+
+/**
+ * Git branch names flowing into argv as part of a refspec (`git fetch
+ * origin <branch>`, `git worktree add ... origin/<branch>`) can include
+ * characters that git treats specially: `:` (push-side refspec separator
+ * — `evil:refs/heads/main` rewrites local refs during fetch), `+` (force
+ * update flag), `^{}` (deref dereferencing), `~` and `^` (ancestor
+ * navigation), and leading `-` (mistaken as a flag in some git builds).
+ *
+ * argv-form spawnSync prevents shell injection but not git's own
+ * refspec syntax. The allowlist guards the cwd; this guards branch
+ * names that flow through argv.
+ *
+ * Accept only the safe subset of git's reference-name grammar:
+ * letters, digits, `.`, `_`, `/`, `-`. Reject leading `-` to defeat
+ * the flag-confusion attack. Reject empty strings.
+ */
+const SAFE_BRANCH_RE = /^(?!-)[A-Za-z0-9._/-]+$/;
+export function isAllowedFeatureBranch(
+  branch: string | undefined,
+): { ok: true } | { ok: false; reason: string } {
+  if (!branch || typeof branch !== "string") {
+    return { ok: false, reason: "featureBranch is empty or not a string" };
+  }
+  if (!SAFE_BRANCH_RE.test(branch)) {
+    return {
+      ok: false,
+      reason: `featureBranch ${JSON.stringify(branch)} contains characters outside the safe subset [A-Za-z0-9._/-] (or starts with -)`,
+    };
+  }
+  return { ok: true };
 }
 
 /**
@@ -81,29 +160,47 @@ export function buildAllowlistWithRoot(
     return base;
   }
   const prefix = resolved.endsWith(path.sep) ? resolved : resolved + path.sep;
+  // Codex P2 (round 10) fix: reject root. If --project-root=/ (or
+  // resolveDaemonProjectRoot defaulted to a / cwd, or extraRoot was
+  // anything that realpath'd to /), prepending `/` to the allowlist
+  // means every absolute path with a .git entry passes the gate.
+  // The env-side rejection in getRepoAllowlistPrefixes guards the
+  // GSTACK_DAEMON_REPO_ALLOWLIST=/ vector; this branch guards the
+  // --project-root vector. Same defense, different entrypoint.
+  if (prefix === path.sep) return base;
   if (base.includes(prefix)) return base;
   return [prefix, ...base];
 }
 
 /**
- * Returns true if `repoPath` is safe for the daemon to use as a subprocess
- * cwd. A safe path is absolute, exists, is a directory, contains `.git`,
- * AND resolves (via realpath, following symlinks) to a location inside an
- * allowlisted prefix. Failures are diagnostic strings so callers can log them.
+ * Returns the canonical realpath of `repoPath` (with `ok: true`) when it
+ * is safe for the daemon to use as a subprocess cwd. A safe path is
+ * absolute, exists, is a directory, contains `.git`, AND resolves (via
+ * realpath, following symlinks) to a location inside an allowlisted
+ * prefix. Failures are diagnostic strings so callers can log them.
  *
- * The realpath check defeats symlink bypass: if the queue contains a record
- * with repoPath="/Users/me/Documents/evil-link" and that link points at
- * /tmp/attacker-repo/, the lexical path.resolve() check would pass (the
- * input is lexically inside ~/Documents/) but the subsequent `git fetch`
- * with cwd=evil-link would resolve the symlink and read
+ * **Callers must use the returned `resolved` path for all subsequent
+ * spawnSync `cwd` arguments**, not the input `repoPath`. Passing the
+ * original `repoPath` (a possibly-symlink string) re-opens the TOCTOU:
+ * the kernel re-resolves the symlink at spawn time, so an attacker who
+ * can flip a symlink between gate-time and spawn-time bypasses the
+ * gate. By forcing callers to substitute the resolved path, the spawn
+ * target is the same physical inode the gate validated.
+ *
+ * The realpath check defeats symlink bypass: if the queue contains a
+ * record with repoPath="/Users/me/Documents/evil-link" and that link
+ * points at /tmp/attacker-repo/, the lexical path.resolve() check would
+ * pass (the input is lexically inside ~/Documents/) but the subsequent
+ * `git fetch` with cwd=evil-link would resolve the symlink and read
  * /tmp/attacker-repo/.git/config — running any malicious core.sshCommand
  * the attacker planted. realpathSync forces both checks to use the same
- * physical location.
+ * physical location, and returning that location to the caller forces
+ * the spawn to operate on the inode the gate approved.
  */
 export function isAllowedRepoPath(
   repoPath: string,
   prefixes: string[] = getRepoAllowlistPrefixes(),
-): { ok: true } | { ok: false; reason: string } {
+): { ok: true; resolved: string } | { ok: false; reason: string } {
   if (!repoPath || typeof repoPath !== "string") {
     return { ok: false, reason: "repoPath is empty or not a string" };
   }
@@ -158,7 +255,7 @@ export function isAllowedRepoPath(
       reason: `repoPath ${repoPath} (realpath ${resolved}) has no .git entry (not a git repo)`,
     };
   }
-  return { ok: true };
+  return { ok: true, resolved };
 }
 
 /**
@@ -193,6 +290,22 @@ interface ActiveRecordEntry {
 }
 const activeRecords = new Map<string, ActiveRecordEntry>();
 
+/**
+ * Run-ids whose record was revived by reviveActiveRecordsForSignal. The
+ * still-running processReleaseQueueRecord (mid-await on land/ship) checks
+ * this set before every terminal status write — if the run was revived,
+ * the late-returning sub-agent's result must NOT overwrite the queued
+ * state the signal handler just wrote.
+ *
+ * Codex P2 fix: without this guard, the racing processor could land a
+ * `blocked` or `landed` write AFTER the signal revived to `queued`,
+ * clobbering the revival and stranding the record in the wrong state.
+ * The flag is one-shot per runId — the processor on noticing it
+ * abandons writes (and the lock is already released by the signal
+ * handler's callback).
+ */
+const interruptedRunIds = new Set<string>();
+
 let signalHandlersInstalled = false;
 
 /**
@@ -206,35 +319,98 @@ let signalHandlersInstalled = false;
  */
 const SIGNAL_RELEASE_BUDGET_MS = 4000;
 
+const INFLIGHT_STATES = new Set(["claiming", "landing", "drift_repairing"]);
+
+/**
+ * Revive all in-flight records back to "queued" so the next daemon
+ * tick picks them up. Exported so the SIGTERM handler can call it AND
+ * so tests can directly drive the same code path without sending real
+ * signals to the test runner.
+ *
+ * **C5/C6 fix: re-reads each record from disk before deciding to
+ * revive, and skips records whose on-disk status is already terminal**
+ * (landed/blocked/abandoned). The in-memory `activeRecords` snapshot
+ * is captured at registration time (status=queued) and never updates
+ * — without the re-read, a SIGTERM arriving after the natural-path
+ * `finally` block wrote `status=landed` (but before
+ * `activeRecords.delete()` ran) would rewrite the disk back to
+ * `queued`, erasing the version bump and CHANGELOG fields that
+ * already shipped. Re-reading ensures the handler never undoes work
+ * that already completed.
+ */
+export function reviveActiveRecordsForSignal(
+  signal: NodeJS.Signals | "TEST",
+  log: (msg: string) => void = () => {},
+): { revived: number; skipped: number; failed: number } {
+  let revived = 0;
+  let skipped = 0;
+  let failed = 0;
+  for (const [runId, entry] of activeRecords) {
+    try {
+      const onDiskPath = releaseQueueRecordPath(entry.queueDir, entry.record);
+      let onDisk: ReleaseQueueRecord;
+      try {
+        onDisk = JSON.parse(
+          fs.readFileSync(onDiskPath, "utf8"),
+        ) as ReleaseQueueRecord;
+      } catch {
+        // Disk file missing or corrupt — fall back to the in-memory
+        // snapshot (status=queued). Better to mark queued than to leak.
+        onDisk = entry.record;
+      }
+      if (!INFLIGHT_STATES.has(onDisk.status)) {
+        // Terminal state already on disk (landed/blocked) — don't touch.
+        skipped++;
+        log(
+          `signal ${signal}: skipping revive of ${runId}: already terminal (${onDisk.status})`,
+        );
+        continue;
+      }
+      // Codex P2 (round 6) fix: if the interrupt happened mid-
+      // drift_repairing, the in-progress repair didn't complete. Clear
+      // `retries` so the next daemon pass gets a fresh attempt at drift
+      // repair. Without this, the revived record carries retries=1
+      // through queued→claiming→landing, and the next drift failure
+      // immediately blocks the PR without ever finishing /ship —
+      // permanently stuck until manual retryReleaseQueueRecord.
+      const revivalPatch: Partial<ReleaseQueueRecord> = {
+        status: "queued",
+        lastError: `interrupted by signal ${signal} mid-landing`,
+      };
+      if (onDisk.status === "drift_repairing") {
+        revivalPatch.retries = 0;
+      }
+      updateReleaseQueueRecord(entry.queueDir, onDisk, revivalPatch);
+      // Mark the run interrupted so the still-running processor (if
+      // any) sees it and abandons further status writes. Without this,
+      // a late-returning land/ship result could overwrite the queued
+      // status the signal just wrote.
+      interruptedRunIds.add(runId);
+      revived++;
+    } catch (err) {
+      failed++;
+      log(
+        `signal ${signal}: failed to revive record ${runId}: ${(err as Error).message}`,
+      );
+    }
+  }
+  activeRecords.clear();
+  if (revived + skipped + failed > 0) {
+    log(
+      `signal ${signal}: revived ${revived} record(s) to queued, ${skipped} skipped (terminal on disk), ${failed} failed`,
+    );
+  }
+  return { revived, skipped, failed };
+}
+
 function installReleaseDaemonSignalHandlers(log: (msg: string) => void): void {
   if (signalHandlersInstalled) return;
   signalHandlersInstalled = true;
   const handler = (signal: NodeJS.Signals) => {
-    // Step 1: revive in-flight records BEFORE attempting lock release. If the
-    // process is killed before we get to lock release, the records are at
-    // least back to "queued" status and the next daemon will retry.
-    let revivedRecords = 0;
-    let reviveFailed = 0;
-    for (const [runId, entry] of activeRecords) {
-      try {
-        updateReleaseQueueRecord(entry.queueDir, entry.record, {
-          status: "queued",
-          lastError: `interrupted by signal ${signal} mid-landing`,
-        });
-        revivedRecords++;
-      } catch (err) {
-        reviveFailed++;
-        log(
-          `signal ${signal}: failed to revive record ${runId}: ${(err as Error).message}`,
-        );
-      }
-    }
-    activeRecords.clear();
-    if (revivedRecords + reviveFailed > 0) {
-      log(
-        `signal ${signal}: revived ${revivedRecords} record(s) to queued, ${reviveFailed} failed`,
-      );
-    }
+    // Step 1: revive in-flight records BEFORE attempting lock release. If
+    // the process is killed before we get to lock release, the records
+    // are at least back to "queued" status and the next daemon will retry.
+    reviveActiveRecordsForSignal(signal, log);
     // Step 2: release locks within a bounded budget. Once budget is gone,
     // log the rest as deferred and exit — better to leak a lock for 2h than
     // get SIGKILLed mid-git-push, which can be worse if it corrupts state.
@@ -287,10 +463,26 @@ function installReleaseDaemonSignalHandlers(log: (msg: string) => void): void {
 export function _resetReleaseDaemonForTests(): void {
   activeLockReleases.clear();
   activeRecords.clear();
+  interruptedRunIds.clear();
   signalHandlersInstalled = false;
   // Note: we can't `process.removeAllListeners('SIGTERM')` because that
   // would also remove any test-runner handlers. Tests that need a clean
   // signal surface should run in a child process.
+}
+
+/**
+ * Test-only: register a synthetic in-flight record so tests can drive
+ * `reviveActiveRecordsForSignal` directly without going through the
+ * full processReleaseQueueRecord flow. Used to exercise the C5/C6
+ * race: write a record to disk, set its on-disk status to something
+ * (landed / landing / etc.), register it as "in-flight" with a stale
+ * snapshot, then invoke revive — assert what happens.
+ */
+export function _registerActiveRecordForTests(
+  queueDir: string,
+  record: ReleaseQueueRecord,
+): void {
+  activeRecords.set(record.runId, { queueDir, record });
 }
 
 export interface ReleaseDaemonOptions {
@@ -299,6 +491,16 @@ export interface ReleaseDaemonOptions {
   watch?: boolean;
   pollMs?: number;
   repoPath?: string;
+  /**
+   * Test-only allowlist override. Production callers should leave this
+   * undefined and rely on `buildAllowlistWithRoot(opts.repoPath)`. Tests
+   * that exercise the processor against synthetic paths set this to the
+   * fixture's parent dir so isAllowedRepoPath accepts the fixture. This
+   * is NOT a security-bypass — every value passes through the same
+   * `isAllowedRepoPath` realpath+`.git` checks; it only controls which
+   * prefixes are accepted, identical in shape to GSTACK_DAEMON_REPO_ALLOWLIST.
+   */
+  allowlistPrefixes?: string[];
   discoverRemote?: (repoPath: string) => {
     records: ReleaseQueueRecord[];
     error?: string;
@@ -391,8 +593,32 @@ function scratchWorktreePath(record: ReleaseQueueRecord): string {
   );
 }
 
-function checkoutScratchWorktree(record: ReleaseQueueRecord): string {
-  if (fs.existsSync(record.worktreePath)) return record.worktreePath;
+function checkoutScratchWorktree(
+  record: ReleaseQueueRecord,
+  resolvedRepoPath: string,
+  allowlistPrefixes: string[],
+): string {
+  // Codex P2 (round 9) fix: gate record.worktreePath too. A planted
+  // queue record can have an allowed repoPath but a worktreePath
+  // pointing anywhere on disk (an attacker checkout, /tmp, etc). The
+  // returned cwd flows straight into /land-and-deploy's spawnSync,
+  // bypassing the repoPath gate. Validate worktreePath with the same
+  // allowlist + .git marker checks, and only honor it if it passes;
+  // otherwise fall through to creating a fresh scratch worktree from
+  // the gate-validated resolvedRepoPath.
+  if (fs.existsSync(record.worktreePath)) {
+    const worktreeGate = isAllowedRepoPath(
+      record.worktreePath,
+      allowlistPrefixes,
+    );
+    if (worktreeGate.ok) {
+      // Use the realpath-resolved worktree path, not the raw record
+      // value — same TOCTOU mitigation as the repoPath gate.
+      return worktreeGate.resolved;
+    }
+    // worktreePath exists but is disallowed — ignore it and create a
+    // fresh scratch worktree from the validated repo instead.
+  }
   const scratch = scratchWorktreePath(record);
   fs.mkdirSync(path.dirname(scratch), { recursive: true });
   if (!fs.existsSync(scratch)) {
@@ -400,7 +626,7 @@ function checkoutScratchWorktree(record: ReleaseQueueRecord): string {
       "git",
       ["fetch", "origin", record.featureBranch],
       {
-        cwd: record.repoPath,
+        cwd: resolvedRepoPath,
         encoding: "utf8",
       },
     );
@@ -416,7 +642,7 @@ function checkoutScratchWorktree(record: ReleaseQueueRecord): string {
         scratch,
         `origin/${record.featureBranch}`,
       ],
-      { cwd: record.repoPath, encoding: "utf8" },
+      { cwd: resolvedRepoPath, encoding: "utf8" },
     );
     if (added.status !== 0) {
       throw new Error(
@@ -433,33 +659,160 @@ export async function processReleaseQueueRecord(
 ): Promise<ReleaseQueueRecord> {
   const queueDir = opts.queueDir ?? defaultReleaseQueueDir();
   const log = opts.log ?? (() => {});
+  // Allowlist + branch-name gate at the entry of the processor itself.
+  // This is the only choke point that EVERY code path must pass through
+  // (CLI, test injection with opts.processor, direct callers from other
+  // modules). The discovery-time and watch-loop gates above are
+  // redundant defenses; the gate here is the load-bearing one. The gate
+  // returns the realpath-resolved repo path, which we substitute into
+  // every spawnSync cwd argument below — passing the original (possibly
+  // symlink) `record.repoPath` re-opens the TOCTOU the gate exists to
+  // close, because the kernel re-resolves the symlink at spawn time.
+  //
+  // Tests that drive processReleaseQueueRecord directly with synthetic
+  // paths can set GSTACK_DAEMON_REPO_ALLOWLIST or pass opts.allowlist to
+  // include their fixture root. The gate has no test-bypass flag — if
+  // tests get to bypass it, future production wrappers that copy a
+  // similar shape will too, which is exactly the C7 bypass.
+  const prefixes =
+    opts.allowlistPrefixes ?? buildAllowlistWithRoot(opts.repoPath);
+  const gate = isAllowedRepoPath(record.repoPath, prefixes);
+  if (!gate.ok) {
+    // Codex P1 (round 12) fix: use runId-based block to avoid `git
+    // remote get-url` in the rejected repo. Falls back to
+    // updateReleaseQueueRecord (which is safe when repoIdentity is
+    // set — the canonicalRepoIdentity git fallback only fires when
+    // repoIdentity is missing).
+    const blocked = blockReleaseQueueRecordByRunId(
+      queueDir,
+      record,
+      `repoPath rejected by daemon allowlist: ${gate.reason}`,
+    );
+    if (blocked) return blocked;
+    return updateReleaseQueueRecord(queueDir, record, {
+      status: "blocked",
+      lastError: `repoPath rejected by daemon allowlist: ${gate.reason}`,
+    });
+  }
+  const resolvedRepoPath = gate.resolved;
+  const branchGate = isAllowedFeatureBranch(record.featureBranch);
+  if (!branchGate.ok) {
+    const blocked = blockReleaseQueueRecordByRunId(
+      queueDir,
+      record,
+      `featureBranch rejected: ${branchGate.reason}`,
+    );
+    if (blocked) return blocked;
+    return updateReleaseQueueRecord(queueDir, record, {
+      status: "blocked",
+      lastError: `featureBranch rejected: ${branchGate.reason}`,
+    });
+  }
   const ownedBy = `${ownerId()}-pr-${record.prNumber}`;
   let current = updateReleaseQueueRecord(queueDir, record, {
     status: "claiming",
     lastError: undefined,
   });
-  const marker = (opts.verifyQueued ?? verifyPrQueued)(record.repoPath, record);
+  // Codex P2 (round 7) fix: register the record in activeRecords
+  // IMMEDIATELY after the claiming-write, before the blocking
+  // verifyQueued + acquireLock calls. Without this, SIGTERM arriving
+  // during verifyPrQueued (which can spawn `gh`) or
+  // acquireRemoteReleaseLock (spawns `git push` to claim the ref)
+  // leaves the disk record stuck in `claiming` — discovery only
+  // refans `queued` records, so the PR is abandoned until manual
+  // retryReleaseQueueRecord. The signal handler can now see this
+  // claiming record (claiming is in INFLIGHT_STATES) and revive it
+  // back to queued. We deregister in the finally block as before.
+  activeRecords.set(record.runId, { queueDir, record });
+  // Helper to deregister early-return paths. The full try/finally
+  // registers the lock-release callback too — those paths use the
+  // finally cleanup. These pre-lock returns deregister manually.
+  const deregisterPreLock = () => {
+    activeRecords.delete(record.runId);
+    interruptedRunIds.delete(record.runId);
+  };
+  // Short-circuit if SIGTERM already fired since the claiming write.
+  if (interruptedRunIds.has(record.runId)) {
+    deregisterPreLock();
+    try {
+      return JSON.parse(
+        fs.readFileSync(releaseQueueRecordPath(queueDir, current), "utf8"),
+      ) as ReleaseQueueRecord;
+    } catch {
+      return current;
+    }
+  }
+  const marker = (opts.verifyQueued ?? verifyPrQueued)(
+    resolvedRepoPath,
+    record,
+  );
+  // Codex P2 (round 8) fix: check interruption BEFORE honoring a
+  // !marker.ok result. If shutdown revival fired during verifyQueued
+  // (which spawns `gh pr view` — a likely victim of SIGTERM-driven
+  // child cleanup), the marker failure could be just "the gh subprocess
+  // got killed mid-shutdown," not a real "PR not queued" verdict.
+  // Writing blocked here would convert a retryable shutdown into a
+  // manual-retry hang. Bail out on interruption first.
+  if (interruptedRunIds.has(record.runId)) {
+    deregisterPreLock();
+    try {
+      return JSON.parse(
+        fs.readFileSync(releaseQueueRecordPath(queueDir, current), "utf8"),
+      ) as ReleaseQueueRecord;
+    } catch {
+      return current;
+    }
+  }
   if (!marker.ok) {
+    deregisterPreLock();
     return updateReleaseQueueRecord(queueDir, current, {
       status: "blocked",
       lastError: `queued PR marker verification failed: ${marker.error}`,
     });
   }
   const lock = (opts.acquireLock ?? acquireRemoteReleaseLock)({
-    cwd: record.repoPath,
-    repoPath: record.repoPath,
+    cwd: resolvedRepoPath,
+    repoPath: resolvedRepoPath,
     baseBranch: record.baseBranch,
     ownerId: ownedBy,
     ttlMs: RELEASE_LOCK_TTL_MS,
     now: opts.now?.(),
   });
+  // Codex P2 (round 8) fix: if interruption happened during acquireLock
+  // AND the lock was actually acquired, we MUST release it before
+  // returning — the heartbeat+finally cleanup hasn't been wired up yet,
+  // so a plain early-return leaks the ref for the 2h TTL. Same defense
+  // for !lock.acquired (no leak there; just deregister).
+  if (interruptedRunIds.has(record.runId)) {
+    deregisterPreLock();
+    if (lock.acquired) {
+      try {
+        (opts.releaseLock ?? releaseRemoteReleaseLock)({
+          cwd: resolvedRepoPath,
+          handle: lock.handle,
+        });
+      } catch (err) {
+        log(
+          `warning: failed to release lock during pre-heartbeat interrupt: ${(err as Error).message}`,
+        );
+      }
+    }
+    try {
+      return JSON.parse(
+        fs.readFileSync(releaseQueueRecordPath(queueDir, current), "utf8"),
+      ) as ReleaseQueueRecord;
+    } catch {
+      return current;
+    }
+  }
   if (!lock.acquired) {
+    deregisterPreLock();
     log(`release lock unavailable for ${record.baseBranch}: ${lock.reason}`);
     return updateReleaseQueueRecord(queueDir, current, { status: "queued" });
   }
 
   const heartbeat = createReleaseLockHeartbeat({
-    cwd: record.repoPath,
+    cwd: resolvedRepoPath,
     handle: lock.handle,
     ttlMs: RELEASE_LOCK_TTL_MS,
     intervalMs: opts.heartbeatIntervalMs,
@@ -468,35 +821,79 @@ export async function processReleaseQueueRecord(
     refresh: opts.refreshLock,
   });
   heartbeat.start();
-  // Register a synchronous lock-release callback. SIGTERM handler runs it if
-  // the daemon is killed mid-landing so the ref is freed on the remote
-  // instead of waiting for the 2h TTL.
+  // Register a synchronous lock-release callback. SIGTERM handler runs it
+  // if the daemon is killed mid-landing so the ref is freed on the remote
+  // instead of waiting for the 2h TTL. The callback ALSO stops the
+  // heartbeat before releasing — without that, an in-flight heartbeat
+  // tick (or one fired between release and process exit) re-pushes the
+  // ref using its captured handle, resurrecting the lock the handler
+  // just released. The macOS launchctl SIGTERM→SIGKILL grace window is
+  // long enough (~5-10s) that one re-push round trip easily fits inside
+  // it, and the heartbeat timer is `unref`'d but not cleared, so the
+  // event loop can keep it alive while the handler is processing other
+  // records.
   const releaseFn = opts.releaseLock ?? releaseRemoteReleaseLock;
-  const signalReleaseCallback: LockReleaseFn = () =>
-    releaseFn({
-      cwd: record.repoPath,
+  const signalReleaseCallback: LockReleaseFn = () => {
+    heartbeat.stop();
+    return releaseFn({
+      cwd: resolvedRepoPath,
       handle: heartbeat.currentHandle(),
     });
+  };
   activeLockReleases.add(signalReleaseCallback);
-  // Register the record itself so the signal handler can rewrite its status
-  // back to "queued" before exiting. Without this, SIGTERM mid-landing
-  // strands the record in "landing" status — invisible to the next
-  // discovery cycle and abandoned until manual retry.
-  activeRecords.set(record.runId, { queueDir, record });
+  // activeRecords.set already happened above immediately after the
+  // claiming-write — registering here would be a no-op (same runId).
+  // Codex P2 fix: every status write after registration goes through this
+  // wrapper. If reviveActiveRecordsForSignal already revived this runId,
+  // the wrapper short-circuits and returns the pre-write snapshot —
+  // preventing a late-returning land/ship result from overwriting the
+  // signal handler's queued revival with a blocked or landed write.
+  // Reads disk to return the actual current state when interrupted (the
+  // revival wrote queued; we want callers to see that, not the stale
+  // pre-revival current).
+  const isInterrupted = () => interruptedRunIds.has(record.runId);
+  const readCurrentFromDisk = (
+    snapshot: ReleaseQueueRecord,
+  ): ReleaseQueueRecord => {
+    try {
+      return JSON.parse(
+        fs.readFileSync(releaseQueueRecordPath(queueDir, snapshot), "utf8"),
+      ) as ReleaseQueueRecord;
+    } catch {
+      return { ...snapshot, status: "queued" };
+    }
+  };
+  const safeUpdate = (
+    snapshot: ReleaseQueueRecord,
+    patch: Partial<ReleaseQueueRecord>,
+  ): ReleaseQueueRecord => {
+    if (isInterrupted()) return readCurrentFromDisk(snapshot);
+    return updateReleaseQueueRecord(queueDir, snapshot, patch);
+  };
   const blockIfLockLost = () => {
     const lost = heartbeat.lostOwnership();
     if (!lost) return null;
-    return updateReleaseQueueRecord(queueDir, current, {
+    return safeUpdate(current, {
       status: "blocked",
       lastError: `release lock ownership lost during landing: ${lost}`,
     });
   };
 
   try {
-    const cwd = checkoutScratchWorktree(record);
-    current = updateReleaseQueueRecord(queueDir, current, {
+    // Codex P1 fix: bail out before any expensive work if the signal
+    // handler already interrupted us. Without this, a SIGTERM that
+    // arrives mid-checkoutScratchWorktree (or any of the blocking git
+    // calls below) revives the record but the processor keeps going,
+    // launching sub-agents AFTER the lock was released and the record
+    // marked queued for retry. Two processes (the old, dying one and
+    // the next daemon's pickup) could then race on the same PR.
+    if (isInterrupted()) return readCurrentFromDisk(current);
+    const cwd = checkoutScratchWorktree(record, resolvedRepoPath, prefixes);
+    if (isInterrupted()) return readCurrentFromDisk(current);
+    current = safeUpdate(current, {
       status: "landing",
     });
+    if (isInterrupted()) return readCurrentFromDisk(current);
     const land = opts.land ?? landOnly;
     const ship = opts.ship ?? shipOnly;
     let landResult = await land({
@@ -504,6 +901,7 @@ export async function processReleaseQueueRecord(
       slug: `release-daemon-pr-${record.prNumber}`,
       landRole: opts.roles.land,
     });
+    if (isInterrupted()) return readCurrentFromDisk(current);
     const lockLost = blockIfLockLost();
     if (lockLost) return lockLost;
     const landOutput = `${landResult.stdout}\n${landResult.stderr}`;
@@ -512,43 +910,47 @@ export async function processReleaseQueueRecord(
       isDriftFailure(landOutput) &&
       (current.retries ?? 0) < 1
     ) {
-      current = updateReleaseQueueRecord(queueDir, current, {
+      current = safeUpdate(current, {
         status: "drift_repairing",
         retries: (current.retries ?? 0) + 1,
       });
+      if (isInterrupted()) return readCurrentFromDisk(current);
       const shipResult = await ship({
         cwd,
         slug: `release-daemon-pr-${record.prNumber}-drift`,
         shipRole: opts.roles.ship,
       });
+      if (isInterrupted()) return readCurrentFromDisk(current);
       const lockLostAfterShip = blockIfLockLost();
       if (lockLostAfterShip) return lockLostAfterShip;
       if (shipResult.exitCode !== 0 || shipResult.timedOut) {
-        return updateReleaseQueueRecord(queueDir, current, {
+        return safeUpdate(current, {
           status: "blocked",
           lastError: `drift repair /ship failed (exit ${shipResult.exitCode}, timed_out=${shipResult.timedOut})`,
         });
       }
-      current = updateReleaseQueueRecord(queueDir, current, {
+      current = safeUpdate(current, {
         status: "landing",
       });
+      if (isInterrupted()) return readCurrentFromDisk(current);
       landResult = await land({
         cwd,
         slug: `release-daemon-pr-${record.prNumber}-retry`,
         landRole: opts.roles.land,
       });
+      if (isInterrupted()) return readCurrentFromDisk(current);
       const lockLostAfterRetry = blockIfLockLost();
       if (lockLostAfterRetry) return lockLostAfterRetry;
     }
     if (landResult.exitCode !== 0 || landResult.timedOut) {
-      return updateReleaseQueueRecord(queueDir, current, {
+      return safeUpdate(current, {
         status: "blocked",
         lastError: `land-and-deploy failed (exit ${landResult.exitCode}, timed_out=${landResult.timedOut}); see ${landResult.logPath}`,
       });
     }
-    return updateReleaseQueueRecord(queueDir, current, { status: "landed" });
+    return safeUpdate(current, { status: "landed" });
   } catch (err) {
-    return updateReleaseQueueRecord(queueDir, current, {
+    return safeUpdate(current, {
       status: "blocked",
       lastError: (err as Error).message,
     });
@@ -563,26 +965,88 @@ export async function processReleaseQueueRecord(
     // double-release is cheap. Missed release is not.
     heartbeat.stop();
     // Use the already-resolved releaseFn so the natural-completion path
-    // and the SIGTERM-callback path go through one callable.
+    // and the SIGTERM-callback path go through one callable. Use the
+    // gate-resolved path for cwd, not the original record.repoPath —
+    // same TOCTOU mitigation as the spawnSync calls above.
     const released = releaseFn({
-      cwd: record.repoPath,
+      cwd: resolvedRepoPath,
       handle: heartbeat.currentHandle(),
     });
     activeLockReleases.delete(signalReleaseCallback);
     activeRecords.delete(record.runId);
+    // Clear the interrupt flag — this run is done. The natural-path
+    // cleanup may have completed concurrently with revival; either way,
+    // the flag served its purpose (blocking late terminal writes) and
+    // should not leak across daemon ticks where a new run could reuse
+    // the same runId.
+    interruptedRunIds.delete(record.runId);
     if (!released.ok) {
       log(`warning: could not release ${lock.handle.ref}: ${released.error}`);
     }
   }
 }
 
+interface DiscoveryResult {
+  records: ReleaseQueueRecord[];
+  preBlocked: number;
+}
+
 function discoverQueuedRecords(
   queueDir: string,
   opts: ReleaseDaemonOptions,
-): ReleaseQueueRecord[] {
+): DiscoveryResult {
   const local = readReleaseQueueRecords(queueDir);
   const byId = new Map<string, ReleaseQueueRecord>();
+  let preBlocked = 0;
+  // Codex P1 (round 11) fix: when no test seam bypasses the
+  // production path, gate each local record's repoPath BEFORE
+  // calling releaseQueueRecordId. Without `repoIdentity`,
+  // releaseQueueRecordId falls back to `canonicalRepoIdentity`,
+  // which spawns `git remote get-url origin` in `cwd: record.repoPath`.
+  // A planted disallowed record could trigger that git subprocess
+  // (running .git/config in an attacker dir) before any allowlist
+  // check fires. The early gate here keeps the trust boundary
+  // intact: legacy records without repoIdentity must pass the
+  // allowlist before any git/gh invocation touches their repoPath.
+  // Tests that inject opts.discoverRemote OR opts.processor bypass
+  // this — same seam as the watch-loop early gate, since those
+  // injections take responsibility for not running git against
+  // synthetic paths.
+  const earlyGateEnabled = !opts.discoverRemote && !opts.processor;
+  const earlyAllowlist =
+    opts.allowlistPrefixes ?? buildAllowlistWithRoot(opts.repoPath);
   for (const record of local) {
+    if (
+      earlyGateEnabled &&
+      !record.repoIdentity &&
+      record.status === "queued"
+    ) {
+      const check = isAllowedRepoPath(record.repoPath, earlyAllowlist);
+      if (!check.ok) {
+        opts.log?.(
+          `warning: blocking PR #${record.prNumber}: disallowed repoPath: ${check.reason}`,
+        );
+        // Codex P1 (round 12) fix: use the runId-based blocking path
+        // instead of updateReleaseQueueRecord. The latter would compute
+        // releaseQueueRecordPath → releaseQueueRecordId →
+        // canonicalRepoIdentity → `git remote get-url` IN THE REJECTED
+        // REPO, defeating the gate. The runId-based path writes the
+        // existing on-disk file directly without touching the
+        // disallowed repo.
+        try {
+          const blocked = blockReleaseQueueRecordByRunId(
+            queueDir,
+            record,
+            `repoPath rejected by daemon allowlist (pre-id derivation): ${check.reason}`,
+          );
+          if (blocked) preBlocked++;
+        } catch {
+          // Transition validator may reject if record is already
+          // terminal. Either way, skip it.
+        }
+        continue;
+      }
+    }
     byId.set(releaseQueueRecordId(record), record);
   }
   // Build set of repos to discover remote PRs from. Always include
@@ -610,11 +1074,24 @@ function discoverQueuedRecords(
   // Build the effective allowlist once per discovery pass. Always extend with
   // opts.repoPath (the configured daemon root) so daemons installed outside
   // the hardcoded defaults work without manual GSTACK_DAEMON_REPO_ALLOWLIST.
-  const allowlistPrefixes = buildAllowlistWithRoot(opts.repoPath);
+  const allowlistPrefixes =
+    opts.allowlistPrefixes ?? buildAllowlistWithRoot(opts.repoPath);
   for (const [, repoPath] of reposToDiscover) {
-    // Allowlist gate: only applies when we'd hit the filesystem-touching
-    // default. Tests that inject `opts.discoverRemote` opt out of the gate
-    // and take responsibility for whatever paths they pass through.
+    // Allowlist gate + path-resolution: only applies when we'd hit the
+    // filesystem-touching default. Tests that inject `opts.discoverRemote`
+    // opt out of the gate and take responsibility for whatever paths they
+    // pass through.
+    //
+    // Codex-2 fix: pass the GATE-RESOLVED realpath to
+    // discoverBuildQueuedPullRequests, not the original (possibly-symlink)
+    // path. Same TOCTOU concern as the processor's spawnSync chain — if
+    // we validate /Users/me/Documents/evil-link (which realpaths to
+    // /tmp/attacker) and then run `gh pr list` against the original
+    // symlink string, the kernel re-resolves the link at spawn time and
+    // the gh subprocess runs against /tmp/attacker. Substituting the
+    // resolved path forces the spawn to operate on the inode the gate
+    // approved.
+    let cwdForDiscovery = repoPath;
     if (!opts.discoverRemote) {
       const check = isAllowedRepoPath(repoPath, allowlistPrefixes);
       if (!check.ok) {
@@ -623,10 +1100,11 @@ function discoverQueuedRecords(
         );
         continue;
       }
+      cwdForDiscovery = check.resolved;
     }
     const remote = opts.discoverRemote
       ? opts.discoverRemote(repoPath)
-      : discoverBuildQueuedPullRequests(repoPath);
+      : discoverBuildQueuedPullRequests(cwdForDiscovery);
     if (remote.error) {
       opts.log?.(
         `warning: could not discover queued PRs for ${repoPath}: ${remote.error}`,
@@ -637,10 +1115,11 @@ function discoverQueuedRecords(
       if (!byId.has(id)) byId.set(id, record);
     }
   }
-  return [...byId.values()].sort((a, b) => {
+  const records = [...byId.values()].sort((a, b) => {
     const byQueued = a.queuedAt.localeCompare(b.queuedAt);
     return byQueued !== 0 ? byQueued : a.prNumber - b.prNumber;
   });
+  return { records, preBlocked };
 }
 
 export async function runReleaseDaemon(
@@ -657,35 +1136,82 @@ export async function runReleaseDaemon(
   }
   // Effective allowlist for this daemon — always includes the configured
   // opts.repoPath so daemons installed outside the hardcoded defaults work.
-  const candidateAllowlist = buildAllowlistWithRoot(opts.repoPath);
+  // Tests can override via opts.allowlistPrefixes (same shape, used to
+  // accept synthetic fixture paths). The same `allowlist` value is
+  // threaded through to processReleaseQueueRecord below so the gate
+  // inside the processor uses identical prefixes — there must be exactly
+  // one allowlist for a given daemon invocation, otherwise the early
+  // block here and the processor's gate can disagree and a record could
+  // pass one but not the other.
+  const candidateAllowlist =
+    opts.allowlistPrefixes ?? buildAllowlistWithRoot(opts.repoPath);
   while (true) {
-    const candidates = discoverQueuedRecords(queueDir, { ...opts, log }).filter(
+    const discovery = discoverQueuedRecords(queueDir, {
+      ...opts,
+      allowlistPrefixes: candidateAllowlist,
+      log,
+    });
+    const candidates = discovery.records.filter(
       (record) => record.status === "queued",
     );
-    // Gate every candidate's repoPath against the allowlist BEFORE handing
-    // it to the processor. Without this check, a planted JSON file with a
-    // crafted repoPath bypasses the allowlist (which only gates the remote
-    // discovery fan-out) and processReleaseQueueRecord will happily `cd`
-    // into the attacker-controlled directory for `git fetch`. The threat
-    // model docstring on the allowlist names exactly this attack — local
-    // record processing was the unguarded surface.
+    // Early-block disallowed candidates so they're marked "blocked" in
+    // the queue before any processor work happens. This is redundant
+    // with the gate inside processReleaseQueueRecord (which is the
+    // load-bearing one — every code path passes through it), but the
+    // early block here lets the daemon skip past bad records on the
+    // same tick and emits a clearer log message naming the PR.
     //
-    // Tests inject opts.processor to bypass the real processReleaseQueueRecord
-    // (and thus the real git/gh subprocesses). When a test processor is
-    // present, skip the gate so tests with synthetic paths still run.
-    const productionPath = !opts.processor;
+    // Tests that inject opts.processor opt out of THIS early gate: their
+    // synthetic paths (/repo-a, etc.) don't exist on disk, so the gate
+    // would reject them and the test couldn't exercise the watch loop.
+    // The processor injection is the test seam — when present, the test
+    // takes responsibility for path safety (its processor doesn't run
+    // any subprocesses with the synthetic path as cwd). The gate inside
+    // processReleaseQueueRecord remains unconditional: any production
+    // wrapper that uses the real processor still gets gated.
+    const earlyGateEnabled = !opts.processor;
     let next: ReleaseQueueRecord | undefined;
+    // Combine discovery-time pre-blocks (Codex-12 / round-11 gate) with
+    // watch-loop early blocks (round-7). Either signals a poisoned
+    // queue and bumps --once's exit code to 1.
+    let earlyBlockedCount = discovery.preBlocked;
     for (const candidate of candidates) {
-      if (productionPath) {
+      if (earlyGateEnabled) {
         const check = isAllowedRepoPath(candidate.repoPath, candidateAllowlist);
         if (!check.ok) {
           log(
             `blocking PR #${candidate.prNumber}: disallowed repoPath: ${check.reason}`,
           );
-          updateReleaseQueueRecord(queueDir, candidate, {
-            status: "blocked",
-            lastError: `repoPath outside daemon allowlist: ${check.reason}`,
-          });
+          // Codex P1 (round 12) fix: if the candidate lacks
+          // repoIdentity, use the runId-based block path to avoid
+          // invoking git in the rejected repo. For candidates that DO
+          // have repoIdentity, updateReleaseQueueRecord is safe (no
+          // git fallback). Use the runId path always for consistency
+          // since both work and runId-based avoids any future
+          // regression where someone removes repoIdentity.
+          const blocked = blockReleaseQueueRecordByRunId(
+            queueDir,
+            candidate,
+            `repoPath outside daemon allowlist: ${check.reason}`,
+          );
+          if (blocked) {
+            earlyBlockedCount++;
+          } else {
+            // Fallback: no on-disk file matched (record came from
+            // remote discovery, never written to local queue). Fall
+            // back to updateReleaseQueueRecord, which is safe here
+            // because remote-discovered records always have
+            // repoIdentity (gh pr list provides it).
+            try {
+              updateReleaseQueueRecord(queueDir, candidate, {
+                status: "blocked",
+                lastError: `repoPath outside daemon allowlist: ${check.reason}`,
+              });
+              earlyBlockedCount++;
+            } catch {
+              // Best-effort. Skip.
+            }
+          }
           continue;
         }
       }
@@ -698,6 +1224,18 @@ export async function runReleaseDaemon(
       log(`PR #${result.prNumber}: ${result.status}`);
       if (opts.once) return result.status === "blocked" ? 1 : 0;
     } else if (opts.once) {
+      // Codex P2 (round 8) fix: if --once only saw disallowed records
+      // and early-blocked them, return 1 so automation notices the
+      // poisoned queue. The original code path returned 0 ("queue
+      // empty") because next was unset — that masked the broken state
+      // and disagreed with the processor's behavior, which returns 1
+      // for a blocked result.
+      if (earlyBlockedCount > 0) {
+        log(
+          `release queue: blocked ${earlyBlockedCount} record(s) for disallowed repoPath; no eligible records to process`,
+        );
+        return 1;
+      }
       log("release queue empty");
       return 0;
     }
