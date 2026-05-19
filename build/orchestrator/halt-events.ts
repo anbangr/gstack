@@ -120,3 +120,37 @@ export function emitHaltEvent(
   fs.renameSync(tmpPath, finalPath);
   return faultId;
 }
+
+export function loadPendingInvestigations(opts?: {
+  queueDir?: string;
+}): HaltEvent[] {
+  const dir = pendingInvestigationsDir(opts);
+  if (!fs.existsSync(dir)) return [];
+  const out: HaltEvent[] = [];
+  for (const name of fs.readdirSync(dir)) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const raw = fs.readFileSync(path.join(dir, name), "utf8");
+      out.push(JSON.parse(raw) as HaltEvent);
+    } catch {
+      // skip malformed
+    }
+  }
+  return out;
+}
+
+export function markInvestigated(
+  runId: string,
+  faultId: string,
+  // _outcome is reserved for future use; logging happens at the call site.
+  _outcome: "investigated" | "skipped-no-context" | "self-healed",
+  opts?: { queueDir?: string },
+): void {
+  const safeRun = safeRegistryRunId(runId);
+  const fileName = `${safeRun}-${faultId}.json`;
+  const src = path.join(pendingInvestigationsDir(opts), fileName);
+  const dstDir = processedDir(opts);
+  fs.mkdirSync(dstDir, { recursive: true });
+  const dst = path.join(dstDir, fileName);
+  fs.renameSync(src, dst);
+}

@@ -5,6 +5,8 @@ import * as path from "node:path";
 import {
   computeFaultId,
   emitHaltEvent,
+  loadPendingInvestigations,
+  markInvestigated,
   type HaltEvent,
 } from "../halt-events";
 
@@ -145,5 +147,119 @@ describe("emitHaltEvent", () => {
       .readdirSync(path.join(tmpDir, "pending-investigations"))
       .filter((f) => f.includes(".tmp."));
     expect(tmpFiles.length).toBe(0);
+  });
+});
+
+describe("loadPendingInvestigations", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "halt-events-"));
+  });
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("returns empty array when dir missing", () => {
+    expect(loadPendingInvestigations({ queueDir: tmpDir })).toEqual([]);
+  });
+
+  test("loads multiple events, ignores .tmp files", () => {
+    const a = emitHaltEvent(
+      {
+        kind: "PHASE_FAILED",
+        runId: "r1",
+        stateSlug: "s1",
+        severity: "CRITICAL",
+        message: "a",
+        pointers: {
+          stateFile: "/x", stdoutLog: "/x", livingPlan: "/x", worktreePath: "/x",
+        },
+        snapshot: { stdoutTail: "" },
+      },
+      { queueDir: tmpDir },
+    );
+    const b = emitHaltEvent(
+      {
+        kind: "PHASE_FAILED",
+        runId: "r1",
+        stateSlug: "s1",
+        severity: "CRITICAL",
+        message: "b",
+        pointers: {
+          stateFile: "/x", stdoutLog: "/x", livingPlan: "/x", worktreePath: "/x",
+        },
+        snapshot: { stdoutTail: "" },
+      },
+      { queueDir: tmpDir },
+    );
+    // Plant a stray .tmp file
+    fs.writeFileSync(
+      path.join(tmpDir, "pending-investigations", "stray.tmp.99999"),
+      "{}",
+    );
+    const loaded = loadPendingInvestigations({ queueDir: tmpDir });
+    expect(loaded.map((e) => e.faultId).sort()).toEqual([a, b].sort());
+  });
+
+  test("skips malformed JSON files without throwing", () => {
+    const good = emitHaltEvent(
+      {
+        kind: "PHASE_FAILED",
+        runId: "r1",
+        stateSlug: "s1",
+        severity: "CRITICAL",
+        message: "good event",
+        pointers: {
+          stateFile: "/x", stdoutLog: "/x", livingPlan: "/x", worktreePath: "/x",
+        },
+        snapshot: { stdoutTail: "" },
+      },
+      { queueDir: tmpDir },
+    );
+    // Plant a malformed JSON file alongside the good one
+    fs.writeFileSync(
+      path.join(tmpDir, "pending-investigations", "r1-broken.json"),
+      "{not valid json",
+    );
+    const loaded = loadPendingInvestigations({ queueDir: tmpDir });
+    expect(loaded.map((e) => e.faultId)).toEqual([good]);
+  });
+});
+
+describe("markInvestigated", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "halt-events-"));
+  });
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("moves file to processed/", () => {
+    const faultId = emitHaltEvent(
+      {
+        kind: "FEATURE_FAILED",
+        runId: "r1",
+        stateSlug: "s1",
+        severity: "CRITICAL",
+        message: "x",
+        pointers: {
+          stateFile: "/x", stdoutLog: "/x", livingPlan: "/x", worktreePath: "/x",
+        },
+        snapshot: { stdoutTail: "" },
+      },
+      { queueDir: tmpDir },
+    );
+    markInvestigated("r1", faultId, "investigated", { queueDir: tmpDir });
+    const pending = path.join(
+      tmpDir, "pending-investigations", `r1-${faultId}.json`,
+    );
+    const processed = path.join(
+      tmpDir, "processed", `r1-${faultId}.json`,
+    );
+    expect(fs.existsSync(pending)).toBe(false);
+    expect(fs.existsSync(processed)).toBe(true);
   });
 });
