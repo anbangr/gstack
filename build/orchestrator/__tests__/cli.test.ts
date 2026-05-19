@@ -488,6 +488,39 @@ describe("--ship-on-plan-complete flag wiring", () => {
   });
 });
 
+describe("--commit-dirty / --force-dirty flag wiring", () => {
+  it("parseArgs defaults -> forceDirty=false, commitDirty=false", () => {
+    const args = parseArgs(["plan.md"]);
+    expect(args.forceDirty).toBe(false);
+    expect(args.commitDirty).toBe(false);
+  });
+
+  it("parseArgs([plan, --force-dirty]) sets forceDirty=true", () => {
+    const args = parseArgs(["plan.md", "--force-dirty"]);
+    expect(args.forceDirty).toBe(true);
+    expect(args.commitDirty).toBe(false);
+  });
+
+  it("parseArgs([plan, --commit-dirty]) sets commitDirty=true", () => {
+    const args = parseArgs(["plan.md", "--commit-dirty"]);
+    expect(args.commitDirty).toBe(true);
+    expect(args.forceDirty).toBe(false);
+  });
+
+  it("both --force-dirty and --commit-dirty parse but caller enforces mutex", () => {
+    // parseArgs allows both — the mutex check lives in
+    // markPhaseCommittedAfterManualRecovery (see dirty-tree guard tests).
+    const args = parseArgs(["plan.md", "--force-dirty", "--commit-dirty"]);
+    expect(args.forceDirty).toBe(true);
+    expect(args.commitDirty).toBe(true);
+  });
+
+  it("--force-dirty and --commit-dirty are documented in --help", () => {
+    expect(HELP_TEXT).toContain("--force-dirty");
+    expect(HELP_TEXT).toContain("--commit-dirty");
+  });
+});
+
 describe("release-daemon CLI", () => {
   it("parses release-daemon run defaults", () => {
     const args = parseArgs(["release-daemon", "run"]);

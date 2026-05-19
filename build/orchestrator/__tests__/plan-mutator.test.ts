@@ -540,6 +540,28 @@ describe("unflipPhaseCheckboxes", () => {
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 
+  it("collects errors without throwing when a setCheckboxState call fails", () => {
+    // The errors array is populated when expectedMarker doesn't match the
+    // line (e.g. plan was hand-edited between parse and rewind). The
+    // un-flip continues for the other checkboxes; we get a partial result.
+    const md = `### Phase 1: Foo
+- [x] **Wrong Marker**: not what we expect
+- [x] **Review**: review
+`;
+    const p = _testWritePlan(md);
+    const phase = {
+      testSpecCheckboxLine: -1,
+      implementationCheckboxLine: 2, // **Wrong Marker** instead of **Implementation
+      reviewCheckboxLine: 3,
+      kind: "code",
+    };
+    const r = unflipPhaseCheckboxes(p, phase as any);
+    expect(r.errors).toHaveLength(1);
+    expect(r.errors[0]).toMatch(/impl/);
+    expect(r.unflipped).toBe(1); // review still un-flipped
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
   it("symmetric round-trip: reconcile flips [ ]→[x], unflip flips [x]→[ ]", () => {
     const md = `### Phase 1: Foo
 - [ ] **Test Specification**: spec
