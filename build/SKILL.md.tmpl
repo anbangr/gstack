@@ -1,7 +1,7 @@
 ---
 name: build
 preamble-tier: 4
-version: 1.24.0
+version: 1.25.0
 description: |
   gstack autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -1768,6 +1768,109 @@ When in Reexamine Mode, spawn one configured `featureVerifier` subagent per feat
 5. **Update living plan**: For any features where gaps were fixed, flip the relevant `[ ]` checkboxes to `[x]` in `LIVING_PLAN_FILE`.
 
 6. **Proceed to CLI Monitoring Loop** if any feature was FIXED and new phases remain. Otherwise report completion.
+
+### Step M3.7: Learn fault patterns from this build (curator gate)
+
+The end-of-build auto-drain (PR 6) may have produced investigator-proposed
+detector patterns in `~/.gstack/skill-faults/pending-patterns.jsonl`. This
+step promotes good proposals into `learned-patterns.json` so future builds
+catch the same shape cheaply (no LLM call) and the static detector grows
+over time.
+
+**Run this step every successful build, after Step M3 (the monitor exits 0/13).**
+
+#### Phase 1: dry-run preview
+
+```bash
+gstack-build learn-fault-patterns --dry-run 2>/dev/null
+```
+
+The CLI prints a JSON object:
+```json
+{
+  "totalProposals": N,
+  "dropDuplicates": N,
+  "eligible": N,
+  "keep": [...],
+  "drop": [...]
+}
+```
+
+If `totalProposals` is 0, **skip the rest of this step**. Nothing to do.
+
+If `eligible` is 0 but `dropDuplicates > 0`, the queue contained only duplicates of already-learned patterns. **Just promote with `--auto-promote`** — this archives the duplicates to `rejected-patterns.jsonl` with `reason=duplicate` and truncates pending-patterns.jsonl. No AskUserQuestion needed for a no-op.
+
+#### Phase 2: operator decision
+
+If `eligible > 0`, surface the decision via AskUserQuestion. Show up to 4 of the highest-severity proposals as the visible options. Use the gstack decision-brief format:
+
+```
+D<n> — N new fault patterns learned this build. Promote which?
+Project/branch/task: <slug>
+ELI10: The codex investigator (PR 5) ran on N halt events during this
+build and proposed reusable detector rules for K of them. If you promote
+a rule, future builds catch the same shape cheaply — no LLM call. If you
+defer, the next build re-investigates the same halt at codex cost (~$0.10-$2).
+Stakes if we pick wrong: a promoted bad rule fires false-positive faults
+on healthy builds (annoying but recoverable — hand-edit learned-patterns.json
+or `rejected-patterns.jsonl` to roll back). A skipped good rule means
+we keep paying codex on the same halt class.
+Recommendation: A. Promotion is two-way (the curator can hand-edit
+learned-patterns.json later), and the most expensive thing you can do
+is keep paying codex for halts you've already seen N times.
+Completeness: A=10/10, B=7/10, C=3/10
+A) Promote all eligible (recommended)
+  ✅ Future builds catch every observed halt class without LLM cost
+  ❌ One bad rule = false-positive spam (recoverable by hand-edit)
+B) Promote HIGH+ severity only (M of N)
+  ✅ Safer — only structural / load-bearing bugs land in the registry
+  ❌ MEDIUM proposals deferred; next codex pass re-pays for them
+C) Defer everything — review later
+  ✅ Zero registry risk; review pending-patterns.jsonl when you have time
+  ❌ Next build keeps investigating the same halts ($0.10-$2 each)
+Net: promotion is two-way; favor coverage unless a proposal looks dangerous.
+```
+
+**In spawned sessions** (`$OPENCLAW_SESSION` is `true` or the agent has no
+AskUserQuestion surface), skip the question and run:
+
+```bash
+gstack-build learn-fault-patterns --auto-promote 2>/dev/null
+```
+
+This applies `autoPromoteDecision`: HIGH+ severity proposals are promoted,
+MEDIUM are deferred to `rejected-patterns.jsonl` with `reason=deferred-auto`.
+
+#### Phase 3: commit the operator's choice
+
+After the operator answers:
+
+- **Option A** (promote all eligible):
+  ```bash
+  IDS=$(gstack-build learn-fault-patterns --dry-run 2>/dev/null | jq -r '.keep[].faultId' | paste -sd, -)
+  gstack-build learn-fault-patterns --promote "$IDS"
+  ```
+
+- **Option B** (HIGH+ only): same as `--auto-promote`:
+  ```bash
+  gstack-build learn-fault-patterns --auto-promote
+  ```
+
+- **Option C** (defer everything): no-op. Leave `pending-patterns.jsonl` alone.
+  The next build's auto-drain will re-append (with dedup) and the next
+  Step M3.7 will offer the same proposals again.
+
+The promote commands write a summary line: `learn-fault-patterns: promoted N, deferred M, duplicates K`. Include the line verbatim in the build's completion report so the operator has a trace of what the registry just grew.
+
+#### Phase 4: log to completion report
+
+After this step, the build's completion summary (Step 3 below) should include a one-line stat:
+
+```
+Step M3.7: <N> patterns learned (<M> promoted, <K> deferred, <D> duplicates dropped).
+```
+
+If `totalProposals` was 0 (phase 1 skipped), include: `Step M3.7: no new patterns.` Skip the line entirely if the auto-drain was off (`GSTACK_HALT_EVENTS_OFF=1` or `--no-auto-drain`).
 
 ## Step 3: Final Ship & Completion
 
