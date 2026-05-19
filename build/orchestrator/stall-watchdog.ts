@@ -89,6 +89,35 @@ function isActivityLine(line: string): boolean {
 }
 
 /**
+ * Signal both the child (positive pid) AND its process group (negative pid).
+ *
+ * Why both: Bun's child_process module accepts `detached: true` but its
+ * execFile shim sometimes doesn't actually setpgrp the child, so the group
+ * signal returns ESRCH. spawn() works correctly. We send both signals and
+ * swallow ESRCH/EPERM either way — at least one of the two will reach the
+ * process tree.
+ *
+ * The group signal is important because most sub-agent binaries are shell
+ * scripts that exec `sleep`/long-running children. A SIGTERM to the shell
+ * alone doesn't propagate to its children — but a group signal does.
+ */
+function killProcessAndGroup(pid: number, signal: NodeJS.Signals): void {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    // ESRCH (no such pgrp) or EPERM — fall through to positive-pid kill.
+  }
+  try {
+    process.kill(pid, signal);
+  } catch {
+    // ESRCH (already exited) or EPERM — the watchdog never throws.
+  }
+}
+
+/**
  * Classify a Claude `--output-format stream-json` line. Returns true if the
  * line represents a tool_use content block or any structured event we'd
  * count as forward progress. Returns false for the empty/keepalive shapes.
@@ -244,21 +273,9 @@ export function attachStallWatchdog(
       if (source.mode === "stream") {
         const pid = source.child.pid;
         if (typeof pid === "number") {
-          try {
-            // Negative pid signals the process group (child-registry spawns
-            // with detached:true, so pgid === pid). Matches the shutdown
-            // pattern in child-registry.ts:118.
-            process.kill(-pid, "SIGTERM");
-          } catch {
-            // ESRCH or EPERM — child already gone or out of reach; nothing
-            // useful to do.
-          }
+          killProcessAndGroup(pid, "SIGTERM");
           killTimerHandle = clock.setTimeout(() => {
-            try {
-              process.kill(-pid, "SIGKILL");
-            } catch {
-              // Same swallowing rationale.
-            }
+            killProcessAndGroup(pid, "SIGKILL");
           }, gracePeriodMs);
         }
       }

@@ -82,7 +82,7 @@ function makeFakeClock() {
   return { clock, advance };
 }
 
-// Fake ChildProcess: an EventEmitter with stdout/stderr emitters and a pid.
+// Fake ChildProcess: an EventEmitter with stdout/stderr emitters and no real pid.
 // We don't actually kill anything; we just verify the watchdog signaled.
 function makeFakeChild(): {
   child: ChildProcess;
@@ -99,9 +99,8 @@ function makeFakeChild(): {
   };
   const stderr = new EventEmitter() as typeof stdout;
   const child = new EventEmitter() as ChildProcess;
-  (child as unknown as { stdout: EventEmitter; stderr: EventEmitter; pid: number }).stdout = stdout;
-  (child as unknown as { stdout: EventEmitter; stderr: EventEmitter; pid: number }).stderr = stderr;
-  (child as unknown as { stdout: EventEmitter; stderr: EventEmitter; pid: number }).pid = -1; // negative so process.kill is a no-op-on-our-own-test-process
+  (child as unknown as { stdout: EventEmitter; stderr: EventEmitter }).stdout = stdout;
+  (child as unknown as { stdout: EventEmitter; stderr: EventEmitter }).stderr = stderr;
   return {
     child,
     emitStdout: (s: string) => stdout.emit("data", s),
@@ -164,6 +163,42 @@ describe("attachStallWatchdog (stream mode)", () => {
     expect(killSilence).not.toBeNull();
     expect(killSilence!).toBeGreaterThanOrEqual(200);
     ctrl.stop();
+  });
+
+  it("never signals non-positive pids", () => {
+    const { clock, advance } = makeFakeClock();
+    const { child } = makeFakeChild();
+    (child as unknown as { pid: number }).pid = -1;
+
+    const originalKill = process.kill;
+    const calls: Array<{ pid: number; signal?: NodeJS.Signals | number }> = [];
+    (process as unknown as { kill: typeof process.kill }).kill = ((
+      pid: number,
+      signal?: NodeJS.Signals | number,
+    ) => {
+      calls.push({ pid, signal });
+      return true;
+    }) as typeof process.kill;
+
+    try {
+      const ctrl = attachStallWatchdog(
+        { mode: "stream", child },
+        {
+          stallMs: 200,
+          provider: "shell",
+          pollIntervalMs: 50,
+          gracePeriodMs: 100,
+          clock,
+        },
+      );
+
+      advance(300);
+      expect(ctrl.stallKilled()).toBe(true);
+      expect(calls).toEqual([]);
+      ctrl.stop();
+    } finally {
+      (process as unknown as { kill: typeof process.kill }).kill = originalKill;
+    }
   });
 
   it("empty/whitespace-only lines do NOT reset the timer", () => {

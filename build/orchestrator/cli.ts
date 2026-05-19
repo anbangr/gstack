@@ -4169,14 +4169,9 @@ export async function runRoleTask(opts: {
   iteration: number;
   logPrefix: string;
   timeoutMs?: number;
-  retryOnTimeout?: boolean;
 }): Promise<SubAgentResult> {
   const resolved = resolveRoleTimeouts(opts.role, opts.timeoutMs);
   const effectiveTimeoutMs = resolved.primaryMs;
-  const retryOnTimeout =
-    opts.retryOnTimeout !== undefined
-      ? opts.retryOnTimeout
-      : resolved.retryOnTimeout;
 
   let result: SubAgentResult;
 
@@ -4191,7 +4186,6 @@ export async function runRoleTask(opts: {
       logPrefix: opts.logPrefix,
       model: opts.role.model,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   } else if (opts.role.provider === "kimi") {
     result = await runKimi({
@@ -4204,7 +4198,6 @@ export async function runRoleTask(opts: {
       logPrefix: opts.logPrefix,
       model: opts.role.model,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   } else if (opts.role.provider === "codex") {
     result = await runCodexImpl({
@@ -4218,7 +4211,6 @@ export async function runRoleTask(opts: {
       model: opts.role.model,
       reasoning: opts.role.reasoning,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   } else {
     result = await runClaudeTask({
@@ -4232,7 +4224,6 @@ export async function runRoleTask(opts: {
       model: opts.role.model,
       reasoning: opts.role.reasoning,
       timeoutMs: effectiveTimeoutMs,
-      retryOnTimeout,
     });
   }
 
