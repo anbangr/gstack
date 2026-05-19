@@ -1,4 +1,7 @@
 import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { BuildState } from "./types";
 
 export type HaltEventKind =
@@ -79,4 +82,41 @@ export function computeFaultId(
     .digest("hex")
     .slice(0, 8);
   return `${event.kind}:${idx}:${hash}`;
+}
+
+function defaultSkillFaultsDir(): string {
+  const home = process.env.GSTACK_HOME ?? path.join(os.homedir(), ".gstack");
+  return path.join(home, "skill-faults");
+}
+
+function safeRegistryRunId(runId: string): string {
+  return runId.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+export function pendingInvestigationsDir(opts?: { queueDir?: string }): string {
+  return path.join(
+    opts?.queueDir ?? defaultSkillFaultsDir(),
+    "pending-investigations",
+  );
+}
+
+export function processedDir(opts?: { queueDir?: string }): string {
+  return path.join(opts?.queueDir ?? defaultSkillFaultsDir(), "processed");
+}
+
+export function emitHaltEvent(
+  event: Omit<HaltEvent, "faultId" | "timestamp">,
+  opts?: { queueDir?: string; now?: Date },
+): string {
+  const faultId = computeFaultId(event);
+  const timestamp = (opts?.now ?? new Date()).toISOString();
+  const full: HaltEvent = { ...event, faultId, timestamp };
+  const dir = pendingInvestigationsDir(opts);
+  fs.mkdirSync(dir, { recursive: true });
+  const safeRun = safeRegistryRunId(event.runId);
+  const finalPath = path.join(dir, `${safeRun}-${faultId}.json`);
+  const tmpPath = `${finalPath}.tmp.${process.pid}`;
+  fs.writeFileSync(tmpPath, JSON.stringify(full, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(tmpPath, finalPath);
+  return faultId;
 }
