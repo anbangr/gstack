@@ -60,6 +60,32 @@ function getRepoAllowlistPrefixes(): string[] {
 }
 
 /**
+ * Add the realpath of `extraRoot` to the standard allowlist prefixes. Used
+ * by runReleaseDaemon to always allow the explicitly-configured project
+ * root, regardless of whether it sits under one of the hardcoded defaults.
+ * Without this, a daemon installed from a path like /workspaces/my-repo/
+ * would reject its own configured repoPath and never process queued records
+ * unless the user also set GSTACK_DAEMON_REPO_ALLOWLIST. The realpath
+ * resolution defeats the same symlink-bypass as the main check.
+ */
+export function buildAllowlistWithRoot(
+  extraRoot: string | undefined,
+): string[] {
+  const base = getRepoAllowlistPrefixes();
+  if (!extraRoot) return base;
+  let resolved: string;
+  try {
+    resolved = fs.realpathSync(extraRoot);
+  } catch {
+    // Bad/missing path — don't extend the allowlist with garbage.
+    return base;
+  }
+  const prefix = resolved.endsWith(path.sep) ? resolved : resolved + path.sep;
+  if (base.includes(prefix)) return base;
+  return [prefix, ...base];
+}
+
+/**
  * Returns true if `repoPath` is safe for the daemon to use as a subprocess
  * cwd. A safe path is absolute, exists, is a directory, contains `.git`,
  * AND resolves (via realpath, following symlinks) to a location inside an
@@ -236,18 +262,17 @@ function installReleaseDaemonSignalHandlers(log: (msg: string) => void): void {
     }
     activeLockReleases.clear();
     log(
-      `signal ${signal}: released ${released} lock(s), ${failed} failed, ${deferred} deferred (budget exhausted); exiting`,
+      `signal ${signal}: released ${released} lock(s), ${failed} failed, ${deferred} deferred (budget exhausted)`,
     );
-    // Conventional exit code: 128 + signal number for SIGTERM(15)/SIGINT(2)/SIGHUP(1).
-    const code =
-      signal === "SIGTERM"
-        ? 143
-        : signal === "SIGINT"
-          ? 130
-          : signal === "SIGHUP"
-            ? 129
-            : 1;
-    process.exit(code);
+    // Intentionally do NOT call process.exit here. child-registry installs
+    // its own SIGTERM/SIGINT/SIGHUP handler that runs `killAllChildren("SIGTERM")`,
+    // waits 2s for graceful shutdown, then `killAllChildren("SIGKILL")` for
+    // survivors before exiting. If we exit here, we abort that 2s fallback
+    // and any child process that ignores SIGTERM gets reparented to init
+    // (orphaned, exactly the failure child-registry exists to prevent).
+    // Both handlers fire on the same signal; node runs them in registration
+    // order. Our work is sync (record revival + bounded lock release), so it
+    // completes before child-registry's async sleep + kill + exit sequence.
   };
   process.on("SIGTERM", handler);
   process.on("SIGINT", handler);
@@ -582,12 +607,16 @@ function discoverQueuedRecords(
       reposToDiscover.set(key, repoPath);
     }
   }
+  // Build the effective allowlist once per discovery pass. Always extend with
+  // opts.repoPath (the configured daemon root) so daemons installed outside
+  // the hardcoded defaults work without manual GSTACK_DAEMON_REPO_ALLOWLIST.
+  const allowlistPrefixes = buildAllowlistWithRoot(opts.repoPath);
   for (const [, repoPath] of reposToDiscover) {
     // Allowlist gate: only applies when we'd hit the filesystem-touching
     // default. Tests that inject `opts.discoverRemote` opt out of the gate
     // and take responsibility for whatever paths they pass through.
     if (!opts.discoverRemote) {
-      const check = isAllowedRepoPath(repoPath);
+      const check = isAllowedRepoPath(repoPath, allowlistPrefixes);
       if (!check.ok) {
         opts.log?.(
           `warning: skipping discovery for disallowed repoPath: ${check.reason}`,
@@ -626,6 +655,9 @@ export async function runReleaseDaemon(
   if (opts.watch) {
     installReleaseDaemonSignalHandlers(log);
   }
+  // Effective allowlist for this daemon — always includes the configured
+  // opts.repoPath so daemons installed outside the hardcoded defaults work.
+  const candidateAllowlist = buildAllowlistWithRoot(opts.repoPath);
   while (true) {
     const candidates = discoverQueuedRecords(queueDir, { ...opts, log }).filter(
       (record) => record.status === "queued",
@@ -645,7 +677,7 @@ export async function runReleaseDaemon(
     let next: ReleaseQueueRecord | undefined;
     for (const candidate of candidates) {
       if (productionPath) {
-        const check = isAllowedRepoPath(candidate.repoPath);
+        const check = isAllowedRepoPath(candidate.repoPath, candidateAllowlist);
         if (!check.ok) {
           log(
             `blocking PR #${candidate.prNumber}: disallowed repoPath: ${check.reason}`,

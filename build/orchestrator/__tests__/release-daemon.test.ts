@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  buildAllowlistWithRoot,
   createReleaseLockHeartbeat,
   isAllowedRepoPath,
   processReleaseQueueRecord,
@@ -783,5 +784,93 @@ describe("runReleaseDaemon allowlist enforcement on local records (F1 fix)", () 
 
     expect(exit).toBe(0);
     expect(processed).toEqual([200]);
+  });
+});
+
+describe("buildAllowlistWithRoot (Codex-1 fix)", () => {
+  // The daemon's configured opts.repoPath must be allowlisted automatically.
+  // Without this, a daemon installed from /workspaces/repo/ (or any path
+  // outside ~/Documents/, ~/code/, etc.) rejects its own configured root
+  // and blocks every record unless the user manually sets
+  // GSTACK_DAEMON_REPO_ALLOWLIST.
+
+  it("returns the default allowlist when extraRoot is undefined", () => {
+    const result = buildAllowlistWithRoot(undefined);
+    expect(result.length).toBeGreaterThan(0);
+    // All default prefixes end with path.sep.
+    for (const prefix of result) {
+      expect(prefix.endsWith(path.sep)).toBe(true);
+    }
+  });
+
+  it("prepends the realpath of extraRoot to the default prefixes", () => {
+    const installedRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-codex1-build-allowlist-"),
+    );
+    try {
+      const result = buildAllowlistWithRoot(installedRoot);
+      const expectedPrefix = fs.realpathSync(installedRoot) + path.sep;
+      // The realpath of the installed root is the FIRST entry.
+      expect(result[0]).toBe(expectedPrefix);
+      // And the default prefixes follow.
+      expect(result.length).toBeGreaterThan(1);
+    } finally {
+      fs.rmSync(installedRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not duplicate when extraRoot already matches a default prefix", () => {
+    // ~/Documents/ is in the defaults. If a user happens to install the
+    // daemon at ~/Documents/<something>, the realpath might still resolve
+    // to a subpath of an existing default. Dedup test: passing a sub-path
+    // produces a properly-prepended entry, but passing the EXACT default
+    // path (synthetic via env override) doesn't duplicate.
+    const fakeOverride = "/tmp/gstack-codex1-already-listed";
+    const prev = process.env.GSTACK_DAEMON_REPO_ALLOWLIST;
+    process.env.GSTACK_DAEMON_REPO_ALLOWLIST = fakeOverride;
+    fs.mkdirSync(fakeOverride, { recursive: true });
+    try {
+      const result = buildAllowlistWithRoot(fakeOverride);
+      // The first entry is the realpath of fakeOverride, plus separator.
+      const expectedPrefix = fs.realpathSync(fakeOverride) + path.sep;
+      // It should appear exactly once: either as the prepended entry OR
+      // because the env override already provided it. Count occurrences.
+      const occurrences = result.filter((p) => p === expectedPrefix).length;
+      expect(occurrences).toBe(1);
+    } finally {
+      fs.rmSync(fakeOverride, { recursive: true, force: true });
+      if (prev === undefined) delete process.env.GSTACK_DAEMON_REPO_ALLOWLIST;
+      else process.env.GSTACK_DAEMON_REPO_ALLOWLIST = prev;
+    }
+  });
+
+  it("ignores extraRoot when realpath fails (missing path)", () => {
+    const result = buildAllowlistWithRoot("/nonexistent/gstack-codex1-missing");
+    // Should fall back to default prefixes — no garbage entry added.
+    const defaults = buildAllowlistWithRoot(undefined);
+    expect(result).toEqual(defaults);
+  });
+
+  it("makes isAllowedRepoPath accept the configured root via the extended allowlist", () => {
+    // Integration check: a path that would be rejected by the default
+    // allowlist passes when we extend with that root.
+    const installedRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-codex1-integration-"),
+    );
+    fs.mkdirSync(path.join(installedRoot, ".git"));
+    try {
+      // Default allowlist rejects: /tmp/folders/... isn't on any of the
+      // hardcoded prefixes.
+      const defaultCheck = isAllowedRepoPath(installedRoot);
+      expect(defaultCheck.ok).toBe(false);
+      // Extended allowlist accepts.
+      const extendedCheck = isAllowedRepoPath(
+        installedRoot,
+        buildAllowlistWithRoot(installedRoot),
+      );
+      expect(extendedCheck.ok).toBe(true);
+    } finally {
+      fs.rmSync(installedRoot, { recursive: true, force: true });
+    }
   });
 });
