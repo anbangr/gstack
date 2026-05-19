@@ -2404,6 +2404,77 @@ describe("stageGeminiIO", () => {
     // After cleanup, outputFilePath should hold the agent's content.
     expect(fs.readFileSync(outputFile, "utf8")).toBe("agent wrote this");
   });
+
+  // Regression for the 2026-05-18 path-mismatch bug on the
+  // build-mitosis-control-plane-impl-plan-anbang build. The state slug
+  // always carries a `build-` prefix (state.ts:deriveRunSlug). Gemini's
+  // --yolo workspace policy auto-derives its tmp allowlist from the spawn
+  // cwd basename (~/.gemini/projects.json), which is the run-id-shaped
+  // worktree name without the prefix. The two paths used to diverge by
+  // exactly `build-`, so every Gemini fallback ran blind. The fix strips
+  // the prefix inside stageGeminiIO. This test exercises the actual
+  // production slug shape (the earlier T111646 test used `smoke-test-*`
+  // which lacked the prefix and never caught this regression).
+  it("strips leading `build-` prefix so path matches Gemini's cwd-derived sandbox key", () => {
+    const inputFile = path.join(
+      os.tmpdir(),
+      `gstack-test-input-buildprefix-${Date.now()}.md`,
+    );
+    fs.writeFileSync(inputFile, "test input\n");
+    stagedPaths.push(inputFile);
+
+    const runId = `mitosis-control-plane-impl-plan-anbang-${Date.now()}-bee3aea0`;
+    const slug = `build-${runId}`;
+    const outputFile = path.join(os.tmpdir(), `out-${slug}.md`);
+    stagedPaths.push(outputFile);
+
+    const r = stageGeminiIO({
+      slug,
+      phaseNumber: "3.3",
+      iteration: 1,
+      suffix: "primary-impl",
+      inputFilePath: inputFile,
+      outputFilePath: outputFile,
+    });
+    stagedPaths.push(r.stagedInput, r.stagedOutput);
+
+    const home = os.homedir();
+    const expectedPrefix = path.join(home, ".gemini", "tmp", runId);
+    const forbiddenPrefix = path.join(home, ".gemini", "tmp", "build-");
+    expect(r.stagedInput.startsWith(expectedPrefix)).toBe(true);
+    expect(r.stagedOutput.startsWith(expectedPrefix)).toBe(true);
+    expect(r.stagedInput.startsWith(forbiddenPrefix)).toBe(false);
+    expect(r.stagedOutput.startsWith(forbiddenPrefix)).toBe(false);
+    expect(fs.existsSync(r.stagedInput)).toBe(true);
+    expect(fs.existsSync(r.stagedOutput)).toBe(true);
+  });
+
+  it("leaves slugs without `build-` prefix unchanged (idempotent)", () => {
+    const inputFile = path.join(
+      os.tmpdir(),
+      `gstack-test-input-noprefix-${Date.now()}.md`,
+    );
+    fs.writeFileSync(inputFile, "test input\n");
+    stagedPaths.push(inputFile);
+
+    const slug = `no-prefix-${Date.now()}`;
+    const outputFile = path.join(os.tmpdir(), `out-${slug}.md`);
+    stagedPaths.push(outputFile);
+
+    const r = stageGeminiIO({
+      slug,
+      phaseNumber: "1.1",
+      iteration: 1,
+      suffix: "primary-impl",
+      inputFilePath: inputFile,
+      outputFilePath: outputFile,
+    });
+    stagedPaths.push(r.stagedInput, r.stagedOutput);
+
+    const home = os.homedir();
+    const expectedPrefix = path.join(home, ".gemini", "tmp", slug);
+    expect(r.stagedInput.startsWith(expectedPrefix)).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@
 import { execFile } from "./child-registry";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { logDir, ensureLogDir } from "./state";
+import { logDir, ensureLogDir, deriveGeminiSlug } from "./state";
 import type { RoleConfig, RoleProvider, RoleReasoning } from "./role-config";
 import { BUILD_DEFAULTS, envNumberOrDefault } from "./build-config";
 import type { DualImplCandidateKey } from "./types";
@@ -291,16 +291,19 @@ function quote(s: string): string {
 }
 
 /**
- * Stage Gemini I/O files in ~/.gemini/tmp/<slug>/ — Gemini's `--yolo`
- * sandbox allows that path AND the project temp dir keyed on `<slug>`.
+ * Stage Gemini I/O files in ~/.gemini/tmp/<geminiSlug>/ — Gemini's `--yolo`
+ * sandbox allows that path AND the project temp dir keyed on `<geminiSlug>`.
  *
- * NOTE: This used to write to ~/.gemini/tmp/gstack/<slug>/ but Gemini's
- * workspace policy only whitelists ~/.gemini/tmp/<slug>/ (no `gstack/`
- * subdirectory). The `gstack/` segment made every Gemini sub-agent run
- * blind — its `read_file` call failed with "Path not in workspace" and
- * the agent fell back to inference, dirtying the worktree with
- * unintended changes. Observed 2026-05-17 on agnt2-prototype-plan4
- * (T111646 fault report) and again 2026-05-18 on this very build.
+ * Path-shape history:
+ *   - ~/.gemini/tmp/gstack/<slug>/ — broken: Gemini's workspace policy
+ *     rejected the `gstack/` segment. Fixed 2026-05-17 (T111646).
+ *   - ~/.gemini/tmp/<slug>/ where slug = `build-<runId>` — still broken:
+ *     Gemini auto-derives its tmp allowlist from the spawn cwd basename
+ *     (~/.gemini/projects.json), which is the run-id-shaped worktree name
+ *     with no `build-` prefix. Observed 2026-05-18 on
+ *     build-mitosis-control-plane-impl-plan-anbang. Fixed via deriveGeminiSlug
+ *     stripping the leading `build-` so the staging path matches the
+ *     cwd-derived allowlist exactly.
  *
  * Exporting this helper so build/orchestrator/__tests__/sub-agents.test.ts
  * can pin the path shape (gpt-5.5 plan-review IMPORTANT objection).
@@ -319,11 +322,12 @@ export function stageGeminiIO(opts: {
   inputFilePath: string;
   outputFilePath: string;
 }): { stagedInput: string; stagedOutput: string; cleanup: () => void } {
+  const geminiSlug = deriveGeminiSlug(opts.slug);
   const stagingDir = path.join(
     process.env.HOME ?? "~",
     ".gemini",
     "tmp",
-    opts.slug,
+    geminiSlug,
   );
   fs.mkdirSync(stagingDir, { recursive: true });
 

@@ -78,6 +78,15 @@ export function deriveStateSlug(planFile: string, runId?: string): string {
   return runId ? deriveRunSlug(runId) : deriveSlug(planFile);
 }
 
+// Gemini's --yolo workspace policy auto-derives its tmp allowlist from the
+// spawn cwd basename (see ~/.gemini/projects.json). Staging dirs we create
+// under ~/.gemini/tmp/<dir>/ must match that basename shape — no `build-`
+// prefix, no subdirs. State/lock slugs keep `build-` for namespacing;
+// strip it only at the Gemini boundary.
+export function deriveGeminiSlug(slug: string): string {
+  return slug.replace(/^build-/, "");
+}
+
 export function statePath(slug: string): string {
   return path.join(stateDir(), `${slug}.json`);
 }

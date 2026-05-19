@@ -6,6 +6,7 @@ import {
   deriveSlug,
   deriveRunSlug,
   deriveStateSlug,
+  deriveGeminiSlug,
   statePath,
   lockPath,
   freshState,
@@ -86,6 +87,42 @@ describe("deriveSlug", () => {
     expect(deriveRunSlug("run:one/alpha")).toBe("build-run-one-alpha");
     expect(deriveStateSlug("/x/same.md", "run-a")).toBe("build-run-a");
     expect(deriveStateSlug("/y/same.md", "run-b")).toBe("build-run-b");
+  });
+});
+
+describe("deriveGeminiSlug", () => {
+  // Gemini's --yolo workspace policy auto-derives its tmp allowlist from the
+  // spawn cwd basename (~/.gemini/projects.json). State slugs always carry
+  // the `build-` prefix for namespacing, but Gemini's sandbox rejects any
+  // tmp path under ~/.gemini/tmp/build-*. Strip the prefix only at the
+  // Gemini boundary. Regression for the 2026-05-18 path-mismatch bug on
+  // build-mitosis-control-plane-impl-plan-anbang where every Gemini fallback
+  // ran blind (144 stale `~/.gemini/tmp/build-*` dirs on disk at fix time).
+  it("strips a leading `build-` prefix", () => {
+    expect(deriveGeminiSlug("build-foo-bar")).toBe("foo-bar");
+  });
+  it("strips only the leading `build-`, leaves mid-string `build-` alone", () => {
+    expect(deriveGeminiSlug("build-foo-build-bar")).toBe("foo-build-bar");
+  });
+  it("is idempotent on slugs without the prefix", () => {
+    expect(deriveGeminiSlug("foo-bar")).toBe("foo-bar");
+    expect(deriveGeminiSlug("mitosis-control-plane-impl-plan-anbang")).toBe(
+      "mitosis-control-plane-impl-plan-anbang",
+    );
+  });
+  it("does not strip `build-` that appears mid-string", () => {
+    expect(deriveGeminiSlug("foo-build-bar")).toBe("foo-build-bar");
+  });
+  it("matches the production slug shape from deriveRunSlug", () => {
+    const stateSlug = deriveRunSlug(
+      "mitosis-control-plane-impl-plan-anbang-20260518-154933-bee3aea0",
+    );
+    expect(stateSlug).toBe(
+      "build-mitosis-control-plane-impl-plan-anbang-20260518-154933-bee3aea0",
+    );
+    expect(deriveGeminiSlug(stateSlug)).toBe(
+      "mitosis-control-plane-impl-plan-anbang-20260518-154933-bee3aea0",
+    );
   });
 });
 
