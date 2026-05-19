@@ -392,7 +392,7 @@ export async function reconcilePlanReview(
 // Sub-agent invocation
 // ---------------------------------------------------------------------------
 
-const PLAN_REVIEW_PROMPT = `Review this living implementation plan before autonomous TDD execution begins.
+export const PLAN_REVIEW_PROMPT = `Review this living implementation plan before autonomous TDD execution begins.
 
 Review for:
 1. COMPLETENESS — Does it cover all features from the source intent?
@@ -410,6 +410,32 @@ Review for:
      (no concrete inputs/outputs named), or no edge cases listed.
    - Flag SUGGESTION if the coverage target line is missing (add \`**Coverage target: ≥80%**\`).
 
+The plan file may contain annotation blocks (HTML comments) above each
+\`### Phase N\` heading that record prior review rounds. They look like:
+
+  <!-- ROUND 1 CRITICAL [Feature 3, Phase 2]: issue → suggestion
+       ROUND 1 USER: accept ("rationale")
+       ROUND 1 RESOLUTION: synth added chainId per suggestion
+       ROUND 2 REVIEWER: not re-raised -->
+
+Use this history:
+
+1. If a prior round raised an objection and the user REJECTED it
+   ("USER: reject"), do NOT re-raise the same objection unless you have
+   NEW evidence the plan doesn't address. The user explicitly considered
+   and rejected this concern. Repeating it wastes a round.
+
+2. If a prior round raised an objection and the synth's RESOLUTION
+   appears to actually address the issue, do not re-raise. Check the
+   resolution against the plan text — if the plan reflects the fix, the
+   objection is settled.
+
+3. If a prior round's RESOLUTION says "disputed" or doesn't fully address
+   the concern, you SHOULD re-raise it. The user will re-triage.
+
+4. New objections (not in any prior round's annotations) follow normal
+   severity rules.
+
 Output format (strict, machine-parsed):
 PLAN_REVIEW: APPROVE | REVISE
 
@@ -420,6 +446,48 @@ PLAN_REVIEW: APPROVE | REVISE
 
 ## Overall Assessment
 <1-2 paragraph assessment>
+`;
+
+export const SYNTH_REVISION_PROMPT = `You previously synthesized a living implementation plan. A second-opinion
+reviewer raised CRITICAL objections, and the user has triaged them.
+
+Your task: revise the plan to address ONLY the user-accepted objections.
+Do NOT address objections the user rejected. Do NOT modify sections without
+accepted objections.
+
+The plan file contains annotation blocks immediately above each
+\`### Phase N\` heading that look like:
+
+  <!-- ROUND <N> CRITICAL [<location>]: <issue> → <suggestion>
+       ROUND <N> USER: accept ("<rationale>")
+       ROUND <N> RESOLUTION: <YOUR PRIOR WORK or 'pending'> -->
+
+For each annotation with \`USER: accept\` and \`RESOLUTION: pending\`:
+  1. Apply the suggested fix (or a better fix you can defend).
+  2. Replace \`RESOLUTION: pending\` with \`RESOLUTION: <one-line description
+     of what you changed and where>\`. The reviewer will read this next round.
+  3. If you decide the suggestion is wrong even though the user accepted
+     it, do NOT make the change. Replace \`RESOLUTION: pending\` with
+     \`RESOLUTION: disputed — <one-line reason>\`. The user will see this
+     in next round's triage.
+
+For each annotation with \`USER: reject\`:
+  Do NOT change the plan around it. Leave the annotation in place.
+
+For each annotation with \`USER: defer\`:
+  Do NOT change the plan, but keep the annotation attached to the right
+  phase heading.
+
+Annotation history from prior rounds is informational — read for context
+on what was already resolved. Do not re-resolve already-resolved items.
+
+If the plan file's \`<!-- gstack-plan-review-history -->\` header indicates
+this is round 3 or later, you may collapse stale RESOLUTION lines from
+rounds 1+ to keep the plan readable, but preserve the annotation header
+counts so the reviewer can see the trajectory.
+
+Return only the path of the updated plan and a single-line summary of
+what you changed.
 `;
 
 /**
