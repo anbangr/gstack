@@ -468,19 +468,20 @@ export interface PlanReviewVerdict {
   reviewedBy: string;
   /** 1-based round counter; survives cross-launch resume via readPlanReviewRound. */
   round: number;
-  /** NEW: per-objection user triage decisions for this round. Absent on APPROVE rounds. */
-  triage_decisions?: TriageDecision[];
-  /** NEW: absolute path to the append-only per-build history JSONL. */
-  round_history_path?: string;
-  /** NEW: convergence snapshot for this round. */
+  /** Per-objection user triage decisions for this round. Absent on APPROVE rounds. */
+  triageDecisions?: TriageDecision[];
+  /** Absolute path to the append-only per-build history JSONL. */
+  roundHistoryPath?: string;
+  /** Convergence snapshot for this round. */
   convergence?: ConvergenceSnapshot;
-  /** NEW: when set, the user interrupted triage mid-round at this objection (0-based). */
-  interrupted_at_objection?: number;
+  /** When set, the user interrupted triage mid-round at this objection (0-based). */
+  interruptedAtObjection?: number;
 }
 
 export interface TriageDecision {
   /** Index into the round's objections array. */
-  objection_index: number;
+  objectionIndex: number;
+  /** User disposition: accept feeds into convergence count, reject/defer do not. */
   decision: "accept" | "reject" | "defer";
   /** Optional one-line user rationale. Empty string when not provided. */
   rationale?: string;
@@ -488,19 +489,19 @@ export interface TriageDecision {
 
 export interface ConvergenceSnapshot {
   /** CRITICAL count returned by reviewer before triage. */
-  objection_count_raw: number;
+  objectionCountRaw: number;
   /** CRITICAL count the user accepted in this round's triage. */
-  objection_count_accepted: number;
+  objectionCountAccepted: number;
   /** Accepted CRITICAL count from round k-1. null on round 1. */
-  prior_round_accepted: number | null;
-  /** objection_count_accepted - prior_round_accepted. null on round 1. */
+  priorRoundAccepted: number | null;
+  /** objectionCountAccepted - priorRoundAccepted. null on round 1. */
   delta: number | null;
   /** Count of round-k accepted objections matching a round-(k-1) accepted-and-resolved entry by (location, severity). */
-  re_raises: number;
+  reRaises: number;
   /** Count of round-k objections that don't match any prior-round annotation. */
-  new_objections: number;
+  newObjections: number;
   /** True when adaptive-cap rule fires (see plan-review-loop.ts). */
-  no_forward_progress: boolean;
+  noForwardProgress: boolean;
 }
 
 /** Round-history annotation format version. Bump if the contract in plan-reviewer.ts changes. */
