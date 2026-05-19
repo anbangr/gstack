@@ -79,12 +79,39 @@ export function deriveStateSlug(planFile: string, runId?: string): string {
 }
 
 // Gemini's --yolo workspace policy auto-derives its tmp allowlist from the
-// spawn cwd basename (see ~/.gemini/projects.json). Staging dirs we create
-// under ~/.gemini/tmp/<dir>/ must match that basename shape — no `build-`
-// prefix, no subdirs. State/lock slugs keep `build-` for namespacing;
-// strip it only at the Gemini boundary.
+// spawn cwd basename. The key gets stored in ~/.gemini/projects.json with
+// a specific sanitization: lowercase, every non-[a-z0-9] run collapsed to
+// a single `-`, leading/trailing `-` stripped. Empirically verified across
+// 100+ keys in projects.json — keys are always `[a-z0-9-]+` with no double
+// dashes. Examples observed: `v3_1` → `v3-1`, `MyObs` → `myobs`,
+// `the-Big-Paper` → `the-big-paper`.
+//
+// Staging dirs we create under ~/.gemini/tmp/<dir>/ must match that exact
+// shape; otherwise Gemini's sandbox rejects every read_file as "Path not
+// in workspace" and the agent runs blind (silent inference fallback).
+// Callers must derive the input to this function from `path.basename(cwd)`,
+// NOT the state slug — single-impl and dual-impl pass different `cwd`
+// values, and only `cwd` matches what Gemini sees.
+//
+// Empty-result guard: if sanitization yields "" (e.g. input was all
+// punctuation like `_` or `...`), fall back to a fixed "gstack-run" key.
+// Without this, `path.join(HOME, ".gemini", "tmp", "")` would stage
+// directly in the shared tmp root and collide with everything else. The
+// fallback is intentionally a literal so collisions are debuggable and
+// never escalate to "this run wrote to the tmp root."
+//
+// The leading `^build-` strip is retained for callers that still pass a
+// state slug (e.g. the existing unit tests that pin the contract on slug
+// shapes; safe because the strip is the first step of sanitization that
+// Gemini itself does NOT do — Gemini's input is already `cwd` basename).
+// Idempotent: running twice produces the same result.
 export function deriveGeminiSlug(slug: string): string {
-  return slug.replace(/^build-/, "");
+  const sanitized = slug
+    .replace(/^build-/, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return sanitized || "gstack-run";
 }
 
 export function statePath(slug: string): string {

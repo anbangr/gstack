@@ -92,12 +92,16 @@ describe("deriveSlug", () => {
 
 describe("deriveGeminiSlug", () => {
   // Gemini's --yolo workspace policy auto-derives its tmp allowlist from the
-  // spawn cwd basename (~/.gemini/projects.json). State slugs always carry
-  // the `build-` prefix for namespacing, but Gemini's sandbox rejects any
-  // tmp path under ~/.gemini/tmp/build-*. Strip the prefix only at the
-  // Gemini boundary. Regression for the 2026-05-18 path-mismatch bug on
-  // build-mitosis-control-plane-impl-plan-anbang where every Gemini fallback
-  // ran blind (144 stale `~/.gemini/tmp/build-*` dirs on disk at fix time).
+  // spawn cwd basename. The key in ~/.gemini/projects.json is sanitized:
+  // lowercase, non-alphanumeric runs collapsed to a single `-`, leading/
+  // trailing `-` stripped. Empirically verified across 100+ keys: every key
+  // matches `[a-z0-9-]+` with no double dashes. State slugs always carry
+  // the `build-` prefix for namespacing; strip + re-derive at the Gemini
+  // boundary. Regression for the 2026-05-18 path-mismatch bug on
+  // build-mitosis-control-plane-impl-plan-anbang AND the wider class
+  // surfaced by the socc26-v022a-schema-v3_1 worktree where Gemini's key
+  // `socc26-v022a-schema-v3-1` diverges from the orchestrator's raw slug
+  // by `_` → `-` (144+ stale `~/.gemini/tmp/build-*` dirs at fix time).
   it("strips a leading `build-` prefix", () => {
     expect(deriveGeminiSlug("build-foo-bar")).toBe("foo-bar");
   });
@@ -123,6 +127,54 @@ describe("deriveGeminiSlug", () => {
     expect(deriveGeminiSlug(stateSlug)).toBe(
       "mitosis-control-plane-impl-plan-anbang-20260518-154933-bee3aea0",
     );
+  });
+  // Regression for adversarial review Finding 2 (2026-05-19): Gemini's
+  // projects.json sanitization transforms `_` → `-`. The on-disk worktree
+  // for socc26-v022a-schema-v3_1 already exists; the orchestrator's raw
+  // slug would write to `~/.gemini/tmp/...v3_1...` but Gemini's allowlist
+  // expects `...v3-1...`. Same bug class as the original `build-` prefix.
+  it("replaces underscores with hyphens (matches Gemini key sanitization)", () => {
+    expect(
+      deriveGeminiSlug(
+        "build-mitosis-prototype-socc26-v022a-schema-v3_1-behavior-subtree-20260518",
+      ),
+    ).toBe(
+      "mitosis-prototype-socc26-v022a-schema-v3-1-behavior-subtree-20260518",
+    );
+  });
+  it("lowercases uppercase characters (matches Gemini key sanitization)", () => {
+    expect(deriveGeminiSlug("build-AGIL-paper")).toBe("agil-paper");
+    expect(deriveGeminiSlug("build-MyObs")).toBe("myobs");
+    expect(deriveGeminiSlug("build-the-Big-Paper")).toBe("the-big-paper");
+  });
+  it("replaces dots with hyphens", () => {
+    expect(deriveGeminiSlug("build-foo.bar.baz")).toBe("foo-bar-baz");
+  });
+  it("collapses consecutive non-alphanumeric chars to single `-`", () => {
+    expect(deriveGeminiSlug("build-foo__bar..baz")).toBe("foo-bar-baz");
+  });
+  it("strips leading/trailing `-` after sanitization", () => {
+    // After stripping `build-` we get `_foo_`, which sanitizes to `-foo-`,
+    // and then strips to `foo`.
+    expect(deriveGeminiSlug("build-_foo_")).toBe("foo");
+  });
+  it("is fully idempotent — running twice produces the same result", () => {
+    const input =
+      "build-mitosis-prototype-socc26-v022a-schema-v3_1-behavior-subtree-20260518";
+    const once = deriveGeminiSlug(input);
+    const twice = deriveGeminiSlug(once);
+    expect(twice).toBe(once);
+  });
+  // Regression for Codex adversarial Finding 3 (2026-05-19): an all-punctuation
+  // slug like `build-_` or `build-...` would sanitize to `""`, and
+  // `path.join(HOME, ".gemini", "tmp", "")` would stage in the shared tmp
+  // root. Fallback to a fixed literal so the failure is debuggable and the
+  // staging path is always well-formed.
+  it("falls back to `gstack-run` when sanitization yields empty string", () => {
+    expect(deriveGeminiSlug("build-_")).toBe("gstack-run");
+    expect(deriveGeminiSlug("build-...")).toBe("gstack-run");
+    expect(deriveGeminiSlug("build-___---...")).toBe("gstack-run");
+    expect(deriveGeminiSlug("")).toBe("gstack-run");
   });
 });
 

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import {
   parseVerdict,
   stripAnsi,
@@ -1274,6 +1274,15 @@ process.stdout.write(match[1]);
         },
       });
 
+      // After the 2026-05-19 cwd-derivation fix, the staging dir is derived
+      // from `path.basename(cwd)` (sanitized to lowercase-alphanumeric per
+      // Gemini's projects.json rules), NOT from the state slug. cwd here is
+      // `tmpDir` from mkdtempSync (random suffix); its basename will sanitize.
+      const expectedGeminiKey = path
+        .basename(tmpDir)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "");
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toBe("fake gemini ran /ship\n");
       expect(fs.readFileSync(outputFilePath, "utf8")).toBe(
@@ -1281,9 +1290,14 @@ process.stdout.write(match[1]);
       );
       expect(fs.existsSync(result.logPath)).toBe(true);
       expect(fs.readFileSync(result.logPath, "utf8")).toContain(
-        path.join(".gemini", "tmp", slug),
+        path.join(".gemini", "tmp", expectedGeminiKey),
       );
-      const stagingDir = path.join(os.homedir(), ".gemini", "tmp", slug);
+      const stagingDir = path.join(
+        os.homedir(),
+        ".gemini",
+        "tmp",
+        expectedGeminiKey,
+      );
       const leftovers = fs.existsSync(stagingDir)
         ? fs.readdirSync(stagingDir)
         : [];
@@ -1291,12 +1305,17 @@ process.stdout.write(match[1]);
     } finally {
       if (oldGeminiBin === undefined) delete process.env.GEMINI_BIN;
       else process.env.GEMINI_BIN = oldGeminiBin;
+      const cleanupKey = path
+        .basename(tmpDir)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "");
       fs.rmSync(tmpDir, { recursive: true, force: true });
       fs.rmSync(path.join(os.homedir(), ".gstack", "build-state", slug), {
         recursive: true,
         force: true,
       });
-      fs.rmSync(path.join(os.homedir(), ".gemini", "tmp", "gstack", slug), {
+      fs.rmSync(path.join(os.homedir(), ".gemini", "tmp", cleanupKey), {
         recursive: true,
         force: true,
       });
@@ -2308,30 +2327,47 @@ describe("buildGeminiTestSpecPrompt — framework hint", () => {
 });
 
 describe("stageGeminiIO", () => {
-  // Regression for T111646 / Phase 1.1 attempt 3 failure: stageGeminiIO used to
-  // write Gemini I/O files at ~/.gemini/tmp/gstack/<slug>/, but Gemini's --yolo
-  // sandbox only allows ~/.gemini/tmp/<slug>/. The `gstack/` segment made every
-  // backup-Gemini invocation fail with "Path not in workspace" and the agent
-  // ran blind. The fix drops the `gstack/` segment so the path matches the
-  // sandbox shape exactly.
+  // Regression history (each test below pins one iteration):
+  //   1. ~/.gemini/tmp/gstack/<slug>/ — T111646, fixed 2026-05-17.
+  //   2. ~/.gemini/tmp/<state-slug>/ — single-impl `build-` prefix bug, fixed
+  //      2026-05-18.
+  //   3. ~/.gemini/tmp/<state-slug-sans-build>/ — still broken for dual-impl
+  //      (cwd basename is `primary`/`secondary`, not the state slug), fixed
+  //      2026-05-19 by deriving staging dir from `path.basename(cwd)`.
+  //
+  // All tests below override HOME to an isolated tmp directory so they don't
+  // pollute the developer's real ~/.gemini/tmp/ on every test run
+  // (pre-existing pattern was to write directly under real $HOME; this is
+  // the Claude adversarial review Finding 6 fix).
 
   let stagedPaths: string[] = [];
+  let isolatedHome: string;
+  let realHome: string | undefined;
+
+  beforeEach(() => {
+    realHome = process.env.HOME;
+    isolatedHome = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-stage-test-home-"),
+    );
+    process.env.HOME = isolatedHome;
+  });
 
   afterEach(() => {
     for (const p of stagedPaths) {
       try {
         fs.unlinkSync(p);
       } catch {}
-      try {
-        const dir = path.dirname(p);
-        fs.rmdirSync(dir);
-      } catch {}
     }
     stagedPaths = [];
+    // Recursively clean the isolated HOME (includes .gemini/tmp/...).
+    try {
+      fs.rmSync(isolatedHome, { recursive: true, force: true });
+    } catch {}
+    if (realHome !== undefined) process.env.HOME = realHome;
+    else delete process.env.HOME;
   });
 
-  it("writes staged files under ~/.gemini/tmp/<slug>/ with no `gstack/` segment", () => {
-    // Create a fake input file to copy from
+  it("derives staging dir from `path.basename(cwd)` — no `gstack/` segment (T111646 regression)", () => {
     const inputFile = path.join(
       os.tmpdir(),
       `gstack-test-input-${Date.now()}.md`,
@@ -2339,12 +2375,14 @@ describe("stageGeminiIO", () => {
     fs.writeFileSync(inputFile, "test input\n");
     stagedPaths.push(inputFile);
 
-    const slug = `smoke-test-${Date.now()}`;
-    const outputFile = path.join(os.tmpdir(), `out-${slug}.md`);
+    const cwdBase = `smoke-test-${Date.now()}`;
+    const cwd = path.join(os.tmpdir(), cwdBase);
+    fs.mkdirSync(cwd, { recursive: true });
+    const outputFile = path.join(os.tmpdir(), `out-${cwdBase}.md`);
     stagedPaths.push(outputFile);
 
     const r = stageGeminiIO({
-      slug,
+      cwd,
       phaseNumber: "1.1",
       iteration: 1,
       suffix: "primary-impl",
@@ -2353,24 +2391,17 @@ describe("stageGeminiIO", () => {
     });
     stagedPaths.push(r.stagedInput, r.stagedOutput);
 
-    // Path must match the Gemini sandbox-allowed shape.
-    const home = os.homedir();
-    const expectedPrefix = path.join(home, ".gemini", "tmp", slug);
+    const expectedPrefix = path.join(isolatedHome, ".gemini", "tmp", cwdBase);
     expect(r.stagedInput.startsWith(expectedPrefix)).toBe(true);
     expect(r.stagedOutput.startsWith(expectedPrefix)).toBe(true);
-
-    // CRITICAL: path must NOT contain `/gstack/` between `/tmp/` and `/<slug>/`.
-    // This is the exact T111646 regression. Gemini's sandbox rejects paths
-    // that traverse outside `~/.gemini/tmp/<slug>/`.
+    // CRITICAL: path must NOT contain `/gstack/` between `/tmp/` and `/<key>/`.
     expect(r.stagedInput).not.toContain("/.gemini/tmp/gstack/");
     expect(r.stagedOutput).not.toContain("/.gemini/tmp/gstack/");
-
-    // Verify the file actually exists at the new location.
     expect(fs.existsSync(r.stagedInput)).toBe(true);
     expect(fs.existsSync(r.stagedOutput)).toBe(true);
 
-    // Cleanup should remove the staged files.
     r.cleanup();
+    fs.rmdirSync(cwd);
     expect(fs.existsSync(r.stagedInput)).toBe(false);
     expect(fs.existsSync(r.stagedOutput)).toBe(false);
   });
@@ -2383,12 +2414,14 @@ describe("stageGeminiIO", () => {
     fs.writeFileSync(inputFile, "test input\n");
     stagedPaths.push(inputFile);
 
-    const slug = `smoke-copyback-${Date.now()}`;
-    const outputFile = path.join(os.tmpdir(), `out-${slug}.md`);
+    const cwdBase = `smoke-copyback-${Date.now()}`;
+    const cwd = path.join(os.tmpdir(), cwdBase);
+    fs.mkdirSync(cwd, { recursive: true });
+    const outputFile = path.join(os.tmpdir(), `out-${cwdBase}.md`);
     stagedPaths.push(outputFile);
 
     const r = stageGeminiIO({
-      slug,
+      cwd,
       phaseNumber: "2.1",
       iteration: 1,
       suffix: "review",
@@ -2400,36 +2433,30 @@ describe("stageGeminiIO", () => {
     fs.writeFileSync(r.stagedOutput, "agent wrote this");
 
     r.cleanup();
+    fs.rmdirSync(cwd);
 
-    // After cleanup, outputFilePath should hold the agent's content.
     expect(fs.readFileSync(outputFile, "utf8")).toBe("agent wrote this");
   });
 
-  // Regression for the 2026-05-18 path-mismatch bug on the
-  // build-mitosis-control-plane-impl-plan-anbang build. The state slug
-  // always carries a `build-` prefix (state.ts:deriveRunSlug). Gemini's
-  // --yolo workspace policy auto-derives its tmp allowlist from the spawn
-  // cwd basename (~/.gemini/projects.json), which is the run-id-shaped
-  // worktree name without the prefix. The two paths used to diverge by
-  // exactly `build-`, so every Gemini fallback ran blind. The fix strips
-  // the prefix inside stageGeminiIO. This test exercises the actual
-  // production slug shape (the earlier T111646 test used `smoke-test-*`
-  // which lacked the prefix and never caught this regression).
-  it("strips leading `build-` prefix so path matches Gemini's cwd-derived sandbox key", () => {
+  // Single-impl regression for the 2026-05-18 path-mismatch bug on
+  // build-mitosis-control-plane-impl-plan-anbang.
+  it("single-impl: staging dir matches the run-id-shaped worktree basename (no `build-` prefix)", () => {
     const inputFile = path.join(
       os.tmpdir(),
-      `gstack-test-input-buildprefix-${Date.now()}.md`,
+      `gstack-test-input-singleimpl-${Date.now()}.md`,
     );
     fs.writeFileSync(inputFile, "test input\n");
     stagedPaths.push(inputFile);
 
+    // Real single-impl cwd shape: $HOME/.gstack/build-worktrees/<repo>/<runId>
     const runId = `mitosis-control-plane-impl-plan-anbang-${Date.now()}-bee3aea0`;
-    const slug = `build-${runId}`;
-    const outputFile = path.join(os.tmpdir(), `out-${slug}.md`);
+    const cwd = path.join(os.tmpdir(), `gstack-test-wt-${Date.now()}`, runId);
+    fs.mkdirSync(cwd, { recursive: true });
+    const outputFile = path.join(os.tmpdir(), `out-singleimpl-${Date.now()}.md`);
     stagedPaths.push(outputFile);
 
     const r = stageGeminiIO({
-      slug,
+      cwd,
       phaseNumber: "3.3",
       iteration: 1,
       suffix: "primary-impl",
@@ -2438,9 +2465,8 @@ describe("stageGeminiIO", () => {
     });
     stagedPaths.push(r.stagedInput, r.stagedOutput);
 
-    const home = os.homedir();
-    const expectedPrefix = path.join(home, ".gemini", "tmp", runId);
-    const forbiddenPrefix = path.join(home, ".gemini", "tmp", "build-");
+    const expectedPrefix = path.join(isolatedHome, ".gemini", "tmp", runId);
+    const forbiddenPrefix = path.join(isolatedHome, ".gemini", "tmp", "build-");
     expect(r.stagedInput.startsWith(expectedPrefix)).toBe(true);
     expect(r.stagedOutput.startsWith(expectedPrefix)).toBe(true);
     expect(r.stagedInput.startsWith(forbiddenPrefix)).toBe(false);
@@ -2449,31 +2475,76 @@ describe("stageGeminiIO", () => {
     expect(fs.existsSync(r.stagedOutput)).toBe(true);
   });
 
-  it("leaves slugs without `build-` prefix unchanged (idempotent)", () => {
+  // Dual-impl regression (Codex adversarial Finding 2, 2026-05-19): dual-impl
+  // calls pass `cwd: <baseDir>/primary` (or `secondary`) — basename is NOT
+  // the state slug. Staging must match cwd basename, not slug.
+  it("dual-impl: staging dir matches the `primary`/`secondary` worktree basename (NOT the parent state slug)", () => {
     const inputFile = path.join(
       os.tmpdir(),
-      `gstack-test-input-noprefix-${Date.now()}.md`,
+      `gstack-test-input-dualimpl-${Date.now()}.md`,
     );
     fs.writeFileSync(inputFile, "test input\n");
     stagedPaths.push(inputFile);
 
-    const slug = `no-prefix-${Date.now()}`;
-    const outputFile = path.join(os.tmpdir(), `out-${slug}.md`);
+    // Real dual-impl cwd shape: /tmp/gstack-dual-<state-slug>-p<N>-<ts>/primary
+    const baseDir = path.join(
+      os.tmpdir(),
+      `gstack-dual-build-mitosis-control-plane-p3.3-${Date.now()}`,
+    );
+    const primaryCwd = path.join(baseDir, "primary");
+    fs.mkdirSync(primaryCwd, { recursive: true });
+    const outputFile = path.join(os.tmpdir(), `out-dualimpl-${Date.now()}.md`);
     stagedPaths.push(outputFile);
 
     const r = stageGeminiIO({
-      slug,
-      phaseNumber: "1.1",
+      cwd: primaryCwd,
+      phaseNumber: "3.3",
       iteration: 1,
-      suffix: "primary-impl",
+      suffix: "dual-primary",
       inputFilePath: inputFile,
       outputFilePath: outputFile,
     });
     stagedPaths.push(r.stagedInput, r.stagedOutput);
 
-    const home = os.homedir();
-    const expectedPrefix = path.join(home, ".gemini", "tmp", slug);
+    // Gemini sandbox: `~/.gemini/tmp/primary/`, NOT `~/.gemini/tmp/build-mitosis-...`.
+    const expectedPrefix = path.join(isolatedHome, ".gemini", "tmp", "primary");
     expect(r.stagedInput.startsWith(expectedPrefix)).toBe(true);
+    expect(r.stagedOutput.startsWith(expectedPrefix)).toBe(true);
+    // Must NOT use the parent state slug.
+    expect(r.stagedInput).not.toContain("build-mitosis-control-plane");
+    expect(r.stagedOutput).not.toContain("build-mitosis-control-plane");
+    expect(fs.existsSync(r.stagedInput)).toBe(true);
+    expect(fs.existsSync(r.stagedOutput)).toBe(true);
+  });
+
+  // Codex adversarial Finding 1: staged filename must include a process
+  // discriminator so two concurrent runs that sanitize to the same key
+  // can't overwrite each other's input/output.
+  it("staged filenames include pid discriminator to avoid concurrent-run collisions", () => {
+    const inputFile = path.join(
+      os.tmpdir(),
+      `gstack-test-input-pid-${Date.now()}.md`,
+    );
+    fs.writeFileSync(inputFile, "test input\n");
+    stagedPaths.push(inputFile);
+
+    const cwd = path.join(os.tmpdir(), `pid-discriminator-${Date.now()}`);
+    fs.mkdirSync(cwd, { recursive: true });
+    const outputFile = path.join(os.tmpdir(), `out-pid-${Date.now()}.md`);
+    stagedPaths.push(outputFile);
+
+    const r = stageGeminiIO({
+      cwd,
+      phaseNumber: "1.1",
+      iteration: 1,
+      suffix: "impl",
+      inputFilePath: inputFile,
+      outputFilePath: outputFile,
+    });
+    stagedPaths.push(r.stagedInput, r.stagedOutput);
+
+    expect(r.stagedInput).toContain(`-${process.pid}-input.md`);
+    expect(r.stagedOutput).toContain(`-${process.pid}-output.md`);
   });
 });
 

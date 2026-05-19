@@ -291,19 +291,32 @@ function quote(s: string): string {
 }
 
 /**
- * Stage Gemini I/O files in ~/.gemini/tmp/<geminiSlug>/ — Gemini's `--yolo`
- * sandbox allows that path AND the project temp dir keyed on `<geminiSlug>`.
+ * Stage Gemini I/O files in ~/.gemini/tmp/<geminiKey>/ — Gemini's `--yolo`
+ * sandbox derives `<geminiKey>` from `path.basename(cwd)` (then sanitizes
+ * lowercase + non-alphanumeric → `-`, see deriveGeminiSlug). Staging dir
+ * MUST match that derivation exactly; otherwise Gemini rejects every
+ * `read_file` as "Path not in workspace" and the agent runs blind.
  *
- * Path-shape history:
- *   - ~/.gemini/tmp/gstack/<slug>/ — broken: Gemini's workspace policy
- *     rejected the `gstack/` segment. Fixed 2026-05-17 (T111646).
- *   - ~/.gemini/tmp/<slug>/ where slug = `build-<runId>` — still broken:
- *     Gemini auto-derives its tmp allowlist from the spawn cwd basename
- *     (~/.gemini/projects.json), which is the run-id-shaped worktree name
- *     with no `build-` prefix. Observed 2026-05-18 on
- *     build-mitosis-control-plane-impl-plan-anbang. Fixed via deriveGeminiSlug
- *     stripping the leading `build-` so the staging path matches the
- *     cwd-derived allowlist exactly.
+ * Path-shape history (this fix is the third iteration):
+ *   1. ~/.gemini/tmp/gstack/<slug>/ — broken: Gemini's workspace policy
+ *      rejected the `gstack/` segment. Fixed 2026-05-17 (T111646).
+ *   2. ~/.gemini/tmp/<state-slug>/ where slug=`build-<runId>` — still
+ *      broken for single-impl: Gemini's key has no `build-` prefix. Fixed
+ *      2026-05-18 by stripping the prefix.
+ *   3. ~/.gemini/tmp/<state-slug-sans-build>/ — still broken for dual-impl:
+ *      dual-impl calls pass `cwd=<worktreePath>/primary` (or `/secondary`)
+ *      so Gemini's key is `primary`/`secondary`, NOT the state slug.
+ *      Surfaced by Codex adversarial review 2026-05-19. Fixed in this
+ *      patch by deriving the staging dir from `cwd` directly via
+ *      `path.basename(cwd)` + Gemini's sanitization, which is the actual
+ *      contract.
+ *
+ * Why a process discriminator (pid) in the filename: per Codex Finding 1,
+ * two concurrent runs that produce the same sanitized key (e.g. one
+ * `socc26-v3_1` worktree and one `socc26-v3-1`) used to share a staging
+ * directory AND a deterministic filename (`gstack-gemini-3.3-1-impl-input.md`),
+ * which let one run truncate the other's input. The pid in the filename
+ * makes that collision impossible without changing the directory shape.
  *
  * Exporting this helper so build/orchestrator/__tests__/sub-agents.test.ts
  * can pin the path shape (gpt-5.5 plan-review IMPORTANT objection).
@@ -315,23 +328,28 @@ function quote(s: string): string {
  * swallowed) and the delete still runs regardless.
  */
 export function stageGeminiIO(opts: {
-  slug: string;
+  cwd: string;
   phaseNumber: string;
   iteration: number;
   suffix: string;
   inputFilePath: string;
   outputFilePath: string;
 }): { stagedInput: string; stagedOutput: string; cleanup: () => void } {
-  const geminiSlug = deriveGeminiSlug(opts.slug);
+  // Gemini derives its sandbox key from `path.basename(cwd)`, then applies
+  // the same sanitization rules deriveGeminiSlug already implements
+  // (lowercase, non-alphanumeric → `-`, collapse, trim). Reuse it.
+  const geminiKey = deriveGeminiSlug(path.basename(opts.cwd));
   const stagingDir = path.join(
     process.env.HOME ?? "~",
     ".gemini",
     "tmp",
-    geminiSlug,
+    geminiKey,
   );
   fs.mkdirSync(stagingDir, { recursive: true });
 
-  const base = `gstack-gemini-${opts.phaseNumber}-${opts.iteration}-${opts.suffix}`;
+  // pid discriminator: makes the filename collision-free even if two
+  // concurrent runs sanitize to the same dir (Codex Finding 1).
+  const base = `gstack-gemini-${opts.phaseNumber}-${opts.iteration}-${opts.suffix}-${process.pid}`;
   const stagedInput = path.join(stagingDir, `${base}-input.md`);
   const stagedOutput = path.join(stagingDir, `${base}-output.md`);
 
@@ -911,7 +929,7 @@ export async function runRoleTask(opts: {
     stagedOutput,
     cleanup: cleanupStaged,
   } = stageGeminiIO({
-    slug: opts.slug,
+    cwd: opts.cwd,
     phaseNumber: opts.phaseNumber ?? "ship",
     iteration: opts.iteration ?? 1,
     suffix: opts.logPrefix,
@@ -2156,7 +2174,7 @@ export async function runGeminiTestSpec(opts: {
     stagedOutput,
     cleanup: cleanupStaged,
   } = stageGeminiIO({
-    slug: opts.slug,
+    cwd: opts.cwd,
     phaseNumber: opts.phaseNumber,
     iteration: opts.iteration,
     suffix: "testspec",
