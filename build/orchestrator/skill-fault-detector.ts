@@ -11,6 +11,7 @@ import {
   DEFAULT_MAX_CODEX_ITERATIONS,
   DEFAULT_MAX_TEST_ITERATIONS,
 } from "./phase-runner";
+import { safeJsonPathEval } from "./safe-jsonpath";
 
 export interface DetectorInput {
   state: BuildState | null;
@@ -63,7 +64,8 @@ export type LearnedMatcherKind =
   | "failureReason_contains"
   | "failureReason_regex"
   | "plan_contains"
-  | "plan_regex";
+  | "plan_regex"
+  | "state_jsonpath";
 
 export interface LearnedPattern {
   category: string; // UPPER_SNAKE_CASE, unique key
@@ -242,6 +244,7 @@ export function loadLearnedPatterns(): LearnedPattern[] {
       "failureReason_regex",
       "plan_contains",
       "plan_regex",
+      "state_jsonpath",
     ]);
     const VALID_SEVERITIES = new Set<string>(["CRITICAL", "HIGH", "MEDIUM"]);
     return parsed.filter(
@@ -283,6 +286,8 @@ function applyLearnedPattern(
         return planContent?.includes(lp.pattern) ?? false;
       case "plan_regex":
         return new RegExp(lp.pattern).test(planContent ?? "");
+      case "state_jsonpath":
+        return safeJsonPathEval(input.state, lp.pattern).length > 0;
       default:
         return false;
     }
