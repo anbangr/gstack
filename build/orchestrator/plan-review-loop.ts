@@ -8,7 +8,8 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { PlanReviewObjection } from "./types";
+import * as readline from "node:readline";
+import type { PlanReviewObjection, TriageDecision } from "./types";
 import type { RoundAnnotation, RoundAnnotationEntry } from "./plan-reviewer";
 
 export interface HistoryEntry {
@@ -317,4 +318,181 @@ export function shouldBailAdaptive(
     };
   }
   return { action: "continue" };
+}
+
+// ---------------------------------------------------------------------------
+// Triage Gate (TTY interactive)
+// ---------------------------------------------------------------------------
+
+export interface TriageGateInput {
+  objections: PlanReviewObjection[];
+  round: number;
+  trajectory: number[];
+  historyPath: string;
+  input: NodeJS.ReadableStream;
+  output: NodeJS.WritableStream;
+  /** Indices of objections that match a prior-round rejection (for special framing). */
+  reRaisedSet: Set<number>;
+  /** Optional map from objection index → prior round's reject rationale. */
+  priorRejectRationale?: Map<number, string>;
+  /** Optional: pre-formatted reviewer assessment to show on [v]iew prose. */
+  assessmentProse?: string;
+}
+
+export interface TriageGateResult {
+  decisions: TriageDecision[];
+  /** True when user picked [q]uit mid-triage. */
+  quitEarly: boolean;
+  /** True when user used [A]ccept-ALL or [R]eject-ALL. */
+  fastPathed: boolean;
+}
+
+/**
+ * Per-objection TTY triage gate.
+ *
+ * Prompts the user once per CRITICAL objection with an 8-key menu
+ * (a/r/d/v/A/R/s/q). After each decision (except quit), optionally captures
+ * a one-line rationale that lands in the resulting TriageDecision. Returns
+ * a TriageGateResult that runPlanReviewLoop uses to write annotations and
+ * decide convergence.
+ *
+ * Streams are injected for testability — caller is expected to pass process.stdin
+ * and process.stdout in production.
+ */
+export async function runTriageGateTTY(
+  opts: TriageGateInput,
+): Promise<TriageGateResult> {
+  const rl = readline.createInterface({
+    input: opts.input,
+    terminal: false,
+  });
+
+  // Buffer lines as they arrive so ask() can dequeue synchronously or wait.
+  const lineQueue: string[] = [];
+  const waiters: Array<(line: string) => void> = [];
+  let streamClosed = false;
+
+  rl.on("line", (line) => {
+    if (waiters.length > 0) {
+      const resolve = waiters.shift()!;
+      resolve(line);
+    } else {
+      lineQueue.push(line);
+    }
+  });
+
+  rl.on("close", () => {
+    streamClosed = true;
+    // Drain any pending waiters with empty string (EOF).
+    while (waiters.length > 0) {
+      const resolve = waiters.shift()!;
+      resolve("");
+    }
+  });
+
+  const ask = (q: string): Promise<string> => {
+    opts.output.write(q);
+    return new Promise((resolve) => {
+      if (lineQueue.length > 0) {
+        resolve(lineQueue.shift()!);
+      } else if (streamClosed) {
+        resolve("");
+      } else {
+        waiters.push(resolve);
+      }
+    });
+  };
+
+  const decisions: TriageDecision[] = [];
+  let quitEarly = false;
+  let fastPathed = false;
+  let stopRemaining = false;
+
+  opts.output.write(
+    `\n═══════════════════════════════════════════════════════════════════════\n` +
+      `[plan-review] Round ${opts.round} — ${opts.objections.length} CRITICAL objection(s)\n` +
+      `Trajectory so far: ${opts.trajectory.join(" → ")}\n` +
+      `History: ${opts.historyPath}\n` +
+      `═══════════════════════════════════════════════════════════════════════\n`,
+  );
+
+  for (let i = 0; i < opts.objections.length; i++) {
+    const o = opts.objections[i];
+    if (stopRemaining) {
+      decisions.push({ objectionIndex: i, decision: "accept", rationale: "" });
+      continue;
+    }
+    const isReRaise = opts.reRaisedSet.has(i);
+    const reRaiseFraming = isReRaise
+      ? `\nObjection ${i + 1} of ${opts.objections.length} — CRITICAL (RE-RAISED from prior round)\n` +
+        (opts.priorRejectRationale?.has(i)
+          ? `  Prior round: user rejected with rationale:\n               "${opts.priorRejectRationale.get(i)}"\n`
+          : "")
+      : `\nObjection ${i + 1} of ${opts.objections.length} — CRITICAL\n`;
+
+    opts.output.write(
+      `${reRaiseFraming}` +
+        `  Location:    ${o.location}\n` +
+        `  Issue:       ${o.issue}\n` +
+        `  Suggestion:  ${o.suggestion}\n\n` +
+        `  [a]ccept  [r]eject  [d]efer  [v]iew prose  [A]ccept ALL  [R]eject ALL  [s]top  [q]uit\n`,
+    );
+
+    let decision: TriageDecision["decision"] | null = null;
+    while (decision === null) {
+      const ans = (await ask("  Decision (a/r/d/v/A/R/s/q): ")).trim();
+      switch (ans) {
+        case "a": decision = "accept"; break;
+        case "r": decision = "reject"; break;
+        case "d": decision = "defer"; break;
+        case "v":
+          opts.output.write(
+            `\n  Reviewer's Overall Assessment:\n` +
+              `  ${(opts.assessmentProse ?? "(no assessment captured)").replace(/\n/g, "\n  ")}\n\n`,
+          );
+          // Re-loop for an actual decision.
+          break;
+        case "A":
+          fastPathed = true;
+          decisions.push({ objectionIndex: i, decision: "accept", rationale: "" });
+          for (let j = i + 1; j < opts.objections.length; j++) {
+            decisions.push({ objectionIndex: j, decision: "accept", rationale: "" });
+          }
+          rl.close();
+          return { decisions, quitEarly: false, fastPathed: true };
+        case "R":
+          fastPathed = true;
+          decisions.push({ objectionIndex: i, decision: "reject", rationale: "" });
+          for (let j = i + 1; j < opts.objections.length; j++) {
+            decisions.push({ objectionIndex: j, decision: "reject", rationale: "" });
+          }
+          rl.close();
+          return { decisions, quitEarly: false, fastPathed: true };
+        case "s":
+          stopRemaining = true;
+          decision = "accept";
+          break;
+        case "q":
+          quitEarly = true;
+          rl.close();
+          return { decisions, quitEarly: true, fastPathed: false };
+        default:
+          opts.output.write(`  Invalid input '${ans}'. Try again.\n`);
+      }
+    }
+
+    const rationale = (await ask("  Rationale (optional, one line): ")).trim();
+    decisions.push({ objectionIndex: i, decision, rationale });
+  }
+
+  rl.close();
+  opts.output.write(
+    `\n═══════════════════════════════════════════════════════════════════════\n` +
+      `[plan-review] Round ${opts.round} triage complete.\n` +
+      `  Accepted: ${decisions.filter((d) => d.decision === "accept").length}\n` +
+      `  Rejected: ${decisions.filter((d) => d.decision === "reject").length}\n` +
+      `  Deferred: ${decisions.filter((d) => d.decision === "defer").length}\n` +
+      `═══════════════════════════════════════════════════════════════════════\n`,
+  );
+  return { decisions, quitEarly: false, fastPathed };
 }
