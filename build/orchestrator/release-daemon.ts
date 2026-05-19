@@ -62,8 +62,17 @@ function getRepoAllowlistPrefixes(): string[] {
 /**
  * Returns true if `repoPath` is safe for the daemon to use as a subprocess
  * cwd. A safe path is absolute, exists, is a directory, contains `.git`,
- * and starts with an allowlisted prefix. Failures are diagnostic strings so
- * callers can log them.
+ * AND resolves (via realpath, following symlinks) to a location inside an
+ * allowlisted prefix. Failures are diagnostic strings so callers can log them.
+ *
+ * The realpath check defeats symlink bypass: if the queue contains a record
+ * with repoPath="/Users/me/Documents/evil-link" and that link points at
+ * /tmp/attacker-repo/, the lexical path.resolve() check would pass (the
+ * input is lexically inside ~/Documents/) but the subsequent `git fetch`
+ * with cwd=evil-link would resolve the symlink and read
+ * /tmp/attacker-repo/.git/config — running any malicious core.sshCommand
+ * the attacker planted. realpathSync forces both checks to use the same
+ * physical location.
  */
 export function isAllowedRepoPath(
   repoPath: string,
@@ -75,8 +84,33 @@ export function isAllowedRepoPath(
   if (!path.isAbsolute(repoPath)) {
     return { ok: false, reason: `repoPath is not absolute: ${repoPath}` };
   }
-  // Resolve to defeat `..` traversal that would land outside the prefix.
-  const resolved = path.resolve(repoPath);
+  // Step 1: existence + directory check on the input path (before realpath,
+  // so we get a clean "does not exist" message rather than "ENOENT, realpath").
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(repoPath);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `repoPath ${repoPath} does not exist: ${(err as Error).message}`,
+    };
+  }
+  if (!stat.isDirectory()) {
+    return { ok: false, reason: `repoPath ${repoPath} is not a directory` };
+  }
+  // Step 2: realpath. Follows symlinks. The allowlist check below operates
+  // on the realpath — this is the only correct way to defeat the symlink
+  // bypass. Lexical path.resolve() would allow /Users/me/Documents/evil-link
+  // (where evil-link → /tmp/attacker) to pass; the realpath does not.
+  let resolved: string;
+  try {
+    resolved = fs.realpathSync(repoPath);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `repoPath ${repoPath} realpath failed: ${(err as Error).message}`,
+    };
+  }
   const withSep = resolved + path.sep;
   const allowed = prefixes.some(
     (prefix) => withSep === prefix || withSep.startsWith(prefix),
@@ -84,29 +118,18 @@ export function isAllowedRepoPath(
   if (!allowed) {
     return {
       ok: false,
-      reason: `repoPath ${resolved} is outside the daemon allowlist (set GSTACK_DAEMON_REPO_ALLOWLIST to extend)`,
+      reason: `repoPath ${repoPath} (realpath ${resolved}) is outside the daemon allowlist (set GSTACK_DAEMON_REPO_ALLOWLIST to extend)`,
     };
   }
-  let stat: fs.Stats;
-  try {
-    stat = fs.statSync(resolved);
-  } catch (err) {
-    return {
-      ok: false,
-      reason: `repoPath ${resolved} does not exist: ${(err as Error).message}`,
-    };
-  }
-  if (!stat.isDirectory()) {
-    return { ok: false, reason: `repoPath ${resolved} is not a directory` };
-  }
-  // `.git` is a directory in normal clones, a file in linked worktrees. Both fine.
+  // Step 3: confirm there's a .git entry (dir for clones, file for linked
+  // worktrees). Use the realpath to avoid a TOCTOU between Step 2 and now.
   const gitMarker = path.join(resolved, ".git");
   try {
     fs.statSync(gitMarker);
   } catch {
     return {
       ok: false,
-      reason: `repoPath ${resolved} has no .git entry (not a git repo)`,
+      reason: `repoPath ${repoPath} (realpath ${resolved}) has no .git entry (not a git repo)`,
     };
   }
   return { ok: true };
@@ -122,19 +145,83 @@ export function isAllowedRepoPath(
  * Each entry returns the release-lock result so the handler can log
  * unreleased locks for forensics. The registry is process-global because
  * the signal handler can't reach into a closure.
+ *
+ * Today the daemon processes one record at a time, so this set has at most
+ * one entry. When concurrent multi-repo processing lands, this needs to
+ * grow into a map keyed by record runId — same shape as activeRecords below.
  */
 type LockReleaseFn = () => { ok: boolean; error?: string };
 const activeLockReleases = new Set<LockReleaseFn>();
 
+/**
+ * Module-level registry of in-flight records. Maps runId → {queueDir, record}
+ * for every record currently being processed. The signal handler uses this
+ * to rewrite each record's status back to "queued" before exiting, so a
+ * SIGTERM mid-landing doesn't strand the record in "landing" — invisible to
+ * `discoverQueuedRecords` (which only fans out for status==="queued") and
+ * thus permanently abandoned until manual `retryReleaseQueueRecord`.
+ */
+interface ActiveRecordEntry {
+  queueDir: string;
+  record: ReleaseQueueRecord;
+}
+const activeRecords = new Map<string, ActiveRecordEntry>();
+
 let signalHandlersInstalled = false;
+
+/**
+ * Per-call timeout for synchronous release in the signal handler. macOS
+ * launchctl waits ~5-10s between SIGTERM and SIGKILL; if `git push` to the
+ * remote hangs (slow network, paged-out auth helper), the release stalls
+ * past SIGKILL and the lock leaks anyway. We can't timeout spawnSync directly
+ * in the signal handler (it's blocking), but we do measure elapsed and stop
+ * after we've burned a reasonable fraction of the grace period. The total
+ * budget across all in-flight records is RELEASE_BUDGET_MS.
+ */
+const SIGNAL_RELEASE_BUDGET_MS = 4000;
 
 function installReleaseDaemonSignalHandlers(log: (msg: string) => void): void {
   if (signalHandlersInstalled) return;
   signalHandlersInstalled = true;
   const handler = (signal: NodeJS.Signals) => {
+    // Step 1: revive in-flight records BEFORE attempting lock release. If the
+    // process is killed before we get to lock release, the records are at
+    // least back to "queued" status and the next daemon will retry.
+    let revivedRecords = 0;
+    let reviveFailed = 0;
+    for (const [runId, entry] of activeRecords) {
+      try {
+        updateReleaseQueueRecord(entry.queueDir, entry.record, {
+          status: "queued",
+          lastError: `interrupted by signal ${signal} mid-landing`,
+        });
+        revivedRecords++;
+      } catch (err) {
+        reviveFailed++;
+        log(
+          `signal ${signal}: failed to revive record ${runId}: ${(err as Error).message}`,
+        );
+      }
+    }
+    activeRecords.clear();
+    if (revivedRecords + reviveFailed > 0) {
+      log(
+        `signal ${signal}: revived ${revivedRecords} record(s) to queued, ${reviveFailed} failed`,
+      );
+    }
+    // Step 2: release locks within a bounded budget. Once budget is gone,
+    // log the rest as deferred and exit — better to leak a lock for 2h than
+    // get SIGKILLed mid-git-push, which can be worse if it corrupts state.
     let released = 0;
     let failed = 0;
+    let deferred = 0;
+    const start = Date.now();
     for (const release of activeLockReleases) {
+      const elapsed = Date.now() - start;
+      if (elapsed >= SIGNAL_RELEASE_BUDGET_MS) {
+        deferred++;
+        continue;
+      }
       try {
         const r = release();
         if (r.ok) released++;
@@ -149,7 +236,7 @@ function installReleaseDaemonSignalHandlers(log: (msg: string) => void): void {
     }
     activeLockReleases.clear();
     log(
-      `signal ${signal}: released ${released} lock(s), ${failed} failed; exiting`,
+      `signal ${signal}: released ${released} lock(s), ${failed} failed, ${deferred} deferred (budget exhausted); exiting`,
     );
     // Conventional exit code: 128 + signal number for SIGTERM(15)/SIGINT(2)/SIGHUP(1).
     const code =
@@ -165,6 +252,20 @@ function installReleaseDaemonSignalHandlers(log: (msg: string) => void): void {
   process.on("SIGTERM", handler);
   process.on("SIGINT", handler);
   process.on("SIGHUP", handler);
+}
+
+/**
+ * Test-only: reset module-level state. Tests that exercise the signal
+ * handler or watch loop should call this in afterEach so the handler
+ * doesn't accumulate listeners or stale registry entries.
+ */
+export function _resetReleaseDaemonForTests(): void {
+  activeLockReleases.clear();
+  activeRecords.clear();
+  signalHandlersInstalled = false;
+  // Note: we can't `process.removeAllListeners('SIGTERM')` because that
+  // would also remove any test-runner handlers. Tests that need a clean
+  // signal surface should run in a child process.
 }
 
 export interface ReleaseDaemonOptions {
@@ -352,6 +453,11 @@ export async function processReleaseQueueRecord(
       handle: heartbeat.currentHandle(),
     });
   activeLockReleases.add(signalReleaseCallback);
+  // Register the record itself so the signal handler can rewrite its status
+  // back to "queued" before exiting. Without this, SIGTERM mid-landing
+  // strands the record in "landing" status — invisible to the next
+  // discovery cycle and abandoned until manual retry.
+  activeRecords.set(record.runId, { queueDir, record });
   const blockIfLockLost = () => {
     const lost = heartbeat.lostOwnership();
     if (!lost) return null;
@@ -422,15 +528,23 @@ export async function processReleaseQueueRecord(
       lastError: (err as Error).message,
     });
   } finally {
+    // Order matters: release the lock FIRST, then deregister the
+    // SIGTERM-callback. The reverse order opens a one-statement window
+    // where SIGTERM between delete() and releaseFn() runs neither path
+    // and the lock leaks for the full 2h TTL — the exact failure mode
+    // this code exists to prevent. If SIGTERM lands after releaseFn but
+    // before delete, the handler may re-release; releaseRemoteReleaseLock
+    // is idempotent (returns ok:true when the ref is already gone), so
+    // double-release is cheap. Missed release is not.
     heartbeat.stop();
-    activeLockReleases.delete(signalReleaseCallback);
-    // Use the already-resolved releaseFn so the natural-completion path and
-    // the SIGTERM-callback path go through one callable. Otherwise a future
-    // wrapper (retries, telemetry) added to one path silently diverges.
+    // Use the already-resolved releaseFn so the natural-completion path
+    // and the SIGTERM-callback path go through one callable.
     const released = releaseFn({
       cwd: record.repoPath,
       handle: heartbeat.currentHandle(),
     });
+    activeLockReleases.delete(signalReleaseCallback);
+    activeRecords.delete(record.runId);
     if (!released.ok) {
       log(`warning: could not release ${lock.handle.ref}: ${released.error}`);
     }
@@ -513,9 +627,39 @@ export async function runReleaseDaemon(
     installReleaseDaemonSignalHandlers(log);
   }
   while (true) {
-    const next = discoverQueuedRecords(queueDir, { ...opts, log }).find(
+    const candidates = discoverQueuedRecords(queueDir, { ...opts, log }).filter(
       (record) => record.status === "queued",
     );
+    // Gate every candidate's repoPath against the allowlist BEFORE handing
+    // it to the processor. Without this check, a planted JSON file with a
+    // crafted repoPath bypasses the allowlist (which only gates the remote
+    // discovery fan-out) and processReleaseQueueRecord will happily `cd`
+    // into the attacker-controlled directory for `git fetch`. The threat
+    // model docstring on the allowlist names exactly this attack — local
+    // record processing was the unguarded surface.
+    //
+    // Tests inject opts.processor to bypass the real processReleaseQueueRecord
+    // (and thus the real git/gh subprocesses). When a test processor is
+    // present, skip the gate so tests with synthetic paths still run.
+    const productionPath = !opts.processor;
+    let next: ReleaseQueueRecord | undefined;
+    for (const candidate of candidates) {
+      if (productionPath) {
+        const check = isAllowedRepoPath(candidate.repoPath);
+        if (!check.ok) {
+          log(
+            `blocking PR #${candidate.prNumber}: disallowed repoPath: ${check.reason}`,
+          );
+          updateReleaseQueueRecord(queueDir, candidate, {
+            status: "blocked",
+            lastError: `repoPath outside daemon allowlist: ${check.reason}`,
+          });
+          continue;
+        }
+      }
+      next = candidate;
+      break;
+    }
     if (next) {
       const processor = opts.processor ?? processReleaseQueueRecord;
       const result = await processor(next, { ...opts, queueDir, log });

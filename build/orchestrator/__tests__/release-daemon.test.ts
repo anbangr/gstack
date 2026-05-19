@@ -540,6 +540,12 @@ describe("release daemon queue loop", () => {
 });
 
 describe("isAllowedRepoPath (security gate)", () => {
+  // os.tmpdir() returns /var/folders/... on macOS but realpath resolves to
+  // /private/var/folders/...; on Linux /tmp/ realpaths to /private/tmp/ on
+  // macOS. The security gate uses realpath, so tests need the realpath of
+  // tmpdir as the allowlist prefix to match what the gate computes.
+  const TMP_REAL = fs.realpathSync(os.tmpdir()) + path.sep;
+
   it("rejects empty / non-string repoPath", () => {
     expect(isAllowedRepoPath("", [])).toEqual({
       ok: false,
@@ -583,7 +589,7 @@ describe("isAllowedRepoPath (security gate)", () => {
     const file = path.join(os.tmpdir(), "gstack-allowlist-file-" + Date.now());
     fs.writeFileSync(file, "x");
     try {
-      const result = isAllowedRepoPath(file, [os.tmpdir() + path.sep]);
+      const result = isAllowedRepoPath(file, [TMP_REAL]);
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.reason).toContain("not a directory");
     } finally {
@@ -596,7 +602,7 @@ describe("isAllowedRepoPath (security gate)", () => {
       path.join(os.tmpdir(), "gstack-allowlist-nogit-"),
     );
     try {
-      const result = isAllowedRepoPath(dir, [os.tmpdir() + path.sep]);
+      const result = isAllowedRepoPath(dir, [TMP_REAL]);
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.reason).toContain("no .git entry");
     } finally {
@@ -610,7 +616,7 @@ describe("isAllowedRepoPath (security gate)", () => {
     );
     fs.mkdirSync(path.join(dir, ".git"));
     try {
-      const result = isAllowedRepoPath(dir, [os.tmpdir() + path.sep]);
+      const result = isAllowedRepoPath(dir, [TMP_REAL]);
       expect(result.ok).toBe(true);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -626,7 +632,7 @@ describe("isAllowedRepoPath (security gate)", () => {
       "gitdir: /elsewhere/.git/worktrees/x",
     );
     try {
-      const result = isAllowedRepoPath(dir, [os.tmpdir() + path.sep]);
+      const result = isAllowedRepoPath(dir, [TMP_REAL]);
       expect(result.ok).toBe(true);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -635,9 +641,147 @@ describe("isAllowedRepoPath (security gate)", () => {
 
   it("defeats path traversal via .. that escapes the prefix", () => {
     // /tmp is allowlisted, but /tmp/../etc resolves to /etc which is not.
-    const result = isAllowedRepoPath("/tmp/../etc", [os.tmpdir() + path.sep]);
+    const result = isAllowedRepoPath("/tmp/../etc", [TMP_REAL]);
     expect(result.ok).toBe(false);
     if (!result.ok)
       expect(result.reason).toContain("outside the daemon allowlist");
+  });
+
+  it("defeats symlink bypass via realpath", () => {
+    // The attack: queue file contains repoPath="<allowed>/evil-link" where
+    // evil-link → /tmp/attacker/. Lexical path.resolve passes (the input is
+    // lexically inside the allowlist). But realpath follows the symlink and
+    // exposes that the actual filesystem location is outside.
+    const allowedDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-allowlist-symlink-allowed-"),
+    );
+    const attackerDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-allowlist-symlink-attacker-"),
+    );
+    fs.mkdirSync(path.join(attackerDir, ".git"));
+    const linkPath = path.join(allowedDir, "evil-link");
+    fs.symlinkSync(attackerDir, linkPath, "dir");
+    try {
+      // Allowlist is the allowedDir's realpath. The link path is lexically
+      // inside the allowlist BUT realpath resolves to attackerDir which
+      // is OUTSIDE. Gate must reject.
+      const result = isAllowedRepoPath(linkPath, [
+        fs.realpathSync(allowedDir) + path.sep,
+      ]);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toContain("outside the daemon allowlist");
+      }
+    } finally {
+      fs.unlinkSync(linkPath);
+      fs.rmSync(allowedDir, { recursive: true, force: true });
+      fs.rmSync(attackerDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("runReleaseDaemon allowlist enforcement on local records (F1 fix)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-release-f1-"));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function record(overrides: Partial<ReleaseQueueRecord>): ReleaseQueueRecord {
+    return {
+      runId: "run",
+      repoPath: "/repo",
+      baseBranch: "main",
+      featureBranch: "feat/a",
+      prNumber: 1,
+      version: "1.0.0.1",
+      livingPlanPath: "/plans/living.md",
+      worktreePath: "/worktree",
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+      ...overrides,
+    };
+  }
+
+  it("blocks records with disallowed repoPath rather than handing them to the processor", async () => {
+    // A planted queue record with repoPath pointing outside the allowlist.
+    // The production path (no opts.processor) must mark it blocked and skip
+    // it instead of running it through processReleaseQueueRecord (which
+    // would `cd` into the attacker-controlled directory).
+    writeReleaseQueueRecord(
+      dir,
+      record({
+        prNumber: 100,
+        repoPath: "/tmp/attacker-planted",
+        repoIdentity: "github.com/attacker/repo",
+        queuedAt: "2026-05-09T00:00:01.000Z",
+      }),
+    );
+    writeReleaseQueueRecord(
+      dir,
+      record({
+        prNumber: 101,
+        // Also disallowed.
+        repoPath: "/etc",
+        repoIdentity: "github.com/attacker/other",
+        queuedAt: "2026-05-09T00:00:02.000Z",
+      }),
+    );
+
+    const logs: string[] = [];
+    const exit = await runReleaseDaemon({
+      queueDir: dir,
+      once: true,
+      roles: DEFAULT_ROLE_CONFIGS,
+      log: (msg) => logs.push(msg),
+      // NO opts.processor → production path. Allowlist gate MUST fire.
+      // NO opts.discoverRemote → real gh would be called for the configured
+      // repoPath; we leave that unset so only local records are evaluated.
+    });
+
+    expect(exit).toBe(0); // queue empty after blocking
+    // Both records get marked blocked.
+    const records = readReleaseQueueRecords(dir);
+    const pr100 = records.find((r) => r.prNumber === 100);
+    const pr101 = records.find((r) => r.prNumber === 101);
+    expect(pr100?.status).toBe("blocked");
+    expect(pr100?.lastError).toContain("outside daemon allowlist");
+    expect(pr101?.status).toBe("blocked");
+    expect(pr101?.lastError).toContain("outside daemon allowlist");
+    // Log lines mention which PRs got blocked.
+    expect(logs.some((m) => m.includes("blocking PR #100"))).toBe(true);
+    expect(logs.some((m) => m.includes("blocking PR #101"))).toBe(true);
+  });
+
+  it("test processor injection bypasses the gate (tests opt into synthetic paths)", async () => {
+    // When tests inject opts.processor, paths like /repo-a aren't real
+    // directories — but the test takes responsibility for that. Gate must
+    // not interfere.
+    writeReleaseQueueRecord(
+      dir,
+      record({
+        prNumber: 200,
+        repoPath: "/repo-fake-but-test-injected",
+        repoIdentity: "github.com/acme/fake",
+        queuedAt: "2026-05-09T00:00:01.000Z",
+      }),
+    );
+
+    const processed: number[] = [];
+    const exit = await runReleaseDaemon({
+      queueDir: dir,
+      once: true,
+      roles: DEFAULT_ROLE_CONFIGS,
+      log: () => {},
+      processor: async (item) => {
+        processed.push(item.prNumber);
+        return { ...item, status: "landed" };
+      },
+    });
+
+    expect(exit).toBe(0);
+    expect(processed).toEqual([200]);
   });
 });
