@@ -529,3 +529,242 @@ export async function runPlanReview(opts: {
     round,
   });
 }
+
+// ---------------------------------------------------------------------------
+// Round annotation read/write (cross-round memory contract)
+// ---------------------------------------------------------------------------
+
+export interface RoundAnnotationEntry {
+  round: number;
+  userDecision?: "accept" | "reject" | "defer";
+  userRationale?: string;
+  /** Synth-written. Possible values: "pending", "disputed — <reason>", or "<one-line description>". */
+  resolution?: string;
+  /** Parser-written when comparing round N to round N-1. "re-raised" | "not re-raised". */
+  reviewerOutcome?: string;
+}
+
+export interface RoundAnnotation {
+  location: string;
+  severity: "CRITICAL" | "IMPORTANT" | "SUGGESTION";
+  issue: string;
+  suggestion: string;
+  rounds: RoundAnnotationEntry[];
+}
+
+/**
+ * Match a full annotation block. Lazy body up to first `-->`.
+ * `[^\]\n]+` for location prevents the bracket-group from spanning lines,
+ * which would cause malformed blocks to be glued to the next valid block.
+ */
+const ANNOTATION_BLOCK_RE =
+  /<!--\s*ROUND\s+\d+\s+(CRITICAL|IMPORTANT|SUGGESTION)\s+\[([^\]\n]+)\]:\s+([\s\S]*?)-->/gm;
+
+const ROUND_HEADER_RE =
+  /ROUND\s+(\d+)\s+(CRITICAL|IMPORTANT|SUGGESTION)\s+\[([^\]\n]+)\]:\s+(.+?)\s+→\s+(.+?)$/m;
+
+const ROUND_USER_RE = /ROUND\s+(\d+)\s+USER:\s+(accept|reject|defer)(?:\s+\("([^"]*)"\))?/g;
+
+/** Stop before trailing ` -->` when the field is the last line in the block. */
+const ROUND_RESOLUTION_RE = /ROUND\s+(\d+)\s+RESOLUTION:\s+(.+?)(?:\s+-->)?$/gm;
+
+const ROUND_REVIEWER_RE = /ROUND\s+(\d+)\s+REVIEWER:\s+(.+?)(?:\s+-->)?$/gm;
+
+/**
+ * Parse all round-annotation blocks out of a plan file's text.
+ * Skips malformed blocks (logs to console.warn) instead of throwing.
+ */
+export function parseRoundAnnotations(planText: string): RoundAnnotation[] {
+  const results: RoundAnnotation[] = [];
+  let m: RegExpExecArray | null;
+  ANNOTATION_BLOCK_RE.lastIndex = 0;
+  while ((m = ANNOTATION_BLOCK_RE.exec(planText)) !== null) {
+    const body = m[0];
+    // The header is the first line inside the comment.
+    const headerMatch = body.match(ROUND_HEADER_RE);
+    if (!headerMatch) {
+      console.warn(
+        "[plan-review] malformed annotation block (no header); skipping",
+      );
+      continue;
+    }
+    const severity = headerMatch[2] as RoundAnnotation["severity"];
+    const location = headerMatch[3].trim();
+    const issue = headerMatch[4].trim();
+    const suggestion = headerMatch[5].trim();
+
+    // Collect every ROUND N USER / RESOLUTION / REVIEWER line into a per-round map.
+    const byRound = new Map<number, RoundAnnotationEntry>();
+    const ensure = (round: number): RoundAnnotationEntry => {
+      let entry = byRound.get(round);
+      if (!entry) {
+        entry = { round };
+        byRound.set(round, entry);
+      }
+      return entry;
+    };
+    // The header itself names round 1 of this annotation; track its round number.
+    ensure(parseInt(headerMatch[1], 10));
+
+    ROUND_USER_RE.lastIndex = 0;
+    let u: RegExpExecArray | null;
+    while ((u = ROUND_USER_RE.exec(body)) !== null) {
+      const entry = ensure(parseInt(u[1], 10));
+      entry.userDecision = u[2] as RoundAnnotationEntry["userDecision"];
+      if (u[3] !== undefined) entry.userRationale = u[3];
+    }
+
+    ROUND_RESOLUTION_RE.lastIndex = 0;
+    let r: RegExpExecArray | null;
+    while ((r = ROUND_RESOLUTION_RE.exec(body)) !== null) {
+      const entry = ensure(parseInt(r[1], 10));
+      entry.resolution = r[2].trim();
+    }
+
+    // ROUND N REVIEWER attaches to round N-1's entry (it records what the reviewer
+    // decided about the prior-round annotation when they revisited it in round N).
+    ROUND_REVIEWER_RE.lastIndex = 0;
+    let v: RegExpExecArray | null;
+    while ((v = ROUND_REVIEWER_RE.exec(body)) !== null) {
+      const reviewerRound = parseInt(v[1], 10);
+      const targetRound = Math.max(1, reviewerRound - 1);
+      const entry = ensure(targetRound);
+      entry.reviewerOutcome = v[2].trim();
+    }
+
+    const rounds = Array.from(byRound.values()).sort((a, b) => a.round - b.round);
+    results.push({ location, severity, issue, suggestion, rounds });
+  }
+  return results;
+}
+
+/**
+ * Serialize a single RoundAnnotation back to the canonical HTML comment.
+ */
+function serializeAnnotation(ann: RoundAnnotation): string {
+  const lines: string[] = [];
+  const head = ann.rounds[0].round;
+  lines.push(
+    `<!-- ROUND ${head} ${ann.severity} [${ann.location}]: ${ann.issue} → ${ann.suggestion}`,
+  );
+  for (const r of ann.rounds) {
+    if (r.userDecision) {
+      const rat = r.userRationale ? ` ("${r.userRationale}")` : "";
+      lines.push(`     ROUND ${r.round} USER: ${r.userDecision}${rat}`);
+    }
+    if (r.resolution) {
+      lines.push(`     ROUND ${r.round} RESOLUTION: ${r.resolution}`);
+    }
+    if (r.reviewerOutcome) {
+      lines.push(`     ROUND ${r.round} REVIEWER: ${r.reviewerOutcome}`);
+    }
+  }
+  lines[lines.length - 1] += " -->";
+  return lines.join("\n");
+}
+
+/**
+ * Insert or merge an annotation into the plan text.
+ *
+ * - If an existing annotation matches by (location, severity, issue), merge the new round's entries into it.
+ * - Otherwise insert a new annotation block immediately above the matching `### Phase` heading.
+ * - If no matching phase heading is found, prepend the annotation to the file (before any feature).
+ */
+export function writeRoundAnnotation(
+  planText: string,
+  ann: RoundAnnotation,
+): string {
+  // Merge path: scan existing annotations, find a match.
+  const existing = parseRoundAnnotations(planText);
+  const matchIdx = existing.findIndex(
+    (e) =>
+      e.location === ann.location &&
+      e.severity === ann.severity &&
+      e.issue === ann.issue,
+  );
+  if (matchIdx >= 0) {
+    const merged: RoundAnnotation = {
+      ...existing[matchIdx],
+      rounds: [...existing[matchIdx].rounds, ...ann.rounds],
+    };
+    const oldText = serializeAnnotation(existing[matchIdx]);
+    const newText = serializeAnnotation(merged);
+    return planText.replace(oldText, newText);
+  }
+
+  // Insert path: place above `### Phase <phaseId>` for the location.
+  const phaseMatch = ann.location.match(/Phase\s+(\S+)/i);
+  const newBlock = serializeAnnotation(ann);
+  if (phaseMatch) {
+    const phaseRe = new RegExp(
+      `(^###\\s*Phase\\s+${escapeRegExp(phaseMatch[1])}(?!\\d)[^\\n]*$)`,
+      "m",
+    );
+    if (phaseRe.test(planText)) {
+      return planText.replace(phaseRe, `${newBlock}\n$1`);
+    }
+  }
+  // Fallback: prepend.
+  return `${newBlock}\n${planText}`;
+}
+
+// ---------------------------------------------------------------------------
+// Round-history header (top-of-plan block)
+// ---------------------------------------------------------------------------
+
+export interface RoundHistoryEntry {
+  round: number;
+  ts: string;
+  reviewer: string;
+  verdict: "APPROVE" | "REVISE";
+  criticalCount: number;
+  accepted: number;
+  rejected: number;
+  deferred: number;
+}
+
+const HISTORY_BLOCK_RE =
+  /<!--\s*gstack-plan-review-history\s*\n([\s\S]*?)-->\s*/m;
+
+export function parseRoundHistoryHeader(planText: string): RoundHistoryEntry[] {
+  const m = planText.match(HISTORY_BLOCK_RE);
+  if (!m) return [];
+  const lines = m[1].split("\n").filter((l) => l.trim().startsWith("round "));
+  const entries: RoundHistoryEntry[] = [];
+  for (const line of lines) {
+    const parsed = line.match(
+      /^round\s+(\d+)\s+\(([^)]+)\):\s+(\S+)\s+→\s+(APPROVE|REVISE)\s+—\s+(\d+)\s+CRITICAL\s+\((\d+)\s+accepted,\s+(\d+)\s+rejected(?:,\s+(\d+)\s+deferred)?\)/,
+    );
+    if (!parsed) continue;
+    entries.push({
+      round: parseInt(parsed[1], 10),
+      ts: parsed[2],
+      reviewer: parsed[3],
+      verdict: parsed[4] as "APPROVE" | "REVISE",
+      criticalCount: parseInt(parsed[5], 10),
+      accepted: parseInt(parsed[6], 10),
+      rejected: parseInt(parsed[7], 10),
+      deferred: parsed[8] ? parseInt(parsed[8], 10) : 0,
+    });
+  }
+  return entries;
+}
+
+export function updateRoundHistoryHeader(
+  planText: string,
+  newEntry: RoundHistoryEntry,
+  opts?: { finalLine?: string },
+): string {
+  const entries = parseRoundHistoryHeader(planText);
+  entries.push(newEntry);
+  const lines = entries.map(
+    (e) =>
+      `round ${e.round} (${e.ts}): ${e.reviewer} → ${e.verdict} — ${e.criticalCount} CRITICAL (${e.accepted} accepted, ${e.rejected} rejected${e.deferred ? `, ${e.deferred} deferred` : ""})`,
+  );
+  if (opts?.finalLine) lines.push(opts.finalLine);
+  const newBlock = `<!-- gstack-plan-review-history\n${lines.join("\n")}\n-->\n`;
+  if (HISTORY_BLOCK_RE.test(planText)) {
+    return planText.replace(HISTORY_BLOCK_RE, newBlock);
+  }
+  return newBlock + planText;
+}
