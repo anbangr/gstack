@@ -9,8 +9,11 @@
  */
 
 import { describe, test, expect } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import {
   detectLearnedFaults,
+  detectSkillFaults,
   type LearnedPattern,
 } from "../skill-fault-detector";
 
@@ -109,5 +112,70 @@ describe("state_jsonpath learned pattern", () => {
         null,
       );
     }).not.toThrow();
+  });
+});
+
+describe("HAND_MERGED_FEATURE detector", () => {
+  test("fires on polis state shape", () => {
+    const state = JSON.parse(
+      fs.readFileSync(
+        path.join(
+          __dirname,
+          "fixtures",
+          "halt-events",
+          "hand-merged-feature-state.json",
+        ),
+        "utf8",
+      ),
+    );
+    const out = detectSkillFaults({
+      state,
+      livingPlanPath: "/x",
+      worktreePath: "/x",
+      stateDir: "/x",
+      stdoutLogPath: "/x",
+    });
+    const f = out.find((x) => x.category === "HAND_MERGED_FEATURE");
+    expect(f).toBeTruthy();
+    expect(f!.severity).toBe("HIGH");
+  });
+
+  test("does NOT fire when completedAt is present", () => {
+    const state = {
+      phases: [],
+      features: [
+        {
+          index: 0,
+          number: "1",
+          status: "committed",
+          mergeSha: "abc",
+          prNumber: 1,
+          completedAt: "2026-05-19",
+        },
+      ],
+    } as any;
+    const out = detectSkillFaults({
+      state,
+      livingPlanPath: "/x",
+      worktreePath: "/x",
+      stateDir: "/x",
+      stdoutLogPath: "/x",
+    });
+    expect(out.find((x) => x.category === "HAND_MERGED_FEATURE")).toBeFalsy();
+  });
+
+  test("does NOT fire without mergeSha", () => {
+    const state = {
+      phases: [],
+      features: [{ index: 0, number: "1", status: "committed", prNumber: 1 }],
+    } as any;
+    const out = detectSkillFaults({
+      state,
+      livingPlanPath: "/x",
+      worktreePath: "/x",
+      stateDir: "/x",
+      stdoutLogPath: "/x",
+    });
+    expect(out.find((x) => x.category === "HAND_MERGED_FEATURE")).toBeFalsy();
   });
 });

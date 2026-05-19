@@ -500,6 +500,34 @@ export function detectSkillFaults(
     }
 
     // ------------------------------------------------------------------
+    // HAND_MERGED_FEATURE — feature carries merge metadata but no completedAt.
+    // ------------------------------------------------------------------
+    // Closes the 2026-05-17 polis-bug detection gap: a feature whose status is
+    // "committed" with mergeSha+prNumber but missing completedAt was hand-merged
+    // via gh CLI bypassing the orchestrator's ship pipeline. Severity HIGH:
+    // the orchestrator's resume loop will try to re-process this feature and
+    // fail because the branch is already deleted post-merge.
+    if (state && Array.isArray((state as any).features)) {
+      for (const f of (state as any).features as any[]) {
+        if (
+          f &&
+          f.status === "committed" &&
+          !f.completedAt &&
+          f.mergeSha &&
+          f.prNumber
+        ) {
+          faults.push({
+            category: "HAND_MERGED_FEATURE",
+            severity: "HIGH",
+            description: `Feature ${f.number} carries mergeSha+prNumber but completedAt is missing. Likely a hand-merged PR.`,
+            sourceFiles: [],
+            evidence: {},
+          });
+        }
+      }
+    }
+
+    // ------------------------------------------------------------------
     // WORKTREE_LEAK
     // ------------------------------------------------------------------
     if (state && state.completed === true && dirExists(input.worktreePath)) {
