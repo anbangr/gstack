@@ -184,6 +184,31 @@ import {
   streakSurfaceMessage,
 } from "./escalation-streak";
 import { renderPlanStatusTable, resolvePlanSelection } from "./plan-selection";
+import { markPhaseFailed } from "./halt-event-helpers";
+
+/**
+ * Builds the HelperContext that halt-event helpers (markPhaseFailed,
+ * markFeatureFailed, rewindPhase, recordRetryCapHit) need for emitting
+ * PHASE_FAILED / FEATURE_FAILED / PHASE_REWIND / RETRY_CAP_HIT halt events.
+ *
+ * runId is sourced from state.launch?.runId where available, falling back to
+ * state.slug for older state files that pre-date durable run identity. The
+ * pointer fields are best-effort: when state.launch is unset (older state)
+ * the path fields fall back to "" — emitHaltEvent will write the empty
+ * string and downstream tests stay structural.
+ */
+function helperCtxFor(state: BuildState) {
+  return {
+    runId: state.launch?.runId ?? state.slug,
+    stateSlug: state.slug,
+    pointers: {
+      stateFile: statePath(state.slug),
+      stdoutLog: "",
+      livingPlan: state.planFile,
+      worktreePath: state.launch?.projectRoot ?? "",
+    },
+  };
+}
 
 const DEFAULT_MAX_ORIGIN_VERIFICATION_ITERATIONS =
   BUILD_DEFAULTS.limits.originVerificationMaxIterations;
@@ -6569,9 +6594,12 @@ async function runPhase(args: {
       // If a prior run crashed between createWorktrees and saveState, phaseState.dualImpl
       // already holds the orphaned paths — tear them down before creating a fresh pair.
       if (isLegacyDualImplState(phaseState.dualImpl)) {
-        phaseState.status = "failed";
-        phaseState.error = legacyDualImplError();
-        state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          legacyDualImplError(),
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -6596,9 +6624,13 @@ async function runPhase(args: {
           action,
           mockResult({ exitCode: 1, stderr: msg }),
         );
-        phaseState.error = msg;
-        phaseState.status = "failed";
         state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          msg,
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -6775,9 +6807,13 @@ async function runPhase(args: {
         // null = git rev-list failed (worktree may be broken) — fail closed rather than
         // silently treating it as "0 commits" and auto-selecting the other side.
         if (primaryCommits === null || secondaryCommits === null) {
-          phaseState.status = "failed";
-          phaseState.error = `Failed to count commits since base — cannot determine implementation eligibility (primary=${primaryCommits}, secondary=${secondaryCommits})`;
           state.phases[phase.index] = phaseState;
+          markPhaseFailed(
+            state,
+            phaseState.index,
+            `Failed to count commits since base — cannot determine implementation eligibility (primary=${primaryCommits}, secondary=${secondaryCommits})`,
+            helperCtxFor(state),
+          );
           saveState(state, { noGbrain, log: console.warn });
           continue;
         }
@@ -6797,12 +6833,15 @@ async function runPhase(args: {
         const neitherCommitted = !primaryCommitted && !secondaryCommitted;
 
         if (bothTimedOut || bothExitNonZero || neitherCommitted) {
-          phaseState.status = "failed";
-          phaseState.error =
-            `Dual implementation failed: ` +
-            `primary exit=${primaryResult.implResult.exitCode} timedOut=${primaryResult.implResult.timedOut} commits=${primaryCommits}; ` +
-            `secondary exit=${secondaryResult.implResult.exitCode} timedOut=${secondaryResult.implResult.timedOut} commits=${secondaryCommits}`;
           state.phases[phase.index] = phaseState;
+          markPhaseFailed(
+            state,
+            phaseState.index,
+            `Dual implementation failed: ` +
+              `primary exit=${primaryResult.implResult.exitCode} timedOut=${primaryResult.implResult.timedOut} commits=${primaryCommits}; ` +
+              `secondary exit=${secondaryResult.implResult.exitCode} timedOut=${secondaryResult.implResult.timedOut} commits=${secondaryCommits}`,
+            helperCtxFor(state),
+          );
           saveState(state, { noGbrain, log: console.warn });
           // dualImplOk stays false → finally block will tear down.
           continue;
@@ -6841,9 +6880,13 @@ async function runPhase(args: {
         // Skip RUN_DUAL_TESTS + RUN_JUDGE entirely; auto-select the committed side.
         if (primaryCommitted && !secondaryCommitted) {
           if (primaryResult.testResult.testExitCode !== 0) {
-            phaseState.status = "failed";
-            phaseState.error = `Primary auto-selected (secondary=0 commits) but tests are failing (exit=${primaryResult.testResult.testExitCode}) — worktrees will be torn down; re-run gstack-build to retry this phase`;
             state.phases[phase.index] = phaseState;
+            markPhaseFailed(
+              state,
+              phaseState.index,
+              `Primary auto-selected (secondary=0 commits) but tests are failing (exit=${primaryResult.testResult.testExitCode}) — worktrees will be torn down; re-run gstack-build to retry this phase`,
+              helperCtxFor(state),
+            );
             saveState(state, { noGbrain, log: console.warn });
             continue;
           }
@@ -6858,9 +6901,13 @@ async function runPhase(args: {
           phaseState.status = "dual_winner_pending";
         } else if (!primaryCommitted && secondaryCommitted) {
           if (secondaryResult.testResult.testExitCode !== 0) {
-            phaseState.status = "failed";
-            phaseState.error = `Secondary auto-selected (primary=0 commits) but tests are failing (exit=${secondaryResult.testResult.testExitCode}) — worktrees will be torn down; re-run gstack-build to retry this phase`;
             state.phases[phase.index] = phaseState;
+            markPhaseFailed(
+              state,
+              phaseState.index,
+              `Secondary auto-selected (primary=0 commits) but tests are failing (exit=${secondaryResult.testResult.testExitCode}) — worktrees will be torn down; re-run gstack-build to retry this phase`,
+              helperCtxFor(state),
+            );
             saveState(state, { noGbrain, log: console.warn });
             continue;
           }
@@ -6919,9 +6966,13 @@ async function runPhase(args: {
         dualImplOk = true; // suppress finally teardown; downstream phases own cleanup
       } catch (err) {
         const msg = `Dual implementation crashed unexpectedly: ${(err as Error).message}`;
-        phaseState.status = "failed";
-        phaseState.error = msg;
         state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          msg,
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
       } finally {
         if (!dualImplOk) {
@@ -6943,17 +6994,22 @@ async function runPhase(args: {
       );
       const dual = phaseState.dualImpl;
       if (!dual) {
-        phaseState.status = "failed";
-        phaseState.error =
-          "RUN_DUAL_TESTS reached without dualImpl state — orchestrator bug";
-        state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          "RUN_DUAL_TESTS reached without dualImpl state — orchestrator bug",
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
       if (isLegacyDualImplState(dual)) {
-        phaseState.status = "failed";
-        phaseState.error = legacyDualImplError();
-        state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          legacyDualImplError(),
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -7224,11 +7280,14 @@ async function runPhase(args: {
             teardownWorktrees({ cwd, dualImpl: dual });
           } catch {}
         }
-        phaseState.status = "failed";
-        phaseState.error = isLegacyDualImplState(dual)
-          ? legacyDualImplError()
-          : "RUN_JUDGE reached without dual test results — orchestrator bug";
-        state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          isLegacyDualImplState(dual)
+            ? legacyDualImplError()
+            : "RUN_JUDGE reached without dual test results — orchestrator bug",
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -7257,12 +7316,14 @@ async function runPhase(args: {
         // evidence and pick arbitrarily. (Phase 4 review, HIGH.)
         if (diffs.primary === null || diffs.secondary === null) {
           teardownWorktrees({ cwd, dualImpl: dual });
-          phaseState.status = "failed";
-          phaseState.error =
+          markPhaseFailed(
+            state,
+            phaseState.index,
             `Failed to read worktree diff before judge: ` +
-            `primary=${diffs.primary === null ? "failed" : "ok"}, ` +
-            `secondary=${diffs.secondary === null ? "failed" : "ok"}`;
-          state.phases[phase.index] = phaseState;
+              `primary=${diffs.primary === null ? "failed" : "ok"}, ` +
+              `secondary=${diffs.secondary === null ? "failed" : "ok"}`,
+            helperCtxFor(state),
+          );
           saveState(state, { noGbrain, log: console.warn });
           continue;
         }
@@ -7331,9 +7392,12 @@ async function runPhase(args: {
         if (judgeRes.timedOut || judgeRes.exitCode !== 0) {
           // Tear down worktrees and fail closed.
           teardownWorktrees({ cwd, dualImpl: dual });
-          phaseState.status = "failed";
-          phaseState.error = `Judge failed: exit=${judgeRes.exitCode} timedOut=${judgeRes.timedOut}`;
-          state.phases[phase.index] = phaseState;
+          markPhaseFailed(
+            state,
+            phaseState.index,
+            `Judge failed: exit=${judgeRes.exitCode} timedOut=${judgeRes.timedOut}`,
+            helperCtxFor(state),
+          );
           saveState(state, { noGbrain, log: console.warn });
           continue;
         }
@@ -7342,9 +7406,12 @@ async function runPhase(args: {
       if (verdict === null) {
         // Malformed judge output — fail closed (Phase 3 review).
         teardownWorktrees({ cwd, dualImpl: dual });
-        phaseState.status = "failed";
-        phaseState.error = `Judge output was malformed (no anchored WINNER line); reasoning: ${reasoning}`;
-        state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          `Judge output was malformed (no anchored WINNER line); reasoning: ${reasoning}`,
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -7385,9 +7452,13 @@ async function runPhase(args: {
             `  ⚠ Judge-selected ${verdict} modified test files — failing closed (test hygiene)`,
           );
           teardownWorktrees({ cwd, dualImpl: dual });
-          phaseState.status = "failed";
-          phaseState.error = `Judge-selected ${verdict} modified test assertions — potential test-weakening; phase requires manual review`;
           state.phases[phase.index] = phaseState;
+          markPhaseFailed(
+            state,
+            phaseState.index,
+            `Judge-selected ${verdict} modified test assertions — potential test-weakening; phase requires manual review`,
+            helperCtxFor(state),
+          );
           saveState(state, { noGbrain, log: console.warn });
           continue;
         }
@@ -7403,11 +7474,14 @@ async function runPhase(args: {
       );
       const dual = phaseState.dualImpl;
       if (!dual || isLegacyDualImplState(dual)) {
-        phaseState.status = "failed";
-        phaseState.error = isLegacyDualImplState(dual)
-          ? legacyDualImplError()
-          : "APPLY_WINNER reached without dualImpl state — orchestrator bug";
-        state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          isLegacyDualImplState(dual)
+            ? legacyDualImplError()
+            : "APPLY_WINNER reached without dualImpl state — orchestrator bug",
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -7426,16 +7500,18 @@ async function runPhase(args: {
         // winner's code. Surface paths/branches so the user can inspect, manually
         // recover, or replay. (Phase 4 review, MEDIUM: don't destroy recovery
         // artifact.)
-        phaseState.status = "failed";
-        phaseState.error =
+        markPhaseFailed(
+          state,
+          phaseState.index,
           `applyWinner(${action.winner}) failed: ${applyError ?? "unknown"}\n` +
-          `  Worktrees PRESERVED for recovery:\n` +
-          `    primary:   ${dual.candidates.primary.worktreePath} (branch ${dual.candidates.primary.branch})\n` +
-          `    secondary: ${dual.candidates.secondary.worktreePath} (branch ${dual.candidates.secondary.branch})\n` +
-          `  Inspect, fix, then re-run. Manual cleanup when done:\n` +
-          `    git worktree remove --force ${dual.candidates.primary.worktreePath} && git branch -D ${dual.candidates.primary.branch}\n` +
-          `    git worktree remove --force ${dual.candidates.secondary.worktreePath} && git branch -D ${dual.candidates.secondary.branch}`;
-        state.phases[phase.index] = phaseState;
+            `  Worktrees PRESERVED for recovery:\n` +
+            `    primary:   ${dual.candidates.primary.worktreePath} (branch ${dual.candidates.primary.branch})\n` +
+            `    secondary: ${dual.candidates.secondary.worktreePath} (branch ${dual.candidates.secondary.branch})\n` +
+            `  Inspect, fix, then re-run. Manual cleanup when done:\n` +
+            `    git worktree remove --force ${dual.candidates.primary.worktreePath} && git branch -D ${dual.candidates.primary.branch}\n` +
+            `    git worktree remove --force ${dual.candidates.secondary.worktreePath} && git branch -D ${dual.candidates.secondary.branch}`,
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
