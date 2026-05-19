@@ -1,8 +1,11 @@
+import { spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { BuildState } from "./types";
+
+const STDOUT_TAIL_LINES = 200;
 
 export type HaltEventKind =
   | "PHASE_FAILED"
@@ -153,4 +156,60 @@ export function markInvestigated(
   fs.mkdirSync(dstDir, { recursive: true });
   const dst = path.join(dstDir, fileName);
   fs.renameSync(src, dst);
+}
+
+export interface BuildHaltSnapshotInput {
+  state: BuildState | null;
+  stdoutLogPath: string;
+  worktreePath: string;
+  phaseIndex?: number;
+  featureIndex?: number;
+  failureReason?: string;
+}
+
+export function buildHaltSnapshot(
+  input: BuildHaltSnapshotInput,
+): HaltEvent["snapshot"] {
+  const phase =
+    typeof input.phaseIndex === "number"
+      ? input.state?.phases?.[input.phaseIndex]
+      : undefined;
+  const feature =
+    typeof input.featureIndex === "number"
+      ? input.state?.features?.[input.featureIndex]
+      : undefined;
+  const iterationHistory = phase
+    ? {
+        testRun: phase.testRun?.iterations,
+        testFix: phase.testFix?.iterations,
+        codexReview: phase.codexReview?.iterations,
+      }
+    : undefined;
+  let stdoutTail = "";
+  try {
+    const raw = fs.readFileSync(input.stdoutLogPath, "utf8");
+    const lines = raw.split("\n");
+    stdoutTail = lines.slice(Math.max(0, lines.length - STDOUT_TAIL_LINES)).join("\n");
+  } catch {
+    stdoutTail = "";
+  }
+  let worktreeHead: string | undefined;
+  try {
+    const res = spawnSync(
+      "git",
+      ["-C", input.worktreePath, "rev-parse", "HEAD"],
+      { encoding: "utf8" },
+    );
+    if (res.status === 0) worktreeHead = res.stdout.trim();
+  } catch {
+    // ignore
+  }
+  return {
+    phase,
+    feature,
+    failureReason: input.failureReason,
+    iterationHistory,
+    worktreeHead,
+    stdoutTail,
+  };
 }
