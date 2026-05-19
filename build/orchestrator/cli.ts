@@ -643,6 +643,8 @@ export interface Args {
   dryRun: boolean;
   noResume: boolean;
   noGbrain: boolean;
+  /** Skip the end-of-build auto-drain hook that runs the halt-events investigator. */
+  noAutoDrain?: boolean;
   skipShip: boolean;
   /** When true, all features share one feat/<prefix> branch; /ship + /land-and-deploy run once after all features complete. */
   singleBranch: boolean;
@@ -845,6 +847,7 @@ export function parseArgs(argv: string[]): Args {
     dryRun: false,
     noResume: false,
     noGbrain: false,
+    noAutoDrain: false,
     skipShip: false,
     singleBranch: false,
     shipOnPlanComplete: false,
@@ -918,6 +921,7 @@ export function parseArgs(argv: string[]): Args {
     else if (a === "--dry-run") args.dryRun = true;
     else if (a === "--no-resume" || a === "--restart") args.noResume = true;
     else if (a === "--no-gbrain") args.noGbrain = true;
+    else if (a === "--no-auto-drain") args.noAutoDrain = true;
     else if (a === "--skip-ship") args.skipShip = true;
     else if (a === "--single-branch") args.singleBranch = true;
     else if (a === "--ship-on-plan-complete") args.shipOnPlanComplete = true;
@@ -2645,6 +2649,7 @@ Flags:
   --dry-run            Walk state machine without spawning sub-agents.
   --no-resume          Ignore existing state, start fresh.
   --no-gbrain          Skip gbrain mirror; local JSON only.
+  --no-auto-drain      Skip the end-of-build halt-events investigator drain.
   --skip-ship          Skip per-feature /ship + /land-and-deploy steps.
   --single-branch      All features share one feat/<prefix> branch. /ship +
                        /land-and-deploy runs once after all features complete
@@ -9065,6 +9070,85 @@ export async function runStopRun(
   return 3;
 }
 
+/**
+ * End-of-build hook: drain the halt-events queue through the investigator
+ * pipeline so events queued during this build get diagnosed immediately
+ * (no operator action needed). See PR 5 for the dispatch machinery and
+ * PR 6 (this commit) for the auto-fire wiring.
+ *
+ * Opt-outs (either short-circuits to no-op):
+ *   --no-auto-drain        per-invocation CLI flag
+ *   GSTACK_HALT_EVENTS_OFF=1  env-level kill switch (shared with emission)
+ *
+ * Failure is non-fatal: caught, logged, and the build's exit code is
+ * preserved. Telemetry rows are written to
+ * ~/.gstack/analytics/halt-events-drain.jsonl so the operator can see
+ * per-build counts over time. When the queue is empty, the function is
+ * fully silent (no stdout line, no telemetry row).
+ */
+async function runAutoDrainIfEnabled(
+  args: Args,
+  state: BuildState | null,
+): Promise<void> {
+  if (args.noAutoDrain) return;
+  if (process.env.GSTACK_HALT_EVENTS_OFF === "1") return;
+
+  try {
+    const startMs = Date.now();
+    const result = await drainFaultsFromHaltEventsQueue({
+      max: 20,
+      severityMin: "MEDIUM",
+      investigatorTimeoutMs: 10 * 60 * 1000,
+    });
+    const durationMs = Date.now() - startMs;
+
+    if (
+      result.processed === 0 &&
+      result.skipped === 0 &&
+      result.shortCircuited === 0
+    ) {
+      return;
+    }
+
+    console.log(
+      `auto-drain: processed ${result.processed}, ` +
+        `shortCircuited ${result.shortCircuited}, ` +
+        `skipped ${result.skipped}, ` +
+        `inboxFiled ${result.inboxFiled} ` +
+        `(${(durationMs / 1000).toFixed(1)}s)`,
+    );
+
+    try {
+      const home =
+        process.env.GSTACK_HOME ?? path.join(os.homedir(), ".gstack");
+      const analyticsDir = path.join(home, "analytics");
+      fs.mkdirSync(analyticsDir, { recursive: true });
+      const row =
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          runId: state?.launch?.runId ?? state?.slug ?? "unknown",
+          stateSlug: state?.slug ?? "unknown",
+          durationMs,
+          processed: result.processed,
+          shortCircuited: result.shortCircuited,
+          skipped: result.skipped,
+          inboxFiled: result.inboxFiled,
+          proposalsAppended: result.proposalsAppended,
+        }) + "\n";
+      fs.appendFileSync(
+        path.join(analyticsDir, "halt-events-drain.jsonl"),
+        row,
+      );
+    } catch {
+      // Telemetry write failures are silent — never block exit on them.
+    }
+  } catch (err) {
+    console.warn(
+      `auto-drain failed (non-fatal): ${(err as Error).message ?? err}`,
+    );
+  }
+}
+
 async function main() {
   // Install SIGTERM/SIGINT/SIGHUP handlers before spawning anything so the
   // first sub-process to outlive a survivable signal still gets reaped.
@@ -10747,6 +10831,11 @@ async function main() {
       singleBranch: args.singleBranch,
     });
   }
+
+  // PR 6: end-of-build auto-drain of the halt-events queue. Failure is
+  // non-fatal — preserves whatever exitCode the build produced. Opt out
+  // via --no-auto-drain or GSTACK_HALT_EVENTS_OFF=1.
+  await runAutoDrainIfEnabled(args, state);
 
   process.exit(exitCode);
 }
