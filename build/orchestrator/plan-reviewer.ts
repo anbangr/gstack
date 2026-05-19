@@ -621,14 +621,16 @@ export function parseRoundAnnotations(planText: string): RoundAnnotation[] {
       entry.resolution = r[2].trim();
     }
 
-    // ROUND N REVIEWER attaches to round N-1's entry (it records what the reviewer
-    // decided about the prior-round annotation when they revisited it in round N).
+    // ROUND N REVIEWER attaches to round N's own entry: it records the
+    // reviewer's observation IN round N (e.g., "re-raised" / "not re-raised")
+    // about a prior-round objection, paired with round N's USER decision if
+    // present. The round number on the line names the round in which the
+    // observation happened, not the round being observed. See the design
+    // spec §"Why the format" bullet 4.
     ROUND_REVIEWER_RE.lastIndex = 0;
     let v: RegExpExecArray | null;
     while ((v = ROUND_REVIEWER_RE.exec(body)) !== null) {
-      const reviewerRound = parseInt(v[1], 10);
-      const targetRound = Math.max(1, reviewerRound - 1);
-      const entry = ensure(targetRound);
+      const entry = ensure(parseInt(v[1], 10));
       entry.reviewerOutcome = v[2].trim();
     }
 

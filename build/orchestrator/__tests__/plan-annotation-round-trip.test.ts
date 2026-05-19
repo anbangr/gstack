@@ -19,7 +19,7 @@ const SAMPLE_PLAN = `# Living Plan
 `;
 
 describe("parseRoundAnnotations", () => {
-  it("extracts a single annotation block with full history", () => {
+  it("extracts a single annotation block with full multi-round history", () => {
     const annotations = parseRoundAnnotations(SAMPLE_PLAN);
     expect(annotations).toHaveLength(1);
     const a = annotations[0];
@@ -27,12 +27,19 @@ describe("parseRoundAnnotations", () => {
     expect(a.severity).toBe("CRITICAL");
     expect(a.issue).toBe("EIP-712 digest missing chainId");
     expect(a.suggestion).toBe("add chainId field");
-    expect(a.rounds).toHaveLength(1);
+    // Two rounds: round 1 has the user decision + resolution; round 2 has
+    // only the reviewer outcome (the reviewer observed the annotation but
+    // did not re-raise, so there is no ROUND 2 USER line).
+    expect(a.rounds).toHaveLength(2);
     expect(a.rounds[0].round).toBe(1);
     expect(a.rounds[0].userDecision).toBe("accept");
     expect(a.rounds[0].userRationale).toBe("agreed, real bug");
     expect(a.rounds[0].resolution).toBe("synth added chainId to digest struct");
-    expect(a.rounds[0].reviewerOutcome).toBe("not re-raised");
+    expect(a.rounds[0].reviewerOutcome).toBeUndefined();
+    expect(a.rounds[1].round).toBe(2);
+    expect(a.rounds[1].userDecision).toBeUndefined();
+    expect(a.rounds[1].resolution).toBeUndefined();
+    expect(a.rounds[1].reviewerOutcome).toBe("not re-raised");
   });
 
   it("returns empty array when no annotations present", () => {
