@@ -78,6 +78,40 @@ export function deriveStateSlug(planFile: string, runId?: string): string {
   return runId ? deriveRunSlug(runId) : deriveSlug(planFile);
 }
 
+// Gemini's --yolo workspace policy auto-derives the tmp allowlist from the
+// spawn cwd basename, then sanitizes it before storing in ~/.gemini/projects.json:
+// lowercase, every non-[a-z0-9] run collapsed to a single `-`, leading/trailing
+// `-` stripped. Empirically verified across 100+ existing keys — every key is
+// `[a-z0-9-]+` with no double dashes. Examples observed in projects.json:
+//   `socc26-v3_1` → `socc26-v3-1`
+//   `MyObs` → `myobs`
+//   `the-Big-Paper` → `the-big-paper`
+//   `AGIL-paper` → `agil-paper`
+//
+// PR #49 fixed the `build-` prefix divergence by using `path.basename(opts.cwd)`
+// as the staging dir name, but left it raw — so worktrees with `_`, `.`, or
+// uppercase in the basename still diverge from what Gemini's sandbox actually
+// allows. The mitosis-prototype-socc26-v022a-schema-v3_1 worktree on this
+// machine reproduces the bug class: orchestrator writes to `~/.gemini/tmp/
+// ...v3_1.../`, Gemini's allowlist is `~/.gemini/tmp/...v3-1.../`. This helper
+// matches Gemini's full key derivation so the two paths align.
+//
+// Empty-result fallback: if sanitization yields "" (e.g. cwd basename was
+// all punctuation), fall back to a fixed "gstack-run" key. Without this,
+// `path.join(HOME, ".gemini", "tmp", "")` would stage in the shared tmp root
+// and collide with everything else. Fallback is intentionally a literal so
+// failures are debuggable, not invisible.
+//
+// Idempotent: running twice produces the same result.
+export function deriveGeminiTmpKey(cwd: string): string {
+  const sanitized = path
+    .basename(cwd)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return sanitized || "gstack-run";
+}
+
 export function statePath(slug: string): string {
   return path.join(stateDir(), `${slug}.json`);
 }
