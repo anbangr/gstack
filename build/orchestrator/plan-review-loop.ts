@@ -676,7 +676,7 @@ export async function runPlanReviewLoop(
   let totalDeferred = 0;
   let reviewerWallTimeS = 0;
   let synthWallTimeS = 0;
-  const annotationParseErrors = 0;
+  let annotationParseErrors = 0;
   const interrupted = false;
   let lastVerdict: PlanReviewVerdict | null = null;
 
@@ -998,11 +998,38 @@ export async function runPlanReviewLoop(
       return finalResult(outcome, round, exitCode, verdict);
     }
 
-    // 9. Invoke synthesizer (Task 11 will instrument disputed-resolution counting here).
+    // 9. Invoke synthesizer.
     const synthStart = Date.now();
     await input.synthFn();
     synthWallTimeS += Math.round((Date.now() - synthStart) / 1000);
-    disputedResolutions.push(0); // placeholder; Task 11 replaces with real count
+
+    // 9a. Count disputed resolutions in this round's annotations.
+    // The synth writes RESOLUTION: disputed — <reason> when it disagrees
+    // with a user-accepted objection. Each disputed entry surfaces in the
+    // next round's triage so the user can re-decide; the aggregate count
+    // is a tuning signal for "how often does synth disagree with user accepts".
+    let disputedThisRound = 0;
+    try {
+      const postSynthText = fs.readFileSync(input.planPath, "utf8");
+      const postSynthAnns = parseRoundAnnotations(postSynthText);
+      for (const ann of postSynthAnns) {
+        for (const r of ann.rounds) {
+          if (
+            r.round === round &&
+            r.resolution !== undefined &&
+            /^disputed\b/.test(r.resolution)
+          ) {
+            disputedThisRound += 1;
+          }
+        }
+      }
+    } catch (err) {
+      annotationParseErrors += 1;
+      console.warn(
+        `[plan-review-loop] annotation parse error after synth round ${round}: ${(err as Error).message}`,
+      );
+    }
+    disputedResolutions.push(disputedThisRound);
   }
 
   // MAX_ROUNDS reached without hitting earlier exits — fire stalemate gate.
