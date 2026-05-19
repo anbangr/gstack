@@ -9553,6 +9553,30 @@ async function main() {
             featureState.status === "committed" &&
             !featureState.completedAt
           ) {
+            // Emit SILENT_STATE_MUTATION BEFORE the destructive rewrite so the
+            // halt-events queue captures the original shape (the polis
+            // hand-merged-feature class). Mutation behavior unchanged in this
+            // PR; a follow-up will decide whether to keep re-processing or
+            // treat the merge as authoritative.
+            {
+              const ctx = helperCtxFor(state);
+              emitHaltEvent({
+                kind: "SILENT_STATE_MUTATION",
+                runId: ctx.runId,
+                stateSlug: ctx.stateSlug,
+                severity: severityFor("SILENT_STATE_MUTATION"),
+                message:
+                  `Feature ${featureState.number} status="committed" without completedAt — ` +
+                  `orchestrator re-processing (mergeSha=${featureState.mergeSha ?? "absent"}, prNumber=${featureState.prNumber ?? "absent"})`,
+                pointers: ctx.pointers,
+                snapshot: buildHaltSnapshot({
+                  state,
+                  stdoutLogPath: ctx.pointers.stdoutLog,
+                  worktreePath: ctx.pointers.worktreePath,
+                  featureIndex,
+                }),
+              });
+            }
             console.warn(
               `⚠ Feature ${featureState.number} status is "committed" but completedAt is missing — ` +
                 `this indicates a manual JSON state patch that bypassed ship+land+verify. ` +
@@ -9572,6 +9596,25 @@ async function main() {
             featureState.status === "release_queued" &&
             !isFeatureTerminal(featureState)
           ) {
+            {
+              const ctx = helperCtxFor(state);
+              emitHaltEvent({
+                kind: "SILENT_STATE_MUTATION",
+                runId: ctx.runId,
+                stateSlug: ctx.stateSlug,
+                severity: severityFor("SILENT_STATE_MUTATION"),
+                message:
+                  `Feature ${featureState.number} status="release_queued" without shippedAt/prNumber — ` +
+                  `orchestrator re-processing (shippedAt=${featureState.shippedAt ?? "absent"}, prNumber=${featureState.prNumber ?? "absent"})`,
+                pointers: ctx.pointers,
+                snapshot: buildHaltSnapshot({
+                  state,
+                  stdoutLogPath: ctx.pointers.stdoutLog,
+                  worktreePath: ctx.pointers.worktreePath,
+                  featureIndex,
+                }),
+              });
+            }
             console.warn(
               `⚠ Feature ${featureState.number} status is "release_queued" but shippedAt/prNumber are missing — ` +
                 `this indicates a manual JSON state patch that bypassed ship. ` +
