@@ -402,6 +402,53 @@ describe("buildFeatureReviewPrompt — structure", () => {
     expect(md).toContain("### Phase 1: ThisOne");
     expect(md).not.toContain("### Phase 2: OtherFeature");
   });
+
+  // K-history constraint: the FEATURE_NEEDS_PHASES instruction must list
+  // existing phase numbers under this feature so the reviewer picks a fresh
+  // K. Without this, the LLM can re-emit `Phase 1.review-1` across cycles;
+  // the reconciler then fails closed (post v1.40.3.0 dedup) and blocks the
+  // feature. Better to prevent the collision upstream.
+  it("lists phase numbers already in use under the feature in the Additional phases block", () => {
+    const md = buildFeatureReviewPrompt(
+      defaultArgs({
+        feature: fakeFeature({ phaseIndexes: [0, 1] }),
+        phases: [
+          fakePhase({ index: 0, number: "1", name: "Schema" }),
+          fakePhase({
+            index: 1,
+            number: "1.review-1",
+            name: "Wire routes",
+          }),
+        ],
+        phaseStates: [
+          fakePhaseState({ index: 0, number: "1", name: "Schema" }),
+          fakePhaseState({
+            index: 1,
+            number: "1.review-1",
+            name: "Wire routes",
+          }),
+        ],
+      }),
+    );
+    // The constraint sentence should call out both existing numbers.
+    expect(md).toMatch(
+      /K MUST NOT collide with phase numbers already in use under this feature:[\s\S]*`1`[\s\S]*`1\.review-1`/,
+    );
+    expect(md).toContain("Always pick a new K.");
+  });
+
+  it("renders the K-history with `(none)` defensively when feature has no phases", () => {
+    const md = buildFeatureReviewPrompt(
+      defaultArgs({
+        feature: fakeFeature({ phaseIndexes: [] }),
+        phases: [],
+        phaseStates: [],
+      }),
+    );
+    expect(md).toContain(
+      "K MUST NOT collide with phase numbers already in use under this feature: (none)",
+    );
+  });
 });
 
 describe("shouldSkipFeatureReview — skip heuristic", () => {

@@ -318,6 +318,17 @@ loop then re-issued `FEATURE_NEEDS_PHASES` until
 from `reparsedFeatures`. A future PR may tighten this when the
 `FEATURE_REDO` path lands.
 
+**Upstream collision prevention (v1.40.4.0):** the
+`FEATURE_NEEDS_PHASES` prompt now lists every phase number already in
+use under the feature inline (`K MUST NOT collide with phase numbers
+already in use under this feature: \`1\`, \`1.review-1\`, ...`). Without
+this feedback loop, the reviewer model picked `K` blind across review
+cycles, occasionally re-emitting an existing `Phase N.review-K` heading
+that the v1.40.3.0 reconciler dedup would then reject. Better to
+prevent the collision at prompt-build time than to recover from it at
+the reconciler. See `buildPhaseNumberHistory` in
+`build/orchestrator/feature-review.ts`.
+
 ---
 
 ## 7. Lock + active-run record lifecycle

@@ -151,6 +151,29 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * Render the list of phase numbers already in use under this feature so the
+ * reviewer can pick a fresh `K` value for any new `Phase N.review-K` it
+ * adds. Used by the FEATURE_NEEDS_PHASES branch of the prompt: without an
+ * explicit collision-set the LLM has no feedback loop on its K choices
+ * across review cycles, and a duplicate now fails closed at the reconciler
+ * (see state.ts:reconcileStatePhasesAfterReparse).
+ *
+ * Returns a comma-separated list like ``1, 2, 1.review-1`` for inline embed,
+ * or ``(none)`` when the feature has zero phases (defensive — should never
+ * happen in production because feature-review only runs after at least one
+ * phase has committed).
+ */
+function buildPhaseNumberHistory(
+  featurePhases: ReadonlyArray<{ phase: Phase; state: PhaseState }>,
+): string {
+  const numbers = featurePhases
+    .map((p) => p.phase?.number)
+    .filter((n): n is string => typeof n === "string" && n.length > 0);
+  if (numbers.length === 0) return "(none)";
+  return numbers.map((n) => `\`${n}\``).join(", ");
+}
+
 export interface FeatureReviewPromptArgs {
   feature: Feature;
   featureState: FeatureState;
@@ -325,7 +348,11 @@ export function buildFeatureReviewPrompt(
     "starting with `### Phase N.review-K: <title>` headings under the",
     "current feature. Include `- [ ] **Implementation**: <description>` and",
     "`- [ ] **Review**: <description>` checkboxes for each — these will be",
-    "appended to the plan file and re-parsed.>",
+    "appended to the plan file and re-parsed.",
+    "",
+    `K MUST NOT collide with phase numbers already in use under this feature: ${buildPhaseNumberHistory(featurePhases)}.`,
+    "The parser/reconciler rejects duplicate phase numbers and fails closed,",
+    "blocking the feature with a recovery report. Always pick a new K.>",
     "```",
     "",
     "## Verdict guidance",
