@@ -171,9 +171,12 @@ import { BUILD_DEFAULTS, warnOnLargeStallWindows } from "./build-config";
 import { evaluateMonitorOnce, monitorExitCode } from "./monitor";
 import {
   drainFaults,
+  drainFaultsFromHaltEventsQueue,
   drainFaultsFromMonitor,
   type DrainFaultsResult,
+  type DrainHaltEventsResult,
 } from "./drain-faults";
+import type { HaltSeverity } from "./halt-events";
 import { runMarkShipped } from "./mark-shipped";
 import { buildMonitorAgentEscalation } from "./monitor-supervisor";
 import { startHeartbeat, type HeartbeatController } from "./heartbeat";
@@ -191,6 +194,14 @@ import {
   rewindPhase,
 } from "./halt-event-helpers";
 import { buildHaltSnapshot, emitHaltEvent, severityFor } from "./halt-events";
+import {
+  autoPromoteDecision,
+  dedupeAgainstLearned,
+  loadPendingProposals,
+  promoteProposals,
+  type PendingProposal,
+} from "./learn-fault-patterns";
+import { loadLearnedPatterns } from "./skill-fault-detector";
 import { installWrapConsole } from "./wrap-console";
 
 /**
@@ -634,12 +645,21 @@ export interface Args {
     | "reconcile"
     | "doctor"
     | "drain-faults"
-    | "mark-shipped";
+    | "mark-shipped"
+    | "learn-fault-patterns";
+  /** learn-fault-patterns: dry-run only — print diff against learned-patterns.json. */
+  learnFaultPatternsDryRun?: boolean;
+  /** learn-fault-patterns: comma-separated faultIds to promote. */
+  learnFaultPatternsPromote?: string;
+  /** learn-fault-patterns: auto-promote per autoPromoteDecision (spawned sessions). */
+  learnFaultPatternsAutoPromote?: boolean;
   planFile: string;
   printOnly: boolean;
   dryRun: boolean;
   noResume: boolean;
   noGbrain: boolean;
+  /** Skip the end-of-build auto-drain hook that runs the halt-events investigator. */
+  noAutoDrain?: boolean;
   skipShip: boolean;
   /** When true, all features share one feat/<prefix> branch; /ship + /land-and-deploy run once after all features complete. */
   singleBranch: boolean;
@@ -761,6 +781,19 @@ export interface Args {
   drainFaultsCatchAll?: boolean;
   /** Per-investigator timeout in ms for drain-faults mode. Default 10min. */
   drainFaultsInvestigatorTimeoutMs?: number;
+  /**
+   * Halt-events queue mode (PR 5 of the halt-events rollout). When true,
+   * drain-faults consumes ~/.gstack/skill-faults/pending-investigations/
+   * instead of monitor-output.log. Mutually exclusive with --manifest and
+   * --build-tmp-dir.
+   */
+  drainFaultsQueueMode?: boolean;
+  /** Max investigations per invocation (queue mode). Default 20. */
+  drainFaultsMax?: number;
+  /** Minimum severity filter (queue mode). Default MEDIUM. */
+  drainFaultsSeverityMin?: HaltSeverity;
+  /** Override the configure.cm investigator role's model. */
+  investigatorModel?: string;
   /** Feature number to mark shipped (mark-shipped mode). */
   markShippedFeature?: string;
   /** PR number override for mark-shipped (otherwise auto-resolved). */
@@ -829,6 +862,7 @@ export function parseArgs(argv: string[]): Args {
     dryRun: false,
     noResume: false,
     noGbrain: false,
+    noAutoDrain: false,
     skipShip: false,
     singleBranch: false,
     shipOnPlanComplete: false,
@@ -882,6 +916,10 @@ export function parseArgs(argv: string[]): Args {
     drainFaultsBuildTmpDir: undefined,
     drainFaultsCatchAll: false,
     drainFaultsInvestigatorTimeoutMs: undefined,
+    drainFaultsQueueMode: false,
+    drainFaultsMax: undefined,
+    drainFaultsSeverityMin: undefined,
+    investigatorModel: undefined,
     markShippedFeature: undefined,
     markShippedPr: undefined,
     markShippedMergeSha: undefined,
@@ -898,6 +936,15 @@ export function parseArgs(argv: string[]): Args {
     else if (a === "--dry-run") args.dryRun = true;
     else if (a === "--no-resume" || a === "--restart") args.noResume = true;
     else if (a === "--no-gbrain") args.noGbrain = true;
+    else if (a === "--no-auto-drain") args.noAutoDrain = true;
+    else if (a === "--promote") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--promote requires a comma-separated list of faultIds");
+        process.exit(2);
+      }
+      args.learnFaultPatternsPromote = next;
+    } else if (a === "--auto-promote") args.learnFaultPatternsAutoPromote = true;
     else if (a === "--skip-ship") args.skipShip = true;
     else if (a === "--single-branch") args.singleBranch = true;
     else if (a === "--ship-on-plan-complete") args.shipOnPlanComplete = true;
@@ -989,6 +1036,37 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.drainFaultsInvestigatorTimeoutMs = n;
+    } else if (a === "--queue") {
+      args.drainFaultsQueueMode = true;
+    } else if (a === "--max") {
+      const next = argv[++i];
+      const n = Number(next);
+      if (!Number.isInteger(n) || n < 1) {
+        console.error(`--max expects an integer >= 1, got: ${next}`);
+        process.exit(2);
+      }
+      args.drainFaultsMax = n;
+    } else if (a === "--severity-min") {
+      const next = argv[++i];
+      if (
+        next !== "LOW" &&
+        next !== "MEDIUM" &&
+        next !== "HIGH" &&
+        next !== "CRITICAL"
+      ) {
+        console.error(
+          `--severity-min expects LOW|MEDIUM|HIGH|CRITICAL, got: ${next}`,
+        );
+        process.exit(2);
+      }
+      args.drainFaultsSeverityMin = next as HaltSeverity;
+    } else if (a === "--investigator-model") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--investigator-model requires a value");
+        process.exit(2);
+      }
+      args.investigatorModel = next;
     } else if (a === "--state") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
@@ -1334,20 +1412,25 @@ export function parseArgs(argv: string[]): Args {
   } else if (positional[0] === "drain-faults") {
     if (positional.length !== 1) {
       console.error(
-        "usage: gstack-build drain-faults --manifest <path> | --build-tmp-dir <path>   [--dry-run] [--catch-all] [--investigator-timeout-ms <N>]   (-h for help)",
+        "usage: gstack-build drain-faults --manifest <path> | --build-tmp-dir <path> | --queue   [--dry-run] [--catch-all] [--investigator-timeout-ms <N>] [--max <N>] [--severity-min LOW|MEDIUM|HIGH|CRITICAL] [--investigator-model <m>]   (-h for help)",
       );
       process.exit(2);
     }
     args.mode = "drain-faults";
-    if (!args.monitorManifest && !args.drainFaultsBuildTmpDir) {
+    const inputSources = [
+      args.monitorManifest ? "manifest" : null,
+      args.drainFaultsBuildTmpDir ? "build-tmp-dir" : null,
+      args.drainFaultsQueueMode ? "queue" : null,
+    ].filter((x) => x !== null);
+    if (inputSources.length === 0) {
       console.error(
-        "gstack-build drain-faults requires --manifest <path> OR --build-tmp-dir <path>",
+        "gstack-build drain-faults requires --manifest <path> OR --build-tmp-dir <path> OR --queue",
       );
       process.exit(2);
     }
-    if (args.monitorManifest && args.drainFaultsBuildTmpDir) {
+    if (inputSources.length > 1) {
       console.error(
-        "gstack-build drain-faults: provide only one of --manifest or --build-tmp-dir",
+        "gstack-build drain-faults: provide only one of --manifest, --build-tmp-dir, or --queue",
       );
       process.exit(2);
     }
@@ -1387,6 +1470,22 @@ export function parseArgs(argv: string[]): Args {
       console.error("gstack-build mark-shipped requires --feature <number>");
       process.exit(2);
     }
+  } else if (positional[0] === "learn-fault-patterns") {
+    if (positional.length !== 1) {
+      console.error(
+        "usage: gstack-build learn-fault-patterns [--dry-run | --promote <faultIds,...> | --auto-promote]   (-h for help)",
+      );
+      process.exit(2);
+    }
+    args.mode = "learn-fault-patterns";
+    // dry-run is the default if no explicit action flag set
+    if (
+      !args.dryRun &&
+      !args.learnFaultPatternsPromote &&
+      !args.learnFaultPatternsAutoPromote
+    ) {
+      args.dryRun = true;
+    }
   } else if (positional.length === 1) {
     args.planFile = path.resolve(positional[0]);
     if (
@@ -1404,7 +1503,7 @@ export function parseArgs(argv: string[]): Args {
     }
   } else {
     console.error(
-      "usage: gstack-build <plan-file> [flags]\n       gstack-build merge [flags]\n       gstack-build monitor --manifest <path> [--once|--watch]\n       gstack-build plan-status --gstack-repo <path> [--project-root <path>] [--json]   (-h for help)",
+      "usage: gstack-build <plan-file> [flags]\n       gstack-build merge [flags]\n       gstack-build monitor --manifest <path> [--once|--watch]\n       gstack-build plan-status --gstack-repo <path> [--project-root <path>] [--json]\n       gstack-build learn-fault-patterns [--dry-run | --promote <ids> | --auto-promote]   (-h for help)",
     );
     process.exit(2);
   }
@@ -2589,6 +2688,7 @@ Flags:
   --dry-run            Walk state machine without spawning sub-agents.
   --no-resume          Ignore existing state, start fresh.
   --no-gbrain          Skip gbrain mirror; local JSON only.
+  --no-auto-drain      Skip the end-of-build halt-events investigator drain.
   --skip-ship          Skip per-feature /ship + /land-and-deploy steps.
   --single-branch      All features share one feat/<prefix> branch. /ship +
                        /land-and-deploy runs once after all features complete
@@ -7792,6 +7892,18 @@ function resetStreakFor(
  *   2 - usage error (caught in parseArgs; this function should not hit it)
  */
 async function runDrainFaultsMode(args: Args): Promise<number> {
+  if (args.drainFaultsQueueMode) {
+    const queueResult: DrainHaltEventsResult =
+      await drainFaultsFromHaltEventsQueue({
+        max: args.drainFaultsMax,
+        severityMin: args.drainFaultsSeverityMin,
+        investigatorModel: args.investigatorModel,
+        investigatorTimeoutMs: args.drainFaultsInvestigatorTimeoutMs,
+        dryRun: args.dryRun,
+      });
+    process.stdout.write(JSON.stringify(queueResult, null, 2) + "\n");
+    return queueResult.failed > 0 ? 1 : 0;
+  }
   const result: DrainFaultsResult = await drainFaults({
     manifestPath: args.monitorManifest,
     buildTmpDir: args.drainFaultsBuildTmpDir,
@@ -8997,6 +9109,163 @@ export async function runStopRun(
   return 3;
 }
 
+/**
+ * End-of-build hook: drain the halt-events queue through the investigator
+ * pipeline so events queued during this build get diagnosed immediately
+ * (no operator action needed). See PR 5 for the dispatch machinery and
+ * PR 6 (this commit) for the auto-fire wiring.
+ *
+ * Opt-outs (either short-circuits to no-op):
+ *   --no-auto-drain        per-invocation CLI flag
+ *   GSTACK_HALT_EVENTS_OFF=1  env-level kill switch (shared with emission)
+ *
+ * Failure is non-fatal: caught, logged, and the build's exit code is
+ * preserved. Telemetry rows are written to
+ * ~/.gstack/analytics/halt-events-drain.jsonl so the operator can see
+ * per-build counts over time. When the queue is empty, the function is
+ * fully silent (no stdout line, no telemetry row).
+ */
+/**
+ * `gstack-build learn-fault-patterns` subcommand: drain
+ * pending-patterns.jsonl (PR 5's investigator output) through the curator
+ * gate into learned-patterns.json (consumed by the detector).
+ *
+ * Modes:
+ *   --dry-run (default if no other action set): print the proposed promote/
+ *     defer split as JSON. Useful for `build/SKILL.md.tmpl` Step M3.7 to
+ *     surface the diff in an AskUserQuestion.
+ *   --promote <faultIds,...>: commit only the listed faultIds; remaining
+ *     non-duplicates go to rejected-patterns.jsonl with reason="deferred".
+ *   --auto-promote: spawned-session mode. Promotes HIGH+ severity per
+ *     autoPromoteDecision; MEDIUM → rejected with reason="deferred-auto".
+ *
+ * Always exits 0 unless an IO error occurs. Empty pending-patterns.jsonl
+ * is a no-op (prints {keep:[],drop:[]} on dry-run, exits silently otherwise).
+ */
+async function runLearnFaultPatternsMode(args: Args): Promise<number> {
+  const proposals = loadPendingProposals();
+  const learned = loadLearnedPatterns();
+  const { keep, drop } = dedupeAgainstLearned(proposals, learned);
+
+  if (args.dryRun) {
+    console.log(
+      JSON.stringify(
+        {
+          totalProposals: proposals.length,
+          dropDuplicates: drop.length,
+          eligible: keep.length,
+          keep,
+          drop,
+        },
+        null,
+        2,
+      ),
+    );
+    return 0;
+  }
+
+  if (args.learnFaultPatternsAutoPromote) {
+    const decision = autoPromoteDecision(keep);
+    const toReject: Array<{ proposal: PendingProposal; reason: string }> = [
+      ...decision.defer.map((p) => ({ proposal: p, reason: "deferred-auto" })),
+      ...drop.map((p) => ({ proposal: p, reason: "duplicate" })),
+    ];
+    promoteProposals(decision.promote, toReject);
+    console.log(
+      `learn-fault-patterns: promoted ${decision.promote.length}, ` +
+        `deferred ${decision.defer.length}, duplicates ${drop.length}`,
+    );
+    return 0;
+  }
+
+  if (args.learnFaultPatternsPromote) {
+    const ids = new Set(
+      args.learnFaultPatternsPromote.split(",").map((s) => s.trim()).filter(Boolean),
+    );
+    const toPromote = keep.filter((p) => ids.has(p.faultId));
+    const deferred = keep.filter((p) => !ids.has(p.faultId));
+    const toReject: Array<{ proposal: PendingProposal; reason: string }> = [
+      ...deferred.map((p) => ({ proposal: p, reason: "deferred" })),
+      ...drop.map((p) => ({ proposal: p, reason: "duplicate" })),
+    ];
+    promoteProposals(toPromote, toReject);
+    console.log(
+      `learn-fault-patterns: promoted ${toPromote.length}, ` +
+        `deferred ${deferred.length}, duplicates ${drop.length}`,
+    );
+    return 0;
+  }
+
+  // Should not reach here — parser sets dryRun=true if no action flag.
+  console.error(
+    "learn-fault-patterns: no action specified (use --dry-run, --promote, or --auto-promote)",
+  );
+  return 2;
+}
+
+async function runAutoDrainIfEnabled(
+  args: Args,
+  state: BuildState | null,
+): Promise<void> {
+  if (args.noAutoDrain) return;
+  if (process.env.GSTACK_HALT_EVENTS_OFF === "1") return;
+
+  try {
+    const startMs = Date.now();
+    const result = await drainFaultsFromHaltEventsQueue({
+      max: 20,
+      severityMin: "MEDIUM",
+      investigatorTimeoutMs: 10 * 60 * 1000,
+    });
+    const durationMs = Date.now() - startMs;
+
+    if (
+      result.processed === 0 &&
+      result.skipped === 0 &&
+      result.shortCircuited === 0
+    ) {
+      return;
+    }
+
+    console.log(
+      `auto-drain: processed ${result.processed}, ` +
+        `shortCircuited ${result.shortCircuited}, ` +
+        `skipped ${result.skipped}, ` +
+        `inboxFiled ${result.inboxFiled} ` +
+        `(${(durationMs / 1000).toFixed(1)}s)`,
+    );
+
+    try {
+      const home =
+        process.env.GSTACK_HOME ?? path.join(os.homedir(), ".gstack");
+      const analyticsDir = path.join(home, "analytics");
+      fs.mkdirSync(analyticsDir, { recursive: true });
+      const row =
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          runId: state?.launch?.runId ?? state?.slug ?? "unknown",
+          stateSlug: state?.slug ?? "unknown",
+          durationMs,
+          processed: result.processed,
+          shortCircuited: result.shortCircuited,
+          skipped: result.skipped,
+          inboxFiled: result.inboxFiled,
+          proposalsAppended: result.proposalsAppended,
+        }) + "\n";
+      fs.appendFileSync(
+        path.join(analyticsDir, "halt-events-drain.jsonl"),
+        row,
+      );
+    } catch {
+      // Telemetry write failures are silent — never block exit on them.
+    }
+  } catch (err) {
+    console.warn(
+      `auto-drain failed (non-fatal): ${(err as Error).message ?? err}`,
+    );
+  }
+}
+
 async function main() {
   // Install SIGTERM/SIGINT/SIGHUP handlers before spawning anything so the
   // first sub-process to outlive a survivable signal still gets reaped.
@@ -9074,7 +9343,8 @@ async function main() {
         (args.drainFaultsBuildTmpDir
           ? ` (build-tmp-dir=${args.drainFaultsBuildTmpDir})`
           : "") +
-        (args.monitorManifest ? ` (manifest=${args.monitorManifest})` : ""),
+        (args.monitorManifest ? ` (manifest=${args.monitorManifest})` : "") +
+        (args.drainFaultsQueueMode ? ` (queue)` : ""),
       pointers: {
         stateFile: args.planFile ? statePath(deriveStateSlug(args.planFile)) : "",
         stdoutLog: "",
@@ -9114,6 +9384,11 @@ async function main() {
       runId: args.runId,
     });
     process.exit(result.exitCode);
+  }
+
+  if (args.mode === "learn-fault-patterns") {
+    const exitCode = await runLearnFaultPatternsMode(args);
+    process.exit(exitCode);
   }
 
   if (
@@ -10678,6 +10953,11 @@ async function main() {
       singleBranch: args.singleBranch,
     });
   }
+
+  // PR 6: end-of-build auto-drain of the halt-events queue. Failure is
+  // non-fatal — preserves whatever exitCode the build produced. Opt out
+  // via --no-auto-drain or GSTACK_HALT_EVENTS_OFF=1.
+  await runAutoDrainIfEnabled(args, state);
 
   process.exit(exitCode);
 }
