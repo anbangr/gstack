@@ -496,3 +496,57 @@ export async function runTriageGateTTY(
   );
   return { decisions, quitEarly: false, fastPathed };
 }
+
+// ---------------------------------------------------------------------------
+// Triage Gate (non-TTY: CI, scripts, agent harnesses)
+// ---------------------------------------------------------------------------
+
+/**
+ * Non-interactive triage mode. Mirrors the existing IMPORTANT-objection
+ * auto-accept default in plan-reviewer.ts, extended to CRITICAL objections
+ * for the multi-round loop.
+ *
+ * - "auto-accept": accept every CRITICAL, proceed to re-synth (recommended for CI)
+ * - "fail-fast": exit code 3 immediately on first round with CRITICAL (stricter CI)
+ * - "auto-reject": reject every CRITICAL, annotate, proceed (escape hatch)
+ */
+export type NonInteractiveMode = "auto-accept" | "fail-fast" | "auto-reject";
+
+export interface NonTTYTriageResult {
+  decisions: TriageDecision[];
+  shouldFailFast: boolean;
+}
+
+/**
+ * Non-interactive triage gate. Synchronous — no readline, no streams.
+ *
+ * Called by runPlanReviewLoop when process.stdin is not a TTY (typical for
+ * CI runs and agent harnesses). The mode is set via the
+ * --plan-review-noninteractive CLI flag (default: auto-accept).
+ *
+ * Returns:
+ * - decisions: per-objection TriageDecision[] (one per input objection, or
+ *   empty for fail-fast / empty input)
+ * - shouldFailFast: true only when mode === "fail-fast" AND objections is non-empty
+ */
+export function runTriageGateNonTTY(opts: {
+  objections: PlanReviewObjection[];
+  mode: NonInteractiveMode;
+}): NonTTYTriageResult {
+  if (opts.objections.length === 0) {
+    return { decisions: [], shouldFailFast: false };
+  }
+  if (opts.mode === "fail-fast") {
+    return { decisions: [], shouldFailFast: true };
+  }
+  const decision: TriageDecision["decision"] =
+    opts.mode === "auto-accept" ? "accept" : "reject";
+  return {
+    decisions: opts.objections.map((_o, i) => ({
+      objectionIndex: i,
+      decision,
+      rationale: `non-interactive ${opts.mode}`,
+    })),
+    shouldFailFast: false,
+  };
+}
