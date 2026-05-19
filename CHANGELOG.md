@@ -1,5 +1,46 @@
 # Changelog
 
+## [1.40.4.2] - 2026-05-19
+
+**Gemini staging-path fix now matches Gemini's actual `projects.json` key sanitization. Worktrees with `_`, `.`, or uppercase in the basename no longer fall through the same hole the v1.40.4.1 fix tried to plug.**
+
+v1.40.4.1 keyed the Gemini staging dir on `path.basename(opts.cwd)` raw. Gemini's `--yolo` workspace policy actually stores its tmp allowlist in `~/.gemini/projects.json` under a sanitized form of that basename: lowercase, every non-alphanumeric run collapsed to a single `-`, leading/trailing `-` stripped. The `mitosis-prototype-socc26-v022a-schema-v3_1-behavior-subtree-...` worktree on this machine reproduces the bug class one level deeper: the orchestrator was about to write to `~/.gemini/tmp/...v3_1.../` while Gemini's allowlist key is `...v3-1...`. Same shape of failure, different character (`_` instead of `build-` prefix). New `deriveGeminiTmpKey` helper in `state.ts` matches Gemini's exact key derivation, including an empty-result fallback to a fixed `gstack-run` literal so all-punctuation basenames don't collapse the staging dir to the shared `~/.gemini/tmp/` root. Empirically verified across 100+ existing keys in `projects.json`.
+
+### The numbers that matter
+
+| Basename observed in projects.json | Raw `basename(cwd)` (v1.40.4.1) | Gemini's actual key | Match? |
+| --- | --- | --- | --- |
+| `socc26-v022a-schema-v3_1-behavior-subtree-...` | `...v3_1...` | `...v3-1...` | NO |
+| `MyObs` | `MyObs` | `myobs` | NO |
+| `AGIL-paper` | `AGIL-paper` | `agil-paper` | NO |
+| `the-Big-Paper` | `the-Big-Paper` | `the-big-paper` | NO |
+| `mitosis-control-plane-impl-plan-anbang-20260518-...` | (same) | (same) | yes (accidental) |
+
+Four out of five real worktrees on this machine produce divergent staging vs allowlist paths under v1.40.4.1. Only the v1.40.4.1 happy-path case (already-lowercase, alphanumeric+hyphen) matches.
+
+Also addresses two adversarial findings layered on v1.40.4.1: a per-process discriminator (`process.pid`) in staged filenames so two concurrent runs of the same slug can't clobber each other's input/output (v1.40.4.1's slug-in-filename catches different runs; pid catches identical-slug runs), and test isolation via `HOME` override so `bun test` no longer pollutes the developer's real `~/.gemini/tmp/` directory on every run (the prior pattern leaked test slugs into Gemini's actual `projects.json`).
+
+### What this means for builders
+
+If you've been hitting the Gemini fallback on a worktree whose basename has `_` or uppercase (anything `gh repo clone` of a repo with mixed-case names, or any worktree path with an `_`-bearing run-id), the fallback was still silently degrading to inference even after v1.40.4.1. After v1.40.4.2 the path-shape divergence is closed regardless of basename shape. Concurrent retry storms on the same slug also no longer corrupt each other's staged files. And running `bun test` no longer dumps test artifacts under `~/.gemini/tmp/smoke-test-*`.
+
+### Itemized changes
+
+#### Fixed
+
+- New helper `deriveGeminiTmpKey(cwd)` in `build/orchestrator/state.ts` that matches Gemini's `projects.json` key derivation exactly: lowercase, non-alphanumeric runs collapsed to single `-`, leading/trailing `-` stripped, empty-result fallback to literal `gstack-run`. `stageGeminiIO` now uses this instead of `path.basename(opts.cwd)` for the staging dir name.
+- `stageGeminiIO` now includes `process.pid` in the staged filename (`gstack-gemini-<slug>-<phase>-<iter>-<suffix>-<pid>-(input|output).md`). v1.40.4.1's slug-in-filename catches different runs sharing a `cwd`; the pid is a finer-grain discriminator for two concurrent runs of the same slug (retry storms, replay-style debugging).
+
+#### Changed
+
+- `build/orchestrator/__tests__/sub-agents.test.ts`: the `stageGeminiIO` describe block now uses `beforeEach`/`afterEach` to swap `process.env.HOME` to an isolated tmp directory. Tests no longer write under the developer's real `~/.gemini/tmp/`, which was leaking slug literals into Gemini's `projects.json` on every test run (pre-existing pattern, addressed here as part of adversarial review Finding 6). Four new tests pin: (1) `_` → `-` sanitization on the real `socc26-v022a-schema-v3_1` worktree shape; (2) uppercase → lowercase via `MyObs` basename; (3) empty-result fallback to `gstack-run` for all-punctuation cwd basenames; (4) pid discriminator presence in staged filenames.
+- `build/orchestrator/__tests__/state.test.ts`: new `deriveGeminiTmpKey` describe block with 7 tests covering the sanitization rules empirically observed in `projects.json` (lowercase, `_`/`./other-punct` → `-`, collapse, trim, empty-fallback, idempotency, basename-only operation).
+- The `runSlashCommand (gemini role dispatch)` test now asserts against `deriveGeminiTmpKey(tmpDir)` instead of `path.basename(tmpDir)` for the staging key.
+
+### For contributors
+
+The `stageGeminiIO` doc comment now describes the full three-iteration history of this bug class explicitly (gstack-segment → `build-` prefix → raw-basename divergence), and explains why directory key = `deriveGeminiTmpKey(cwd)` (Gemini's exact `projects.json` derivation), filename key = `slug + pid + phase/iter/suffix` (orchestrator's parallel-run namespace). The empirical observation that every Gemini key in `projects.json` is `[a-z0-9-]+` with no double dashes is documented inline so future drift in Gemini's key rules will surface as a test failure on `deriveGeminiTmpKey` rather than a silent staging-path regression.
+
 ## [1.40.4.1] - 2026-05-19
 
 **Gemini fallback implementor reads its own input files again, and parallel dual-impl runs no longer clobber each other's I/O. Two related fixes shipped together: directory alignment with Gemini's `--yolo` whitelist, and per-filename slug disambiguation for concurrent runs.**

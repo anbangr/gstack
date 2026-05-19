@@ -22,7 +22,7 @@
 import { execFile } from "./child-registry";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { logDir, ensureLogDir } from "./state";
+import { logDir, ensureLogDir, deriveGeminiTmpKey } from "./state";
 import type { RoleConfig, RoleProvider, RoleReasoning } from "./role-config";
 import { BUILD_DEFAULTS, envNumberOrDefault } from "./build-config";
 import type { DualImplCandidateKey } from "./types";
@@ -291,40 +291,48 @@ function quote(s: string): string {
 }
 
 /**
- * Stage Gemini I/O files in ~/.gemini/tmp/<basename(cwd)>/ — Gemini's
- * `--yolo` sandbox auto-whitelists that path based on the spawned
+ * Stage Gemini I/O files in ~/.gemini/tmp/<deriveGeminiTmpKey(cwd)>/ —
+ * Gemini's `--yolo` sandbox auto-whitelists that path based on the spawned
  * process's working directory.
  *
- * Why basename(cwd), not opts.slug for the directory:
- * Gemini infers its workspace temp dir from `basename(cwd)`. The
- * orchestrator's `slug` is `deriveSlug(planFile)` which prepends `build-`
- * to the plan basename (see state.ts:deriveSlug). The worktree directory
- * has no `build-` prefix. Staging under `slug` lands files in a sibling
- * directory Gemini's sandbox rejects, the agent fails every `read_file`,
- * and silently degrades to inference — dirtying the worktree with
- * hallucinated edits.
+ * Why deriveGeminiTmpKey(cwd), not basename(cwd) or opts.slug:
+ * Gemini stores its tmp allowlist in ~/.gemini/projects.json under a
+ * SANITIZED form of `basename(cwd)` — lowercase, non-alphanumeric runs
+ * collapsed to single `-`, leading/trailing `-` trimmed (see
+ * state.ts:deriveGeminiTmpKey). PR #49 used `basename(opts.cwd)` raw,
+ * which still diverges from Gemini's allowlist for worktrees with `_`,
+ * `.`, or uppercase in the basename. The mitosis-prototype-socc26-v022a-
+ * schema-v3_1 worktree on this machine is a real example: orchestrator
+ * was writing to `~/.gemini/tmp/...v3_1.../`, Gemini allowed
+ * `~/.gemini/tmp/...v3-1.../`. deriveGeminiTmpKey closes that gap.
  *
  * Why opts.slug IS in the staged filename:
  * Dual-impl runs (build/orchestrator/worktree.ts) always produce
  * worktrees named `primary` and `secondary`, so two concurrent builds
  * of different plans would collide on ~/.gemini/tmp/primary/ if the
- * filename only carried phase/iteration/suffix. The slug (typically
- * `build-<plan-basename>-p<N>-<ts>` after deriveSlug, but a clean
- * non-empty token in any case) disambiguates parallel runs sharing
- * a basename(cwd). Sanitized to a single path segment to prevent
- * directory traversal into the staging dir.
+ * filename only carried phase/iteration/suffix. The slug disambiguates
+ * parallel runs sharing a sanitized basename(cwd).
  *
- * History: This helper used to write to ~/.gemini/tmp/gstack/<slug>/.
- * Commit 67480efe dropped the `gstack/` segment but kept `opts.slug` as
- * the directory key, which still mismatched when `slug` carried the
- * `build-` prefix. Observed 2026-05-17 on agnt2-prototype-plan4
- * (T111646), 2026-05-18 on mitosis-control-plane-impl-plan Phase 3.3.
- * Adversarial review on the directory-fix patch caught the dual-impl
- * collision risk and forced opts.slug into the filename too.
+ * Why process.pid is ALSO in the staged filename:
+ * Two concurrent runs that happen to derive the same slug (e.g. retry
+ * loops, replay-style debugging) would still collide at the filename
+ * level. The pid is a per-process discriminator that catches this finer
+ * shape without changing directory semantics.
+ *
+ * History:
+ *   - ~/.gemini/tmp/gstack/<slug>/ — broken: T111646, fixed 2026-05-17
+ *     (67480efe).
+ *   - ~/.gemini/tmp/<slug>/ where slug = `build-<runId>` — still broken:
+ *     `build-` prefix divergence. Fixed 2026-05-18.
+ *   - ~/.gemini/tmp/<basename(cwd)>/ — still broken: dual-impl + raw
+ *     basename divergence on worktrees with `_`/`.`/uppercase. Fixed in
+ *     two commits, PR #49 (cwd-derivation + slug-in-filename) and this
+ *     one (full sanitization via deriveGeminiTmpKey + pid discriminator).
  *
  * Exported so build/orchestrator/__tests__/sub-agents.test.ts can pin
- * the cross-system invariants (basename(cwd) equals Gemini's whitelist
- * key; opts.slug appears in the filename to disambiguate parallel runs).
+ * the cross-system invariants (sanitized basename(cwd) equals Gemini's
+ * whitelist key; opts.slug + pid appear in the filename to disambiguate
+ * parallel runs).
  *
  * Returns { stagedInput, stagedOutput, cleanup }.
  * Call cleanup() after spawnCaptured returns; it copies the output back to
@@ -345,12 +353,12 @@ export function stageGeminiIO(opts: {
     process.env.HOME ?? "~",
     ".gemini",
     "tmp",
-    path.basename(opts.cwd),
+    deriveGeminiTmpKey(opts.cwd),
   );
   fs.mkdirSync(stagingDir, { recursive: true });
 
   const slugSegment = opts.slug.replace(/[^a-zA-Z0-9._-]+/g, "-");
-  const base = `gstack-gemini-${slugSegment}-${opts.phaseNumber}-${opts.iteration}-${opts.suffix}`;
+  const base = `gstack-gemini-${slugSegment}-${opts.phaseNumber}-${opts.iteration}-${opts.suffix}-${process.pid}`;
   const stagedInput = path.join(stagingDir, `${base}-input.md`);
   const stagedOutput = path.join(stagingDir, `${base}-output.md`);
 

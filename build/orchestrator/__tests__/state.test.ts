@@ -6,6 +6,7 @@ import {
   deriveSlug,
   deriveRunSlug,
   deriveStateSlug,
+  deriveGeminiTmpKey,
   statePath,
   lockPath,
   freshState,
@@ -86,6 +87,64 @@ describe("deriveSlug", () => {
     expect(deriveRunSlug("run:one/alpha")).toBe("build-run-one-alpha");
     expect(deriveStateSlug("/x/same.md", "run-a")).toBe("build-run-a");
     expect(deriveStateSlug("/y/same.md", "run-b")).toBe("build-run-b");
+  });
+});
+
+describe("deriveGeminiTmpKey", () => {
+  // Gemini's --yolo workspace policy stores its tmp allowlist in
+  // ~/.gemini/projects.json under a sanitized form of `basename(cwd)`:
+  // lowercase, non-alphanumeric runs collapsed to single `-`, leading/
+  // trailing `-` stripped. This helper matches that exact derivation so
+  // the orchestrator's staging dir aligns with what Gemini's sandbox allows.
+  it("lowercases uppercase characters", () => {
+    expect(deriveGeminiTmpKey("/wt/MyObs")).toBe("myobs");
+    expect(deriveGeminiTmpKey("/wt/AGIL-paper")).toBe("agil-paper");
+    expect(deriveGeminiTmpKey("/wt/the-Big-Paper")).toBe("the-big-paper");
+  });
+  it("replaces underscores with hyphens (real-world case: socc26-v3_1)", () => {
+    expect(
+      deriveGeminiTmpKey(
+        "/wt/mitosis-prototype-socc26-v022a-schema-v3_1-behavior-subtree-20260518",
+      ),
+    ).toBe(
+      "mitosis-prototype-socc26-v022a-schema-v3-1-behavior-subtree-20260518",
+    );
+  });
+  it("replaces dots with hyphens", () => {
+    expect(deriveGeminiTmpKey("/wt/foo.bar.baz")).toBe("foo-bar-baz");
+  });
+  it("collapses consecutive non-alphanumeric chars to single `-`", () => {
+    expect(deriveGeminiTmpKey("/wt/foo__bar..baz")).toBe("foo-bar-baz");
+  });
+  it("strips leading/trailing `-` after sanitization", () => {
+    expect(deriveGeminiTmpKey("/wt/_foo_")).toBe("foo");
+  });
+  it("falls back to `gstack-run` on empty sanitized result", () => {
+    // basename of a path ending in all-punctuation reduces to "" after sanitize.
+    expect(deriveGeminiTmpKey("/wt/___")).toBe("gstack-run");
+    expect(deriveGeminiTmpKey("/wt/...")).toBe("gstack-run");
+    // Edge: empty string basename.
+    expect(deriveGeminiTmpKey("")).toBe("gstack-run");
+    // path.basename("/wt/") returns "wt" (Node strips trailing slash); for the
+    // truly-empty case use trailing-slash-only or just `/`.
+    expect(deriveGeminiTmpKey("/")).toBe("gstack-run");
+  });
+  it("is idempotent on already-sanitized keys", () => {
+    expect(deriveGeminiTmpKey("/wt/foo-bar")).toBe("foo-bar");
+    const sanitized = deriveGeminiTmpKey(
+      "/wt/mitosis-control-plane-impl-plan-anbang-20260518-154933-bee3aea0",
+    );
+    expect(sanitized).toBe(
+      "mitosis-control-plane-impl-plan-anbang-20260518-154933-bee3aea0",
+    );
+    // running twice = once
+    expect(deriveGeminiTmpKey(`/wt/${sanitized}`)).toBe(sanitized);
+  });
+  it("operates on basename only (ignores parent path)", () => {
+    expect(deriveGeminiTmpKey("/some/long/parent/path/foo-bar")).toBe(
+      "foo-bar",
+    );
+    expect(deriveGeminiTmpKey("/some/UPPERCASE/PARENT/myobs")).toBe("myobs");
   });
 });
 
