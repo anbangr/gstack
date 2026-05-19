@@ -276,3 +276,55 @@ export function envNumberOrDefault(envName: string, fallback: number): number {
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
+
+/**
+ * Under liveness semantics, GSTACK_BUILD_*_TIMEOUT env vars represent stall
+ * windows (max ms of silence), not wall-clock budgets. Values above 30min
+ * almost certainly come from the old model where users padded the budget to
+ * avoid mid-flight kills. That's no longer needed — emit a one-line nudge
+ * pointing at the semantic shift.
+ *
+ * Idempotent: only logs once per process. Logs nothing if no oversized env
+ * vars are set, so quiet defaults stay quiet.
+ */
+const LARGE_STALL_WINDOW_THRESHOLD_MS = 30 * 60 * 1000;
+const STALL_ENV_VARS = [
+  "GSTACK_BUILD_GEMINI_TIMEOUT",
+  "GSTACK_BUILD_KIMI_TIMEOUT",
+  "GSTACK_BUILD_CODEX_TIMEOUT",
+  "GSTACK_BUILD_TEST_TIMEOUT",
+  "GSTACK_BUILD_SHIP_TIMEOUT",
+  "GSTACK_BUILD_FEATURE_REVIEW_TIMEOUT",
+  "GSTACK_BUILD_JUDGE_TIMEOUT",
+  "GSTACK_BUILD_MONITOR_AGENT_TIMEOUT_MS",
+];
+let warnOnLargeStallWindowsCalled = false;
+export function warnOnLargeStallWindows(
+  env: Record<string, string | undefined> = process.env,
+  log: (msg: string) => void = (msg) => console.warn(msg),
+): void {
+  if (warnOnLargeStallWindowsCalled) return;
+  warnOnLargeStallWindowsCalled = true;
+  const oversized: Array<{ name: string; valueMs: number }> = [];
+  for (const name of STALL_ENV_VARS) {
+    const raw = env[name];
+    if (!raw) continue;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= LARGE_STALL_WINDOW_THRESHOLD_MS) continue;
+    oversized.push({ name, valueMs: n });
+  }
+  if (oversized.length === 0) return;
+  log(
+    `[gstack-build] ${oversized.length} timeout env var${oversized.length === 1 ? "" : "s"} set above 30min. ` +
+      `Under liveness semantics these are STALL WINDOWS (max ms of silence), not wall-clock budgets — ` +
+      `oversized values probably aren't doing what you expect.`,
+  );
+  for (const { name, valueMs } of oversized) {
+    log(`  ${name}=${valueMs}ms (${Math.round(valueMs / 60000)}min)`);
+  }
+}
+
+/** Test-only: reset the one-shot warning flag. */
+export function _resetWarnOnLargeStallWindowsForTest(): void {
+  warnOnLargeStallWindowsCalled = false;
+}

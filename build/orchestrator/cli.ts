@@ -167,7 +167,7 @@ import {
   type RoleField,
   type RoleKey,
 } from "./role-config";
-import { BUILD_DEFAULTS } from "./build-config";
+import { BUILD_DEFAULTS, warnOnLargeStallWindows } from "./build-config";
 import { evaluateMonitorOnce, monitorExitCode } from "./monitor";
 import {
   drainFaults,
@@ -8839,6 +8839,11 @@ async function main() {
   // and terminal-disconnect (SIGHUP) paths are all clean now.
   // See orchestrator/README.md "Child process management".
   installSignalHandlers();
+
+  // One-shot nudge: timeout env vars set above 30min probably come from
+  // pre-liveness-semantics config where users padded the budget to avoid
+  // mid-flight kills. Under the new model these are stall windows.
+  warnOnLargeStallWindows();
 
   const rawArgv = process.argv.slice(2);
   const args = parseArgs(rawArgv);

@@ -25,7 +25,7 @@ describe("role config defaults", () => {
     const loaded = loadBuildDefaults(DEFAULT_BUILD_CONFIG_FILE);
     expect(path.basename(DEFAULT_BUILD_CONFIG_FILE)).toBe("configure.cm");
     expect(loaded.roles.primaryImpl.model).toBeTruthy();
-    expect(loaded.limits.codexMaxIterations).toBe(5);
+    expect(loaded.limits.codexMaxIterations).toBe(10);
     expect(loaded.timeoutsMs.gemini).toBe(900000);
     expect(loaded.timeoutsMs.kimi).toBe(1500000);
     expect(BUILD_DEFAULTS.roles.primaryImpl.model).toBe(
@@ -93,9 +93,11 @@ describe("role config defaults", () => {
   it("exposes featureReviewMaxIterations and featureReview timeout in BUILD_DEFAULTS", () => {
     // The default cap on per-feature meta-review cycles. After this count,
     // the orchestrator pauses and prompts the user via stdin readline.
-    expect(BUILD_DEFAULTS.limits.featureReviewMaxIterations).toBe(3);
-    // 1200000ms = 20min — larger than codex's 900000ms because the feature
-    // review reads ALL phase artifacts (not just one phase's diff).
+    // Bumped 3 -> 5 under liveness semantics (individual iterations no longer
+    // time out mid-flight, so the cap is now the only fence).
+    expect(BUILD_DEFAULTS.limits.featureReviewMaxIterations).toBe(5);
+    // 1200000ms = 20min stall window — larger than codex's 900000ms because
+    // the feature review reads ALL phase artifacts (not just one phase's diff).
     expect(BUILD_DEFAULTS.timeoutsMs.featureReview).toBe(1200000);
   });
 });
@@ -140,7 +142,7 @@ describe("role config precedence helpers", () => {
       expect(loaded.roles.monitorAgent).toEqual(
         DEFAULT_ROLE_CONFIGS.monitorAgent,
       );
-      expect(loaded.limits.featureReviewMaxIterations).toBe(3);
+      expect(loaded.limits.featureReviewMaxIterations).toBe(5);
       expect(loaded.timeoutsMs.kimi).toBe(1500000);
       expect(loaded.timeoutsMs.featureReview).toBe(1200000);
     } finally {
