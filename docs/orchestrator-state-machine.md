@@ -266,6 +266,13 @@ Default test-path globs (cli.ts:`DEFAULT_QA_TEST_PATH_GLOBS`):
 `~/.gstack/projects/{slug}/config.yaml` key `qa_test_path_globs`
 (not wired in v1; defaults handle every observed case).
 
+**Recovery-path dirty-tree guard.** A separate guard runs inside
+`markPhaseCommittedAfterManualRecovery` (the
+`--mark-phase-committed` recovery exit) — see §8. The recovery guard
+is independent of the hygiene gates above because the recovery exit
+runs OUTSIDE the per-phase agent loop; the operator is the one
+holding the worktree at that point, not an agent.
+
 ---
 
 ## 6.5. Phase-array reconciler (FEATURE_NEEDS_PHASES path)
@@ -331,6 +338,48 @@ the reconciler. See `buildPhaseNumberHistory` in
 
 ---
 
+## 6.6. Origin-issue rewind contract (`restartFeatureFromOriginIssues`)
+
+After a feature ships, the origin-verification gate may re-open it by
+rewinding a `committed` phase back to `tests_green` so the review/QA
+loop reruns against the freshly merged main. When this rewind crosses
+a `committed → tests_green` boundary, the plan markdown must rewind
+in lockstep — otherwise the rewound phase shows `[x][x][x]` while
+state is `tests_green`/`failed`, which is the exact
+PREMATURE_COMPLETION signature observed in the 2026-05-18 mitosis
+faults.
+
+Contract (`cli.ts:3401`):
+
+1. **Un-flip checkboxes first, mutate state second.** When
+   `phaseState.status === "committed"` and `args.phases` is supplied,
+   call `unflipPhaseCheckboxes(planFile, phase)` BEFORE the state
+   transition. `unflipPhaseCheckboxes`
+   (`plan-mutator.ts:409`) is atomic: it validates all three target
+   lines (test-spec, impl, review) against the expected markers in
+   memory, and only then writes the rewound markdown in one
+   temp+rename pass. Partial rewinds are structurally impossible.
+2. **Fail closed on un-flip error.** If validation fails (plan
+   hand-edited mid-rewind, wrong marker, line drift), the helper
+   returns a non-empty `errors[]`, this function sets
+   `feature.status = "paused"` with a `plan markdown drift` reason,
+   and returns `restarted: false`. **State is NOT advanced.** The
+   operator must resolve the markdown drift (re-flip `[x]→[ ]` for
+   the named phase's three lines) before retrying the restart.
+3. **Markdown follows state backward as faithfully as it follows
+   forward.** The symmetric counterpart to `flipPhaseCheckboxes` +
+   `flipTestSpecCheckbox` is `unflipPhaseCheckboxes`. Whenever a
+   future rewind path crosses `committed → not-committed`, it MUST
+   call `unflipPhaseCheckboxes` before mutating state, or recreate
+   the PREMATURE_COMPLETION class.
+
+The `phases` argument is `Phase[] | undefined` so legacy unit tests
+that exercise state-only transitions keep working; production
+callers in `cli.ts` (the two `restartFeatureFromOriginIssues` call
+sites at `cli.ts:10067` and `cli.ts:10211`) ALWAYS pass it.
+
+---
+
 ## 7. Lock + active-run record lifecycle
 
 **Lock file:** `~/.gstack/build-state/<slug>.lock` (created via
@@ -359,7 +408,7 @@ auto-cleared on the next `acquireLock` retry.
 ## 8. markPhaseCommittedAfterManualRecovery invariants
 
 This is the **only sanctioned exit from `failed`**. It atomically
-performs the following mutations (`cli.ts:4263+`):
+performs the following mutations (`cli.ts:5439+`):
 
 | Field                      | Mutation                                                                         |
 | -------------------------- | -------------------------------------------------------------------------------- |
@@ -381,27 +430,62 @@ falls back to direct match.
 The function still returns `ok: true` so callers can render a preview
 message. No state.json write, no plan file write.
 
+**Dirty-tree guard (skill-faults-fix-2026-05-19).** Three of the four
+2026-05-18 mitosis PREMATURE_COMPLETION faults were rescued by
+`--mark-phase-committed` AFTER an agent had left the worktree dirty.
+The original behavior silently force-marked over the dirty state and
+the next phase started on an inconsistent tree. The function now
+inspects `cwd` (production callers in `cli.ts` always pass
+`projectRoot`) before mutating state:
+
+- **Clean worktree:** proceeds as before.
+- **Dirty worktree, no policy flag:** refuses with `ok: false`,
+  returns the dirty file list, and instructs the operator to re-run
+  with one of the two policy flags below.
+- **`commitDirty: true`:** stages everything with `git add -- .` and
+  commits with a standard `fix(recovery): ...` message. Pre-commit
+  hooks still run; if a hook fails, the commit fails and the mark
+  refuses (operator sees the hook output and decides next step).
+- **`forceDirty: true`:** preserves the dirty state, prints a WARN
+  listing every dirty path, and proceeds. The next phase will start
+  on the dirty tree.
+- **Both flags set:** refuses with "mutually exclusive".
+- **`git status` errors (stale `.git/index.lock`, corrupted repo):**
+  `captureGitSnapshot` encodes the error as `<git error: ...>`. The
+  guard treats this as fail-closed unless `forceDirty: true` was
+  passed — silently bypassing a `git status` failure was the exact
+  failure mode the operator needs to know about.
+
+The legacy callers (unit tests that exercise state-only transitions)
+keep working because `cwd` is optional; production CLI callers always
+supply it. Surfaces as `--commit-dirty` / `--force-dirty` CLI flags.
+
 ---
 
 ## 9. Glossary of source pointers
 
 For each contract above, the canonical implementation lives at:
 
-- `phaseGateProjection`: `cli.ts:262`
-- `featureGateProjection`: `cli.ts:323`
-- `reconcilePhaseVisibleGates`: `cli.ts:374`
-- `reconcileFeatureVisibleGates`: `cli.ts:410`
-- `reconcileVisiblePlanState` (entry point): `cli.ts:439`
-- `reconcileStatePhasesAfterReparse`: `state.ts:292`
-- `markPhaseCommittedAfterManualRecovery`: `cli.ts:4304`
-- `resolvePhaseByMarkArg`: `cli.ts:4281`
-- `applyGateHygiene`: `cli.ts:3950`
-- `applyMutableAgentHygiene`: `cli.ts:3895`
-- `maybeAutoCommitTestOnlyDirty`: `cli.ts:3910`
-- `validatePostAgentHygiene`: `cli.ts:1501`
-- `runStopRun`: `cli.ts:7649`
-- `markCommitted`: `phase-runner.ts:818`
-- `decideNextAction`: `phase-runner.ts:166`
-- `acquireLock`: `state.ts:382`
+- `phaseGateProjection`: `cli.ts:269`
+- `featureGateProjection`: `cli.ts:330`
+- `reconcilePhaseVisibleGates`: `cli.ts:376`
+- `reconcileFeatureVisibleGates`: `cli.ts:417`
+- `reconcileVisiblePlanState` (entry point): `cli.ts:457`
+- `reconcileStatePhasesAfterReparse`: `state.ts:331`
+- `restartFeatureFromOriginIssues`: `cli.ts:3401`
+- `markPhaseCommittedAfterManualRecovery`: `cli.ts:5439`
+- `resolvePhaseByMarkArg`: `cli.ts:5419`
+- `applyGateHygiene`: `cli.ts:4767`
+- `applyMutableAgentHygiene`: `cli.ts:4890`
+- `maybeAutoCommitTestOnlyDirty`: `cli.ts:4572`
+- `validatePostAgentHygiene`: `cli.ts:1777`
+- `runStopRun`: `cli.ts:8747`
+- `markCommitted`: `phase-runner.ts:865`
+- `decideNextAction`: `phase-runner.ts:170`
+- `flipPhaseCheckboxes`: `plan-mutator.ts:225`
+- `flipTestSpecCheckbox`: `plan-mutator.ts:262`
+- `unflipPhaseCheckboxes`: `plan-mutator.ts:409`
+- `reconcilePhaseCheckboxes`: `plan-mutator.ts:510`
+- `acquireLock`: `state.ts:565`
 - `isPidAlive`: `active-runs.ts:51`
 - `PhaseStatus` / `FeatureStatus` types: `types.ts:32, 53`

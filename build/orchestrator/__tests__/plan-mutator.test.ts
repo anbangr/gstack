@@ -7,6 +7,7 @@ import {
   _testWritePlan,
   flipTestSpecCheckbox,
   reconcilePhaseCheckboxes,
+  unflipPhaseCheckboxes,
   setCheckboxState,
   setCheckboxStatusNote,
 } from "../plan-mutator";
@@ -454,6 +455,143 @@ not a checkbox
     expect(r.errors).toHaveLength(1);
     expect(r.errors[0]).toMatch(/impl/);
     expect(r.flipped).toBe(1); // review still flipped
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+});
+
+describe("unflipPhaseCheckboxes", () => {
+  it("flips all three [x] back to [ ] for a TDD phase", () => {
+    const md = `### Phase 1: Foo
+- [x] **Test Specification**: spec
+- [x] **Implementation**: impl
+- [x] **Review**: review
+`;
+    const p = _testWritePlan(md);
+    const phase = {
+      testSpecCheckboxLine: 2,
+      implementationCheckboxLine: 3,
+      reviewCheckboxLine: 4,
+      kind: "code",
+    };
+    const r = unflipPhaseCheckboxes(p, phase as any);
+    expect(r.unflipped).toBe(3);
+    expect(r.errors).toHaveLength(0);
+    const after = fs.readFileSync(p, "utf8").split(/\r?\n/);
+    expect(after[1]).toContain("[ ] **Test Specification");
+    expect(after[2]).toContain("[ ] **Implementation");
+    expect(after[3]).toContain("[ ] **Review");
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("skips test-spec un-flip when testSpecCheckboxLine is -1", () => {
+    const md = `### Phase 1: Foo
+- [x] **Implementation**: impl
+- [x] **Review**: review
+`;
+    const p = _testWritePlan(md);
+    const phase = {
+      testSpecCheckboxLine: -1,
+      implementationCheckboxLine: 2,
+      reviewCheckboxLine: 3,
+      kind: "code",
+    };
+    const r = unflipPhaseCheckboxes(p, phase as any);
+    expect(r.unflipped).toBe(2);
+    expect(r.errors).toHaveLength(0);
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("is idempotent — already-unchecked boxes produce zero unflipped and no errors", () => {
+    const md = `### Phase 1: Foo
+- [ ] **Implementation**: impl
+- [ ] **Review**: review
+`;
+    const p = _testWritePlan(md);
+    const phase = {
+      testSpecCheckboxLine: -1,
+      implementationCheckboxLine: 2,
+      reviewCheckboxLine: 3,
+      kind: "code",
+    };
+    const r = unflipPhaseCheckboxes(p, phase as any);
+    expect(r.unflipped).toBe(0);
+    expect(r.errors).toHaveLength(0);
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("uses kind-specific markers (writing phase: Draft + Review)", () => {
+    const md = `### Phase 1 [writing]: Draft the intro
+- [x] **Draft**: write the intro section
+- [x] **Review**: review the draft
+`;
+    const p = _testWritePlan(md);
+    const phase = {
+      testSpecCheckboxLine: -1,
+      implementationCheckboxLine: 2,
+      reviewCheckboxLine: 3,
+      kind: "writing",
+    };
+    const r = unflipPhaseCheckboxes(p, phase as any);
+    expect(r.unflipped).toBe(2);
+    expect(r.errors).toHaveLength(0);
+    const after = fs.readFileSync(p, "utf8").split(/\r?\n/);
+    expect(after[1]).toContain("[ ] **Draft");
+    expect(after[2]).toContain("[ ] **Review");
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("ATOMIC: when any target fails validation, NO checkbox is flipped (all-or-nothing)", () => {
+    // Atomicity guarantee added after Codex adversarial review:
+    // previously the function did 3 separate atomic writes. If line 2
+    // failed marker validation but lines 1 + 3 succeeded, the plan was
+    // left half-rewound (test-spec [ ], impl still [x], review [ ]) —
+    // silent corruption under exactly the hand-edit race the function
+    // exists to handle.
+    //
+    // Now: validate all targets first, then do ONE atomic write.
+    // ANY validation error → no writes, errors returned, plan unchanged.
+    const md = `### Phase 1: Foo
+- [x] **Test Specification**: spec
+- [x] **Wrong Marker**: not what we expect
+- [x] **Review**: review
+`;
+    const p = _testWritePlan(md);
+    const phase = {
+      testSpecCheckboxLine: 2,
+      implementationCheckboxLine: 3, // **Wrong Marker** instead of **Implementation
+      reviewCheckboxLine: 4,
+      kind: "code",
+    };
+    const r = unflipPhaseCheckboxes(p, phase as any);
+    expect(r.errors).toHaveLength(1);
+    expect(r.errors[0]).toMatch(/impl/);
+    expect(r.unflipped).toBe(0); // ZERO — atomicity, not partial
+    // Plan markdown MUST be unchanged byte-for-byte.
+    const after = fs.readFileSync(p, "utf8");
+    expect(after).toBe(md);
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("symmetric round-trip: reconcile flips [ ]→[x], unflip flips [x]→[ ]", () => {
+    const md = `### Phase 1: Foo
+- [ ] **Test Specification**: spec
+- [ ] **Implementation**: impl
+- [ ] **Review**: review
+`;
+    const p = _testWritePlan(md);
+    const phase = {
+      testSpecCheckboxLine: 2,
+      implementationCheckboxLine: 3,
+      reviewCheckboxLine: 4,
+      kind: "code",
+    };
+    const fwd = reconcilePhaseCheckboxes(p, phase as any);
+    expect(fwd.flipped).toBe(3);
+    const rev = unflipPhaseCheckboxes(p, phase as any);
+    expect(rev.unflipped).toBe(3);
+    expect(rev.errors).toHaveLength(0);
+    const restored = fs.readFileSync(p, "utf8");
+    expect(restored).toBe(md);
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 });

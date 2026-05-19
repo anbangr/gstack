@@ -488,6 +488,39 @@ describe("--ship-on-plan-complete flag wiring", () => {
   });
 });
 
+describe("--commit-dirty / --force-dirty flag wiring", () => {
+  it("parseArgs defaults -> forceDirty=false, commitDirty=false", () => {
+    const args = parseArgs(["plan.md"]);
+    expect(args.forceDirty).toBe(false);
+    expect(args.commitDirty).toBe(false);
+  });
+
+  it("parseArgs([plan, --force-dirty]) sets forceDirty=true", () => {
+    const args = parseArgs(["plan.md", "--force-dirty"]);
+    expect(args.forceDirty).toBe(true);
+    expect(args.commitDirty).toBe(false);
+  });
+
+  it("parseArgs([plan, --commit-dirty]) sets commitDirty=true", () => {
+    const args = parseArgs(["plan.md", "--commit-dirty"]);
+    expect(args.commitDirty).toBe(true);
+    expect(args.forceDirty).toBe(false);
+  });
+
+  it("both --force-dirty and --commit-dirty parse but caller enforces mutex", () => {
+    // parseArgs allows both — the mutex check lives in
+    // markPhaseCommittedAfterManualRecovery (see dirty-tree guard tests).
+    const args = parseArgs(["plan.md", "--force-dirty", "--commit-dirty"]);
+    expect(args.forceDirty).toBe(true);
+    expect(args.commitDirty).toBe(true);
+  });
+
+  it("--force-dirty and --commit-dirty are documented in --help", () => {
+    expect(HELP_TEXT).toContain("--force-dirty");
+    expect(HELP_TEXT).toContain("--commit-dirty");
+  });
+});
+
 describe("release-daemon CLI", () => {
   it("parses release-daemon run defaults", () => {
     const args = parseArgs(["release-daemon", "run"]);
@@ -2813,6 +2846,184 @@ describe("restartFeatureFromOriginIssues", () => {
     expect(feature.status).toBe("paused");
     expect(feature.error).toContain("still failing after 1 auto-fix attempts");
   });
+
+  it("un-flips plan checkboxes when rewinding a committed phase (PREMATURE_COMPLETION defense)", () => {
+    // Repro for the 2026-05-18 mitosis PREMATURE_COMPLETION faults: when
+    // restartFeatureFromOriginIssues rewinds a phase from `committed` to
+    // `tests_green`, the plan checkboxes (flipped during markCommitted) must
+    // be un-flipped too. Without this, a subsequent failure on the re-run
+    // leaves checkboxes [x][x][x] while status is `failed` — the exact
+    // PREMATURE_COMPLETION signature.
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-restart-rewind-"),
+    );
+    const planFile = path.join(tmpDir, "plan.md");
+    const planMd = [
+      "# Plan",
+      "",
+      "## Feature 1: Auth",
+      "",
+      "### Phase 1.1: Tests",
+      "- [x] **Test Specification (test-writer role)**: spec",
+      "- [x] **Implementation (primary-impl role)**: impl",
+      "- [x] **Review & QA (review roles)**: review",
+      "",
+      "### Phase 1.2: Implementation",
+      "- [x] **Test Specification (test-writer role)**: spec",
+      "- [x] **Implementation (primary-impl role)**: impl",
+      "- [x] **Review & QA (review roles)**: review",
+      "",
+    ].join("\n");
+    fs.writeFileSync(planFile, planMd);
+
+    const { state, feature } = stateAndFeature();
+    state.planFile = planFile;
+
+    const phases: Phase[] = [
+      {
+        ...basePhase,
+        index: 0,
+        number: "1.1",
+        name: "Tests",
+        testSpecCheckboxLine: 6,
+        implementationCheckboxLine: 7,
+        reviewCheckboxLine: 8,
+      },
+      {
+        ...basePhase,
+        index: 1,
+        number: "1.2",
+        name: "Implementation",
+        testSpecCheckboxLine: 11,
+        implementationCheckboxLine: 12,
+        reviewCheckboxLine: 13,
+      },
+    ];
+
+    const restart = restartFeatureFromOriginIssues({
+      state,
+      feature,
+      issueLogPath: "/tmp/origin-issues.md",
+      reason: "missing acceptance behavior",
+      phases,
+    });
+
+    expect(restart).toEqual({ restarted: true, phaseIndex: 1 });
+    expect(state.phases[1].status).toBe("tests_green");
+
+    // Phase 1.2 (the rewound phase) checkboxes should be back to [ ].
+    const after = fs.readFileSync(planFile, "utf8").split(/\r?\n/);
+    expect(after[10]).toContain("[ ] **Test Specification");
+    expect(after[11]).toContain("[ ] **Implementation");
+    expect(after[12]).toContain("[ ] **Review & QA");
+
+    // Phase 1.1 (NOT rewound) checkboxes must stay [x].
+    expect(after[5]).toContain("[x] **Test Specification");
+    expect(after[6]).toContain("[x] **Implementation");
+    expect(after[7]).toContain("[x] **Review & QA");
+
+    fs.rmSync(tmpDir, { recursive: true });
+  });
+
+  it("FAIL-CLOSED: pauses feature when unflipPhaseCheckboxes errors (no state advance)", () => {
+    // Codex adversarial review finding: the original implementation
+    // console.warn'd on un-flip errors but still advanced state, recreating
+    // the exact PREMATURE_COMPLETION bug class (state rewound, markdown
+    // still [x][x][x]). Fix: if un-flip errors, return without state
+    // advance, pause the feature, surface the markdown drift to the user.
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-restart-failclosed-"),
+    );
+    const planFile = path.join(tmpDir, "plan.md");
+    // Plan was hand-edited: the impl checkbox marker is wrong (someone
+    // renamed it from **Implementation to **Wrong Marker mid-flight).
+    const planMd = [
+      "# Plan",
+      "",
+      "## Feature 1: Auth",
+      "",
+      "### Phase 1.1: Tests",
+      "- [x] **Test Specification (test-writer role)**: spec",
+      "- [x] **Implementation (primary-impl role)**: impl",
+      "- [x] **Review & QA (review roles)**: review",
+      "",
+      "### Phase 1.2: Implementation",
+      "- [x] **Test Specification (test-writer role)**: spec",
+      "- [x] **Wrong Marker (someone renamed this)**: impl",
+      "- [x] **Review & QA (review roles)**: review",
+      "",
+    ].join("\n");
+    fs.writeFileSync(planFile, planMd);
+
+    const { state, feature } = stateAndFeature();
+    state.planFile = planFile;
+
+    const phases: Phase[] = [
+      {
+        ...basePhase,
+        index: 0,
+        number: "1.1",
+        name: "Tests",
+        testSpecCheckboxLine: 6,
+        implementationCheckboxLine: 7,
+        reviewCheckboxLine: 8,
+      },
+      {
+        ...basePhase,
+        index: 1,
+        number: "1.2",
+        name: "Implementation",
+        testSpecCheckboxLine: 11,
+        implementationCheckboxLine: 12, // Marker doesn't match!
+        reviewCheckboxLine: 13,
+      },
+    ];
+
+    const restart = restartFeatureFromOriginIssues({
+      state,
+      feature,
+      issueLogPath: "/tmp/origin-issues.md",
+      reason: "missing acceptance behavior",
+      phases,
+    });
+
+    // Restart must be REJECTED, not silently advance.
+    expect(restart.restarted).toBe(false);
+    expect(restart.reason).toContain("plan markdown drift");
+    expect(restart.reason).toContain("1.2");
+    expect(feature.status).toBe("paused");
+    expect(feature.error).toContain("plan markdown drift");
+
+    // CRITICAL: phase status MUST stay `committed` — no rewind happened
+    // because the markdown couldn't follow. This is the fail-closed
+    // guarantee that prevents PREMATURE_COMPLETION recreation.
+    expect(state.phases[1].status).toBe("committed");
+
+    // Plan markdown is unchanged (atomic un-flip refused, atomic write
+    // didn't happen).
+    const after = fs.readFileSync(planFile, "utf8");
+    expect(after).toBe(planMd);
+
+    fs.rmSync(tmpDir, { recursive: true });
+  });
+
+  it("does not un-flip when phases arg is omitted (preserves existing callers)", () => {
+    // Existing tests that pre-date the un-flip wiring must still pass —
+    // when `phases` is omitted, the function falls back to the pre-fix
+    // behavior (rewind status, leave plan markdown alone).
+    const { state, feature } = stateAndFeature();
+    const restart = restartFeatureFromOriginIssues({
+      state,
+      feature,
+      issueLogPath: "/tmp/origin-issues.md",
+      reason: "missing acceptance behavior",
+      // phases intentionally omitted
+    });
+    expect(restart).toEqual({ restarted: true, phaseIndex: 1 });
+    expect(state.phases[1].status).toBe("tests_green");
+    // No fs.readFileSync — proves the function didn't try to touch a
+    // non-existent plan file. If un-flip ran unguarded it would throw ENOENT.
+  });
 });
 
 describe("markPhaseCommittedAfterManualRecovery", () => {
@@ -3049,6 +3260,312 @@ describe("markPhaseCommittedAfterManualRecovery", () => {
     const unchangedPlan = fs.readFileSync(planFile, "utf8");
     expect(unchangedPlan).toContain("- [ ] **Implementation");
     expect(unchangedPlan).toContain("- [ ] **Review");
+  });
+
+  describe("dirty-tree guard", () => {
+    // Stand up a real git repo so captureGitSnapshot can run. The dirty-tree
+    // guard was the recovery anti-pattern the 2026-05-18 mitosis faults all
+    // triggered: --mark-phase-committed silently force-marked over the dirty
+    // tree, leaving the next phase to start on an inconsistent state.
+    function setupDirtyWorktreeFixture(): {
+      tmpDir: string;
+      planFile: string;
+      phase: Phase;
+      state: BuildState;
+    } {
+      const dir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "gstack-dirty-guard-"),
+      );
+      // Init a real git repo so `git status --porcelain` runs.
+      spawnSync("git", ["init", "-q", "-b", "main", dir], { encoding: "utf8" });
+      spawnSync("git", ["-C", dir, "config", "user.email", "t@t"], {
+        encoding: "utf8",
+      });
+      spawnSync("git", ["-C", dir, "config", "user.name", "t"], {
+        encoding: "utf8",
+      });
+      spawnSync("git", ["-C", dir, "config", "commit.gpgsign", "false"], {
+        encoding: "utf8",
+      });
+      // Write the plan file BEFORE seed commit so it's tracked and doesn't
+      // show up as untracked in the "clean tree" tests.
+      const planFile = path.join(dir, "plan.md");
+      fs.writeFileSync(
+        planFile,
+        [
+          "# Plan",
+          "",
+          "### Phase 1.1: Foo",
+          "- [ ] **Implementation**: impl",
+          "- [ ] **Review**: review",
+          "",
+        ].join("\n"),
+      );
+      fs.writeFileSync(path.join(dir, "seed.txt"), "seed\n");
+      spawnSync("git", ["-C", dir, "add", "seed.txt", "plan.md"], {
+        encoding: "utf8",
+      });
+      spawnSync("git", ["-C", dir, "commit", "-q", "-m", "seed"], {
+        encoding: "utf8",
+      });
+      const phase: Phase = {
+        ...basePhase,
+        number: "1.1",
+        name: "Foo",
+        testSpecCheckboxLine: -1,
+        implementationCheckboxLine: 4,
+        reviewCheckboxLine: 5,
+      };
+      const state: BuildState = {
+        planFile,
+        planBasename: "plan",
+        slug: "build-plan",
+        branch: "main",
+        startedAt: "2026-05-19T00:00:00.000Z",
+        lastUpdatedAt: "2026-05-19T00:00:00.000Z",
+        currentPhaseIndex: 0,
+        currentFeatureIndex: 0,
+        features: [],
+        phases: [
+          {
+            index: 0,
+            number: "1.1",
+            name: "Foo",
+            status: "failed",
+            error: "old hygiene failure",
+          },
+        ],
+        completed: false,
+      };
+      return { tmpDir: dir, planFile, phase, state };
+    }
+
+    it("refuses to mark when worktree is dirty and no flag is passed", () => {
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      // Dirty the tree.
+      fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: dir,
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toContain("worktree is dirty");
+        expect(result.error).toContain("--commit-dirty");
+        expect(result.error).toContain("--force-dirty");
+        expect(result.dirtyFiles).toBeDefined();
+        expect(result.dirtyFiles?.some((f) => f.includes("dirty.txt"))).toBe(
+          true,
+        );
+      }
+      // State must NOT have advanced.
+      expect(state.phases[0].status).toBe("failed");
+      const unchangedPlan = fs.readFileSync(planFile, "utf8");
+      expect(unchangedPlan).toContain("- [ ] **Implementation");
+
+      fs.rmSync(dir, { recursive: true });
+    });
+
+    it("--force-dirty marks anyway, preserves the dirty state (warn-only)", () => {
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: dir,
+        forceDirty: true,
+      });
+      expect(result).toEqual({ ok: true, phaseIndex: 0 });
+      expect(state.phases[0].status).toBe("committed");
+      // Dirty file must still be on disk and uncommitted.
+      expect(fs.existsSync(path.join(dir, "dirty.txt"))).toBe(true);
+      const statusAfter = spawnSync(
+        "git",
+        ["-C", dir, "status", "--porcelain"],
+        { encoding: "utf8" },
+      );
+      expect(statusAfter.stdout).toContain("dirty.txt");
+
+      fs.rmSync(dir, { recursive: true });
+    });
+
+    it("--commit-dirty stages + commits dirty files before marking", () => {
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: dir,
+        commitDirty: true,
+      });
+      expect(result).toEqual({ ok: true, phaseIndex: 0 });
+      expect(state.phases[0].status).toBe("committed");
+      // `dirty.txt` (agent-left) must be committed and out of the dirty list.
+      // The orchestrator's subsequent checkbox flip dirties plan.md — that's
+      // expected and not the guard's responsibility.
+      const statusAfter = spawnSync(
+        "git",
+        ["-C", dir, "status", "--porcelain"],
+        { encoding: "utf8" },
+      );
+      expect(statusAfter.stdout).not.toContain("dirty.txt");
+      // The auto-commit must exist with the recovery message prefix.
+      const logAfter = spawnSync(
+        "git",
+        ["-C", dir, "log", "-1", "--format=%s"],
+        { encoding: "utf8" },
+      );
+      expect(logAfter.stdout).toContain("fix(recovery): 1.1 auto-commit");
+      // dirty.txt must be part of the committed tree now.
+      const showAfter = spawnSync(
+        "git",
+        ["-C", dir, "show", "--stat", "--format=", "HEAD"],
+        { encoding: "utf8" },
+      );
+      expect(showAfter.stdout).toContain("dirty.txt");
+
+      fs.rmSync(dir, { recursive: true });
+    });
+
+    it("--force-dirty and --commit-dirty are mutually exclusive", () => {
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: dir,
+        forceDirty: true,
+        commitDirty: true,
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toContain("mutually exclusive");
+      }
+      expect(state.phases[0].status).toBe("failed");
+      fs.rmSync(dir, { recursive: true });
+    });
+
+    it("clean tree marks without invoking the guard (no flags needed)", () => {
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      // No dirty file — tree is clean from setup.
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: dir,
+      });
+      expect(result).toEqual({ ok: true, phaseIndex: 0 });
+      expect(state.phases[0].status).toBe("committed");
+      fs.rmSync(dir, { recursive: true });
+    });
+
+    it("skips the dirty-tree guard when cwd is omitted (legacy callers)", () => {
+      // No cwd passed → no git inspection → no refusal. This preserves
+      // backward compat for existing tests that exercise the state-only
+      // transition without setting up a real git fixture.
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        // cwd intentionally omitted
+      });
+      expect(result).toEqual({ ok: true, phaseIndex: 0 });
+      expect(state.phases[0].status).toBe("committed");
+      fs.rmSync(dir, { recursive: true });
+    });
+
+    it("fails closed when captureGitSnapshot reports a git error (index.lock held, etc)", () => {
+      // Adversarial review finding: a non-zero `git status` exit encodes as
+      // `<git error: ...>` in snapshot.status. Filtering those out treats
+      // them as "clean" → silent guard bypass. Now we surface the error
+      // and refuse, unless --force-dirty is passed.
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      // Point cwd at a non-git directory so captureGitSnapshot fails.
+      const nonGitDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "gstack-not-a-git-repo-"),
+      );
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: nonGitDir,
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toContain("git status failed");
+        expect(result.error).toContain("--force-dirty");
+      }
+      // State must NOT have advanced.
+      expect(state.phases[0].status).toBe("failed");
+
+      fs.rmSync(dir, { recursive: true });
+      fs.rmSync(nonGitDir, { recursive: true });
+    });
+
+    it("--force-dirty bypasses git-error fail-closed (operator accepts unknown state)", () => {
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      const nonGitDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "gstack-not-a-git-repo-"),
+      );
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: nonGitDir,
+        forceDirty: true,
+      });
+      // With --force-dirty, snapshot failure is logged-and-skipped (the
+      // operator already accepted that the worktree state may be dirty;
+      // an unknown state is no worse). State advances.
+      expect(result).toEqual({ ok: true, phaseIndex: 0 });
+      expect(state.phases[0].status).toBe("committed");
+
+      fs.rmSync(dir, { recursive: true });
+      fs.rmSync(nonGitDir, { recursive: true });
+    });
+
+    it("dryRun skips the dirty-tree guard (preview mode never inspects worktree)", () => {
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: dir,
+        dryRun: true,
+      });
+      // Dry-run preview must succeed even on dirty trees; the operator can
+      // see what would happen before deciding whether to add --commit-dirty.
+      expect(result).toEqual({ ok: true, phaseIndex: 0 });
+      // No state mutation in dry-run.
+      expect(state.phases[0].status).toBe("failed");
+      fs.rmSync(dir, { recursive: true });
+    });
   });
 });
 

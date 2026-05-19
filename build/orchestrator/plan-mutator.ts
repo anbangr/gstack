@@ -384,6 +384,125 @@ export function appendFeaturePhases(args: AppendFeaturePhasesArgs): {
 }
 
 /**
+ * Un-flip all phase checkboxes from `[x]` back to `[ ]` in ONE atomic
+ * write. Used when the orchestrator rewinds a `committed` phase back to
+ * an in-flight state (e.g. `restartFeatureFromOriginIssues` rewinds to
+ * `tests_green` to re-run review/QA after origin verification fails).
+ *
+ * **Atomicity is load-bearing.** A previous version did three separate
+ * `setCheckboxState` calls; if the impl flip failed marker validation
+ * mid-way (plan was hand-edited between parse and rewind), the plan
+ * was left half-rewound — test-spec back to `[ ]`, impl still `[x]`,
+ * review back to `[ ]`. That's silent corruption: the next run would
+ * see a partially-checked phase whose state didn't match the markdown.
+ *
+ * Now: validate ALL target lines first (no writes), then do ONE atomic
+ * temp+rename write that contains all three flips. If any line fails
+ * validation, no write happens — caller gets a clear error and can
+ * decide whether to fail closed.
+ *
+ * Without un-flipping, a subsequent re-run failure leaves checkboxes
+ * `[x][x][x]` while phase status is `failed` — the exact
+ * PREMATURE_COMPLETION signature. Symmetric counterpart of
+ * `reconcilePhaseCheckboxes`.
+ */
+export function unflipPhaseCheckboxes(
+  planFile: string,
+  phase: Phase,
+): { unflipped: number; errors: string[] } {
+  const errors: string[] = [];
+  const content = fs.readFileSync(planFile, "utf8");
+  const lines = content.split(/\r?\n/);
+
+  const implMarker = IMPL_MARKER_BY_KIND[phase.kind ?? "code"];
+  const reviewMarker = REVIEW_MARKER_BY_KIND[phase.kind ?? "code"];
+
+  // Build the list of (lineNumber, expectedMarker, label) targets first.
+  const targets: Array<{ line: number; marker: string; label: string }> = [];
+  if (phase.testSpecCheckboxLine !== -1) {
+    targets.push({
+      line: phase.testSpecCheckboxLine,
+      marker: TEST_SPEC_MARKER,
+      label: "test-spec",
+    });
+  }
+  if (phase.implementationCheckboxLine > 0) {
+    targets.push({
+      line: phase.implementationCheckboxLine,
+      marker: implMarker,
+      label: "impl",
+    });
+  }
+  if (phase.reviewCheckboxLine > 0) {
+    targets.push({
+      line: phase.reviewCheckboxLine,
+      marker: reviewMarker,
+      label: "review",
+    });
+  }
+
+  // VALIDATE all targets first. No writes happen until every target passes.
+  // This is the atomicity guarantee — better to leave checkboxes fully [x]
+  // than half-rewound when the plan was hand-edited mid-flight.
+  const checkboxRe = /^(\s*-\s+\[)([ xX])(\])/;
+  const planned: Array<{ idx: number; newLine: string; wasUnchecked: boolean }> = [];
+  for (const t of targets) {
+    if (t.line < 1 || t.line > lines.length) {
+      errors.push(
+        `${t.label}: line ${t.line} out of range (file has ${lines.length} lines)`,
+      );
+      continue;
+    }
+    const idx = t.line - 1;
+    const line = lines[idx];
+    if (!line.includes(t.marker)) {
+      errors.push(
+        `${t.label}: line ${t.line} no longer contains "${t.marker}" — plan was edited externally; re-parse and try again`,
+      );
+      continue;
+    }
+    const m = line.match(checkboxRe);
+    if (!m) {
+      errors.push(
+        `${t.label}: line ${t.line} does not look like a checkbox list item: ${JSON.stringify(line.slice(0, 80))}`,
+      );
+      continue;
+    }
+    const isChecked = m[2].toLowerCase() === "x";
+    if (!isChecked) {
+      // Already unchecked → idempotent no-op for this line.
+      planned.push({ idx, newLine: line, wasUnchecked: true });
+      continue;
+    }
+    planned.push({
+      idx,
+      newLine: line.replace(checkboxRe, "$1 $3"),
+      wasUnchecked: false,
+    });
+  }
+
+  if (errors.length > 0) {
+    // ANY validation error aborts the whole un-flip. Plan markdown stays
+    // unchanged. Caller MUST treat this as a hard failure — proceeding with
+    // a state rewind while the markdown is unchanged recreates exactly the
+    // PREMATURE_COMPLETION race this function exists to prevent.
+    return { unflipped: 0, errors };
+  }
+
+  // Apply all flips in memory, then ONE atomic temp+rename write.
+  const unflipped = planned.filter((p) => !p.wasUnchecked).length;
+  if (unflipped === 0) {
+    // Everything was already unchecked — no write needed.
+    return { unflipped: 0, errors };
+  }
+  for (const p of planned) {
+    lines[p.idx] = p.newLine;
+  }
+  writePlanContentAtomic(planFile, joinPlanLines(content, lines));
+  return { unflipped, errors };
+}
+
+/**
  * Flip all checkboxes for a single phase. Used by both the startup
  * reconcile (cli.ts) and the one-shot backfill CLI. Returns the count
  * of boxes flipped and any error strings so callers can log differently.
