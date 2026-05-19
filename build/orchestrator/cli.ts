@@ -5488,6 +5488,28 @@ export function markPhaseCommittedAfterManualRecovery(args: {
   // --commit-dirty stages and commits with a standard recovery message.
   if (args.cwd && !args.dryRun) {
     const snap = captureGitSnapshot(args.cwd);
+    // captureGitSnapshot encodes `git status` failures as a single
+    // `<git error: ...>` line. Treating those as "clean" would silently
+    // bypass the guard when index.lock is held, the repo is corrupted, or
+    // permissions are wrong — exactly the failure mode the operator needs
+    // to know about. Fail closed and ask the operator to retry or pass
+    // --force-dirty if they understand the snapshot is unavailable.
+    const gitErrorLine = snap.status.find((line) =>
+      line.startsWith("<git error:"),
+    );
+    if (gitErrorLine && !args.forceDirty) {
+      return {
+        ok: false,
+        error: [
+          `git status failed in ${args.cwd}:`,
+          `  ${gitErrorLine}`,
+          ``,
+          `Cannot inspect worktree state — refusing to mark phase ${phase.number} committed.`,
+          `Resolve the git error (often a stale .git/index.lock), then retry.`,
+          `Or pass --force-dirty to mark anyway (you accept that the worktree state is unknown).`,
+        ].join("\n"),
+      };
+    }
     const dirtyFiles = snap.status.filter(
       (line) => !line.startsWith("<git error:"),
     );

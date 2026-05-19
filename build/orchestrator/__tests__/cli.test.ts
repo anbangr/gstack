@@ -3411,6 +3411,60 @@ describe("markPhaseCommittedAfterManualRecovery", () => {
       fs.rmSync(dir, { recursive: true });
     });
 
+    it("fails closed when captureGitSnapshot reports a git error (index.lock held, etc)", () => {
+      // Adversarial review finding: a non-zero `git status` exit encodes as
+      // `<git error: ...>` in snapshot.status. Filtering those out treats
+      // them as "clean" → silent guard bypass. Now we surface the error
+      // and refuse, unless --force-dirty is passed.
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      // Point cwd at a non-git directory so captureGitSnapshot fails.
+      const nonGitDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "gstack-not-a-git-repo-"),
+      );
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: nonGitDir,
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toContain("git status failed");
+        expect(result.error).toContain("--force-dirty");
+      }
+      // State must NOT have advanced.
+      expect(state.phases[0].status).toBe("failed");
+
+      fs.rmSync(dir, { recursive: true });
+      fs.rmSync(nonGitDir, { recursive: true });
+    });
+
+    it("--force-dirty bypasses git-error fail-closed (operator accepts unknown state)", () => {
+      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      const nonGitDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "gstack-not-a-git-repo-"),
+      );
+
+      const result = markPhaseCommittedAfterManualRecovery({
+        state,
+        phases: [phase],
+        phaseNumber: "1.1",
+        planFile,
+        cwd: nonGitDir,
+        forceDirty: true,
+      });
+      // With --force-dirty, snapshot failure is logged-and-skipped (the
+      // operator already accepted that the worktree state may be dirty;
+      // an unknown state is no worse). State advances.
+      expect(result).toEqual({ ok: true, phaseIndex: 0 });
+      expect(state.phases[0].status).toBe("committed");
+
+      fs.rmSync(dir, { recursive: true });
+      fs.rmSync(nonGitDir, { recursive: true });
+    });
+
     it("dryRun skips the dirty-tree guard (preview mode never inspects worktree)", () => {
       const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
       fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
