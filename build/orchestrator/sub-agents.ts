@@ -295,7 +295,7 @@ function quote(s: string): string {
  * `--yolo` sandbox auto-whitelists that path based on the spawned
  * process's working directory.
  *
- * Why basename(cwd), not opts.slug:
+ * Why basename(cwd), not opts.slug for the directory:
  * Gemini infers its workspace temp dir from `basename(cwd)`. The
  * orchestrator's `slug` is `deriveSlug(planFile)` which prepends `build-`
  * to the plan basename (see state.ts:deriveSlug). The worktree directory
@@ -304,17 +304,27 @@ function quote(s: string): string {
  * and silently degrades to inference — dirtying the worktree with
  * hallucinated edits.
  *
+ * Why opts.slug IS in the staged filename:
+ * Dual-impl runs (build/orchestrator/worktree.ts) always produce
+ * worktrees named `primary` and `secondary`, so two concurrent builds
+ * of different plans would collide on ~/.gemini/tmp/primary/ if the
+ * filename only carried phase/iteration/suffix. The slug (typically
+ * `build-<plan-basename>-p<N>-<ts>` after deriveSlug, but a clean
+ * non-empty token in any case) disambiguates parallel runs sharing
+ * a basename(cwd). Sanitized to a single path segment to prevent
+ * directory traversal into the staging dir.
+ *
  * History: This helper used to write to ~/.gemini/tmp/gstack/<slug>/.
  * Commit 67480efe dropped the `gstack/` segment but kept `opts.slug` as
- * the directory key, which still mismatches when `slug` carries the
+ * the directory key, which still mismatched when `slug` carried the
  * `build-` prefix. Observed 2026-05-17 on agnt2-prototype-plan4
  * (T111646), 2026-05-18 on mitosis-control-plane-impl-plan Phase 3.3.
- *
- * `opts.slug` is still used in the staged filename suffix so logs across
- * parallel runs in the same worktree stay distinguishable.
+ * Adversarial review on the directory-fix patch caught the dual-impl
+ * collision risk and forced opts.slug into the filename too.
  *
  * Exported so build/orchestrator/__tests__/sub-agents.test.ts can pin
- * the cross-system invariant (basename(cwd) equals Gemini's whitelist key).
+ * the cross-system invariants (basename(cwd) equals Gemini's whitelist
+ * key; opts.slug appears in the filename to disambiguate parallel runs).
  *
  * Returns { stagedInput, stagedOutput, cleanup }.
  * Call cleanup() after spawnCaptured returns; it copies the output back to
@@ -339,7 +349,8 @@ export function stageGeminiIO(opts: {
   );
   fs.mkdirSync(stagingDir, { recursive: true });
 
-  const base = `gstack-gemini-${opts.phaseNumber}-${opts.iteration}-${opts.suffix}`;
+  const slugSegment = opts.slug.replace(/[^a-zA-Z0-9._-]+/g, "-");
+  const base = `gstack-gemini-${slugSegment}-${opts.phaseNumber}-${opts.iteration}-${opts.suffix}`;
   const stagedInput = path.join(stagingDir, `${base}-input.md`);
   const stagedOutput = path.join(stagingDir, `${base}-output.md`);
 

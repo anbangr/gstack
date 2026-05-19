@@ -2441,6 +2441,123 @@ describe("stageGeminiIO", () => {
       fs.rmdirSync(cwd);
     } catch {}
   });
+
+  it("parallel runs sharing basename(cwd) do NOT collide on filename (dual-impl safety)", () => {
+    // Dual-impl always produces worktrees named `primary` and `secondary`
+    // (build/orchestrator/worktree.ts). Two concurrent dual-impl builds of
+    // different plans would BOTH stage primary under ~/.gemini/tmp/primary/.
+    // Per-filename slug disambiguation prevents one run from clobbering the
+    // other's input/output before cleanup. Without the slug in the filename,
+    // run B would overwrite run A's input mid-flight and A would copy B's
+    // output back as its own. Adversarial review (Claude + Codex) flagged
+    // this on the directory-fix patch; this test pins the disambiguation.
+    const sharedBasename = `primary-${Date.now()}`;
+    const cwd = path.join(os.tmpdir(), sharedBasename);
+    fs.mkdirSync(cwd, { recursive: true });
+
+    const inputFileA = path.join(os.tmpdir(), `in-a-${Date.now()}.md`);
+    const inputFileB = path.join(os.tmpdir(), `in-b-${Date.now()}.md`);
+    fs.writeFileSync(inputFileA, "input A\n");
+    fs.writeFileSync(inputFileB, "input B\n");
+    stagedPaths.push(inputFileA, inputFileB);
+
+    const outputFileA = path.join(os.tmpdir(), `out-a-${Date.now()}.md`);
+    const outputFileB = path.join(os.tmpdir(), `out-b-${Date.now()}.md`);
+    stagedPaths.push(outputFileA, outputFileB);
+
+    // Same cwd, same phase/iteration/suffix — only slug differs.
+    // This mirrors the production case: two parallel dual-impl runs of
+    // different plans both hit phase 1.1 attempt 1 with suffix "dual-primary".
+    const commonOpts = {
+      cwd,
+      phaseNumber: "1.1",
+      iteration: 1,
+      suffix: "dual-primary",
+    };
+
+    const a = stageGeminiIO({
+      ...commonOpts,
+      slug: "build-plan-a-20260519-aaaa",
+      inputFilePath: inputFileA,
+      outputFilePath: outputFileA,
+    });
+    const b = stageGeminiIO({
+      ...commonOpts,
+      slug: "build-plan-b-20260519-bbbb",
+      inputFilePath: inputFileB,
+      outputFilePath: outputFileB,
+    });
+    stagedPaths.push(a.stagedInput, a.stagedOutput, b.stagedInput, b.stagedOutput);
+
+    // Both runs land in the same directory (Gemini sandbox alignment).
+    expect(path.dirname(a.stagedInput)).toBe(path.dirname(b.stagedInput));
+
+    // CRITICAL: filenames MUST diverge so concurrent writes don't clobber.
+    expect(a.stagedInput).not.toBe(b.stagedInput);
+    expect(a.stagedOutput).not.toBe(b.stagedOutput);
+
+    // Each file holds its own input (no cross-contamination).
+    expect(fs.readFileSync(a.stagedInput, "utf8")).toBe("input A\n");
+    expect(fs.readFileSync(b.stagedInput, "utf8")).toBe("input B\n");
+
+    // Simulate both agents writing.
+    fs.writeFileSync(a.stagedOutput, "result A");
+    fs.writeFileSync(b.stagedOutput, "result B");
+
+    // Each cleanup copies back its own result.
+    a.cleanup();
+    b.cleanup();
+    expect(fs.readFileSync(outputFileA, "utf8")).toBe("result A");
+    expect(fs.readFileSync(outputFileB, "utf8")).toBe("result B");
+
+    try {
+      fs.rmdirSync(cwd);
+    } catch {}
+  });
+
+  it("sanitizes path-traversal characters out of slug before embedding in filename", () => {
+    // opts.slug is orchestrator-controlled today but we don't want a future
+    // caller passing a slug containing `../` or `/` to escape stagingDir.
+    // The sanitizer collapses anything outside [a-zA-Z0-9._-] to `-`.
+    const worktreeName = `sanitize-${Date.now()}`;
+    const cwd = path.join(os.tmpdir(), worktreeName);
+    fs.mkdirSync(cwd, { recursive: true });
+
+    const inputFile = path.join(os.tmpdir(), `in-sanitize-${Date.now()}.md`);
+    fs.writeFileSync(inputFile, "test\n");
+    stagedPaths.push(inputFile);
+    const outputFile = path.join(os.tmpdir(), `out-sanitize-${Date.now()}.md`);
+    stagedPaths.push(outputFile);
+
+    const r = stageGeminiIO({
+      cwd,
+      slug: "../../etc/passwd",
+      phaseNumber: "1.1",
+      iteration: 1,
+      suffix: "x",
+      inputFilePath: inputFile,
+      outputFilePath: outputFile,
+    });
+    stagedPaths.push(r.stagedInput, r.stagedOutput);
+
+    const expectedDir = path.join(os.homedir(), ".gemini", "tmp", worktreeName);
+    expect(r.stagedInput.startsWith(expectedDir + path.sep)).toBe(true);
+    expect(r.stagedOutput.startsWith(expectedDir + path.sep)).toBe(true);
+
+    // The filename (everything after stagingDir/) must contain no path separators
+    // and no `etc/passwd`-style segment. `..` as literal characters within
+    // a single filename is harmless — `path.join` treats it as filename text,
+    // not as a parent reference — but `/` would escape stagingDir.
+    const filename = path.basename(r.stagedInput);
+    expect(filename).not.toContain("/");
+    expect(filename).not.toContain("\\");
+    expect(filename).not.toMatch(/etc[\/\\]passwd/);
+
+    r.cleanup();
+    try {
+      fs.rmdirSync(cwd);
+    } catch {}
+  });
 });
 
 // ---------------------------------------------------------------------------
