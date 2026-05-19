@@ -13,7 +13,7 @@ const MODULE_TEST_OWNERS: Record<string, string[]> = {
   "build-config.ts": ["role-config.test.ts"],
   "build-doctor.ts": ["cli.test.ts", "integration.test.ts"],
   "child-registry.ts": ["child-registry.test.ts", "no-bare-spawn.test.ts"],
-  "drain-faults.ts": ["drain-faults.test.ts"],
+  "drain-faults.ts": ["drain-faults.test.ts", "drain-halt-events.test.ts"],
   "escalation-streak.ts": ["escalation-streak.test.ts"],
   "heartbeat.ts": ["cli.test.ts"],
   "mark-shipped.ts": ["mark-shipped.test.ts"],

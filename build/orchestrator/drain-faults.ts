@@ -47,6 +47,19 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, spawnSync, type ChildProcess } from "./child-registry";
 import { attachStallWatchdog, killProcessAndGroup } from "./stall-watchdog";
+import {
+  loadPendingInvestigations,
+  markInvestigated,
+  pendingInvestigationsDir,
+  type HaltEvent,
+  type HaltSeverity,
+} from "./halt-events";
+import {
+  buildInvestigatorPrompt,
+  parseInvestigationReport,
+  type InvestigationReport,
+} from "./investigator-dispatch";
+import { loadLearnedPatterns } from "./skill-fault-detector";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -832,4 +845,591 @@ export async function drainFaultsFromMonitor(
   } catch {
     return null;
   }
+}
+
+// ===========================================================================
+// Halt-events queue path (PR 5 of the halt-events rollout)
+// ===========================================================================
+//
+// This is the NEW queue-driven path that consumes structured halt events from
+// ~/.gstack/skill-faults/pending-investigations/*.json. It runs ALONGSIDE the
+// existing log-based drainFaults() above — that path consumes
+// monitor-output.log line-by-line. They share the provider-dispatch table
+// (PROVIDER_DISPATCH) and the configure.cm resolver, but the new path uses a
+// different role (`investigator` instead of `faultInvestigator`) and a
+// different default model (codex/gpt-5.5/high instead of claude-sonnet-4-6).
+//
+// Why a separate function: the queue path captures stdout (to parse as JSON)
+// rather than redirecting it to a file (which is what the log path does for
+// the markdown report). Different output discipline = different spawn path.
+
+const SEVERITY_RANK: Record<HaltSeverity, number> = {
+  LOW: 0,
+  MEDIUM: 1,
+  HIGH: 2,
+  CRITICAL: 3,
+};
+
+export interface DrainHaltEventsOptions {
+  /** Override the queue dir. Defaults to $GSTACK_HOME/skill-faults. */
+  queueDir?: string;
+  /** Cap the number of investigations dispatched per invocation. Default 20. */
+  max?: number;
+  /** Filter: only process events at or above this severity. Default MEDIUM. */
+  severityMin?: HaltSeverity;
+  /** Scope to a single runId. */
+  runIdFilter?: string;
+  /** Override the configure.cm role for the investigator model. */
+  investigatorModel?: string;
+  /** Per-investigator timeout in ms. Default 10 minutes. */
+  investigatorTimeoutMs?: number;
+  /** Override inbox dir for auto-filing. Default <cwd>/inbox. */
+  inboxDir?: string;
+  /**
+   * TEST-ONLY: synchronous mock returning an InvestigationReport. When set,
+   * skips real LLM dispatch entirely. Production paths MUST leave this unset.
+   */
+  mockInvestigator?: (he: HaltEvent) => InvestigationReport;
+  /** For tests: override gstack-config binary path. */
+  gstackConfigBin?: string;
+  /** For tests: override configure.cm path. */
+  configureFile?: string;
+  /** If true, parse + report intent without spawning an investigator. */
+  dryRun?: boolean;
+}
+
+export interface DrainHaltEventsResult {
+  /** Investigations dispatched and parsed successfully. */
+  processed: number;
+  /** Events filtered out by severity gate or runId filter. */
+  skipped: number;
+  /** Events that matched an existing learned pattern (no dispatch). */
+  shortCircuited: number;
+  /** Auto-filed to <inbox>/<date>-halt-<faultId>.md. */
+  inboxFiled: number;
+  /** Pattern proposals appended to pending-patterns.jsonl. */
+  proposalsAppended: number;
+  /** Events that failed to dispatch or parse. */
+  failed: number;
+}
+
+/**
+ * Read configure.cm and return the resolved investigator role.
+ *
+ * Falls back to { codex, gpt-5.5, high } if file is missing or role is absent.
+ * Distinct from the existing resolveInvestigatorConfig() because:
+ *   - It reads `roles.investigator` (not `roles.faultInvestigator`).
+ *   - Its fallback is codex/gpt-5.5 (not claude-sonnet-4-6).
+ */
+function resolveInvestigatorRole(opts: {
+  configureFile?: string;
+  investigatorModel?: string;
+}): InvestigatorConfig {
+  const configureFile =
+    opts.configureFile ??
+    path.join(
+      os.homedir(),
+      ".claude",
+      "skills",
+      "gstack",
+      "build",
+      "configure.cm",
+    );
+  let provider: InvestigatorProvider = "codex";
+  let model = "gpt-5.5";
+  let reasoning = "high";
+  try {
+    if (fs.existsSync(configureFile)) {
+      const content = fs.readFileSync(configureFile, "utf-8");
+      const parsed = JSON.parse(content) as {
+        roles?: { investigator?: Record<string, unknown> };
+      };
+      const role = parsed?.roles?.investigator;
+      if (role) {
+        const rawProvider = role.provider;
+        if (
+          rawProvider === "claude" ||
+          rawProvider === "codex" ||
+          rawProvider === "gemini" ||
+          rawProvider === "kimi"
+        ) {
+          provider = rawProvider;
+        }
+        if (typeof role.model === "string" && role.model.trim() !== "") {
+          model = role.model;
+        }
+        if (
+          typeof role.reasoning === "string" &&
+          role.reasoning.trim() !== ""
+        ) {
+          reasoning = role.reasoning;
+        }
+      }
+    }
+  } catch {
+    // fall through to defaults
+  }
+  if (opts.investigatorModel && opts.investigatorModel.trim() !== "") {
+    model = opts.investigatorModel;
+    // If user overrode model, re-derive provider via heuristic.
+    provider = heuristicProvider(model);
+  }
+  return { provider, model, reasoning };
+}
+
+/**
+ * Spawn an investigator and CAPTURE its stdout to a buffer (rather than
+ * redirecting to a file like the log-path spawnInvestigator does).
+ *
+ * Returns the raw stdout string on success, or null on spawn/exit failure or
+ * stall-kill. Reuses PROVIDER_DISPATCH for argv construction so all 4
+ * providers work identically across log and queue paths.
+ */
+async function spawnInvestigatorCapture(args: {
+  prompt: string;
+  config: InvestigatorConfig;
+  timeoutMs: number;
+}): Promise<string | null> {
+  const builder = PROVIDER_DISPATCH[args.config.provider as InvestigatorProvider];
+  if (!builder) return null;
+  const { cmd, args: cmdArgs } = builder({
+    prompt: args.prompt,
+    model: args.config.model,
+    reasoning: args.config.reasoning,
+    cwd: process.cwd(),
+  });
+  const child = spawn(cmd, cmdArgs, {
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  let stdoutBuf = "";
+  if (child.stdout) {
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdoutBuf += chunk;
+    });
+  }
+  if (child.stderr) {
+    // Drain stderr so codex doesn't backpressure; we don't use it.
+    child.stderr.resume();
+  }
+
+  // Wall-clock timeout (no mtime watchdog here since we're streaming stdout
+  // directly; this is a different liveness regime than the file-watching
+  // log path).
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    const pid = child.pid;
+    if (typeof pid === "number" && pid > 0) {
+      killProcessAndGroup(pid, "SIGTERM");
+      setTimeout(() => {
+        killProcessAndGroup(pid, "SIGKILL");
+      }, 5000).unref();
+    }
+  }, args.timeoutMs);
+  // Don't keep the event loop alive solely for this timer.
+  if (typeof (timer as NodeJS.Timeout).unref === "function") {
+    (timer as NodeJS.Timeout).unref();
+  }
+
+  return await new Promise<string | null>((resolve) => {
+    let settled = false;
+    const settle = (v: string | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(v);
+    };
+    child.on("error", () => settle(null));
+    child.on("exit", (code) => {
+      if (timedOut) {
+        settle(null);
+        return;
+      }
+      settle(code === 0 ? stdoutBuf : null);
+    });
+  });
+}
+
+/**
+ * Render the InvestigationReport into the per-fault markdown report.
+ * Written to <queueDir>/<runId>/<faultId>.md.
+ */
+function renderInvestigationMarkdown(
+  he: HaltEvent,
+  report: InvestigationReport,
+): string {
+  const lines: string[] = [];
+  lines.push(`# Halt investigation: ${he.faultId}`);
+  lines.push("");
+  lines.push(`**Kind:** ${he.kind}`);
+  lines.push(`**Severity:** ${he.severity}`);
+  lines.push(`**Outcome:** ${report.outcome}`);
+  lines.push(`**Halt message:** ${he.message}`);
+  lines.push("");
+  lines.push("## Root cause");
+  lines.push("");
+  lines.push(report.rootCause);
+  lines.push("");
+  lines.push("## Evidence");
+  lines.push("");
+  if (report.evidence.length === 0) {
+    lines.push("(none)");
+  } else {
+    for (const e of report.evidence) lines.push(`- ${e}`);
+  }
+  lines.push("");
+  if (report.proposedFix && report.proposedFix.options.length > 0) {
+    lines.push("## Proposed fix");
+    lines.push("");
+    for (const opt of report.proposedFix.options) {
+      lines.push(`### ${opt.label} (blast: ${opt.blast_radius})`);
+      lines.push("");
+      lines.push(opt.description);
+      lines.push("");
+    }
+  }
+  if (report.learnedPatternProposal) {
+    const lp = report.learnedPatternProposal;
+    lines.push("## Learned pattern proposal");
+    lines.push("");
+    lines.push(`Category: ${lp.category}`);
+    lines.push(`Matcher: ${lp.matcherKind}`);
+    lines.push(`Pattern: \`${lp.pattern}\``);
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Render the inbox auto-file markdown — Garry's signal that a halt needs
+ * triage. Only written when severity >= HIGH AND outcome is actionable.
+ */
+function renderInboxMarkdown(
+  he: HaltEvent,
+  report: InvestigationReport,
+  now: Date,
+): string {
+  const lines: string[] = [];
+  lines.push(`# Halt investigation: ${he.kind}`);
+  lines.push("");
+  lines.push(`**Auto-filed by drain-faults** (${now.toISOString()})`);
+  lines.push(`**Halt severity:** ${he.severity}`);
+  lines.push(`**Outcome:** ${report.outcome}`);
+  lines.push(`**Run:** ${he.runId}`);
+  lines.push("");
+  lines.push("## Symptom");
+  lines.push("");
+  lines.push(he.message);
+  lines.push("");
+  lines.push("## Root cause (investigator)");
+  lines.push("");
+  lines.push(report.rootCause);
+  lines.push("");
+  lines.push("## Evidence");
+  lines.push("");
+  if (report.evidence.length === 0) {
+    lines.push("(none)");
+  } else {
+    for (const e of report.evidence) lines.push(`- ${e}`);
+  }
+  lines.push("");
+  if (report.proposedFix && report.proposedFix.options.length > 0) {
+    lines.push("## Proposed fix");
+    lines.push("");
+    for (const opt of report.proposedFix.options) {
+      lines.push(`### ${opt.label} (blast: ${opt.blast_radius})`);
+      lines.push("");
+      lines.push(opt.description);
+      lines.push("");
+    }
+  } else {
+    lines.push("## Proposed fix");
+    lines.push("");
+    lines.push("(none — investigator did not propose one)");
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+function isoDateUtc(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Check if any existing learned pattern matches this halt event's symptoms.
+ *
+ * Crude first cut: scan against stdoutTail / failureReason via the same
+ * matcherKind semantics the detector uses. Returns the matched pattern's
+ * category, or null. On match, callers short-circuit the investigator.
+ */
+function learnedPatternMatch(
+  he: HaltEvent,
+): { category: string } | null {
+  let patterns;
+  try {
+    patterns = loadLearnedPatterns();
+  } catch {
+    return null;
+  }
+  if (!patterns || patterns.length === 0) return null;
+  const stdoutTail = he.snapshot?.stdoutTail ?? "";
+  const failureReason = he.snapshot?.failureReason ?? "";
+  for (const lp of patterns) {
+    try {
+      let hit = false;
+      switch (lp.matcherKind) {
+        case "stdout_contains":
+          hit = stdoutTail.includes(lp.pattern);
+          break;
+        case "stdout_regex":
+          hit = new RegExp(lp.pattern).test(stdoutTail);
+          break;
+        case "failureReason_contains":
+          hit = failureReason.includes(lp.pattern);
+          break;
+        case "failureReason_regex":
+          hit = new RegExp(lp.pattern).test(failureReason);
+          break;
+        // plan_*/state_jsonpath would need re-reading the plan/state file
+        // referenced by pointers. Out of scope for the queue's short-circuit
+        // (the detector already evaluates these against live state).
+        default:
+          hit = false;
+      }
+      if (hit) return { category: lp.category };
+    } catch {
+      // ignore malformed pattern
+    }
+  }
+  return null;
+}
+
+/**
+ * Drain halt events from ~/.gstack/skill-faults/pending-investigations/.
+ *
+ * For each pending halt event:
+ *   1. Severity gate + runId filter
+ *   2. Check learned-patterns for a short-circuit. If hit, log + move to
+ *      processed/, skip investigator dispatch.
+ *   3. Dispatch investigator (real via configure.cm role, or mockInvestigator
+ *      for tests). Parse the InvestigationReport from stdout.
+ *   4. Write 3 sinks:
+ *      - Append to ~/.gstack/analytics/skill-faults.jsonl
+ *      - <queueDir>/<runId>/<faultId>.md
+ *      - If severity >= HIGH AND outcome in {root-cause-identified, needs-human}:
+ *        <inboxDir>/<YYYY-MM-DD>-halt-<faultId>.md
+ *   5. If learnedPatternProposal is non-null: append to pending-patterns.jsonl
+ *   6. Move queue file from pending-investigations/ to processed/.
+ *
+ * Guardrails: opts.max (default 20), opts.severityMin (default MEDIUM),
+ * opts.runIdFilter.
+ */
+export async function drainFaultsFromHaltEventsQueue(
+  opts: DrainHaltEventsOptions = {},
+): Promise<DrainHaltEventsResult> {
+  const result: DrainHaltEventsResult = {
+    processed: 0,
+    skipped: 0,
+    shortCircuited: 0,
+    inboxFiled: 0,
+    proposalsAppended: 0,
+    failed: 0,
+  };
+
+  const queueDir =
+    opts.queueDir ?? path.join(getGstackHome(), "skill-faults");
+  const max = opts.max ?? 20;
+  const severityMin = opts.severityMin ?? "MEDIUM";
+  const minRank = SEVERITY_RANK[severityMin];
+  const timeoutMs =
+    opts.investigatorTimeoutMs ?? DEFAULT_INVESTIGATOR_TIMEOUT_MS;
+  const events = loadPendingInvestigations({ queueDir });
+
+  // Existing learned-pattern categories — passed to the prompt so the
+  // investigator doesn't propose duplicates.
+  let existingCategories: string[] = [];
+  try {
+    existingCategories = loadLearnedPatterns().map((lp) => lp.category);
+  } catch {
+    // ignore
+  }
+
+  let processedCount = 0;
+  for (const he of events) {
+    // Severity gate
+    if (SEVERITY_RANK[he.severity] < minRank) {
+      result.skipped += 1;
+      continue;
+    }
+    // runId filter
+    if (opts.runIdFilter && he.runId !== opts.runIdFilter) {
+      result.skipped += 1;
+      continue;
+    }
+    // max cap (count only events that would be processed, after filters)
+    if (processedCount >= max) {
+      // Leave remaining events in pending-investigations/ for the next run.
+      continue;
+    }
+    processedCount += 1;
+
+    // Learned-pattern short-circuit
+    const lpMatch = learnedPatternMatch(he);
+    if (lpMatch) {
+      process.stderr.write(
+        `[drain-faults] matched learned ${lpMatch.category} for ${he.faultId}; skipping investigator\n`,
+      );
+      try {
+        markInvestigated(he.runId, he.faultId, "self-healed", { queueDir });
+      } catch {
+        // ignore — file may have been moved by a concurrent drain
+      }
+      result.shortCircuited += 1;
+      continue;
+    }
+
+    if (opts.dryRun) {
+      result.processed += 1;
+      continue;
+    }
+
+    // Dispatch investigator (real or mock)
+    let report: InvestigationReport | null = null;
+    if (opts.mockInvestigator) {
+      try {
+        report = opts.mockInvestigator(he);
+      } catch (err) {
+        process.stderr.write(
+          `[drain-faults] mockInvestigator threw for ${he.faultId}: ${(err as Error).message}\n`,
+        );
+        result.failed += 1;
+        continue;
+      }
+    } else {
+      const config = resolveInvestigatorRole({
+        configureFile: opts.configureFile,
+        investigatorModel: opts.investigatorModel,
+      });
+      const prompt = buildInvestigatorPrompt({
+        haltEvent: he,
+        existingCategories,
+      });
+      const raw = await spawnInvestigatorCapture({
+        prompt,
+        config,
+        timeoutMs,
+      });
+      if (raw === null) {
+        process.stderr.write(
+          `[drain-faults] investigator dispatch failed for ${he.faultId}\n`,
+        );
+        result.failed += 1;
+        continue;
+      }
+      try {
+        report = parseInvestigationReport(raw, he.faultId);
+      } catch (err) {
+        process.stderr.write(
+          `[drain-faults] failed to parse InvestigationReport for ${he.faultId}: ${(err as Error).message}\n`,
+        );
+        result.failed += 1;
+        continue;
+      }
+    }
+
+    if (!report) {
+      result.failed += 1;
+      continue;
+    }
+
+    // Write the 3 sinks + proposal
+    const now = new Date();
+
+    // Sink 1: analytics jsonl
+    try {
+      const analyticsDir = path.join(getGstackHome(), "analytics");
+      fs.mkdirSync(analyticsDir, { recursive: true });
+      const analyticsPath = path.join(analyticsDir, "skill-faults.jsonl");
+      const row = JSON.stringify({
+        ts: now.toISOString(),
+        faultId: he.faultId,
+        investigation: report,
+      });
+      fs.appendFileSync(analyticsPath, row + "\n");
+    } catch (err) {
+      process.stderr.write(
+        `[drain-faults] analytics sink failed for ${he.faultId}: ${(err as Error).message}\n`,
+      );
+    }
+
+    // Sink 2: per-fault markdown
+    try {
+      const runDir = path.join(queueDir, he.runId);
+      fs.mkdirSync(runDir, { recursive: true });
+      const md = renderInvestigationMarkdown(he, report);
+      fs.writeFileSync(path.join(runDir, `${he.faultId}.md`), md);
+    } catch (err) {
+      process.stderr.write(
+        `[drain-faults] markdown sink failed for ${he.faultId}: ${(err as Error).message}\n`,
+      );
+    }
+
+    // Sink 3: inbox auto-file (severity >= HIGH AND actionable outcome)
+    const actionable =
+      report.outcome === "root-cause-identified" ||
+      report.outcome === "needs-human";
+    if (SEVERITY_RANK[he.severity] >= SEVERITY_RANK.HIGH && actionable) {
+      try {
+        const inboxDir = opts.inboxDir ?? path.join(process.cwd(), "inbox");
+        fs.mkdirSync(inboxDir, { recursive: true });
+        const inboxName = `${isoDateUtc(now)}-halt-${he.faultId}.md`;
+        fs.writeFileSync(
+          path.join(inboxDir, inboxName),
+          renderInboxMarkdown(he, report, now),
+        );
+        result.inboxFiled += 1;
+      } catch (err) {
+        process.stderr.write(
+          `[drain-faults] inbox sink failed for ${he.faultId}: ${(err as Error).message}\n`,
+        );
+      }
+    }
+
+    // Pattern proposal
+    if (report.learnedPatternProposal) {
+      try {
+        const proposalPath = path.join(queueDir, "pending-patterns.jsonl");
+        fs.mkdirSync(path.dirname(proposalPath), { recursive: true });
+        const row = JSON.stringify({
+          ts: now.toISOString(),
+          faultId: he.faultId,
+          proposal: report.learnedPatternProposal,
+        });
+        fs.appendFileSync(proposalPath, row + "\n");
+        result.proposalsAppended += 1;
+      } catch (err) {
+        process.stderr.write(
+          `[drain-faults] proposal sink failed for ${he.faultId}: ${(err as Error).message}\n`,
+        );
+      }
+    }
+
+    // Move to processed/
+    try {
+      markInvestigated(he.runId, he.faultId, "investigated", { queueDir });
+    } catch (err) {
+      process.stderr.write(
+        `[drain-faults] markInvestigated failed for ${he.faultId}: ${(err as Error).message}\n`,
+      );
+    }
+
+    result.processed += 1;
+  }
+
+  // Reference imports so unused-import linting doesn't strip the type re-export.
+  void pendingInvestigationsDir;
+  return result;
 }
