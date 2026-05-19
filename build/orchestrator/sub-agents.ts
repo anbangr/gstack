@@ -291,19 +291,40 @@ function quote(s: string): string {
 }
 
 /**
- * Stage Gemini I/O files in ~/.gemini/tmp/<slug>/ — Gemini's `--yolo`
- * sandbox allows that path AND the project temp dir keyed on `<slug>`.
+ * Stage Gemini I/O files in ~/.gemini/tmp/<basename(cwd)>/ — Gemini's
+ * `--yolo` sandbox auto-whitelists that path based on the spawned
+ * process's working directory.
  *
- * NOTE: This used to write to ~/.gemini/tmp/gstack/<slug>/ but Gemini's
- * workspace policy only whitelists ~/.gemini/tmp/<slug>/ (no `gstack/`
- * subdirectory). The `gstack/` segment made every Gemini sub-agent run
- * blind — its `read_file` call failed with "Path not in workspace" and
- * the agent fell back to inference, dirtying the worktree with
- * unintended changes. Observed 2026-05-17 on agnt2-prototype-plan4
- * (T111646 fault report) and again 2026-05-18 on this very build.
+ * Why basename(cwd), not opts.slug for the directory:
+ * Gemini infers its workspace temp dir from `basename(cwd)`. The
+ * orchestrator's `slug` is `deriveSlug(planFile)` which prepends `build-`
+ * to the plan basename (see state.ts:deriveSlug). The worktree directory
+ * has no `build-` prefix. Staging under `slug` lands files in a sibling
+ * directory Gemini's sandbox rejects, the agent fails every `read_file`,
+ * and silently degrades to inference — dirtying the worktree with
+ * hallucinated edits.
  *
- * Exporting this helper so build/orchestrator/__tests__/sub-agents.test.ts
- * can pin the path shape (gpt-5.5 plan-review IMPORTANT objection).
+ * Why opts.slug IS in the staged filename:
+ * Dual-impl runs (build/orchestrator/worktree.ts) always produce
+ * worktrees named `primary` and `secondary`, so two concurrent builds
+ * of different plans would collide on ~/.gemini/tmp/primary/ if the
+ * filename only carried phase/iteration/suffix. The slug (typically
+ * `build-<plan-basename>-p<N>-<ts>` after deriveSlug, but a clean
+ * non-empty token in any case) disambiguates parallel runs sharing
+ * a basename(cwd). Sanitized to a single path segment to prevent
+ * directory traversal into the staging dir.
+ *
+ * History: This helper used to write to ~/.gemini/tmp/gstack/<slug>/.
+ * Commit 67480efe dropped the `gstack/` segment but kept `opts.slug` as
+ * the directory key, which still mismatched when `slug` carried the
+ * `build-` prefix. Observed 2026-05-17 on agnt2-prototype-plan4
+ * (T111646), 2026-05-18 on mitosis-control-plane-impl-plan Phase 3.3.
+ * Adversarial review on the directory-fix patch caught the dual-impl
+ * collision risk and forced opts.slug into the filename too.
+ *
+ * Exported so build/orchestrator/__tests__/sub-agents.test.ts can pin
+ * the cross-system invariants (basename(cwd) equals Gemini's whitelist
+ * key; opts.slug appears in the filename to disambiguate parallel runs).
  *
  * Returns { stagedInput, stagedOutput, cleanup }.
  * Call cleanup() after spawnCaptured returns; it copies the output back to
@@ -312,6 +333,7 @@ function quote(s: string): string {
  * swallowed) and the delete still runs regardless.
  */
 export function stageGeminiIO(opts: {
+  cwd: string;
   slug: string;
   phaseNumber: string;
   iteration: number;
@@ -323,11 +345,12 @@ export function stageGeminiIO(opts: {
     process.env.HOME ?? "~",
     ".gemini",
     "tmp",
-    opts.slug,
+    path.basename(opts.cwd),
   );
   fs.mkdirSync(stagingDir, { recursive: true });
 
-  const base = `gstack-gemini-${opts.phaseNumber}-${opts.iteration}-${opts.suffix}`;
+  const slugSegment = opts.slug.replace(/[^a-zA-Z0-9._-]+/g, "-");
+  const base = `gstack-gemini-${slugSegment}-${opts.phaseNumber}-${opts.iteration}-${opts.suffix}`;
   const stagedInput = path.join(stagingDir, `${base}-input.md`);
   const stagedOutput = path.join(stagingDir, `${base}-output.md`);
 
@@ -907,6 +930,7 @@ export async function runRoleTask(opts: {
     stagedOutput,
     cleanup: cleanupStaged,
   } = stageGeminiIO({
+    cwd: opts.cwd,
     slug: opts.slug,
     phaseNumber: opts.phaseNumber ?? "ship",
     iteration: opts.iteration ?? 1,
@@ -2152,6 +2176,7 @@ export async function runGeminiTestSpec(opts: {
     stagedOutput,
     cleanup: cleanupStaged,
   } = stageGeminiIO({
+    cwd: opts.cwd,
     slug: opts.slug,
     phaseNumber: opts.phaseNumber,
     iteration: opts.iteration,
