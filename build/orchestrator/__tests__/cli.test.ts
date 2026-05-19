@@ -2925,6 +2925,88 @@ describe("restartFeatureFromOriginIssues", () => {
     fs.rmSync(tmpDir, { recursive: true });
   });
 
+  it("FAIL-CLOSED: pauses feature when unflipPhaseCheckboxes errors (no state advance)", () => {
+    // Codex adversarial review finding: the original implementation
+    // console.warn'd on un-flip errors but still advanced state, recreating
+    // the exact PREMATURE_COMPLETION bug class (state rewound, markdown
+    // still [x][x][x]). Fix: if un-flip errors, return without state
+    // advance, pause the feature, surface the markdown drift to the user.
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-restart-failclosed-"),
+    );
+    const planFile = path.join(tmpDir, "plan.md");
+    // Plan was hand-edited: the impl checkbox marker is wrong (someone
+    // renamed it from **Implementation to **Wrong Marker mid-flight).
+    const planMd = [
+      "# Plan",
+      "",
+      "## Feature 1: Auth",
+      "",
+      "### Phase 1.1: Tests",
+      "- [x] **Test Specification (test-writer role)**: spec",
+      "- [x] **Implementation (primary-impl role)**: impl",
+      "- [x] **Review & QA (review roles)**: review",
+      "",
+      "### Phase 1.2: Implementation",
+      "- [x] **Test Specification (test-writer role)**: spec",
+      "- [x] **Wrong Marker (someone renamed this)**: impl",
+      "- [x] **Review & QA (review roles)**: review",
+      "",
+    ].join("\n");
+    fs.writeFileSync(planFile, planMd);
+
+    const { state, feature } = stateAndFeature();
+    state.planFile = planFile;
+
+    const phases: Phase[] = [
+      {
+        ...basePhase,
+        index: 0,
+        number: "1.1",
+        name: "Tests",
+        testSpecCheckboxLine: 6,
+        implementationCheckboxLine: 7,
+        reviewCheckboxLine: 8,
+      },
+      {
+        ...basePhase,
+        index: 1,
+        number: "1.2",
+        name: "Implementation",
+        testSpecCheckboxLine: 11,
+        implementationCheckboxLine: 12, // Marker doesn't match!
+        reviewCheckboxLine: 13,
+      },
+    ];
+
+    const restart = restartFeatureFromOriginIssues({
+      state,
+      feature,
+      issueLogPath: "/tmp/origin-issues.md",
+      reason: "missing acceptance behavior",
+      phases,
+    });
+
+    // Restart must be REJECTED, not silently advance.
+    expect(restart.restarted).toBe(false);
+    expect(restart.reason).toContain("plan markdown drift");
+    expect(restart.reason).toContain("1.2");
+    expect(feature.status).toBe("paused");
+    expect(feature.error).toContain("plan markdown drift");
+
+    // CRITICAL: phase status MUST stay `committed` — no rewind happened
+    // because the markdown couldn't follow. This is the fail-closed
+    // guarantee that prevents PREMATURE_COMPLETION recreation.
+    expect(state.phases[1].status).toBe("committed");
+
+    // Plan markdown is unchanged (atomic un-flip refused, atomic write
+    // didn't happen).
+    const after = fs.readFileSync(planFile, "utf8");
+    expect(after).toBe(planMd);
+
+    fs.rmSync(tmpDir, { recursive: true });
+  });
+
   it("does not un-flip when phases arg is omitted (preserves existing callers)", () => {
     // Existing tests that pre-date the un-flip wiring must still pass —
     // when `phases` is omitted, the function falls back to the pre-fix

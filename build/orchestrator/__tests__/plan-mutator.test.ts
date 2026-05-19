@@ -540,25 +540,35 @@ describe("unflipPhaseCheckboxes", () => {
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 
-  it("collects errors without throwing when a setCheckboxState call fails", () => {
-    // The errors array is populated when expectedMarker doesn't match the
-    // line (e.g. plan was hand-edited between parse and rewind). The
-    // un-flip continues for the other checkboxes; we get a partial result.
+  it("ATOMIC: when any target fails validation, NO checkbox is flipped (all-or-nothing)", () => {
+    // Atomicity guarantee added after Codex adversarial review:
+    // previously the function did 3 separate atomic writes. If line 2
+    // failed marker validation but lines 1 + 3 succeeded, the plan was
+    // left half-rewound (test-spec [ ], impl still [x], review [ ]) —
+    // silent corruption under exactly the hand-edit race the function
+    // exists to handle.
+    //
+    // Now: validate all targets first, then do ONE atomic write.
+    // ANY validation error → no writes, errors returned, plan unchanged.
     const md = `### Phase 1: Foo
+- [x] **Test Specification**: spec
 - [x] **Wrong Marker**: not what we expect
 - [x] **Review**: review
 `;
     const p = _testWritePlan(md);
     const phase = {
-      testSpecCheckboxLine: -1,
-      implementationCheckboxLine: 2, // **Wrong Marker** instead of **Implementation
-      reviewCheckboxLine: 3,
+      testSpecCheckboxLine: 2,
+      implementationCheckboxLine: 3, // **Wrong Marker** instead of **Implementation
+      reviewCheckboxLine: 4,
       kind: "code",
     };
     const r = unflipPhaseCheckboxes(p, phase as any);
     expect(r.errors).toHaveLength(1);
     expect(r.errors[0]).toMatch(/impl/);
-    expect(r.unflipped).toBe(1); // review still un-flipped
+    expect(r.unflipped).toBe(0); // ZERO — atomicity, not partial
+    // Plan markdown MUST be unchanged byte-for-byte.
+    const after = fs.readFileSync(p, "utf8");
+    expect(after).toBe(md);
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 

@@ -3443,6 +3443,38 @@ export function restartFeatureFromOriginIssues(args: {
 
   const phaseState = args.state.phases[phaseIndex];
   const wasCommitted = phaseState.status === "committed";
+
+  // When rewinding a `committed` phase, un-flip the plan markdown checkboxes
+  // FIRST. Without un-flipping, a subsequent failure on the re-run leaves
+  // checkboxes `[x][x][x]` while phase status is `failed` — the exact
+  // PREMATURE_COMPLETION signature observed in the 2026-05-18 mitosis faults.
+  // Markdown must follow state backward as faithfully as it follows forward.
+  //
+  // **Fail closed on un-flip error.** If the markdown can't be rewound (plan
+  // hand-edited mid-rewind, wrong marker, line drift), we MUST NOT advance
+  // state. unflipPhaseCheckboxes is atomic — either all three checkboxes
+  // flip or none do. A state advance with stale `[x]` markdown recreates
+  // the exact PREMATURE_COMPLETION bug class this function exists to
+  // prevent. The caller (which holds the feature/phase context) must
+  // resolve the markdown drift before retrying the restart.
+  if (wasCommitted && args.phases) {
+    const phase = args.phases[phaseIndex];
+    if (phase) {
+      const { errors } = unflipPhaseCheckboxes(args.state.planFile, phase);
+      if (errors.length > 0) {
+        const errSummary = errors.join("; ");
+        args.feature.status = "paused";
+        args.feature.error = `plan markdown drift — could not un-flip checkboxes for phase ${phase.number}: ${errSummary}. Manually resolve the plan (re-flip [x]→[ ] for phase ${phase.number} test-spec/impl/review lines) and re-run.`;
+        return {
+          restarted: false,
+          reason: args.feature.error,
+        };
+      }
+    }
+  }
+
+  // Markdown is now in sync (or there were no checkboxes to un-flip).
+  // Safe to advance state.
   phaseState.status = "tests_green";
   phaseState.codexReview = undefined;
   phaseState.originIssueLogPath = args.issueLogPath;
@@ -3453,23 +3485,6 @@ export function restartFeatureFromOriginIssues(args: {
   args.feature.featureReview = undefined;
   args.feature.status = "running";
   args.feature.error = `origin verification failed; restarting review loop for phase ${phaseState.number}`;
-
-  // When rewinding a `committed` phase, un-flip the plan markdown checkboxes
-  // too. Without this, a subsequent failure on the re-run leaves checkboxes
-  // `[x][x][x]` while phase status is `failed` — the exact
-  // PREMATURE_COMPLETION signature observed in the 2026-05-18 mitosis faults.
-  // Markdown must follow state backward as faithfully as it follows forward.
-  if (wasCommitted && args.phases) {
-    const phase = args.phases[phaseIndex];
-    if (phase) {
-      const { errors } = unflipPhaseCheckboxes(args.state.planFile, phase);
-      for (const err of errors) {
-        console.warn(
-          `[restart] Phase ${phase.number} checkbox un-flip warning: ${err}`,
-        );
-      }
-    }
-  }
 
   return { restarted: true, phaseIndex };
 }
