@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.40.4.1] - 2026-05-19
+
+**Gemini fallback implementor reads its own input files again. The staging directory now matches Gemini's `--yolo` workspace whitelist instead of mismatching by a `build-` prefix.**
+
+When kimi (primary implementor) failed and the orchestrator fell back to Gemini, every `read_file` call returned "Path not in workspace." Gemini silently degraded to inference, hallucinated the work from prompt context, and dirtied the worktree with edits that didn't match the plan. The orchestrator staged input at `~/.gemini/tmp/build-<plan-slug>/...` while Gemini's `--yolo` sandbox auto-whitelisted `~/.gemini/tmp/<worktree-basename>/` (no `build-` prefix). The two paths only agreed by accident in tests; the production worktree directory never carries the orchestrator's `build-` slug prefix. The fix keys `stageGeminiIO` on `path.basename(cwd)` so the staging directory matches Gemini's inference exactly. The `slug` parameter stays for log filenames so parallel runs in the same worktree stay distinguishable.
+
+### The numbers that matter
+
+Observed on `mitosis-control-plane-impl-plan-anbang-20260518-154933-bee3aea0` Phase 3.3 (`streamPodLogs`), 2026-05-18. Both directories exist on disk after the failing run:
+
+| Path | Contents | Used by |
+| --- | --- | --- |
+| `~/.gemini/tmp/build-mitosis-control-plane-impl-plan-anbang-.../` | empty (orchestrator cleanup ran) | orchestrator stage write |
+| `~/.gemini/tmp/mitosis-control-plane-impl-plan-anbang-.../` | `chats/`, `.project_root` | Gemini's actual workspace |
+
+Same regression observed 2026-05-17 on `agnt2-prototype-plan4` (T111646 fault report). Commit `67480efe` dropped a `gstack/` segment in the same helper but kept `opts.slug` as the directory key, so the `build-` prefix from `deriveSlug` still mismatched. This release closes the remaining gap.
+
+### What this means for builders
+
+Kimi-primary → Gemini-backup is the default impl pairing. Every fallback was silently broken when the plan basename and worktree basename didn't align (which is always, because `deriveSlug` prepends `build-`). After this release, phases that needed the Gemini fallback complete on real file reads instead of inference. If you've been hand-implementing phases after kimi timeouts, the fallback path works again.
+
+### Itemized changes
+
+#### Fixed
+
+- `stageGeminiIO` in `build/orchestrator/sub-agents.ts` now derives its staging directory from `path.basename(opts.cwd)` instead of `opts.slug`. `opts.cwd` is a new required parameter (added to both call sites: `runRoleTask` and `runGeminiTestSpec`). The directory now matches Gemini's `--yolo` auto-whitelist, so the agent can actually read its input and write its output.
+
+#### Changed
+
+- New regression test in `build/orchestrator/__tests__/sub-agents.test.ts` pins the cross-system invariant: when `slug` carries a `build-` prefix (simulating `deriveSlug` output) and `cwd` does not, the staged paths land under `basename(cwd)`, not `slug`. The prior T111646 `/gstack/` guard stays as a negative assertion. The `runSlashCommand (gemini role dispatch)` test was updated to assert against `path.basename(tmpDir)` instead of `slug`.
+
+### For contributors
+
+The `stageGeminiIO` doc comment now explains the two-key system explicitly: directory key = `basename(cwd)` (Gemini's sandbox rule), filename suffix key = `slug` (orchestrator's log/state namespace). The two had been silently entangled by the test's accidental use of the same value for both. The cross-system invariant test is the regression guard for future churn in either `deriveSlug` or Gemini's sandbox rules.
+
 ## [1.40.4.0] - 2026-05-19
 
 **Feature-review now sees which `Phase N.review-K` numbers are already taken before issuing FEATURE_NEEDS_PHASES, and the kimi retry/no-retry timeout tests stop flaking under load.**
