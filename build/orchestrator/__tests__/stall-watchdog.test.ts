@@ -165,6 +165,82 @@ describe("attachStallWatchdog (stream mode)", () => {
     ctrl.stop();
   });
 
+  it("escalates to SIGKILL after gracePeriodMs when child ignores SIGTERM", () => {
+    const { clock, advance } = makeFakeClock();
+    const { child } = makeFakeChild();
+    (child as unknown as { pid: number }).pid = 99999;
+
+    const originalKill = process.kill;
+    const signals: NodeJS.Signals[] = [];
+    (process as unknown as { kill: typeof process.kill }).kill = ((
+      _pid: number,
+      sig?: NodeJS.Signals | number,
+    ) => {
+      if (typeof sig === "string") signals.push(sig);
+      return true;
+    }) as typeof process.kill;
+
+    try {
+      attachStallWatchdog(
+        { mode: "stream", child },
+        {
+          stallMs: 200,
+          provider: "shell",
+          pollIntervalMs: 50,
+          gracePeriodMs: 150,
+          clock,
+        },
+      );
+
+      advance(250); // past stallMs → SIGTERM fires
+      expect(signals.filter((s) => s === "SIGTERM").length).toBeGreaterThan(0);
+      expect(signals.filter((s) => s === "SIGKILL").length).toBe(0);
+
+      advance(200); // past gracePeriodMs (150) → SIGKILL fires
+      expect(signals.filter((s) => s === "SIGKILL").length).toBeGreaterThan(0);
+    } finally {
+      (process as unknown as { kill: typeof process.kill }).kill = originalKill;
+    }
+  });
+
+  it("cancels SIGKILL escalation when child exits within grace period", () => {
+    const { clock, advance } = makeFakeClock();
+    const { child, triggerExit } = makeFakeChild();
+    (child as unknown as { pid: number }).pid = 99999;
+
+    const originalKill = process.kill;
+    const signals: NodeJS.Signals[] = [];
+    (process as unknown as { kill: typeof process.kill }).kill = ((
+      _pid: number,
+      sig?: NodeJS.Signals | number,
+    ) => {
+      if (typeof sig === "string") signals.push(sig);
+      return true;
+    }) as typeof process.kill;
+
+    try {
+      attachStallWatchdog(
+        { mode: "stream", child },
+        {
+          stallMs: 200,
+          provider: "shell",
+          pollIntervalMs: 50,
+          gracePeriodMs: 5000,
+          clock,
+        },
+      );
+
+      advance(250); // SIGTERM fires
+      expect(signals.filter((s) => s === "SIGTERM").length).toBeGreaterThan(0);
+
+      triggerExit(); // child responds to SIGTERM and exits — should cancel SIGKILL
+      advance(10_000); // way past gracePeriodMs
+      expect(signals.filter((s) => s === "SIGKILL").length).toBe(0);
+    } finally {
+      (process as unknown as { kill: typeof process.kill }).kill = originalKill;
+    }
+  });
+
   it("never signals non-positive pids", () => {
     const { clock, advance } = makeFakeClock();
     const { child } = makeFakeChild();

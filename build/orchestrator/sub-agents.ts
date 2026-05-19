@@ -2228,7 +2228,7 @@ export async function runGeminiTestSpec(opts: {
     `phase-${opts.phaseNumber}-gemini-testspec-${opts.iteration}.log`,
   );
 
-  let result = await spawnCaptured({
+  const result = await spawnCaptured({
     bin: geminiBin(),
     argv,
     cwd: opts.cwd,
@@ -2237,23 +2237,8 @@ export async function runGeminiTestSpec(opts: {
     closeStdin: false,
   });
 
-  if (result.timedOut) {
-    const retryLog = path.join(
-      logDir(opts.slug),
-      `phase-${opts.phaseNumber}-gemini-testspec-${opts.iteration}-retry.log`,
-    );
-    const retryResult = await spawnCaptured({
-      bin: geminiBin(),
-      argv,
-      cwd: opts.cwd,
-      timeoutMs: GEMINI_TIMEOUT_MS,
-      logPath: retryLog,
-      closeStdin: false,
-    });
-    retryResult.retries = 1;
-    cleanupStaged();
-    return mergeOutputFile(retryResult, opts.outputFilePath);
-  }
+  // Stall kills aren't retried under liveness semantics — same stall window
+  // would just stall again. Caller can surface this via result.stallKilled.
   cleanupStaged();
   return mergeOutputFile(result, opts.outputFilePath);
 }
@@ -2542,7 +2527,7 @@ export async function runJudge(opts: {
     `phase-${opts.phaseNumber}-judge.log`,
   );
 
-  let result = await spawnCaptured({
+  const result = await spawnCaptured({
     bin: CLAUDE_BIN,
     argv,
     cwd: opts.cwd,
@@ -2551,24 +2536,8 @@ export async function runJudge(opts: {
     closeStdin: false,
   });
 
-  if (result.timedOut) {
-    const retryLog = path.join(
-      logDir(opts.slug),
-      `phase-${opts.phaseNumber}-judge-retry.log`,
-    );
-    const retryResult = await spawnCaptured({
-      bin: CLAUDE_BIN,
-      argv,
-      cwd: opts.cwd,
-      timeoutMs: JUDGE_TIMEOUT_MS,
-      logPath: retryLog,
-      closeStdin: false,
-    });
-    retryResult.retries = 1;
-    return mergeOutputFile(retryResult, opts.outputFilePath, {
-      emptyFileIsError: true,
-    });
-  }
+  // Stall kills aren't retried under liveness semantics — same stall window
+  // would just stall again. The judge caller flags timedOut in the result.
   return mergeOutputFile(result, opts.outputFilePath, {
     emptyFileIsError: true,
   });

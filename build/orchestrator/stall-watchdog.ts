@@ -269,10 +269,25 @@ export function attachStallWatchdog(
             killProcessAndGroup(pid, "SIGKILL");
           }, gracePeriodMs);
         }
+        // Stop the poll loop and stream listeners, but DO NOT call stop()
+        // here — stop() clears killTimerHandle, which would cancel our
+        // SIGKILL escalation before it fires. The grace timer survives
+        // until the child emits 'exit' (auto-stop below) at which point
+        // stop() runs and clears it (a stale SIGKILL would race with PID
+        // reuse). If the child ignores SIGTERM, the timer fires SIGKILL
+        // as designed.
+        if (pollHandle !== null) {
+          clock.clearInterval(pollHandle);
+          pollHandle = null;
+        }
+        source.child.stdout?.off("data", onLine);
+        source.child.stderr?.off("data", onLine);
+      } else {
+        // In mtime mode the caller (drain-faults) owns the child handle
+        // and does its own kill + grace timer. The watchdog just signals
+        // via onStallKill and stops polling.
+        stop();
       }
-      // In mtime mode the caller (drain-faults) owns the child handle and
-      // does its own kill. We just signal via onStallKill and stop polling.
-      stop();
     }
   };
 
