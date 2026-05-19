@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   createReleaseLockHeartbeat,
+  isAllowedRepoPath,
   processReleaseQueueRecord,
   runReleaseDaemon,
 } from "../release-daemon";
@@ -194,6 +195,63 @@ describe("release daemon queue loop", () => {
     expect(processed).toEqual([10]);
   });
 
+  it("isolates per-repo discovery errors so one failing repo doesn't block others", async () => {
+    // Two repos in the local queue. One discoverRemote call errors,
+    // the other returns a record. The errored repo should produce a
+    // warning naming that repo, but the other repo's record should
+    // still be picked up and processed.
+    writeReleaseQueueRecord(
+      dir,
+      record({
+        prNumber: 70,
+        repoPath: "/repo-fails",
+        repoIdentity: "github.com/acme/repo-fails",
+        queuedAt: "2026-05-09T00:00:01.000Z",
+      }),
+    );
+    writeReleaseQueueRecord(
+      dir,
+      record({
+        prNumber: 71,
+        repoPath: "/repo-works",
+        repoIdentity: "github.com/acme/repo-works",
+        queuedAt: "2026-05-09T00:00:02.000Z",
+      }),
+    );
+
+    const logs: string[] = [];
+    const processed: number[] = [];
+    const exit = await runReleaseDaemon({
+      queueDir: dir,
+      once: true,
+      roles: DEFAULT_ROLE_CONFIGS,
+      log: (msg) => logs.push(msg),
+      discoverRemote: (repoPath) => {
+        if (repoPath === "/repo-fails") {
+          return { records: [], error: "gh pr list failed for /repo-fails" };
+        }
+        return { records: [] };
+      },
+      processor: async (item) => {
+        processed.push(item.prNumber);
+        return { ...item, status: "landed" };
+      },
+    });
+
+    expect(exit).toBe(0);
+    // Warning names the failing repo (the new attribution).
+    expect(
+      logs.some(
+        (m) =>
+          m.includes("could not discover queued PRs for /repo-fails") &&
+          m.includes("gh pr list failed for /repo-fails"),
+      ),
+    ).toBe(true);
+    // The non-failing repo's local record (PR 71) is still processed
+    // even though /repo-fails errored. Oldest queued wins (PR 70).
+    expect(processed).toEqual([70]);
+  });
+
   it("dedups discovery by repoIdentity when multiple records share the same repo", async () => {
     writeReleaseQueueRecord(
       dir,
@@ -230,6 +288,81 @@ describe("release daemon queue loop", () => {
     expect(exit).toBe(0);
     // One discovery call for repo-a despite two records.
     expect(discoverCalls).toEqual(["/repo-a"]);
+  });
+
+  it("dedups configured repoPath against queued records at the same path", async () => {
+    // The configured opts.repoPath and a queued record without repoIdentity
+    // both target /repo-shared. They share the same path key and must
+    // produce only one discovery call, not two.
+    writeReleaseQueueRecord(
+      dir,
+      record({
+        prNumber: 80,
+        repoPath: "/repo-shared",
+        repoIdentity: undefined,
+        queuedAt: "2026-05-09T00:00:01.000Z",
+      }),
+    );
+
+    const discoverCalls: string[] = [];
+    const exit = await runReleaseDaemon({
+      queueDir: dir,
+      repoPath: "/repo-shared",
+      once: true,
+      roles: DEFAULT_ROLE_CONFIGS,
+      log: () => {},
+      discoverRemote: (repoPath) => {
+        discoverCalls.push(repoPath);
+        return { records: [] };
+      },
+      processor: async (item) => ({ ...item, status: "landed" }),
+    });
+
+    expect(exit).toBe(0);
+    // ONE call, not two. Before the keying-scheme unification, the configured
+    // entry used a "__configured__:" prefix while the record used "path:",
+    // producing two redundant discovery calls.
+    expect(discoverCalls).toEqual(["/repo-shared"]);
+  });
+
+  it("falls back to path key when repoIdentity is missing", async () => {
+    // Records without repoIdentity should still be discovered, keyed by
+    // resolved path. Two records with the same path but no identity → one
+    // discovery call.
+    writeReleaseQueueRecord(
+      dir,
+      record({
+        prNumber: 25,
+        repoPath: "/repo-no-identity",
+        repoIdentity: undefined,
+        queuedAt: "2026-05-09T00:00:01.000Z",
+      }),
+    );
+    writeReleaseQueueRecord(
+      dir,
+      record({
+        prNumber: 26,
+        repoPath: "/repo-no-identity",
+        repoIdentity: undefined,
+        queuedAt: "2026-05-09T00:00:02.000Z",
+      }),
+    );
+
+    const discoverCalls: string[] = [];
+    const exit = await runReleaseDaemon({
+      queueDir: dir,
+      once: true,
+      roles: DEFAULT_ROLE_CONFIGS,
+      log: () => {},
+      discoverRemote: (repoPath) => {
+        discoverCalls.push(repoPath);
+        return { records: [] };
+      },
+      processor: async (item) => ({ ...item, status: "landed" }),
+    });
+
+    expect(exit).toBe(0);
+    expect(discoverCalls).toEqual(["/repo-no-identity"]);
   });
 
   it("skips discovery for non-queued local records", async () => {
@@ -403,5 +536,108 @@ describe("release daemon queue loop", () => {
     expect(processed.status).toBe("landed");
     // releaseLock called exactly once (from the finally block).
     expect(releaseCalls).toBe(1);
+  });
+});
+
+describe("isAllowedRepoPath (security gate)", () => {
+  it("rejects empty / non-string repoPath", () => {
+    expect(isAllowedRepoPath("", [])).toEqual({
+      ok: false,
+      reason: expect.stringContaining("empty"),
+    });
+  });
+
+  it("rejects relative paths", () => {
+    expect(isAllowedRepoPath("../etc/passwd", ["/tmp/"])).toEqual({
+      ok: false,
+      reason: expect.stringContaining("not absolute"),
+    });
+  });
+
+  it("rejects paths outside the prefix list", () => {
+    const dir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-allowlist-outside-"),
+    );
+    fs.mkdirSync(path.join(dir, ".git"));
+    try {
+      // Real git repo, but `/tmp/...` is not on the allowlist.
+      const result = isAllowedRepoPath(dir, ["/Users/different/"]);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toContain("outside the daemon allowlist");
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects allowlisted paths that don't exist", () => {
+    const fakePath = "/tmp/gstack-allowlist-missing-xyz123";
+    const prefix = "/tmp/";
+    const result = isAllowedRepoPath(fakePath, [prefix]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("does not exist");
+  });
+
+  it("rejects allowlisted paths that aren't directories", () => {
+    const file = path.join(os.tmpdir(), "gstack-allowlist-file-" + Date.now());
+    fs.writeFileSync(file, "x");
+    try {
+      const result = isAllowedRepoPath(file, [os.tmpdir() + path.sep]);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toContain("not a directory");
+    } finally {
+      fs.rmSync(file, { force: true });
+    }
+  });
+
+  it("rejects allowlisted directories without a .git marker", () => {
+    const dir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-allowlist-nogit-"),
+    );
+    try {
+      const result = isAllowedRepoPath(dir, [os.tmpdir() + path.sep]);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toContain("no .git entry");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts allowlisted directories with a .git directory (normal clone)", () => {
+    const dir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-allowlist-clone-"),
+    );
+    fs.mkdirSync(path.join(dir, ".git"));
+    try {
+      const result = isAllowedRepoPath(dir, [os.tmpdir() + path.sep]);
+      expect(result.ok).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts allowlisted directories with a .git FILE (linked worktree)", () => {
+    const dir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-allowlist-worktree-"),
+    );
+    fs.writeFileSync(
+      path.join(dir, ".git"),
+      "gitdir: /elsewhere/.git/worktrees/x",
+    );
+    try {
+      const result = isAllowedRepoPath(dir, [os.tmpdir() + path.sep]);
+      expect(result.ok).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("defeats path traversal via .. that escapes the prefix", () => {
+    // /tmp is allowlisted, but /tmp/../etc resolves to /etc which is not.
+    const result = isAllowedRepoPath("/tmp/../etc", [os.tmpdir() + path.sep]);
+    expect(result.ok).toBe(false);
+    if (!result.ok)
+      expect(result.reason).toContain("outside the daemon allowlist");
   });
 });

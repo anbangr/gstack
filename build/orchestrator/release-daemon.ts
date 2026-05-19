@@ -24,6 +24,95 @@ export const RELEASE_LOCK_TTL_MS = 2 * 60 * 60 * 1000;
 export const RELEASE_LOCK_HEARTBEAT_MS = 15 * 60 * 1000;
 
 /**
+ * Allowlist of path prefixes the daemon will fan out discovery to. The queue
+ * dir is gstack-owned (writes happen via this codebase), but a planted JSON
+ * file with a crafted repoPath could otherwise cause `gh`/`git` to run with
+ * a cwd inside a directory containing a malicious .git/config — git executes
+ * core.sshCommand / core.fsmonitor / core.editor on invocation. The
+ * allowlist is the per-record gate that closes this expansion of the
+ * pre-existing trust boundary.
+ *
+ * Prefixes:
+ *   - `~/Documents/` — where checked-out product repos live
+ *   - `~/.gstack/build-worktrees/` — gstack-managed worktrees
+ *   - `~/code/`, `~/Development/`, `~/src/` — common alternate repo roots
+ *
+ * Override via `GSTACK_DAEMON_REPO_ALLOWLIST` (colon-separated absolute paths).
+ * Default policy: allow only if EXACT prefix matches AND path is a real
+ * directory AND contains `.git` (file or dir, to support worktrees).
+ */
+const DEFAULT_REPO_ALLOWLIST_PREFIXES = [
+  path.join(os.homedir(), "Documents") + path.sep,
+  path.join(os.homedir(), ".gstack", "build-worktrees") + path.sep,
+  path.join(os.homedir(), "code") + path.sep,
+  path.join(os.homedir(), "Development") + path.sep,
+  path.join(os.homedir(), "src") + path.sep,
+];
+
+function getRepoAllowlistPrefixes(): string[] {
+  const override = process.env.GSTACK_DAEMON_REPO_ALLOWLIST;
+  if (!override) return DEFAULT_REPO_ALLOWLIST_PREFIXES;
+  return override
+    .split(":")
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0)
+    .map((p) => (p.endsWith(path.sep) ? p : p + path.sep));
+}
+
+/**
+ * Returns true if `repoPath` is safe for the daemon to use as a subprocess
+ * cwd. A safe path is absolute, exists, is a directory, contains `.git`,
+ * and starts with an allowlisted prefix. Failures are diagnostic strings so
+ * callers can log them.
+ */
+export function isAllowedRepoPath(
+  repoPath: string,
+  prefixes: string[] = getRepoAllowlistPrefixes(),
+): { ok: true } | { ok: false; reason: string } {
+  if (!repoPath || typeof repoPath !== "string") {
+    return { ok: false, reason: "repoPath is empty or not a string" };
+  }
+  if (!path.isAbsolute(repoPath)) {
+    return { ok: false, reason: `repoPath is not absolute: ${repoPath}` };
+  }
+  // Resolve to defeat `..` traversal that would land outside the prefix.
+  const resolved = path.resolve(repoPath);
+  const withSep = resolved + path.sep;
+  const allowed = prefixes.some(
+    (prefix) => withSep === prefix || withSep.startsWith(prefix),
+  );
+  if (!allowed) {
+    return {
+      ok: false,
+      reason: `repoPath ${resolved} is outside the daemon allowlist (set GSTACK_DAEMON_REPO_ALLOWLIST to extend)`,
+    };
+  }
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(resolved);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `repoPath ${resolved} does not exist: ${(err as Error).message}`,
+    };
+  }
+  if (!stat.isDirectory()) {
+    return { ok: false, reason: `repoPath ${resolved} is not a directory` };
+  }
+  // `.git` is a directory in normal clones, a file in linked worktrees. Both fine.
+  const gitMarker = path.join(resolved, ".git");
+  try {
+    fs.statSync(gitMarker);
+  } catch {
+    return {
+      ok: false,
+      reason: `repoPath ${resolved} has no .git entry (not a git repo)`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
  * Module-level registry of active release-lock release functions. When the
  * daemon receives SIGTERM (e.g. from launchctl bootkick/unload), the signal
  * handler runs every registered release synchronously so the lock ref is
@@ -39,9 +128,7 @@ const activeLockReleases = new Set<LockReleaseFn>();
 
 let signalHandlersInstalled = false;
 
-function installReleaseDaemonSignalHandlers(
-  log: (msg: string) => void,
-): void {
+function installReleaseDaemonSignalHandlers(log: (msg: string) => void): void {
   if (signalHandlersInstalled) return;
   signalHandlersInstalled = true;
   const handler = (signal: NodeJS.Signals) => {
@@ -57,9 +144,7 @@ function installReleaseDaemonSignalHandlers(
         }
       } catch (err) {
         failed++;
-        log(
-          `signal ${signal}: lock release threw: ${(err as Error).message}`,
-        );
+        log(`signal ${signal}: lock release threw: ${(err as Error).message}`);
       }
     }
     activeLockReleases.clear();
@@ -339,7 +424,10 @@ export async function processReleaseQueueRecord(
   } finally {
     heartbeat.stop();
     activeLockReleases.delete(signalReleaseCallback);
-    const released = (opts.releaseLock ?? releaseRemoteReleaseLock)({
+    // Use the already-resolved releaseFn so the natural-completion path and
+    // the SIGTERM-callback path go through one callable. Otherwise a future
+    // wrapper (retries, telemetry) added to one path silently diverges.
+    const released = releaseFn({
       cwd: record.repoPath,
       handle: heartbeat.currentHandle(),
     });
@@ -362,21 +450,37 @@ function discoverQueuedRecords(
   // opts.repoPath if set (the explicitly-configured one). Then add every
   // unique repoPath we see in the local queue, since the build orchestrator
   // queues PRs across repos into a shared queue dir. Dedup by repoIdentity
-  // when present, otherwise by resolved path.
-  const reposToDiscover = new Map<string, string>(); // identity → path
+  // when present, otherwise by resolved path. Use one keying scheme for
+  // both sources so a configured path and a queued record at the same path
+  // (with no repoIdentity) collapse to one discovery call.
+  const reposToDiscover = new Map<string, string>();
+  const repoKey = (identity: string | undefined, repoPath: string): string =>
+    identity ? `id:${identity}` : `path:${repoPath}`;
   if (opts.repoPath) {
-    reposToDiscover.set(`__configured__:${opts.repoPath}`, opts.repoPath);
+    reposToDiscover.set(repoKey(undefined, opts.repoPath), opts.repoPath);
   }
   for (const record of local) {
     if (record.status !== "queued") continue;
     const repoPath = record.repoPath;
     if (!repoPath) continue;
-    const key = record.repoIdentity || `path:${repoPath}`;
+    const key = repoKey(record.repoIdentity, repoPath);
     if (!reposToDiscover.has(key)) {
       reposToDiscover.set(key, repoPath);
     }
   }
   for (const [, repoPath] of reposToDiscover) {
+    // Allowlist gate: only applies when we'd hit the filesystem-touching
+    // default. Tests that inject `opts.discoverRemote` opt out of the gate
+    // and take responsibility for whatever paths they pass through.
+    if (!opts.discoverRemote) {
+      const check = isAllowedRepoPath(repoPath);
+      if (!check.ok) {
+        opts.log?.(
+          `warning: skipping discovery for disallowed repoPath: ${check.reason}`,
+        );
+        continue;
+      }
+    }
     const remote = opts.discoverRemote
       ? opts.discoverRemote(repoPath)
       : discoverBuildQueuedPullRequests(repoPath);
