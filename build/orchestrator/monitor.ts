@@ -23,6 +23,11 @@ import {
   faultId as computeFaultId,
   loadLearnedPatterns,
 } from "./skill-fault-detector";
+import {
+  buildHaltSnapshot,
+  emitHaltEvent,
+  type HaltSeverity,
+} from "./halt-events";
 
 export type MonitorEventName =
   | "RUN_RUNNING"
@@ -674,6 +679,34 @@ export function evaluateMonitorOnce(
               manifestPath: opts.manifestPath,
               faults: stampedFaults as typeof faults,
             });
+            // Dual-emit each new fault into the halt-events queue so
+            // drain-faults can be the single sink. The SKILL_FAULT_DETECTED
+            // event shape above is unchanged; this is purely additive.
+            for (const fault of newFaults) {
+              try {
+                emitHaltEvent({
+                  kind: "PHASE_FAILED",
+                  runId: snapshot.run.runId,
+                  stateSlug: snapshot.run.stateSlug,
+                  severity: fault.severity as HaltSeverity,
+                  message: `[${fault.category}] ${fault.description}`,
+                  pointers: {
+                    stateFile: snapshot.stateFile,
+                    stdoutLog: snapshot.run.stdoutLog,
+                    livingPlan: snapshot.run.livingPlanPath,
+                    worktreePath: snapshot.run.worktreePath,
+                  },
+                  snapshot: buildHaltSnapshot({
+                    state: snapshot.state,
+                    stdoutLogPath: snapshot.run.stdoutLog,
+                    worktreePath: snapshot.run.worktreePath,
+                    phaseIndex: fault.evidence?.phaseIndex,
+                  }),
+                });
+              } catch {
+                // Best-effort queue write — never break the monitor.
+              }
+            }
           }
           // Resolved: registry entries that aren't in the current tick.
           for (const [id, entry] of Object.entries(registry)) {
@@ -701,6 +734,35 @@ export function evaluateMonitorOnce(
             manifestPath: opts.manifestPath,
             faults,
           });
+          // Dual-emit each fault into the halt-events queue (additive). On
+          // this back-compat path every tick re-emits, which is fine — the
+          // queue file name is deterministic on faultId so re-emits idempotently
+          // overwrite (atomic tmp+rename) the same on-disk record.
+          for (const fault of faults) {
+            try {
+              emitHaltEvent({
+                kind: "PHASE_FAILED",
+                runId: snapshot.run.runId,
+                stateSlug: snapshot.run.stateSlug,
+                severity: fault.severity as HaltSeverity,
+                message: `[${fault.category}] ${fault.description}`,
+                pointers: {
+                  stateFile: snapshot.stateFile,
+                  stdoutLog: snapshot.run.stdoutLog,
+                  livingPlan: snapshot.run.livingPlanPath,
+                  worktreePath: snapshot.run.worktreePath,
+                },
+                snapshot: buildHaltSnapshot({
+                  state: snapshot.state,
+                  stdoutLogPath: snapshot.run.stdoutLog,
+                  worktreePath: snapshot.run.worktreePath,
+                  phaseIndex: fault.evidence?.phaseIndex,
+                }),
+              });
+            } catch {
+              // Best-effort queue write — never break the monitor.
+            }
+          }
         }
       } catch {
         // swallow
