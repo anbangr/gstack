@@ -216,7 +216,7 @@ One line per _build_ (aggregated, not per round). Written when the loop exits.
   "branch": "feat/bundle-1-crypto",
   "rounds": 4,
   "final_verdict": "APPROVE", // APPROVE | STALEMATE | ABORTED | INTERRUPTED
-  "exit_reason": "approved", // approved | adaptive_cap_no_forward_progress | adaptive_cap_re_raises_only | max_rounds_hit | user_manual | user_abort | sigint | reviewer_unavailable
+  "exit_reason": "approved", // approved | adaptive_cap_re_raises_only | adaptive_cap_regression | max_rounds_hit | user_manual | user_abort | sigint | reviewer_unavailable
   "trajectory_raw": [5, 3, 3, 0], // raw CRITICAL count per round (pre-triage)
   "trajectory_accepted": [3, 3, 2, 0], // accepted CRITICAL per round (post-triage)
   "re_raises": [0, 0, 1, 0], // accepted-objection re-raises per round
@@ -351,14 +351,14 @@ If SIGINT during readline prompt:
 
 After each round's reviewer + triage gate, the loop picks one branch:
 
-| Round verdict | Round k state                                                                              | Round number   | Action                                                                                                         |
-| ------------- | ------------------------------------------------------------------------------------------ | -------------- | -------------------------------------------------------------------------------------------------------------- |
-| APPROVE       | 0 accepted CRITICAL                                                                        | any            | **Exit loop: APPROVE.** Write convergence.jsonl with `exit_reason: approved`. Proceed to Phase 1 of Feature 1. |
-| REVISE        | ≥1 accepted                                                                                | k = 1          | **Continue to re-synth.** Always allow round 2 (no prior round to compare).                                    |
-| REVISE        | ≥1 accepted, accepted count strictly decreased from k-1, OR all round-k objections are new | k ≤ MAX_ROUNDS | **Continue to re-synth.** Forward progress.                                                                    |
-| REVISE        | ≥1 accepted, AND ≥1 re-raise of a round-(k-1) accepted objection, AND zero new objections  | k < MAX_ROUNDS | **Bail-out gate.** Adaptive cap fires. AskUser with 4 options.                                                 |
-| REVISE        | ≥1 accepted, count increased from k-1 (regression)                                         | k < MAX_ROUNDS | **Bail-out gate.** Either reviewer is noisier or new bugs exposed; user decides.                               |
-| REVISE        | ≥1 accepted, any state                                                                     | k = MAX_ROUNDS | **Stalemate gate.** Force AskUser with 3 options.                                                              |
+| Round verdict | Round k state                                                                              | Round number   | Action                                                                                                                                   |
+| ------------- | ------------------------------------------------------------------------------------------ | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| APPROVE       | 0 accepted CRITICAL                                                                        | any            | **Exit loop: APPROVE.** Write convergence.jsonl with `exit_reason: approved`. Proceed to Phase 1 of Feature 1.                           |
+| REVISE        | ≥1 accepted                                                                                | k = 1          | **Continue to re-synth.** Always allow round 2 (no prior round to compare).                                                              |
+| REVISE        | ≥1 accepted, accepted count strictly decreased from k-1, OR all round-k objections are new | k ≤ MAX_ROUNDS | **Continue to re-synth.** Forward progress.                                                                                              |
+| REVISE        | ≥1 accepted, AND ≥1 re-raise of a round-(k-1) accepted objection, AND zero new objections  | k < MAX_ROUNDS | **Bail-out gate.** Adaptive cap fires (`exit_reason: adaptive_cap_re_raises_only` if user picks `[m]`/`[q]`). AskUser with 4 options.    |
+| REVISE        | ≥1 accepted, count increased from k-1 (regression)                                         | k < MAX_ROUNDS | **Bail-out gate.** Either reviewer is noisier or new bugs exposed; user decides (`exit_reason: adaptive_cap_regression` if `[m]`/`[q]`). |
+| REVISE        | ≥1 accepted, any state                                                                     | k = MAX_ROUNDS | **Stalemate gate.** Force AskUser with 3 options.                                                                                        |
 
 **The set-aware rule (from end-to-end walkthrough refinement).** A round k+1 where all objections are NEW (no overlap with round k's accepted set) is forward progress in a different dimension, not a stall. A round k+1 where ≥1 objection re-raises an accepted-and-resolved round-k objection AND no new objections appear is the real stall — the synth isn't getting the fixes done. The latter triggers bail; the former does not.
 
