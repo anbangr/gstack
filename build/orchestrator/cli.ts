@@ -184,6 +184,37 @@ import {
   streakSurfaceMessage,
 } from "./escalation-streak";
 import { renderPlanStatusTable, resolvePlanSelection } from "./plan-selection";
+import {
+  markFeatureFailed,
+  markPhaseFailed,
+  recordRetryCapHit,
+  rewindPhase,
+} from "./halt-event-helpers";
+import { buildHaltSnapshot, emitHaltEvent, severityFor } from "./halt-events";
+
+/**
+ * Builds the HelperContext that halt-event helpers (markPhaseFailed,
+ * markFeatureFailed, rewindPhase, recordRetryCapHit) need for emitting
+ * PHASE_FAILED / FEATURE_FAILED / PHASE_REWIND / RETRY_CAP_HIT halt events.
+ *
+ * runId is sourced from state.launch?.runId where available, falling back to
+ * state.slug for older state files that pre-date durable run identity. The
+ * pointer fields are best-effort: when state.launch is unset (older state)
+ * the path fields fall back to "" — emitHaltEvent will write the empty
+ * string and downstream tests stay structural.
+ */
+function helperCtxFor(state: BuildState) {
+  return {
+    runId: state.launch?.runId ?? state.slug,
+    stateSlug: state.slug,
+    pointers: {
+      stateFile: statePath(state.slug),
+      stdoutLog: "",
+      livingPlan: state.planFile,
+      worktreePath: state.launch?.projectRoot ?? "",
+    },
+  };
+}
 
 const DEFAULT_MAX_ORIGIN_VERIFICATION_ITERATIONS =
   BUILD_DEFAULTS.limits.originVerificationMaxIterations;
@@ -2998,8 +3029,12 @@ function ensureOriginRetryBranch(args: {
 }): boolean {
   const synced = syncLandedBase(args.cwd);
   if (!synced.ok) {
-    args.feature.status = "failed";
-    args.feature.error = `failed to sync landed base before origin retry branch: ${synced.error}`;
+    markFeatureFailed(
+      args.state,
+      args.feature.index,
+      `failed to sync landed base before origin retry branch: ${synced.error}`,
+      helperCtxFor(args.state),
+    );
     saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
     return false;
   }
@@ -3022,8 +3057,12 @@ function ensureOriginRetryBranch(args: {
       encoding: "utf8",
     });
     if (existingBranch.status !== 0) {
-      args.feature.status = "failed";
-      args.feature.error = `failed to create or checkout origin retry branch ${branch}: ${checkout.stderr || checkout.stdout}`;
+      markFeatureFailed(
+        args.state,
+        args.feature.index,
+        `failed to create or checkout origin retry branch ${branch}: ${checkout.stderr || checkout.stdout}`,
+        helperCtxFor(args.state),
+      );
       saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
       return false;
     }
@@ -3079,8 +3118,12 @@ export function ensureFeatureBranch(args: {
         encoding: "utf8",
       });
       if (checkout.status !== 0) {
-        args.feature.status = "failed";
-        args.feature.error = `failed to checkout saved feature branch ${args.feature.branch}: ${checkout.stderr || checkout.stdout}`;
+        markFeatureFailed(
+          args.state,
+          args.feature.index,
+          `failed to checkout saved feature branch ${args.feature.branch}: ${checkout.stderr || checkout.stdout}`,
+          helperCtxFor(args.state),
+        );
         saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
         return false;
       }
@@ -3133,8 +3176,12 @@ export function ensureFeatureBranch(args: {
     encoding: "utf8",
   });
   if (fetchBase.status !== 0) {
-    args.feature.status = "failed";
-    args.feature.error = `failed to fetch origin/${base} before feature branch: ${fetchBase.stderr || fetchBase.stdout}`;
+    markFeatureFailed(
+      args.state,
+      args.feature.index,
+      `failed to fetch origin/${base} before feature branch: ${fetchBase.stderr || fetchBase.stdout}`,
+      helperCtxFor(args.state),
+    );
     saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
     return false;
   }
@@ -3152,8 +3199,12 @@ export function ensureFeatureBranch(args: {
       encoding: "utf8",
     });
     if (existingBranch.status !== 0) {
-      args.feature.status = "failed";
-      args.feature.error = `failed to create or checkout feature branch ${branch}: ${checkout.stderr || checkout.stdout}`;
+      markFeatureFailed(
+        args.state,
+        args.feature.index,
+        `failed to create or checkout feature branch ${branch}: ${checkout.stderr || checkout.stdout}`,
+        helperCtxFor(args.state),
+      );
       saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
       return false;
     }
@@ -3475,7 +3526,14 @@ export function restartFeatureFromOriginIssues(args: {
 
   // Markdown is now in sync (or there were no checkboxes to un-flip).
   // Safe to advance state.
-  phaseState.status = "tests_green";
+  if (wasCommitted) {
+    // Emit PHASE_REWIND so the halt-events pipeline can observe that a
+    // committed phase was rewound (signal of origin verification failure).
+    // rewindPhase sets phaseState.status to the target value (and emits).
+    rewindPhase(args.state, phaseIndex, "tests_green", helperCtxFor(args.state));
+  } else {
+    phaseState.status = "tests_green";
+  }
   phaseState.codexReview = undefined;
   phaseState.originIssueLogPath = args.issueLogPath;
   phaseState.error = undefined;
@@ -6004,6 +6062,13 @@ async function runPhase(args: {
       console.error(
         `✗ Phase ${phase.number} (${phase.name}) failed: ${action.reason}`,
       );
+      recordRetryCapHit(
+        state,
+        phaseState.index,
+        "codex",
+        phaseState.codexReview?.iterations ?? 0,
+        helperCtxFor(state),
+      );
       return "failed";
     }
 
@@ -6569,9 +6634,12 @@ async function runPhase(args: {
       // If a prior run crashed between createWorktrees and saveState, phaseState.dualImpl
       // already holds the orphaned paths — tear them down before creating a fresh pair.
       if (isLegacyDualImplState(phaseState.dualImpl)) {
-        phaseState.status = "failed";
-        phaseState.error = legacyDualImplError();
-        state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          legacyDualImplError(),
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -6596,9 +6664,13 @@ async function runPhase(args: {
           action,
           mockResult({ exitCode: 1, stderr: msg }),
         );
-        phaseState.error = msg;
-        phaseState.status = "failed";
         state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          msg,
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -6740,6 +6812,21 @@ async function runPhase(args: {
               maxFixIter: DEFAULT_MAX_TEST_ITERATIONS,
               allowSubmoduleRecovery: args.allowSubmoduleRecovery,
             });
+          // Emit RETRY_CAP_HIT (kind=testfix) when the fix loop exhausted its
+          // budget but tests are still red. Emit-only — the caller continues
+          // to score this candidate and the judge/auto-select logic decides.
+          if (
+            fixIterations === DEFAULT_MAX_TEST_ITERATIONS &&
+            testResult.testExitCode !== 0
+          ) {
+            recordRetryCapHit(
+              state,
+              phaseState.index,
+              "testfix",
+              fixIterations,
+              helperCtxFor(state),
+            );
+          }
           const headResult = spawnSync(
             "git",
             ["-C", candidateState.worktreePath, "rev-parse", "HEAD"],
@@ -6775,9 +6862,13 @@ async function runPhase(args: {
         // null = git rev-list failed (worktree may be broken) — fail closed rather than
         // silently treating it as "0 commits" and auto-selecting the other side.
         if (primaryCommits === null || secondaryCommits === null) {
-          phaseState.status = "failed";
-          phaseState.error = `Failed to count commits since base — cannot determine implementation eligibility (primary=${primaryCommits}, secondary=${secondaryCommits})`;
           state.phases[phase.index] = phaseState;
+          markPhaseFailed(
+            state,
+            phaseState.index,
+            `Failed to count commits since base — cannot determine implementation eligibility (primary=${primaryCommits}, secondary=${secondaryCommits})`,
+            helperCtxFor(state),
+          );
           saveState(state, { noGbrain, log: console.warn });
           continue;
         }
@@ -6797,12 +6888,15 @@ async function runPhase(args: {
         const neitherCommitted = !primaryCommitted && !secondaryCommitted;
 
         if (bothTimedOut || bothExitNonZero || neitherCommitted) {
-          phaseState.status = "failed";
-          phaseState.error =
-            `Dual implementation failed: ` +
-            `primary exit=${primaryResult.implResult.exitCode} timedOut=${primaryResult.implResult.timedOut} commits=${primaryCommits}; ` +
-            `secondary exit=${secondaryResult.implResult.exitCode} timedOut=${secondaryResult.implResult.timedOut} commits=${secondaryCommits}`;
           state.phases[phase.index] = phaseState;
+          markPhaseFailed(
+            state,
+            phaseState.index,
+            `Dual implementation failed: ` +
+              `primary exit=${primaryResult.implResult.exitCode} timedOut=${primaryResult.implResult.timedOut} commits=${primaryCommits}; ` +
+              `secondary exit=${secondaryResult.implResult.exitCode} timedOut=${secondaryResult.implResult.timedOut} commits=${secondaryCommits}`,
+            helperCtxFor(state),
+          );
           saveState(state, { noGbrain, log: console.warn });
           // dualImplOk stays false → finally block will tear down.
           continue;
@@ -6841,9 +6935,13 @@ async function runPhase(args: {
         // Skip RUN_DUAL_TESTS + RUN_JUDGE entirely; auto-select the committed side.
         if (primaryCommitted && !secondaryCommitted) {
           if (primaryResult.testResult.testExitCode !== 0) {
-            phaseState.status = "failed";
-            phaseState.error = `Primary auto-selected (secondary=0 commits) but tests are failing (exit=${primaryResult.testResult.testExitCode}) — worktrees will be torn down; re-run gstack-build to retry this phase`;
             state.phases[phase.index] = phaseState;
+            markPhaseFailed(
+              state,
+              phaseState.index,
+              `Primary auto-selected (secondary=0 commits) but tests are failing (exit=${primaryResult.testResult.testExitCode}) — worktrees will be torn down; re-run gstack-build to retry this phase`,
+              helperCtxFor(state),
+            );
             saveState(state, { noGbrain, log: console.warn });
             continue;
           }
@@ -6858,9 +6956,13 @@ async function runPhase(args: {
           phaseState.status = "dual_winner_pending";
         } else if (!primaryCommitted && secondaryCommitted) {
           if (secondaryResult.testResult.testExitCode !== 0) {
-            phaseState.status = "failed";
-            phaseState.error = `Secondary auto-selected (primary=0 commits) but tests are failing (exit=${secondaryResult.testResult.testExitCode}) — worktrees will be torn down; re-run gstack-build to retry this phase`;
             state.phases[phase.index] = phaseState;
+            markPhaseFailed(
+              state,
+              phaseState.index,
+              `Secondary auto-selected (primary=0 commits) but tests are failing (exit=${secondaryResult.testResult.testExitCode}) — worktrees will be torn down; re-run gstack-build to retry this phase`,
+              helperCtxFor(state),
+            );
             saveState(state, { noGbrain, log: console.warn });
             continue;
           }
@@ -6873,6 +6975,22 @@ async function runPhase(args: {
             selectedBy: "auto",
           };
           phaseState.status = "dual_winner_pending";
+          // secondary auto-selected because primary did not commit
+          const ctxAuto = helperCtxFor(state);
+          emitHaltEvent({
+            kind: "DUAL_IMPL_SWAP",
+            runId: ctxAuto.runId,
+            stateSlug: ctxAuto.stateSlug,
+            severity: severityFor("DUAL_IMPL_SWAP"),
+            message: `dual-impl: secondary auto-selected (primary did not commit)`,
+            pointers: ctxAuto.pointers,
+            snapshot: buildHaltSnapshot({
+              state,
+              stdoutLogPath: ctxAuto.pointers.stdoutLog,
+              worktreePath: ctxAuto.pointers.worktreePath,
+              phaseIndex: phaseState.index,
+            }),
+          });
         }
         // else: both committed — normal flow → dual_impl_done → RUN_DUAL_TESTS
 
@@ -6919,9 +7037,13 @@ async function runPhase(args: {
         dualImplOk = true; // suppress finally teardown; downstream phases own cleanup
       } catch (err) {
         const msg = `Dual implementation crashed unexpectedly: ${(err as Error).message}`;
-        phaseState.status = "failed";
-        phaseState.error = msg;
         state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          msg,
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
       } finally {
         if (!dualImplOk) {
@@ -6943,17 +7065,22 @@ async function runPhase(args: {
       );
       const dual = phaseState.dualImpl;
       if (!dual) {
-        phaseState.status = "failed";
-        phaseState.error =
-          "RUN_DUAL_TESTS reached without dualImpl state — orchestrator bug";
-        state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          "RUN_DUAL_TESTS reached without dualImpl state — orchestrator bug",
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
       if (isLegacyDualImplState(dual)) {
-        phaseState.status = "failed";
-        phaseState.error = legacyDualImplError();
-        state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          legacyDualImplError(),
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -7224,11 +7351,14 @@ async function runPhase(args: {
             teardownWorktrees({ cwd, dualImpl: dual });
           } catch {}
         }
-        phaseState.status = "failed";
-        phaseState.error = isLegacyDualImplState(dual)
-          ? legacyDualImplError()
-          : "RUN_JUDGE reached without dual test results — orchestrator bug";
-        state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          isLegacyDualImplState(dual)
+            ? legacyDualImplError()
+            : "RUN_JUDGE reached without dual test results — orchestrator bug",
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -7257,12 +7387,14 @@ async function runPhase(args: {
         // evidence and pick arbitrarily. (Phase 4 review, HIGH.)
         if (diffs.primary === null || diffs.secondary === null) {
           teardownWorktrees({ cwd, dualImpl: dual });
-          phaseState.status = "failed";
-          phaseState.error =
+          markPhaseFailed(
+            state,
+            phaseState.index,
             `Failed to read worktree diff before judge: ` +
-            `primary=${diffs.primary === null ? "failed" : "ok"}, ` +
-            `secondary=${diffs.secondary === null ? "failed" : "ok"}`;
-          state.phases[phase.index] = phaseState;
+              `primary=${diffs.primary === null ? "failed" : "ok"}, ` +
+              `secondary=${diffs.secondary === null ? "failed" : "ok"}`,
+            helperCtxFor(state),
+          );
           saveState(state, { noGbrain, log: console.warn });
           continue;
         }
@@ -7331,9 +7463,12 @@ async function runPhase(args: {
         if (judgeRes.timedOut || judgeRes.exitCode !== 0) {
           // Tear down worktrees and fail closed.
           teardownWorktrees({ cwd, dualImpl: dual });
-          phaseState.status = "failed";
-          phaseState.error = `Judge failed: exit=${judgeRes.exitCode} timedOut=${judgeRes.timedOut}`;
-          state.phases[phase.index] = phaseState;
+          markPhaseFailed(
+            state,
+            phaseState.index,
+            `Judge failed: exit=${judgeRes.exitCode} timedOut=${judgeRes.timedOut}`,
+            helperCtxFor(state),
+          );
           saveState(state, { noGbrain, log: console.warn });
           continue;
         }
@@ -7342,9 +7477,12 @@ async function runPhase(args: {
       if (verdict === null) {
         // Malformed judge output — fail closed (Phase 3 review).
         teardownWorktrees({ cwd, dualImpl: dual });
-        phaseState.status = "failed";
-        phaseState.error = `Judge output was malformed (no anchored WINNER line); reasoning: ${reasoning}`;
-        state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          `Judge output was malformed (no anchored WINNER line); reasoning: ${reasoning}`,
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -7385,9 +7523,13 @@ async function runPhase(args: {
             `  ⚠ Judge-selected ${verdict} modified test files — failing closed (test hygiene)`,
           );
           teardownWorktrees({ cwd, dualImpl: dual });
-          phaseState.status = "failed";
-          phaseState.error = `Judge-selected ${verdict} modified test assertions — potential test-weakening; phase requires manual review`;
           state.phases[phase.index] = phaseState;
+          markPhaseFailed(
+            state,
+            phaseState.index,
+            `Judge-selected ${verdict} modified test assertions — potential test-weakening; phase requires manual review`,
+            helperCtxFor(state),
+          );
           saveState(state, { noGbrain, log: console.warn });
           continue;
         }
@@ -7403,13 +7545,34 @@ async function runPhase(args: {
       );
       const dual = phaseState.dualImpl;
       if (!dual || isLegacyDualImplState(dual)) {
-        phaseState.status = "failed";
-        phaseState.error = isLegacyDualImplState(dual)
-          ? legacyDualImplError()
-          : "APPLY_WINNER reached without dualImpl state — orchestrator bug";
-        state.phases[phase.index] = phaseState;
+        markPhaseFailed(
+          state,
+          phaseState.index,
+          isLegacyDualImplState(dual)
+            ? legacyDualImplError()
+            : "APPLY_WINNER reached without dualImpl state — orchestrator bug",
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
+      }
+
+      if (action.winner === "secondary") {
+        const ctx = helperCtxFor(state);
+        emitHaltEvent({
+          kind: "DUAL_IMPL_SWAP",
+          runId: ctx.runId,
+          stateSlug: ctx.stateSlug,
+          severity: severityFor("DUAL_IMPL_SWAP"),
+          message: `dual-impl: secondary implementor won the judge verdict (primary did not deliver)`,
+          pointers: ctx.pointers,
+          snapshot: buildHaltSnapshot({
+            state,
+            stdoutLogPath: ctx.pointers.stdoutLog,
+            worktreePath: ctx.pointers.worktreePath,
+            phaseIndex: phaseState.index,
+          }),
+        });
       }
 
       let applyOk = true;
@@ -7426,16 +7589,18 @@ async function runPhase(args: {
         // winner's code. Surface paths/branches so the user can inspect, manually
         // recover, or replay. (Phase 4 review, MEDIUM: don't destroy recovery
         // artifact.)
-        phaseState.status = "failed";
-        phaseState.error =
+        markPhaseFailed(
+          state,
+          phaseState.index,
           `applyWinner(${action.winner}) failed: ${applyError ?? "unknown"}\n` +
-          `  Worktrees PRESERVED for recovery:\n` +
-          `    primary:   ${dual.candidates.primary.worktreePath} (branch ${dual.candidates.primary.branch})\n` +
-          `    secondary: ${dual.candidates.secondary.worktreePath} (branch ${dual.candidates.secondary.branch})\n` +
-          `  Inspect, fix, then re-run. Manual cleanup when done:\n` +
-          `    git worktree remove --force ${dual.candidates.primary.worktreePath} && git branch -D ${dual.candidates.primary.branch}\n` +
-          `    git worktree remove --force ${dual.candidates.secondary.worktreePath} && git branch -D ${dual.candidates.secondary.branch}`;
-        state.phases[phase.index] = phaseState;
+            `  Worktrees PRESERVED for recovery:\n` +
+            `    primary:   ${dual.candidates.primary.worktreePath} (branch ${dual.candidates.primary.branch})\n` +
+            `    secondary: ${dual.candidates.secondary.worktreePath} (branch ${dual.candidates.secondary.branch})\n` +
+            `  Inspect, fix, then re-run. Manual cleanup when done:\n` +
+            `    git worktree remove --force ${dual.candidates.primary.worktreePath} && git branch -D ${dual.candidates.primary.branch}\n` +
+            `    git worktree remove --force ${dual.candidates.secondary.worktreePath} && git branch -D ${dual.candidates.secondary.branch}`,
+          helperCtxFor(state),
+        );
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -8900,11 +9065,48 @@ async function main() {
   }
 
   if (args.mode === "drain-faults") {
+    emitHaltEvent({
+      kind: "MANUAL_RECOVERY_INVOKED",
+      runId: args.runId ?? "drain-faults",
+      stateSlug: args.planFile
+        ? deriveStateSlug(args.planFile)
+        : "drain-faults-no-plan",
+      severity: severityFor("MANUAL_RECOVERY_INVOKED"),
+      message:
+        `drain-faults subcommand invoked` +
+        (args.drainFaultsBuildTmpDir
+          ? ` (build-tmp-dir=${args.drainFaultsBuildTmpDir})`
+          : "") +
+        (args.monitorManifest ? ` (manifest=${args.monitorManifest})` : ""),
+      pointers: {
+        stateFile: args.planFile ? statePath(deriveStateSlug(args.planFile)) : "",
+        stdoutLog: "",
+        livingPlan: args.planFile ?? "",
+        worktreePath: process.cwd(),
+      },
+      snapshot: { stdoutTail: "" },
+    });
     const exitCode = await runDrainFaultsMode(args);
     process.exit(exitCode);
   }
 
   if (args.mode === "mark-shipped") {
+    emitHaltEvent({
+      kind: "MANUAL_RECOVERY_INVOKED",
+      runId: args.runId ?? "mark-shipped",
+      stateSlug: deriveStateSlug(args.planFile),
+      severity: severityFor("MANUAL_RECOVERY_INVOKED"),
+      message:
+        `mark-shipped subcommand invoked for feature ${args.markShippedFeature}` +
+        (args.markShippedPr ? ` (PR #${args.markShippedPr})` : ""),
+      pointers: {
+        stateFile: statePath(deriveStateSlug(args.planFile)),
+        stdoutLog: "",
+        livingPlan: args.planFile,
+        worktreePath: process.cwd(),
+      },
+      snapshot: { stdoutTail: "" },
+    });
     const result = await runMarkShipped({
       planFile: args.planFile,
       feature: args.markShippedFeature!,
@@ -9178,6 +9380,22 @@ async function main() {
     }
 
     if (!setupFailed && state && args.markPhaseCommitted) {
+      {
+        const ctx = helperCtxFor(state);
+        emitHaltEvent({
+          kind: "MANUAL_RECOVERY_INVOKED",
+          runId: ctx.runId,
+          stateSlug: ctx.stateSlug,
+          severity: severityFor("MANUAL_RECOVERY_INVOKED"),
+          message: `--mark-phase-committed invoked for phase ${args.markPhaseCommitted}`,
+          pointers: ctx.pointers,
+          snapshot: buildHaltSnapshot({
+            state,
+            stdoutLogPath: ctx.pointers.stdoutLog,
+            worktreePath: ctx.pointers.worktreePath,
+          }),
+        });
+      }
       const marked = markPhaseCommittedAfterManualRecovery({
         state,
         phases,
@@ -9335,6 +9553,30 @@ async function main() {
             featureState.status === "committed" &&
             !featureState.completedAt
           ) {
+            // Emit SILENT_STATE_MUTATION BEFORE the destructive rewrite so the
+            // halt-events queue captures the original shape (the polis
+            // hand-merged-feature class). Mutation behavior unchanged in this
+            // PR; a follow-up will decide whether to keep re-processing or
+            // treat the merge as authoritative.
+            {
+              const ctx = helperCtxFor(state);
+              emitHaltEvent({
+                kind: "SILENT_STATE_MUTATION",
+                runId: ctx.runId,
+                stateSlug: ctx.stateSlug,
+                severity: severityFor("SILENT_STATE_MUTATION"),
+                message:
+                  `Feature ${featureState.number} status="committed" without completedAt — ` +
+                  `orchestrator re-processing (mergeSha=${featureState.mergeSha ?? "absent"}, prNumber=${featureState.prNumber ?? "absent"})`,
+                pointers: ctx.pointers,
+                snapshot: buildHaltSnapshot({
+                  state,
+                  stdoutLogPath: ctx.pointers.stdoutLog,
+                  worktreePath: ctx.pointers.worktreePath,
+                  featureIndex,
+                }),
+              });
+            }
             console.warn(
               `⚠ Feature ${featureState.number} status is "committed" but completedAt is missing — ` +
                 `this indicates a manual JSON state patch that bypassed ship+land+verify. ` +
@@ -9354,6 +9596,25 @@ async function main() {
             featureState.status === "release_queued" &&
             !isFeatureTerminal(featureState)
           ) {
+            {
+              const ctx = helperCtxFor(state);
+              emitHaltEvent({
+                kind: "SILENT_STATE_MUTATION",
+                runId: ctx.runId,
+                stateSlug: ctx.stateSlug,
+                severity: severityFor("SILENT_STATE_MUTATION"),
+                message:
+                  `Feature ${featureState.number} status="release_queued" without shippedAt/prNumber — ` +
+                  `orchestrator re-processing (shippedAt=${featureState.shippedAt ?? "absent"}, prNumber=${featureState.prNumber ?? "absent"})`,
+                pointers: ctx.pointers,
+                snapshot: buildHaltSnapshot({
+                  state,
+                  stdoutLogPath: ctx.pointers.stdoutLog,
+                  worktreePath: ctx.pointers.worktreePath,
+                  featureIndex,
+                }),
+              });
+            }
             console.warn(
               `⚠ Feature ${featureState.number} status is "release_queued" but shippedAt/prNumber are missing — ` +
                 `this indicates a manual JSON state patch that bypassed ship. ` +

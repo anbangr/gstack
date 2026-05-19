@@ -49,6 +49,7 @@ describe("markPhaseFailed", () => {
       queueDir: tmp,
     });
     expect(state.phases[0].status).toBe("failed");
+    expect(state.phases[0].error).toBe("spec-flip exploded");
     const pending = loadPendingInvestigations({ queueDir: tmp });
     expect(pending.length).toBe(1);
     expect(pending[0].kind).toBe("PHASE_FAILED");
