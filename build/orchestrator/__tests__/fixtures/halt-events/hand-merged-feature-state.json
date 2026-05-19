@@ -1,0 +1,22 @@
+{
+  "slug": "polis-mesh-lane-b",
+  "planFile": "/x/plan.md",
+  "branch": "feat/polis-mesh-lane-b",
+  "startedAt": "2026-05-17T00:00:00Z",
+  "lastUpdatedAt": "2026-05-17T08:37:01Z",
+  "phases": [{ "index": 0, "number": 1, "status": "committed" }],
+  "features": [
+    {
+      "index": 0,
+      "number": "1",
+      "name": "Lane B Feature 1",
+      "phaseIndexes": [0],
+      "status": "committed",
+      "mergeSha": "d9845c1abcdef1234567890abcdef1234567890ab",
+      "prNumber": 26
+    }
+  ],
+  "currentPhaseIndex": 0,
+  "currentFeatureIndex": 0,
+  "completed": false
+}
