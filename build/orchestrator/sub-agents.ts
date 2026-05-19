@@ -26,6 +26,7 @@ import { logDir, ensureLogDir, deriveGeminiTmpKey } from "./state";
 import type { RoleConfig, RoleProvider, RoleReasoning } from "./role-config";
 import { BUILD_DEFAULTS, envNumberOrDefault } from "./build-config";
 import type { DualImplCandidateKey } from "./types";
+import { attachStallWatchdog, type Provider } from "./stall-watchdog";
 
 export type CodexSandbox =
   | "read-only"
@@ -211,8 +212,19 @@ export interface SubAgentResult {
   stderr: string;
   /** Exit code; null if process was killed by signal. */
   exitCode: number | null;
-  /** True if killed by the timeout, not a real exit. */
+  /**
+   * True if killed by the stall watchdog (no stdout/stderr activity for
+   * stallMs). Aliased to `timedOut` for backwards compatibility with
+   * call-site code that branches on `timedOut`; both flags carry the
+   * same meaning under liveness semantics.
+   */
   timedOut: boolean;
+  /**
+   * Explicit flag set when the stall watchdog fired. Disambiguates a stall
+   * kill (no activity) from a transport/crash failure. Always equal to
+   * `timedOut` today.
+   */
+  stallKilled: boolean;
   /** Absolute path to the log file written for this invocation. */
   logPath: string;
   /** Wall-clock duration in ms. */
@@ -222,8 +234,31 @@ export interface SubAgentResult {
 }
 
 /**
+ * Map a CLI binary name to a Provider for the stall watchdog's classifier.
+ * Falls back to "shell" for anything that isn't a known sub-agent CLI
+ * (tests, ship, git ops). The fallback uses any-non-empty-line activity,
+ * which is correct for shell-driven workflows that print progress to stdout
+ * but don't emit structured tool-use events.
+ */
+function pickProviderForBin(bin: string): Provider {
+  if (bin === CODEX_BIN) return "codex";
+  if (bin === CLAUDE_BIN) return "claude";
+  if (bin === KIMI_BIN) return "kimi";
+  if (bin === geminiBin()) return "gemini";
+  if (bin === process.env.GEMINI_BIN) return "gemini";
+  return "shell";
+}
+
+/**
  * Spawn a child, capture stdout+stderr to a log file, and resolve with
  * structured result. Closes stdin if `closeStdin` (Codex needs this).
+ *
+ * Liveness model: instead of passing `timeout` to execFile (which kills the
+ * child after N total ms regardless of activity), we attach a StallWatchdog
+ * that fires only after `stallMs` of silence on stdout+stderr. Same env-var
+ * names (GSTACK_BUILD_*_TIMEOUT), new semantics: the value is now a stall
+ * window, not a wall-clock budget. A sub-agent that keeps emitting tool-use
+ * or status lines runs as long as it needs.
  */
 function spawnCaptured(args: {
   bin: string;
@@ -236,19 +271,25 @@ function spawnCaptured(args: {
 }): Promise<SubAgentResult> {
   return new Promise((resolve) => {
     const startedAt = Date.now();
-    let timedOut = false;
+    let stallKilled = false;
+    let stallSilenceMs = 0;
     const child = execFile(
       args.bin,
       args.argv,
       {
         maxBuffer: MAX_BUFFER,
-        timeout: args.timeoutMs,
+        // No `timeout` — the StallWatchdog owns kill semantics now.
         cwd: args.cwd,
         shell: args.shell,
       },
       (err, stdout, stderr) => {
-        // Detect timeout via Node's own kill flag (fires before our +1000ms setTimeout).
-        if (err?.killed) timedOut = true;
+        watchdog.stop();
+        // `err.killed` is set whenever Node received a SIGTERM exit for the
+        // child, which happens when our watchdog kills it. Treat watchdog
+        // kill as timedOut for backwards compatibility with existing
+        // call-site branching on `timedOut`. A genuine non-stall failure
+        // (crash, non-zero exit without SIGTERM) leaves stallKilled=false.
+        const timedOut = stallKilled || Boolean(err?.killed);
 
         // Persist captured output regardless of success.
         try {
@@ -259,6 +300,8 @@ function spawnCaptured(args: {
               `# started: ${new Date(startedAt).toISOString()}\n` +
               `# duration_ms: ${Date.now() - startedAt}\n` +
               `# timed_out: ${timedOut}\n` +
+              `# stall_killed: ${stallKilled}\n` +
+              `# stall_silence_ms: ${stallSilenceMs}\n` +
               `# exit: ${err ? ((err as any).code ?? "killed") : 0}\n` +
               `\n# ---- stdout ----\n${stdout}\n# ---- stderr ----\n${stderr}\n`,
           );
@@ -274,10 +317,23 @@ function spawnCaptured(args: {
           stderr: String(stderr || ""),
           exitCode,
           timedOut,
+          stallKilled,
           logPath: args.logPath,
           durationMs: Date.now() - startedAt,
           retries: 0,
         });
+      },
+    );
+
+    const watchdog = attachStallWatchdog(
+      { mode: "stream", child },
+      {
+        stallMs: args.timeoutMs,
+        provider: pickProviderForBin(args.bin),
+        onStallKill: (silenceMs) => {
+          stallKilled = true;
+          stallSilenceMs = silenceMs;
+        },
       },
     );
 

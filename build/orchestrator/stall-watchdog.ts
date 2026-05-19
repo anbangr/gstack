@@ -164,7 +164,11 @@ export function attachStallWatchdog(
 ): StallWatchdogController {
   const stallMs = opts.stallMs;
   const gracePeriodMs = opts.gracePeriodMs ?? 5000;
-  const pollIntervalMs = opts.pollIntervalMs ?? 1000;
+  // Default poll interval is 1s, but never more than half the stall window —
+  // a 100ms stallMs with a 1s poll interval would miss the stall by 10x.
+  // Floor at 10ms to avoid degenerate near-zero polling.
+  const pollIntervalMs =
+    opts.pollIntervalMs ?? Math.max(10, Math.min(1000, Math.floor(stallMs / 2)));
   const clock = opts.clock ?? {
     now: () => Date.now(),
     setInterval: (fn, ms) => setInterval(fn, ms) as unknown,
@@ -230,7 +234,7 @@ export function attachStallWatchdog(
     }
 
     const silence = clock.now() - lastActivityAt;
-    if (silence > stallMs) {
+    if (silence >= stallMs) {
       killed = true;
       try {
         opts.onStallKill?.(silence);

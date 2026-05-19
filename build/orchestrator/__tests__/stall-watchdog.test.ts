@@ -162,7 +162,7 @@ describe("attachStallWatchdog (stream mode)", () => {
     advance(300);
     expect(ctrl.stallKilled()).toBe(true);
     expect(killSilence).not.toBeNull();
-    expect(killSilence!).toBeGreaterThan(200);
+    expect(killSilence!).toBeGreaterThanOrEqual(200);
     ctrl.stop();
   });
 
@@ -329,7 +329,7 @@ describe("attachStallWatchdog (mtime mode)", () => {
 
     advance(500);
     expect(ctrl.stallKilled()).toBe(true);
-    expect(killSilence!).toBeGreaterThan(200);
+    expect(killSilence!).toBeGreaterThanOrEqual(200);
     ctrl.stop();
   });
 
