@@ -2,9 +2,9 @@
 
 ## [1.40.4.1] - 2026-05-19
 
-**Gemini fallback implementor reads its own input files again. The staging directory now matches Gemini's `--yolo` workspace whitelist instead of mismatching by a `build-` prefix.**
+**Gemini fallback implementor reads its own input files again, and parallel dual-impl runs no longer clobber each other's I/O. Two related fixes shipped together: directory alignment with Gemini's `--yolo` whitelist, and per-filename slug disambiguation for concurrent runs.**
 
-When kimi (primary implementor) failed and the orchestrator fell back to Gemini, every `read_file` call returned "Path not in workspace." Gemini silently degraded to inference, hallucinated the work from prompt context, and dirtied the worktree with edits that didn't match the plan. The orchestrator staged input at `~/.gemini/tmp/build-<plan-slug>/...` while Gemini's `--yolo` sandbox auto-whitelisted `~/.gemini/tmp/<worktree-basename>/` (no `build-` prefix). The two paths only agreed by accident in tests; the production worktree directory never carries the orchestrator's `build-` slug prefix. The fix keys `stageGeminiIO` on `path.basename(cwd)` so the staging directory matches Gemini's inference exactly. The `slug` parameter stays for log filenames so parallel runs in the same worktree stay distinguishable.
+When kimi (primary implementor) failed and the orchestrator fell back to Gemini, every `read_file` call returned "Path not in workspace." Gemini silently degraded to inference, hallucinated the work from prompt context, and dirtied the worktree with edits that didn't match the plan. The orchestrator staged input at `~/.gemini/tmp/build-<plan-slug>/...` while Gemini's `--yolo` sandbox auto-whitelisted `~/.gemini/tmp/<worktree-basename>/` (no `build-` prefix). The two paths only agreed by accident in tests; the production worktree directory never carries the orchestrator's `build-` slug prefix. `stageGeminiIO` now keys the staging directory on `path.basename(opts.cwd)` to match Gemini's inference exactly. Adversarial review on the directory fix caught a second issue: dual-impl always names its worktrees `primary` and `secondary` (`build/orchestrator/worktree.ts`), so two concurrent builds of different plans would BOTH stage primary work under `~/.gemini/tmp/primary/`. Filenames previously only carried phase/iteration/suffix, so run B would overwrite run A's input mid-flight and run A would copy B's output back as its own. The fix folds a sanitized `opts.slug` into the staged filename so concurrent runs at the same phase/iteration/suffix diverge.
 
 ### The numbers that matter
 
@@ -15,25 +15,26 @@ Observed on `mitosis-control-plane-impl-plan-anbang-20260518-154933-bee3aea0` Ph
 | `~/.gemini/tmp/build-mitosis-control-plane-impl-plan-anbang-.../` | empty (orchestrator cleanup ran) | orchestrator stage write |
 | `~/.gemini/tmp/mitosis-control-plane-impl-plan-anbang-.../` | `chats/`, `.project_root` | Gemini's actual workspace |
 
-Same regression observed 2026-05-17 on `agnt2-prototype-plan4` (T111646 fault report). Commit `67480efe` dropped a `gstack/` segment in the same helper but kept `opts.slug` as the directory key, so the `build-` prefix from `deriveSlug` still mismatched. This release closes the remaining gap.
+Same regression observed 2026-05-17 on `agnt2-prototype-plan4` (T111646 fault report). Commit `67480efe` dropped a `gstack/` segment in the same helper but kept `opts.slug` as the directory key, so the `build-` prefix from `deriveSlug` still mismatched. This release closes the remaining gap. The concurrent-collision path was caught by adversarial review (both Claude subagent and Codex independently flagged it as the most exploitable finding in the original patch).
 
 ### What this means for builders
 
-Kimi-primary → Gemini-backup is the default impl pairing. Every fallback was silently broken when the plan basename and worktree basename didn't align (which is always, because `deriveSlug` prepends `build-`). After this release, phases that needed the Gemini fallback complete on real file reads instead of inference. If you've been hand-implementing phases after kimi timeouts, the fallback path works again.
+Kimi-primary → Gemini-backup is the default impl pairing. Every fallback was silently broken when the plan basename and worktree basename didn't align (which is always, because `deriveSlug` prepends `build-`). After this release, phases that needed the Gemini fallback complete on real file reads instead of inference. If you've been hand-implementing phases after kimi timeouts, the fallback path works again. Concurrent dual-impl runs of different plans also no longer corrupt each other's I/O.
 
 ### Itemized changes
 
 #### Fixed
 
 - `stageGeminiIO` in `build/orchestrator/sub-agents.ts` now derives its staging directory from `path.basename(opts.cwd)` instead of `opts.slug`. `opts.cwd` is a new required parameter (added to both call sites: `runRoleTask` and `runGeminiTestSpec`). The directory now matches Gemini's `--yolo` auto-whitelist, so the agent can actually read its input and write its output.
+- `stageGeminiIO` now folds a sanitized `opts.slug` into the staged filename (`gstack-gemini-<slug>-<phase>-<iter>-<suffix>-(input|output).md`). Dual-impl worktrees are always named `primary` / `secondary`, so without per-filename slug disambiguation two concurrent builds of different plans would collide on `~/.gemini/tmp/primary/<same-suffix>.md` and silently corrupt each other's I/O. Slug sanitizer collapses anything outside `[a-zA-Z0-9._-]` to `-` to keep the filename a single path segment.
 
 #### Changed
 
-- New regression test in `build/orchestrator/__tests__/sub-agents.test.ts` pins the cross-system invariant: when `slug` carries a `build-` prefix (simulating `deriveSlug` output) and `cwd` does not, the staged paths land under `basename(cwd)`, not `slug`. The prior T111646 `/gstack/` guard stays as a negative assertion. The `runSlashCommand (gemini role dispatch)` test was updated to assert against `path.basename(tmpDir)` instead of `slug`.
+- Three new regression tests in `build/orchestrator/__tests__/sub-agents.test.ts`: (1) the cross-system directory invariant (when `slug` carries a `build-` prefix and `cwd` does not, staged paths land under `basename(cwd)`, not `slug`); (2) the dual-impl concurrency safety case (two `stageGeminiIO` calls sharing the same `cwd`, phase, iteration, and suffix but different slugs produce distinct filenames and don't cross-contaminate); (3) the slug sanitization case (a malicious slug containing `../` doesn't escape `stagingDir`). The prior T111646 `/gstack/` guard stays as a negative assertion. The `runSlashCommand (gemini role dispatch)` test was updated to assert against `path.basename(tmpDir)` instead of `slug`.
 
 ### For contributors
 
-The `stageGeminiIO` doc comment now explains the two-key system explicitly: directory key = `basename(cwd)` (Gemini's sandbox rule), filename suffix key = `slug` (orchestrator's log/state namespace). The two had been silently entangled by the test's accidental use of the same value for both. The cross-system invariant test is the regression guard for future churn in either `deriveSlug` or Gemini's sandbox rules.
+The `stageGeminiIO` doc comment now explains the two-key system explicitly: directory key = `basename(cwd)` (Gemini's sandbox rule), filename key = sanitized `opts.slug` + phase/iteration/suffix (orchestrator's parallel-run namespace). The two had been silently entangled by the test's accidental use of the same value for both. The cross-system invariant test and the concurrency safety test are the regression guards for future churn in either `deriveSlug`, Gemini's sandbox rules, or `worktree.ts`'s naming of dual-impl trees.
 
 ## [1.40.4.0] - 2026-05-19
 
