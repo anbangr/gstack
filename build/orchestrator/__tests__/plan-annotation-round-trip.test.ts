@@ -133,4 +133,32 @@ describe("writeRoundAnnotation", () => {
     expect(parsed).toHaveLength(1);
     expect(parsed[0]).toEqual(ann);
   });
+
+  it("does not interpret $& or $1 in annotation fields as replacement patterns", () => {
+    const plan = `## Feature 1\n### Phase 2: Impl\n- [ ] task\n`;
+    const ann: RoundAnnotation = {
+      location: "Feature 1, Phase 2",
+      severity: "CRITICAL",
+      issue: "regex contains $& and $1",
+      suggestion: "escape $` and $' literally",
+      rounds: [
+        {
+          round: 1,
+          userDecision: "accept",
+          userRationale: "with $& dollar",
+          resolution: "pending",
+        },
+      ],
+    };
+    const updated = writeRoundAnnotation(plan, ann);
+    expect(updated).toContain("regex contains $& and $1");
+    expect(updated).toContain("escape $` and $' literally");
+    expect(updated).toContain('USER: accept ("with $& dollar")');
+    // Round-trip: parse the result and confirm fields survive.
+    const parsed = parseRoundAnnotations(updated);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].issue).toBe("regex contains $& and $1");
+    expect(parsed[0].suggestion).toBe("escape $` and $' literally");
+    expect(parsed[0].rounds[0].userRationale).toBe("with $& dollar");
+  });
 });

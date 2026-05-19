@@ -603,7 +603,7 @@ export function parseRoundAnnotations(planText: string): RoundAnnotation[] {
       }
       return entry;
     };
-    // The header itself names round 1 of this annotation; track its round number.
+    // The header names the round this annotation was first written in; track it.
     ensure(parseInt(headerMatch[1], 10));
 
     ROUND_USER_RE.lastIndex = 0;
@@ -691,7 +691,7 @@ export function writeRoundAnnotation(
     };
     const oldText = serializeAnnotation(existing[matchIdx]);
     const newText = serializeAnnotation(merged);
-    return planText.replace(oldText, newText);
+    return planText.replace(oldText, () => newText);
   }
 
   // Insert path: place above `### Phase <phaseId>` for the location.
@@ -703,7 +703,7 @@ export function writeRoundAnnotation(
       "m",
     );
     if (phaseRe.test(planText)) {
-      return planText.replace(phaseRe, `${newBlock}\n$1`);
+      return planText.replace(phaseRe, (_match, heading) => `${newBlock}\n${heading}`);
     }
   }
   // Fallback: prepend.
@@ -714,11 +714,18 @@ export function writeRoundAnnotation(
 // Round-history header (top-of-plan block)
 // ---------------------------------------------------------------------------
 
+/**
+ * One row inside the top-of-plan `<!-- gstack-plan-review-history -->` block.
+ * Captures the per-round summary that the next reviewer reads to see the trajectory.
+ */
 export interface RoundHistoryEntry {
   round: number;
+  /** ISO 8601 UTC timestamp of when this round completed. */
   ts: string;
+  /** Reviewer identifier — model name from runConfiguredRoleTask, e.g. "gpt-5.5". */
   reviewer: string;
   verdict: "APPROVE" | "REVISE";
+  /** Raw CRITICAL count returned by the reviewer (pre-triage). */
   criticalCount: number;
   accepted: number;
   rejected: number;
@@ -728,6 +735,11 @@ export interface RoundHistoryEntry {
 const HISTORY_BLOCK_RE =
   /<!--\s*gstack-plan-review-history\s*\n([\s\S]*?)-->\s*/m;
 
+/**
+ * Parse the top-of-plan history block (if present) into per-round entries.
+ * Returns an empty array when the block is absent or contains no parseable rows.
+ * Skips malformed rows; never throws.
+ */
 export function parseRoundHistoryHeader(planText: string): RoundHistoryEntry[] {
   const m = planText.match(HISTORY_BLOCK_RE);
   if (!m) return [];
@@ -752,6 +764,17 @@ export function parseRoundHistoryHeader(planText: string): RoundHistoryEntry[] {
   return entries;
 }
 
+/**
+ * Append a new round entry to the top-of-plan history block and return the updated plan text.
+ *
+ * Behavior:
+ * - If the block already exists, parses its rows, appends `newEntry`, and rewrites the block in place.
+ * - If the block does not exist, prepends a new block to the plan.
+ * - `opts.finalLine` (optional): a terminal line appended after all round rows (used for
+ *   `final: APPROVED after N rounds, ...` on loop exit). Caller is responsible for the line's content.
+ *
+ * Atomic in the file-level sense via single string write at the call site (no mid-write corruption).
+ */
 export function updateRoundHistoryHeader(
   planText: string,
   newEntry: RoundHistoryEntry,
