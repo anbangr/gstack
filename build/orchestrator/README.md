@@ -447,18 +447,18 @@ The `<slug>` is `build-<plan-basename-without-ext>`, e.g. `build-agnt2-impl-plan
 
 The orchestrator stops at any of these and writes the failure reason into the state file. Resume picks up at the same phase after the user fixes the underlying issue.
 
-| Symptom                                                                   | Likely cause                                                                                                                    | Fix                                                                                                                                                                                                                                           |
-| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Gemini timed out (after 1 retry)`                                        | Phase too large, network blip, or Gemini hung                                                                                   | Raise `GSTACK_BUILD_GEMINI_TIMEOUT`, or split the phase                                                                                                                                                                                       |
-| `Codex review failed to converge`                                         | One review gate could not reach `GATE PASS` within `GSTACK_BUILD_CODEX_MAX_ITER` attempts                                       | Read the phase review logs, fix the underlying issue manually, resume                                                                                                                                                                         |
-| `Codex output did not contain GATE PASS or GATE FAIL`                     | Codex changed output format, or hit an internal error                                                                           | Read the log; usually means the codex CLI itself errored                                                                                                                                                                                      |
-| `Tests still failing after N fix iterations`                              | Gemini can't converge; tests and impl are in conflict                                                                           | Read `phase-N-gemini-fix-*.log`, fix manually, resume                                                                                                                                                                                         |
-| `Gemini could not produce failing tests after N attempts`                 | Either trivially-asserting tests, OR the wrong test runner is detected (e.g. vitest runs for a pytest phase in a polyglot repo) | Inspect `phase-N-tests-1.log`'s `# command:` header. If the runner is wrong, add `<!-- testCmd: <correct-cmd> -->` to the phase body. If the runner is right, read `phase-N-gemini-testspec-*.log` and tighten the phase description. Resume. |
-| `plan checkbox flip failed: line N no longer contains "**Implementation"` | Plan file edited externally between parse and mutate                                                                            | Re-run; the orchestrator re-parses on every start                                                                                                                                                                                             |
-| `another gstack-build instance is running`                                | Another process holds the lock, or stale lock                                                                                   | Either wait, or `rm ~/.gstack/build-state/<slug>.lock` if you're sure it's stale                                                                                                                                                              |
-| `worktree is dirty (N path(s)) — refusing to mark phase X committed`      | `--mark-phase-committed` invoked while the worktree had uncommitted changes — used to silently force-mark over the dirty state | Inspect the dirty files. Then re-run with `--commit-dirty` to stage+commit them with a `fix(recovery): ...` message, or `--force-dirty` to keep the dirty state and mark anyway (warns; next phase starts dirty). Manual `git reset/checkout/commit` also works. |
-| `git status failed in <cwd> — cannot inspect worktree state`              | Stale `.git/index.lock`, corrupted repo, or permission error during `--mark-phase-committed` recovery                          | Resolve the underlying git error (often `rm .git/index.lock` after confirming no live git process), then retry. Pass `--force-dirty` only if you accept that the worktree state is unknown.                                                   |
-| `plan markdown drift — could not un-flip checkboxes for phase X`          | Origin-verification rewind hit a plan file that was hand-edited between parse and rewind; one or more of the three checkbox lines no longer matches the expected marker | The feature is paused with an explicit reason. Re-flip `[x] → [ ]` for the named phase's test-spec, implementation, and review lines in the plan markdown, then resume.                                                                       |
+| Symptom                                                                   | Likely cause                                                                                                                                                            | Fix                                                                                                                                                                                                                                                              |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Gemini timed out (after 1 retry)`                                        | Phase too large, network blip, or Gemini hung                                                                                                                           | Raise `GSTACK_BUILD_GEMINI_TIMEOUT`, or split the phase                                                                                                                                                                                                          |
+| `Codex review failed to converge`                                         | One review gate could not reach `GATE PASS` within `GSTACK_BUILD_CODEX_MAX_ITER` attempts                                                                               | Read the phase review logs, fix the underlying issue manually, resume                                                                                                                                                                                            |
+| `Codex output did not contain GATE PASS or GATE FAIL`                     | Codex changed output format, or hit an internal error                                                                                                                   | Read the log; usually means the codex CLI itself errored                                                                                                                                                                                                         |
+| `Tests still failing after N fix iterations`                              | Gemini can't converge; tests and impl are in conflict                                                                                                                   | Read `phase-N-gemini-fix-*.log`, fix manually, resume                                                                                                                                                                                                            |
+| `Gemini could not produce failing tests after N attempts`                 | Either trivially-asserting tests, OR the wrong test runner is detected (e.g. vitest runs for a pytest phase in a polyglot repo)                                         | Inspect `phase-N-tests-1.log`'s `# command:` header. If the runner is wrong, add `<!-- testCmd: <correct-cmd> -->` to the phase body. If the runner is right, read `phase-N-gemini-testspec-*.log` and tighten the phase description. Resume.                    |
+| `plan checkbox flip failed: line N no longer contains "**Implementation"` | Plan file edited externally between parse and mutate                                                                                                                    | Re-run; the orchestrator re-parses on every start                                                                                                                                                                                                                |
+| `another gstack-build instance is running`                                | Another process holds the lock, or stale lock                                                                                                                           | Either wait, or `rm ~/.gstack/build-state/<slug>.lock` if you're sure it's stale                                                                                                                                                                                 |
+| `worktree is dirty (N path(s)) — refusing to mark phase X committed`      | `--mark-phase-committed` invoked while the worktree had uncommitted changes — used to silently force-mark over the dirty state                                          | Inspect the dirty files. Then re-run with `--commit-dirty` to stage+commit them with a `fix(recovery): ...` message, or `--force-dirty` to keep the dirty state and mark anyway (warns; next phase starts dirty). Manual `git reset/checkout/commit` also works. |
+| `git status failed in <cwd> — cannot inspect worktree state`              | Stale `.git/index.lock`, corrupted repo, or permission error during `--mark-phase-committed` recovery                                                                   | Resolve the underlying git error (often `rm .git/index.lock` after confirming no live git process), then retry. Pass `--force-dirty` only if you accept that the worktree state is unknown.                                                                      |
+| `plan markdown drift — could not un-flip checkboxes for phase X`          | Origin-verification rewind hit a plan file that was hand-edited between parse and rewind; one or more of the three checkbox lines no longer matches the expected marker | The feature is paused with an explicit reason. Re-flip `[x] → [ ]` for the named phase's test-spec, implementation, and review lines in the plan markdown, then resume.                                                                                          |
 
 Exit codes: `0` clean run, `1` phase failed, `2` bad args, `3` lock contention, `130` SIGINT.
 
@@ -501,7 +501,7 @@ started on inconsistent state. The guard makes you choose a policy:
 
 - `--commit-dirty` — stage everything and commit with a standard
   `fix(recovery): <phase> auto-commit of agent-left changes during
-  --mark-phase-committed` message. Pre-commit hooks still run; if a hook
+--mark-phase-committed` message. Pre-commit hooks still run; if a hook
   fails, the commit fails and the mark refuses (you see the hook output
   and decide).
 - `--force-dirty` — preserve the dirty state, warn-only. The next phase
@@ -642,3 +642,68 @@ The dedicated gate runs `build/orchestrator/__tests__` plus
 guard: every build orchestrator module and build-critical behavior must name
 deterministic tests, so future updates cannot silently bypass the `/build` TDD
 contract.
+
+## Plan review convergence loop
+
+The `planReviewer` role runs at startup (before Phase 1 of Feature 1) and produces structured CRITICAL / IMPORTANT / SUGGESTION objections against the living plan. CRITICAL objections trigger an in-process loop with up to 5 rounds (configurable):
+
+```
+Round N reviewer call
+   ↓
+Triage gate (TTY readline or non-TTY mode)
+   ↓
+Plan-file annotation write (RoundAnnotation per accepted/rejected/deferred objection)
+   ↓
+Convergence snapshot (re-raises vs new objections, set-aware)
+   ↓
+Adaptive-cap decision (continue, bail-out gate, stalemate gate)
+   ↓
+Synthesizer dispatch (in-process, edits plan file, writes RESOLUTION lines)
+   ↓
+Round N+1
+```
+
+### Exit codes from `gstack-build` (plan-review portion)
+
+| Code | Meaning                                                                        |
+| ---- | ------------------------------------------------------------------------------ |
+| 0    | Plan approved (clean APPROVE or user picked `[a]pprove as-is` at a gate)       |
+| 3    | Stalemate — user picked `[m]anual mode`, or non-TTY `fail-fast` mode triggered |
+| 4    | User abort — user picked `[q]uit` at the triage gate or stalemate gate         |
+| 130  | SIGINT during triage (Ctrl+C)                                                  |
+
+### Flags
+
+- `--no-plan-review` — skip the entire loop (no reviewer call, no triage gate)
+- `--plan-review-max-rounds=N` (default 5) — hard cap on rounds
+- `--plan-review-no-adaptive-cap` — disable the no-forward-progress bail
+- `--plan-review-noninteractive=<auto-accept|fail-fast|auto-reject>` (default `auto-accept`) — CI behavior on CRITICAL objections
+
+### Telemetry files
+
+- `~/.gstack/build-state/<slug>/plan-review-report.json` — most recent round's verdict, kept for SKILL.md.tmpl Step 5.5 backward compatibility
+- `~/.gstack/build-state/<slug>/plan-review-history.jsonl` — append-only, one line per round
+- `~/.gstack/analytics/convergence.jsonl` — append-only, one line per completed build (aggregate trajectory + totals)
+
+### Triage gate keys (TTY)
+
+| Key | Action                                         |
+| --- | ---------------------------------------------- |
+| `a` | accept this objection                          |
+| `r` | reject (false positive)                        |
+| `d` | defer (real concern but not this build)        |
+| `v` | view reviewer's Overall Assessment prose       |
+| `A` | accept all remaining                           |
+| `R` | reject all remaining                           |
+| `s` | stop triage, default remaining to accept       |
+| `q` | quit loop (exit 4, state preserved for resume) |
+
+After each decision (a/r/d), user is prompted for an optional one-line rationale that gets written into the plan annotation.
+
+### Module map
+
+- [plan-reviewer.ts](./plan-reviewer.ts) — single-round parsing, reconciliation, annotation read/write, reviewer prompt, synth revision prompt
+- [plan-review-loop.ts](./plan-review-loop.ts) — multi-round orchestration, triage gates, adaptive cap, history JSONL, convergence aggregate
+- [cli.ts](./cli.ts) — wires the loop in at startup
+
+See [docs/superpowers/specs/2026-05-19-build-plan-review-convergence-design.md](../../docs/superpowers/specs/2026-05-19-build-plan-review-convergence-design.md) for the full design rationale.
