@@ -191,6 +191,7 @@ import {
   rewindPhase,
 } from "./halt-event-helpers";
 import { buildHaltSnapshot, emitHaltEvent, severityFor } from "./halt-events";
+import { installWrapConsole } from "./wrap-console";
 
 /**
  * Builds the HelperContext that halt-event helpers (markPhaseFailed,
@@ -9249,6 +9250,7 @@ async function main() {
   const FINALIZATION_REQUIRED = 13;
   let exitCode = 1;
   let heartbeat: HeartbeatController | null = null;
+  let uninstallWrap: (() => void) | null = null;
 
   try {
     ensureLogDir(slug);
@@ -9428,6 +9430,16 @@ async function main() {
     if (!setupFailed && state) {
       state.launch = launch;
       saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+
+      // Install the wrapConsole shim now that state is loaded and the build
+      // run loop is about to start. The shim classifies every console.warn /
+      // console.error line into a halt-event kind (SOFT_HALT_WARN /
+      // SOFT_HALT_ERROR / SILENT_STATE_MUTATION) and emits to the queue.
+      // Only the build run path gets the shim — drain-faults, mark-shipped,
+      // doctor, monitor, etc. all exit before this block. Uninstall happens
+      // in the outer finally so the shim is always removed on exit, even
+      // on uncaught errors.
+      uninstallWrap = installWrapConsole(helperCtxFor(state));
 
       // Reconcile plan-file checkboxes: any phase that reached `committed` via
       // direct JSON state patching (e.g., bypassing MARK_COMPLETE to escape a
@@ -10598,6 +10610,18 @@ async function main() {
       }
     }
   } finally {
+    // Uninstall the wrapConsole shim FIRST so registry / lock cleanup
+    // warnings below go through the real console.warn (not the wrapped
+    // version, which would queue them as halt events on a run that's
+    // already shutting down).
+    if (uninstallWrap) {
+      try {
+        uninstallWrap();
+      } catch {
+        // uninstall just restores console refs; defensive catch in case
+        // a future change makes it non-trivial.
+      }
+    }
     // Stop the stdout heartbeat first so we don't write any more lines
     // while the active-run registry / lock cleanup runs.
     if (heartbeat) {
