@@ -188,6 +188,7 @@ import {
   markFeatureFailed,
   markPhaseFailed,
   recordRetryCapHit,
+  rewindPhase,
 } from "./halt-event-helpers";
 import { buildHaltSnapshot, emitHaltEvent, severityFor } from "./halt-events";
 
@@ -3525,7 +3526,14 @@ export function restartFeatureFromOriginIssues(args: {
 
   // Markdown is now in sync (or there were no checkboxes to un-flip).
   // Safe to advance state.
-  phaseState.status = "tests_green";
+  if (wasCommitted) {
+    // Emit PHASE_REWIND so the halt-events pipeline can observe that a
+    // committed phase was rewound (signal of origin verification failure).
+    // rewindPhase sets phaseState.status to the target value (and emits).
+    rewindPhase(args.state, phaseIndex, "tests_green", helperCtxFor(args.state));
+  } else {
+    phaseState.status = "tests_green";
+  }
   phaseState.codexReview = undefined;
   phaseState.originIssueLogPath = args.issueLogPath;
   phaseState.error = undefined;
