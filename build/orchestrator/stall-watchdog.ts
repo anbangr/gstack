@@ -80,15 +80,6 @@ export interface StallWatchdogController {
 }
 
 /**
- * Trim then check non-empty. A line of only whitespace is NOT activity —
- * a stalled child whose buffer happens to flush blank lines shouldn't
- * keep itself alive forever.
- */
-function isActivityLine(line: string): boolean {
-  return line.trim().length > 0;
-}
-
-/**
  * Signal both the child (positive pid) AND its process group (negative pid).
  *
  * Why both: Bun's child_process module accepts `detached: true` but its
@@ -101,7 +92,10 @@ function isActivityLine(line: string): boolean {
  * scripts that exec `sleep`/long-running children. A SIGTERM to the shell
  * alone doesn't propagate to its children — but a group signal does.
  */
-function killProcessAndGroup(pid: number, signal: NodeJS.Signals): void {
+export function killProcessAndGroup(
+  pid: number,
+  signal: NodeJS.Signals,
+): void {
   if (!Number.isInteger(pid) || pid <= 0) {
     return;
   }
@@ -232,14 +226,11 @@ export function attachStallWatchdog(
   const onLine = (chunk: Buffer | string) => {
     if (stopped) return;
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-    // Split on any newline; check each line for activity. A multi-line burst
-    // resets the timer once (good — it's a single event in human terms).
-    for (const line of text.split(/\r?\n/)) {
-      if (isActivityLine(line)) {
-        recordActivity();
-        return;
-      }
-    }
+    // Single non-whitespace byte anywhere in the chunk counts as activity.
+    // Equivalent to: any line in chunk.split(/\r?\n/) has trim().length > 0.
+    // Regex test is a single short-circuit pass; the prior split-and-loop
+    // allocated a string array per chunk just to discover the same answer.
+    if (/\S/.test(text)) recordActivity();
   };
 
   if (source.mode === "stream") {

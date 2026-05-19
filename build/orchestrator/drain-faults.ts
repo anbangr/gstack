@@ -46,7 +46,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, spawnSync, type ChildProcess } from "./child-registry";
-import { attachStallWatchdog } from "./stall-watchdog";
+import { attachStallWatchdog, killProcessAndGroup } from "./stall-watchdog";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -590,10 +590,17 @@ async function spawnInvestigator(opts: SpawnOpts): Promise<"ok" | "failed"> {
           | "gemini"
           | "kimi",
         onStallKill: () => {
-          try {
-            child.kill("SIGTERM");
-          } catch {
-            // already dead
+          // Investigator can be `bash -lc <user-string>` which spawns
+          // grandchildren. SIGTERM to the bash leader alone leaves the
+          // grandchildren orphaned to init. Signal the whole process
+          // group, then escalate to SIGKILL after gracePeriodMs (5s)
+          // to match the sub-agent stall-kill path in spawnCaptured.
+          const pid = child.pid;
+          if (typeof pid === "number" && pid > 0) {
+            killProcessAndGroup(pid, "SIGTERM");
+            setTimeout(() => {
+              killProcessAndGroup(pid, "SIGKILL");
+            }, 5000).unref();
           }
           settle("failed");
         },

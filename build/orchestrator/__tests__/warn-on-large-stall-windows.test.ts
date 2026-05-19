@@ -41,6 +41,17 @@ describe("warnOnLargeStallWindows", () => {
     expect(logs.join("\n")).toContain("60min");
   });
 
+  it("warns when value is 1ms above the 30min threshold (off-by-one guard)", () => {
+    const logs: string[] = [];
+    warnOnLargeStallWindows(
+      {
+        GSTACK_BUILD_SHIP_TIMEOUT: "1800001", // 30min + 1ms
+      },
+      (msg) => logs.push(msg),
+    );
+    expect(logs.length).toBeGreaterThan(0);
+  });
+
   it("warns for each oversized var", () => {
     const logs: string[] = [];
     warnOnLargeStallWindows(
