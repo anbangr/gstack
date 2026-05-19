@@ -184,7 +184,7 @@ import {
   streakSurfaceMessage,
 } from "./escalation-streak";
 import { renderPlanStatusTable, resolvePlanSelection } from "./plan-selection";
-import { markPhaseFailed } from "./halt-event-helpers";
+import { markFeatureFailed, markPhaseFailed } from "./halt-event-helpers";
 
 /**
  * Builds the HelperContext that halt-event helpers (markPhaseFailed,
@@ -3023,8 +3023,12 @@ function ensureOriginRetryBranch(args: {
 }): boolean {
   const synced = syncLandedBase(args.cwd);
   if (!synced.ok) {
-    args.feature.status = "failed";
-    args.feature.error = `failed to sync landed base before origin retry branch: ${synced.error}`;
+    markFeatureFailed(
+      args.state,
+      args.feature.index,
+      `failed to sync landed base before origin retry branch: ${synced.error}`,
+      helperCtxFor(args.state),
+    );
     saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
     return false;
   }
@@ -3047,8 +3051,12 @@ function ensureOriginRetryBranch(args: {
       encoding: "utf8",
     });
     if (existingBranch.status !== 0) {
-      args.feature.status = "failed";
-      args.feature.error = `failed to create or checkout origin retry branch ${branch}: ${checkout.stderr || checkout.stdout}`;
+      markFeatureFailed(
+        args.state,
+        args.feature.index,
+        `failed to create or checkout origin retry branch ${branch}: ${checkout.stderr || checkout.stdout}`,
+        helperCtxFor(args.state),
+      );
       saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
       return false;
     }
@@ -3104,8 +3112,12 @@ export function ensureFeatureBranch(args: {
         encoding: "utf8",
       });
       if (checkout.status !== 0) {
-        args.feature.status = "failed";
-        args.feature.error = `failed to checkout saved feature branch ${args.feature.branch}: ${checkout.stderr || checkout.stdout}`;
+        markFeatureFailed(
+          args.state,
+          args.feature.index,
+          `failed to checkout saved feature branch ${args.feature.branch}: ${checkout.stderr || checkout.stdout}`,
+          helperCtxFor(args.state),
+        );
         saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
         return false;
       }
@@ -3158,8 +3170,12 @@ export function ensureFeatureBranch(args: {
     encoding: "utf8",
   });
   if (fetchBase.status !== 0) {
-    args.feature.status = "failed";
-    args.feature.error = `failed to fetch origin/${base} before feature branch: ${fetchBase.stderr || fetchBase.stdout}`;
+    markFeatureFailed(
+      args.state,
+      args.feature.index,
+      `failed to fetch origin/${base} before feature branch: ${fetchBase.stderr || fetchBase.stdout}`,
+      helperCtxFor(args.state),
+    );
     saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
     return false;
   }
@@ -3177,8 +3193,12 @@ export function ensureFeatureBranch(args: {
       encoding: "utf8",
     });
     if (existingBranch.status !== 0) {
-      args.feature.status = "failed";
-      args.feature.error = `failed to create or checkout feature branch ${branch}: ${checkout.stderr || checkout.stdout}`;
+      markFeatureFailed(
+        args.state,
+        args.feature.index,
+        `failed to create or checkout feature branch ${branch}: ${checkout.stderr || checkout.stdout}`,
+        helperCtxFor(args.state),
+      );
       saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
       return false;
     }
