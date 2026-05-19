@@ -23,6 +23,65 @@ import { landOnly, shipOnly } from "./ship";
 export const RELEASE_LOCK_TTL_MS = 2 * 60 * 60 * 1000;
 export const RELEASE_LOCK_HEARTBEAT_MS = 15 * 60 * 1000;
 
+/**
+ * Module-level registry of active release-lock release functions. When the
+ * daemon receives SIGTERM (e.g. from launchctl bootkick/unload), the signal
+ * handler runs every registered release synchronously so the lock ref is
+ * deleted on the remote before the process exits. Without this, the lock
+ * lingers for the full TTL (2 hours) blocking any other landing attempt.
+ *
+ * Each entry returns the release-lock result so the handler can log
+ * unreleased locks for forensics. The registry is process-global because
+ * the signal handler can't reach into a closure.
+ */
+type LockReleaseFn = () => { ok: boolean; error?: string };
+const activeLockReleases = new Set<LockReleaseFn>();
+
+let signalHandlersInstalled = false;
+
+function installReleaseDaemonSignalHandlers(
+  log: (msg: string) => void,
+): void {
+  if (signalHandlersInstalled) return;
+  signalHandlersInstalled = true;
+  const handler = (signal: NodeJS.Signals) => {
+    let released = 0;
+    let failed = 0;
+    for (const release of activeLockReleases) {
+      try {
+        const r = release();
+        if (r.ok) released++;
+        else {
+          failed++;
+          log(`signal ${signal}: lock release failed: ${r.error ?? "unknown"}`);
+        }
+      } catch (err) {
+        failed++;
+        log(
+          `signal ${signal}: lock release threw: ${(err as Error).message}`,
+        );
+      }
+    }
+    activeLockReleases.clear();
+    log(
+      `signal ${signal}: released ${released} lock(s), ${failed} failed; exiting`,
+    );
+    // Conventional exit code: 128 + signal number for SIGTERM(15)/SIGINT(2)/SIGHUP(1).
+    const code =
+      signal === "SIGTERM"
+        ? 143
+        : signal === "SIGINT"
+          ? 130
+          : signal === "SIGHUP"
+            ? 129
+            : 1;
+    process.exit(code);
+  };
+  process.on("SIGTERM", handler);
+  process.on("SIGINT", handler);
+  process.on("SIGHUP", handler);
+}
+
 export interface ReleaseDaemonOptions {
   queueDir?: string;
   once?: boolean;
@@ -126,20 +185,32 @@ function checkoutScratchWorktree(record: ReleaseQueueRecord): string {
   const scratch = scratchWorktreePath(record);
   fs.mkdirSync(path.dirname(scratch), { recursive: true });
   if (!fs.existsSync(scratch)) {
-    const fetched = spawnSync("git", ["fetch", "origin", record.featureBranch], {
-      cwd: record.repoPath,
-      encoding: "utf8",
-    });
+    const fetched = spawnSync(
+      "git",
+      ["fetch", "origin", record.featureBranch],
+      {
+        cwd: record.repoPath,
+        encoding: "utf8",
+      },
+    );
     if (fetched.status !== 0) {
       throw new Error(fetched.stderr || fetched.stdout || "git fetch failed");
     }
     const added = spawnSync(
       "git",
-      ["worktree", "add", "--detach", scratch, `origin/${record.featureBranch}`],
+      [
+        "worktree",
+        "add",
+        "--detach",
+        scratch,
+        `origin/${record.featureBranch}`,
+      ],
       { cwd: record.repoPath, encoding: "utf8" },
     );
     if (added.status !== 0) {
-      throw new Error(added.stderr || added.stdout || "git worktree add failed");
+      throw new Error(
+        added.stderr || added.stdout || "git worktree add failed",
+      );
     }
   }
   return scratch;
@@ -186,6 +257,16 @@ export async function processReleaseQueueRecord(
     refresh: opts.refreshLock,
   });
   heartbeat.start();
+  // Register a synchronous lock-release callback. SIGTERM handler runs it if
+  // the daemon is killed mid-landing so the ref is freed on the remote
+  // instead of waiting for the 2h TTL.
+  const releaseFn = opts.releaseLock ?? releaseRemoteReleaseLock;
+  const signalReleaseCallback: LockReleaseFn = () =>
+    releaseFn({
+      cwd: record.repoPath,
+      handle: heartbeat.currentHandle(),
+    });
+  activeLockReleases.add(signalReleaseCallback);
   const blockIfLockLost = () => {
     const lost = heartbeat.lostOwnership();
     if (!lost) return null;
@@ -197,7 +278,9 @@ export async function processReleaseQueueRecord(
 
   try {
     const cwd = checkoutScratchWorktree(record);
-    current = updateReleaseQueueRecord(queueDir, current, { status: "landing" });
+    current = updateReleaseQueueRecord(queueDir, current, {
+      status: "landing",
+    });
     const land = opts.land ?? landOnly;
     const ship = opts.ship ?? shipOnly;
     let landResult = await land({
@@ -255,6 +338,7 @@ export async function processReleaseQueueRecord(
     });
   } finally {
     heartbeat.stop();
+    activeLockReleases.delete(signalReleaseCallback);
     const released = (opts.releaseLock ?? releaseRemoteReleaseLock)({
       cwd: record.repoPath,
       handle: heartbeat.currentHandle(),
@@ -274,12 +358,32 @@ function discoverQueuedRecords(
   for (const record of local) {
     byId.set(releaseQueueRecordId(record), record);
   }
+  // Build set of repos to discover remote PRs from. Always include
+  // opts.repoPath if set (the explicitly-configured one). Then add every
+  // unique repoPath we see in the local queue, since the build orchestrator
+  // queues PRs across repos into a shared queue dir. Dedup by repoIdentity
+  // when present, otherwise by resolved path.
+  const reposToDiscover = new Map<string, string>(); // identity → path
   if (opts.repoPath) {
+    reposToDiscover.set(`__configured__:${opts.repoPath}`, opts.repoPath);
+  }
+  for (const record of local) {
+    if (record.status !== "queued") continue;
+    const repoPath = record.repoPath;
+    if (!repoPath) continue;
+    const key = record.repoIdentity || `path:${repoPath}`;
+    if (!reposToDiscover.has(key)) {
+      reposToDiscover.set(key, repoPath);
+    }
+  }
+  for (const [, repoPath] of reposToDiscover) {
     const remote = opts.discoverRemote
-      ? opts.discoverRemote(opts.repoPath)
-      : discoverBuildQueuedPullRequests(opts.repoPath);
+      ? opts.discoverRemote(repoPath)
+      : discoverBuildQueuedPullRequests(repoPath);
     if (remote.error) {
-      opts.log?.(`warning: could not discover queued PRs: ${remote.error}`);
+      opts.log?.(
+        `warning: could not discover queued PRs for ${repoPath}: ${remote.error}`,
+      );
     }
     for (const record of remote.records) {
       const id = releaseQueueRecordId(record);
@@ -298,6 +402,12 @@ export async function runReleaseDaemon(
   const queueDir = opts.queueDir ?? defaultReleaseQueueDir();
   const pollMs = opts.pollMs ?? 30_000;
   const log = opts.log ?? console.log;
+  // Only install signal handlers for long-running mode. one-shot tests
+  // call runReleaseDaemon many times; installing handlers there leaks
+  // listeners and triggers MaxListenersExceededWarning.
+  if (opts.watch) {
+    installReleaseDaemonSignalHandlers(log);
+  }
   while (true) {
     const next = discoverQueuedRecords(queueDir, { ...opts, log }).find(
       (record) => record.status === "queued",
