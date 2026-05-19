@@ -49,7 +49,7 @@ const MODULE_TEST_OWNERS: Record<string, string[]> = {
   "parser.ts": ["parser.test.ts"],
   "phase-runner.ts": ["phase-runner.test.ts"],
   "plan-mutator.ts": ["plan-mutator.test.ts"],
-  "plan-review-loop.ts": ["plan-review-history-jsonl.test.ts", "convergence-jsonl.test.ts"],
+  "plan-review-loop.ts": ["plan-review-history-jsonl.test.ts", "convergence-jsonl.test.ts", "adaptive-cap-set-aware.test.ts"],
   "plan-reviewer.ts": ["cli.test.ts"],
   "registry.ts": ["release-queue.test.ts", "active-runs.test.ts"],
   "release-daemon.ts": ["cli.test.ts", "release-daemon.test.ts"],
