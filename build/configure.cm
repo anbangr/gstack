@@ -10,10 +10,20 @@
       "model": "claude-opus-4-7",
       "reasoning": "xhigh"
     },
+    "planReviewer": {
+      "provider": "codex",
+      "model": "gpt-5.5",
+      "reasoning": "high"
+    },
+    "monitorAgent": {
+      "provider": "codex",
+      "model": "gpt-5.5",
+      "reasoning": "high"
+    },
     "testWriter": {
-      "provider": "claude",
-      "model": "claude-sonnet-4-6",
-      "reasoning": "xhigh"
+      "provider": "kimi",
+      "model": "kimi-code/kimi-for-coding",
+      "reasoning": "high"
     },
     "primaryImpl": {
       "provider": "kimi",
@@ -59,16 +69,6 @@
       "command": "/qa"
     },
     "featureReview": {
-      "provider": "claude",
-      "model": "claude-sonnet-4-6",
-      "reasoning": "xhigh"
-    },
-    "monitorAgent": {
-      "provider": "kimi",
-      "model": "kimi-code/kimi-for-coding",
-      "reasoning": "high"
-    },
-    "planReviewer": {
       "provider": "codex",
       "model": "gpt-5.5",
       "reasoning": "high"
@@ -92,9 +92,9 @@
       "retryOnTimeout": false
     },
     "featureVerifier": {
-      "provider": "claude",
-      "model": "claude-sonnet-4-6",
-      "reasoning": "xhigh"
+      "provider": "codex",
+      "model": "gpt-5.5",
+      "reasoning": "high"
     }
   },
   "limits": {
