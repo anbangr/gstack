@@ -456,6 +456,9 @@ The orchestrator stops at any of these and writes the failure reason into the st
 | `Gemini could not produce failing tests after N attempts`                 | Either trivially-asserting tests, OR the wrong test runner is detected (e.g. vitest runs for a pytest phase in a polyglot repo) | Inspect `phase-N-tests-1.log`'s `# command:` header. If the runner is wrong, add `<!-- testCmd: <correct-cmd> -->` to the phase body. If the runner is right, read `phase-N-gemini-testspec-*.log` and tighten the phase description. Resume. |
 | `plan checkbox flip failed: line N no longer contains "**Implementation"` | Plan file edited externally between parse and mutate                                                                            | Re-run; the orchestrator re-parses on every start                                                                                                                                                                                             |
 | `another gstack-build instance is running`                                | Another process holds the lock, or stale lock                                                                                   | Either wait, or `rm ~/.gstack/build-state/<slug>.lock` if you're sure it's stale                                                                                                                                                              |
+| `worktree is dirty (N path(s)) — refusing to mark phase X committed`      | `--mark-phase-committed` invoked while the worktree had uncommitted changes — used to silently force-mark over the dirty state | Inspect the dirty files. Then re-run with `--commit-dirty` to stage+commit them with a `fix(recovery): ...` message, or `--force-dirty` to keep the dirty state and mark anyway (warns; next phase starts dirty). Manual `git reset/checkout/commit` also works. |
+| `git status failed in <cwd> — cannot inspect worktree state`              | Stale `.git/index.lock`, corrupted repo, or permission error during `--mark-phase-committed` recovery                          | Resolve the underlying git error (often `rm .git/index.lock` after confirming no live git process), then retry. Pass `--force-dirty` only if you accept that the worktree state is unknown.                                                   |
+| `plan markdown drift — could not un-flip checkboxes for phase X`          | Origin-verification rewind hit a plan file that was hand-edited between parse and rewind; one or more of the three checkbox lines no longer matches the expected marker | The feature is paused with an explicit reason. Re-flip `[x] → [ ]` for the named phase's test-spec, implementation, and review lines in the plan markdown, then resume.                                                                       |
 
 Exit codes: `0` clean run, `1` phase failed, `2` bad args, `3` lock contention, `130` SIGINT.
 
@@ -479,6 +482,44 @@ hasn't passed `--max-wall-ms` explicitly. Each Bash invocation re-enters the
 monitor, and the build progresses one cycle at a time. To opt out (e.g.
 custom supervisor wrapping Claude Code) pass `--max-wall-ms <ms>` and the
 auto-cap is skipped.
+
+## Manual phase recovery (`--mark-phase-committed`)
+
+When an agent leaves the worktree in a half-recovered state — most often after
+a hygiene failure where the operator hand-finishes the work — use
+`--mark-phase-committed <feat>.<phase>` to mark the phase committed without
+re-running test-spec, implementation, tests, or review.
+
+```bash
+gstack-build <plan> --mark-phase-committed 1.2
+```
+
+**Dirty-tree guard.** The recovery exit refuses by default if the worktree is
+dirty. Three of the four 2026-05-18 mitosis PREMATURE_COMPLETION faults traced
+back to a silent force-mark over a dirty worktree, after which the next phase
+started on inconsistent state. The guard makes you choose a policy:
+
+- `--commit-dirty` — stage everything and commit with a standard
+  `fix(recovery): <phase> auto-commit of agent-left changes during
+  --mark-phase-committed` message. Pre-commit hooks still run; if a hook
+  fails, the commit fails and the mark refuses (you see the hook output
+  and decide).
+- `--force-dirty` — preserve the dirty state, warn-only. The next phase
+  starts on this dirty tree, so review carefully.
+- Pass neither — the guard prints the dirty file list and refuses, leaving
+  state untouched.
+- `--commit-dirty` and `--force-dirty` are mutually exclusive.
+
+If `git status` itself fails (stale `.git/index.lock`, corrupted repo,
+permissions) the guard fails closed unless `--force-dirty` is passed. The
+operator needs to know — silently bypassing a `git status` failure is the
+exact failure mode that recreates the bug class.
+
+**Ship side effect.** `--mark-phase-committed` advances state and falls
+through to the main loop. In multi-branch mode, if the marked phase was the
+last phase of a feature, the orchestrator will set that feature to
+`phases_done` and immediately trigger `/ship` + `/land-and-deploy` for it.
+Pair with `--skip-ship` if you want to mark without triggering ship.
 
 ## Mark a feature as already-shipped
 
