@@ -510,6 +510,12 @@ export interface ReleaseDaemonOptions {
   log?: (msg: string) => void;
   heartbeatIntervalMs?: number;
   verifyQueued?: typeof verifyPrQueued;
+  /**
+   * Verify the PR actually merged on GitHub after the land sub-agent
+   * returns exit 0. Defaults to {@link verifyPrMerged}. Tests inject a
+   * stub to control the response.
+   */
+  verifyMerged?: typeof verifyPrMerged;
   acquireLock?: typeof acquireRemoteReleaseLock;
   releaseLock?: typeof releaseRemoteReleaseLock;
   refreshLock?: typeof refreshRemoteReleaseLock;
@@ -583,6 +589,89 @@ function sleepMs(ms: number): Promise<void> {
 
 function isDriftFailure(text: string): boolean {
   return /VERSION drift detected|queue moved since last \/ship/i.test(text);
+}
+
+/**
+ * Result of verifying whether a PR is actually merged on GitHub.
+ * The daemon uses this AFTER the land sub-agent returns exit 0 to
+ * confirm the merge actually happened (the sub-agent may have
+ * gracefully declined and still exited 0 — see verifyPrMerged below).
+ */
+export interface PrMergeStatus {
+  merged: boolean;
+  /** Free-text for the queue record's lastError when not merged. */
+  reason?: string;
+}
+
+/**
+ * Ask GitHub whether a PR is actually merged. The release-daemon
+ * runs this after the /land-and-deploy sub-agent returns exit 0,
+ * because exit code alone is not authoritative: the sub-agent (Kimi,
+ * Claude, or Codex running /land-and-deploy) gracefully declines to
+ * merge in real scenarios — failing CI, no PR found, pre-merge
+ * readiness gate fails — and still exits 0. The verdict in those
+ * cases lives in prose inside the output file. Trusting exit code
+ * alone produced a 50% false-positive landed rate in production
+ * (PRs #120 and #129 on mitosis-control-plane, observed 2026-05-19),
+ * silently stranding queue records as "landed" while the PR was
+ * still OPEN on GitHub. This check makes GitHub the ground truth.
+ *
+ * Uses `gh pr view <pr> --repo <repo> --json state` via spawnSync.
+ * `gh` is already a hard dependency of the daemon for other paths
+ * (verifyPrQueued, discoverBuildQueuedPullRequests). The repo arg
+ * is the OWNER/NAME form parsed from repoIdentity ("github.com/X/Y"
+ * → "X/Y") so we don't depend on cwd or remote URL.
+ *
+ * Network/auth failures are reported as `merged: false, reason:
+ * "could not verify"` rather than thrown, so the daemon blocks the
+ * record instead of crashing. A blocked record can be retried; a
+ * crashed daemon leaks the lock.
+ */
+export function verifyPrMerged(
+  prNumber: number,
+  repoIdentity: string | undefined,
+  cwd: string,
+): PrMergeStatus {
+  // Derive OWNER/NAME from repoIdentity ("github.com/owner/repo" →
+  // "owner/repo"). When repoIdentity is missing, omit --repo and
+  // rely on cwd's remote — last-resort fallback for legacy records.
+  let repoArg: string[] = [];
+  if (repoIdentity) {
+    const match = repoIdentity.match(/^github\.com\/([^/]+\/[^/]+)$/);
+    if (!match) {
+      return {
+        merged: false,
+        reason: `could not parse repoIdentity ${JSON.stringify(repoIdentity)} as github.com/owner/repo`,
+      };
+    }
+    repoArg = ["--repo", match[1]];
+  }
+  const result = spawnSync(
+    "gh",
+    [
+      "pr",
+      "view",
+      String(prNumber),
+      ...repoArg,
+      "--json",
+      "state",
+      "-q",
+      ".state",
+    ],
+    { cwd, encoding: "utf8" },
+  );
+  if (result.status !== 0) {
+    return {
+      merged: false,
+      reason: `gh pr view exited ${result.status}: ${(result.stderr || result.stdout || "").trim().slice(0, 200)}`,
+    };
+  }
+  const state = (result.stdout || "").trim();
+  if (state === "MERGED") return { merged: true };
+  return {
+    merged: false,
+    reason: `PR #${prNumber} state is ${state || "unknown"} on GitHub (sub-agent reported success but PR was not merged)`,
+  };
 }
 
 function scratchWorktreePath(record: ReleaseQueueRecord): string {
@@ -946,6 +1035,26 @@ export async function processReleaseQueueRecord(
       return safeUpdate(current, {
         status: "blocked",
         lastError: `land-and-deploy failed (exit ${landResult.exitCode}, timed_out=${landResult.timedOut}); see ${landResult.logPath}`,
+      });
+    }
+    // GitHub ground-truth check. The land sub-agent (Kimi / Claude /
+    // Codex running /land-and-deploy) gracefully declines to merge in
+    // real scenarios — failing CI, no PR found, pre-merge readiness
+    // gate fails — and still exits 0. Trusting exit code alone
+    // produced a 50% false-positive landed rate in production (PRs
+    // #120, #129 on mitosis-control-plane, 2026-05-19), silently
+    // stranding records as "landed" while the PR was still OPEN on
+    // GitHub. Ask GitHub for the truth before we commit to "landed".
+    const verifyMerged = opts.verifyMerged ?? verifyPrMerged;
+    const mergeStatus = verifyMerged(
+      record.prNumber,
+      record.repoIdentity,
+      resolvedRepoPath,
+    );
+    if (!mergeStatus.merged) {
+      return safeUpdate(current, {
+        status: "blocked",
+        lastError: `land-and-deploy reported success but GitHub disagrees: ${mergeStatus.reason}; see ${landResult.logPath}`,
       });
     }
     return safeUpdate(current, { status: "landed" });
