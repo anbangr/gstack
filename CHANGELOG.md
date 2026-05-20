@@ -53,6 +53,7 @@ If you run `gstack-build drain-faults --queue` and it finds stale `gbrain put` n
 
 - `wrap-console.ts` console.warn / console.error handlers: now call `buildHaltSnapshot()` instead of hardcoding empty snapshot. Halt events carry the last 200 lines of `agent-stdout.log`.
 - `drainFaultsFromHaltEventsQueue` in `drain-faults.ts`: added pair-collapse pre-pass that moves matched DETECTED+RESOLVED pairs to `processed/` before the per-event dispatch loop. Orphan RESOLVEDs are silently moved out of pending. Existing `loadPendingInvestigations` is a back-compat wrapper filtering down to detected entries.
+- End-of-build auto-drain now scopes queue consumption to the current build run id (`state.launch.runId`, falling back to `state.slug`) so manual-recovery events from unrelated projects stay pending for their owner.
 - `runConfiguredRoleTask` in `sub-agents.ts`: on Kimi→Gemini fallback success (exitCode 0 + !timedOut), emits `emitHaltEventResolved` with the precomputed faultId of the wrap-console DETECTED row.
 - `runRoleTask` in `cli.ts` (the non-Configured variant — core phase / feature-review / merge-fixer flows): now mirrors the same Class 4 pattern. Precomputes faultId before `console.warn`, emits RESOLVED on backup success gated on `exitCode === 0 && !timedOut`. This was the broader unpaired surface — every successful primary→backup recovery on those paths used to leave an orphan DETECTED.
 - Fallback runId resolution chain (both `runRoleTask` and `runConfiguredRoleTask`): `opts.runId ?? process.env.GSTACK_BUILD_RUN_ID ?? opts.slug`. Producer-side faultId keys match wrap-console's DETECTED keys (which use `state.launch?.runId ?? state.slug`). Without this match, pair-collapse keys diverged when `launch.runId !== slug` and the RESOLVED never collapsed its DETECTED.
@@ -62,6 +63,7 @@ If you run `gstack-build drain-faults --queue` and it finds stale `gbrain put` n
 
 - `cli.ts` feature-review loop: log message no longer prints `cycle ${currentIter + 1}/${cap}` (off-by-one that produced "cycle 6/5" before the cap-extension prompt fired). Now prints `cycle ${currentIter}/${cap}`.
 - `cli.ts` gate hygiene: `captureGitSnapshot(opts.cwd)` upstream of `applyGateHygiene` now passes `{captureContents: true}`. This unblocks `discardBlindExecutionChanges` from refusing on `before.workTreeContents not captured` — gemini sandbox escapes can be rolled back cleanly.
+- Queue-side DETECTED+RESOLVED pair collapse now honors `runIdFilter`, preventing filtered auto-drains from moving unrelated projects' matched pairs to `processed/`.
 
 #### For contributors
 

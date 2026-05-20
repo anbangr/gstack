@@ -104,6 +104,47 @@ describe("DETECTED + RESOLVED pair collapse in drainFaultsFromHaltEventsQueue", 
     expect(result.failed).toBe(0);
   });
 
+  test("runIdFilter leaves unrelated DETECTED+RESOLVED pairs pending", async () => {
+    const skillFaults = path.join(tmp, "skill-faults");
+    const faultId = emitHaltEvent(
+      {
+        kind: "PHASE_FAILED",
+        runId: "other-run",
+        stateSlug: "other-state",
+        severity: "CRITICAL",
+        message: "unrelated transient failure",
+        pointers: {
+          stateFile: "/x",
+          stdoutLog: "/x",
+          livingPlan: "/x",
+          worktreePath: tmp,
+        },
+        snapshot: { stdoutTail: "" },
+      },
+      { queueDir: skillFaults },
+    );
+    emitHaltEventResolved(faultId, "other-run", { queueDir: skillFaults });
+
+    const result = await drainFaultsFromHaltEventsQueue({
+      queueDir: skillFaults,
+      runIdFilter: "current-run",
+      max: 10,
+      severityMin: "MEDIUM",
+      inboxDir: path.join(tmp, "inbox"),
+      mockInvestigator: () => {
+        throw new Error("must not dispatch for unrelated run");
+      },
+    });
+
+    expect(result.processed).toBe(0);
+    expect(result.shortCircuited).toBe(0);
+    expect(result.failed).toBe(0);
+    const entries = loadPendingEntries({ queueDir: skillFaults });
+    expect(entries.length).toBe(2);
+    expect(entries.some((e) => e.kind === "detected")).toBe(true);
+    expect(entries.some((e) => e.kind === "resolved")).toBe(true);
+  });
+
   test("T5: orphan DETECTED (no matching RESOLVED) still dispatches normally", async () => {
     const skillFaults = path.join(tmp, "skill-faults");
     const faultId = emitHaltEvent(
