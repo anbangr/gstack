@@ -609,6 +609,23 @@ describe("parsePlan — phase kinds", () => {
     const { warnings } = parsePlan(md);
     expect(warnings.join("\n")).not.toContain("look like a split");
   });
+
+  it("does not emit split-phase guidance when a valid phase sits between dropped complements", () => {
+    const md = `## Feature 1: Paper
+
+### Phase 1 [writing]: Draft paper
+- [ ] **Draft**: write the paper
+
+### Phase 2: Implement tool
+- [ ] **Implementation**: implement the tool
+- [ ] **Review**: review the tool
+
+### Phase 3 [writing]: Review paper
+- [ ] **Review**: review the paper
+`;
+    const { warnings } = parsePlan(md);
+    expect(warnings.join("\n")).not.toContain("look like a split");
+  });
 });
 
 describe("parsePlan — audit-only annotation", () => {
