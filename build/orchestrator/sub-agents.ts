@@ -1225,6 +1225,15 @@ export interface RunConfiguredRoleTaskOpts {
   gate?: boolean;
   sandbox?: CodexSandbox;
   codexDefaultCommand?: string;
+  /**
+   * Run identifier matching wrap-console.ts's keying
+   * (`state.launch?.runId ?? state.slug`). Threaded from cli.ts call sites
+   * that have access to state.launch.runId so the Class 4 RESOLVED emit's
+   * pair key matches the DETECTED row wrap-console wrote. When undefined
+   * (older callers, direct test fixtures), fall back to opts.slug — same
+   * default helperCtxFor uses.
+   */
+  runId?: string;
 }
 
 /**
@@ -1278,6 +1287,13 @@ export interface RunRoleTaskOpts {
   iteration: number;
   logPrefix: string;
   timeoutMs?: number;
+  /**
+   * Run identifier matching wrap-console.ts's keying
+   * (`state.launch?.runId ?? state.slug`). Threaded so the Class 4 RESOLVED
+   * emit's pair key matches the DETECTED row wrap-console wrote for the
+   * fallback warn. When undefined, defaults to opts.slug.
+   */
+  runId?: string;
 }
 
 /**
@@ -1449,9 +1465,16 @@ export async function runConfiguredRoleTask(
       `[gstack-build] ${opts.logPrefix}: primary ${opts.role.provider} failed ` +
       `(exit=${result.exitCode ?? "null"}, timedOut=${result.timedOut}); ` +
       `falling back to ${opts.role.backupProvider} with timeout ${verdict.timeoutMs}ms (single-shot, ${verdict.kind})`;
+    // runId MUST match what wrap-console.ts keys on for the DETECTED row
+    // (`state.launch?.runId ?? state.slug`). Otherwise pair-collapse keys
+    // diverge and the RESOLVED never matches its DETECTED twin. Resolution
+    // order: opts.runId (explicit), GSTACK_BUILD_RUN_ID (set by cli.ts at
+    // launch), opts.slug (back-compat default).
+    const fallbackRunId =
+      opts.runId ?? process.env.GSTACK_BUILD_RUN_ID ?? opts.slug;
     const fallbackFaultId = computeFaultId({
       kind: "SOFT_HALT_WARN",
-      runId: opts.slug,
+      runId: fallbackRunId,
       stateSlug: opts.slug,
       severity: "LOW",
       message: fallbackMsg.slice(0, 500),
@@ -1484,7 +1507,7 @@ export async function runConfiguredRoleTask(
     // failure, leave the DETECTED in pending/ — the warning IS real audit
     // signal in that case.
     if (backupResult.exitCode === 0 && !backupResult.timedOut) {
-      emitHaltEventResolved(fallbackFaultId, opts.slug);
+      emitHaltEventResolved(fallbackFaultId, fallbackRunId);
     }
     return backupResult;
   }

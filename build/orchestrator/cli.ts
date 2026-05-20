@@ -4344,6 +4344,14 @@ export async function runRoleTask(opts: {
   iteration: number;
   logPrefix: string;
   timeoutMs?: number;
+  /**
+   * Run identifier matching wrap-console.ts's keying
+   * (`state.launch?.runId ?? state.slug`). Threaded so the Class 4 RESOLVED
+   * emit's pair key matches the DETECTED row wrap-console wrote for the
+   * fallback warn. When undefined, defaults to opts.slug — same fallback
+   * helperCtxFor uses.
+   */
+  runId?: string;
 }): Promise<SubAgentResult> {
   const resolved = resolveRoleTimeouts(opts.role, opts.timeoutMs);
   const effectiveTimeoutMs = resolved.primaryMs;
@@ -4407,15 +4415,48 @@ export async function runRoleTask(opts: {
   // internal phase dispatcher and the slash-command dispatcher accept
   // different opt shapes (codexDefaultCommand, sandbox).
   if ((result.timedOut || result.exitCode !== 0) && opts.role.backupProvider) {
-    console.warn(
+    // Class 4 pairing for the non-Configured variant. Build the warn
+    // message and compute its faultId BEFORE console.warn fires so the
+    // RESOLVED emit (on backup success) can collapse against the DETECTED
+    // wrap-console writes here. runId MUST match wrap-console's keying
+    // (`state.launch?.runId ?? state.slug`) — opts.slug is the same
+    // fallback helperCtxFor uses when launch.runId is unset.
+    const fallbackMsg =
       `[gstack-build] ${opts.logPrefix}: primary ${opts.role.provider} failed ` +
-        `(exit=${result.exitCode ?? "null"}, timedOut=${result.timedOut}); ` +
-        `falling back to ${opts.role.backupProvider} with timeout ${resolved.backupMs}ms (single-shot)`,
-    );
+      `(exit=${result.exitCode ?? "null"}, timedOut=${result.timedOut}); ` +
+      `falling back to ${opts.role.backupProvider} with timeout ${resolved.backupMs}ms (single-shot)`;
+    // Resolution order matches wrap-console's helperCtxFor:
+    //   1. opts.runId (caller explicitly threaded it),
+    //   2. GSTACK_BUILD_RUN_ID (set once at launch in cli.ts:9750-ish),
+    //   3. opts.slug (back-compat default — same as state.slug fallback
+    //      helperCtxFor uses when state.launch.runId is unset).
+    const fallbackRunId =
+      opts.runId ?? process.env.GSTACK_BUILD_RUN_ID ?? opts.slug;
+    const fallbackFaultId = computeFaultId({
+      kind: "SOFT_HALT_WARN",
+      runId: fallbackRunId,
+      stateSlug: opts.slug,
+      severity: "LOW",
+      message: fallbackMsg.slice(0, 500),
+      pointers: {
+        stateFile: "",
+        stdoutLog: "",
+        livingPlan: "",
+        worktreePath: opts.cwd,
+      },
+      snapshot: { stdoutTail: "" },
+    });
+    console.warn(fallbackMsg);
     // Zero stale primary output before backup runs. If backup also fails, the
     // caller gets an empty outputFilePath plus the backup's non-zero exit code.
     fs.writeFileSync(opts.outputFilePath, "");
-    return runRoleTask(resolveFallbackForRoleTask(opts, resolved));
+    const backupResult = await runRoleTask(
+      resolveFallbackForRoleTask(opts, resolved),
+    );
+    if (backupResult.exitCode === 0 && !backupResult.timedOut) {
+      emitHaltEventResolved(fallbackFaultId, fallbackRunId);
+    }
+    return backupResult;
   }
 
   return result;
@@ -9714,6 +9755,19 @@ async function main() {
     if (!setupFailed && state) {
       state.launch = launch;
       saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+
+      // Publish the run identity for the sub-agent fallback paths
+      // (cli.ts::runRoleTask, sub-agents.ts::runConfiguredRoleTask). Those
+      // functions compute a faultId on the primary→backup fallback warn so
+      // the paired RESOLVED can collapse it pre-dispatch. To match what
+      // wrap-console writes for the DETECTED row, the producer-side faultId
+      // must key on the same runId helperCtxFor uses
+      // (`state.launch?.runId ?? state.slug`). Threading runId through every
+      // sub-agent call site is invasive (11+ in cli.ts); the env-var hook
+      // mirrors how GSTACK_BUILD_STDOUT_LOG already plumbs launch metadata
+      // to the same layer, and keeps the back-compat default
+      // (`opts.runId ?? opts.slug`) intact for direct test callers.
+      process.env.GSTACK_BUILD_RUN_ID = launch.runId ?? state.slug;
 
       // Install the wrapConsole shim now that state is loaded and the build
       // run loop is about to start. The shim classifies every console.warn /
