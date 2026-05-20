@@ -128,6 +128,50 @@ export interface ParseOpts {
   dualImpl?: boolean;
 }
 
+interface DroppedPhaseCandidate {
+  featureIndex: number;
+  number: string;
+  name: string;
+  kind: PhaseKind;
+  hasImplementation: boolean;
+  hasReview: boolean;
+}
+
+const IMPL_MARKER_BY_KIND: Record<PhaseKind, string> = {
+  code: "**Implementation**",
+  writing: "**Draft**",
+  experiment: "**Execute**",
+  research: "**Explore**",
+  manual: "**Action Required**",
+};
+
+const REVIEW_MARKER_BY_KIND: Record<PhaseKind, string> = {
+  code: "**Review**",
+  writing: "**Review**",
+  experiment: "**Review**",
+  research: "**Review**",
+  manual: "**Verify Completion**",
+};
+
+function appendSplitNonCodePhaseWarnings(
+  dropped: DroppedPhaseCandidate[],
+  warnings: string[],
+): void {
+  for (let i = 0; i < dropped.length - 1; i++) {
+    const first = dropped[i];
+    const second = dropped[i + 1];
+    if (first.kind === "code") continue;
+    if (first.featureIndex !== second.featureIndex) continue;
+    if (first.kind !== second.kind) continue;
+    if (!first.hasImplementation || first.hasReview) continue;
+    if (second.hasImplementation || !second.hasReview) continue;
+
+    warnings.push(
+      `Phases ${first.number} ("${first.name}") and ${second.number} ("${second.name}") look like a split ${first.kind} phase; merge them into one [${first.kind}] phase containing both ${IMPL_MARKER_BY_KIND[first.kind]} and ${REVIEW_MARKER_BY_KIND[first.kind]} checkboxes.`,
+    );
+  }
+}
+
 export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
   // Strip BOM.
   if (content.charCodeAt(0) === 0xfeff) content = content.slice(1);
@@ -137,6 +181,7 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
   const features: Feature[] = [];
   const warnings: string[] = [];
   let droppedPhasesCount = 0;
+  const droppedCandidates: DroppedPhaseCandidate[] = [];
 
   let inFence = false;
   let currentFeature: (Feature & { bodyLines: string[] }) | null = null;
@@ -241,6 +286,15 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
       });
     } else {
       droppedPhasesCount++;
+      const feature = ensureFeature();
+      droppedCandidates.push({
+        featureIndex: feature.index,
+        number: p.number!,
+        name: p.name!,
+        kind: p.kind ?? "code",
+        hasImplementation: p.implementationCheckboxLine != null,
+        hasReview: p.reviewCheckboxLine != null,
+      });
     }
     currentPhase = null;
   };
@@ -430,6 +484,7 @@ export function parsePlan(content: string, opts: ParseOpts = {}): ParseResult {
 
   // Close out the last phase.
   finalize(lines.length);
+  appendSplitNonCodePhaseWarnings(droppedCandidates, warnings);
   for (const f of features) {
     f.body = f.bodyLines.join("\n");
     delete (f as any).bodyLines;

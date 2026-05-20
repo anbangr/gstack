@@ -576,6 +576,39 @@ describe("parsePlan — phase kinds", () => {
     // plus 1 warning for the synthetic "Full plan" feature having no executable phases = 7
     expect(warnings).toHaveLength(7);
   });
+
+  it("warns when adjacent writing phases split Draft and Review gates", () => {
+    const md = `## Feature 1: Paper
+
+### Phase 1 [writing]: Draft paper
+- [ ] **Draft**: write the paper
+
+### Phase 2 [writing]: Review paper
+- [ ] **Review**: review the paper
+`;
+    const { phases, warnings, droppedPhasesCount } = parsePlan(md);
+    expect(phases).toHaveLength(0);
+    expect(droppedPhasesCount).toBe(2);
+    expect(warnings.join("\n")).toContain(
+      'Phases 1 ("Draft paper") and 2 ("Review paper") look like a split writing phase',
+    );
+    expect(warnings.join("\n")).toContain(
+      "merge them into one [writing] phase containing both **Draft** and **Review** checkboxes",
+    );
+  });
+
+  it("does not emit split-phase guidance for unrelated dropped non-code phases", () => {
+    const md = `## Feature 1: Paper
+
+### Phase 1 [writing]: Draft paper
+- [ ] **Draft**: write the paper
+
+### Phase 2 [research]: Review prior work
+- [ ] **Review**: review the notes
+`;
+    const { warnings } = parsePlan(md);
+    expect(warnings.join("\n")).not.toContain("look like a split");
+  });
 });
 
 describe("parsePlan — audit-only annotation", () => {
