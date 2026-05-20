@@ -501,7 +501,7 @@ started on inconsistent state. The guard makes you choose a policy:
 
 - `--commit-dirty` — stage everything and commit with a standard
   `fix(recovery): <phase> auto-commit of agent-left changes during
-  --mark-phase-committed` message. Pre-commit hooks still run; if a hook
+--mark-phase-committed` message. Pre-commit hooks still run; if a hook
   fails, the commit fails and the mark refuses (you see the hook output
   and decide).
 - `--force-dirty` — preserve the dirty state, warn-only. The next phase
@@ -598,6 +598,11 @@ ship.ts         configurable /ship + /land-and-deploy delegation
 mark-shipped.ts operator escape hatch — write canonical terminal state shape
 pr-info.ts      gh pr lookup helpers (findMergedPRForBranch, readMergedPRInfo)
 child-registry.ts drop-in spawn wrappers + signal handlers (reap detached children)
+plan-reviewer.ts single-round review: parsing, reconciliation, annotation read/write, prompts
+plan-review-loop.ts multi-round orchestration, triage gates, adaptive cap, history JSONL
+drain-faults.ts skill-fault drain consumer; short-circuits audit events (investigate:false)
+halt-event-helpers.ts emitManualRecoveryInvoked() — pins investigate:false on audit events
+halt-events.ts  HaltEvent schema, markInvestigated; investigate?: boolean property
 types.ts        Phase, PhaseState, BuildState
 ```
 

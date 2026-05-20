@@ -50,7 +50,7 @@ These are projections from the bundle-1 case study (real production build, 4 rou
 - New tests: `plan-reviewer-loop.test.ts`, `plan-reviewer-triage-tty.test.ts`, `plan-reviewer-triage-non-tty.test.ts`, `plan-annotation-round-trip.test.ts`, `plan-review-history-jsonl.test.ts`, `adaptive-cap-set-aware.test.ts`, `convergence-jsonl.test.ts`, `plan-review-prompts.test.ts` (snapshot)
 - Integration tests in `build/orchestrator/__tests__/integration/`: bundle-1 trajectory, adaptive bail on re-raises, synth disputes path
 - Layer 4 E2E in `test/skill-e2e-build-convergence.test.ts` (gate tier, ~$0.50/run with real Codex)
-- # Design spec: [docs/superpowers/specs/2026-05-19-build-plan-review-convergence-design.md](docs/superpowers/specs/2026-05-19-build-plan-review-convergence-design.md)
+- Design spec: [docs/superpowers/specs/2026-05-19-build-plan-review-convergence-design.md](docs/superpowers/specs/2026-05-19-build-plan-review-convergence-design.md)
 
 ## [1.40.5.0] - 2026-05-20
 
@@ -104,8 +104,6 @@ If you've been running `gstack-build drain-faults --queue` manually to drain the
 ### For contributors
 
 The helper-based architecture chosen over a per-call gate at `cli.ts:9333` was the eng-review's final synthesis: it future-proofs against a hypothetical second recovery sink with queue-consumer semantics without forcing schema churn (no kind split, no faultId regeneration). The codex outside-voice review pushed back on the original review's expanded scope (kind split + cli-startup-hook migration) and forced the simpler shape: one flag, no kind split, migration only at `/gstack-upgrade` time. Static test T7 (`cli.ts` MUST NOT contain raw `kind: "MANUAL_RECOVERY_INVOKED"` literals) guards against future emit sites bypassing the helper and forgetting the flag.
-
-> > > > > > > origin/main
 
 ## [1.40.4.2] - 2026-05-19
 
