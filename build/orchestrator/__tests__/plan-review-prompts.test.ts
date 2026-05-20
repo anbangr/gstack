@@ -34,6 +34,14 @@ describe("SYNTH_REVISION_PROMPT (synthesizer)", () => {
     expect(SYNTH_REVISION_PROMPT).toContain("RESOLUTION: disputed");
   });
 
+  it("preserves the one-phase two-gate contract for non-code phases", () => {
+    expect(SYNTH_REVISION_PROMPT).toContain("Do NOT split a non-code phase");
+    expect(SYNTH_REVISION_PROMPT).toContain("[writing]");
+    expect(SYNTH_REVISION_PROMPT).toContain("**Draft**");
+    expect(SYNTH_REVISION_PROMPT).toContain("**Review**");
+    expect(SYNTH_REVISION_PROMPT).toContain("one phase");
+  });
+
   it("snapshot — fails if prompt drifts", () => {
     expect(SYNTH_REVISION_PROMPT).toMatchSnapshot();
   });

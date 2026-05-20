@@ -92,6 +92,14 @@ For each annotation with \`USER: defer\`:
 Annotation history from prior rounds is informational — read for context
 on what was already resolved. Do not re-resolve already-resolved items.
 
+Phase shape contract:
+- Do NOT split a non-code phase into separate draft/action and review phases.
+- Each executable phase must contain both required checkboxes for its kind.
+- For [writing], one phase contains both \`- [ ] **Draft**: ...\` and \`- [ ] **Review**: ...\`.
+- For [experiment], one phase contains both \`- [ ] **Execute**: ...\` and \`- [ ] **Review**: ...\`.
+- For [research], one phase contains both \`- [ ] **Explore**: ...\` and \`- [ ] **Review**: ...\`.
+- For [manual], one phase contains both \`- [ ] **Action Required**: ...\` and \`- [ ] **Verify Completion**: ...\`.
+
 If the plan file's \`<!-- gstack-plan-review-history -->\` header indicates
 this is round 3 or later, you may collapse stale RESOLUTION lines from
 rounds 1+ to keep the plan readable, but preserve the annotation header
