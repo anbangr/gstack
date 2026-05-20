@@ -1,5 +1,73 @@
 # Changelog
 
+## [Unreleased - fork-local] - 2026-05-20
+
+**Halt-events pipeline drain. Codex no longer investigates transient warnings; every halt event now carries real log context; two real product bugs in the orchestrator fixed.**
+
+This entry covers the 15-event backlog in `~/.gstack/skill-faults/pending-investigations/` that surfaced after the halt-events pipeline shipped in PRs #54-#62. Five distinct failure classes plus one underlying observability bug that made every codex investigation run blind. No top-level VERSION bump per the fork versioning rule (this is fork-local orchestrator work, not an upstream sync).
+
+### The numbers that matter
+
+End-to-end verified on the dev machine. Numbers from `bun test build/orchestrator/__tests__/` and from the inbox drain itself.
+
+| Surface | Before | After | Δ |
+| --- | --- | --- | --- |
+| `snapshot.stdoutTail` on emitted halt events | always `""` | last 200 lines of `agent-stdout.log` | real context restored |
+| Codex investigations of `gbrain put canonical` noise | every drain | never (`KNOWN_BENIGN_WARN_PATTERNS` skips) | -3 events from current backlog |
+| Codex investigations of Kimi→Gemini fallback success warns | every drain | never (paired RESOLVED collapses pre-dispatch) | future events |
+| Codex investigations of plan-review CRITICAL after re-synthesis success | every resume | never (cross-run RESOLVED) | future events |
+| Review-loop overrun log | "cycle 6/5" before the prompt fires | "cycle 5/5" then prompt | off-by-one closed |
+| `discardBlindExecutionChanges` on gemini sandbox escape | refuses ("workTreeContents not captured") | rolls back cleanly | rollback unblocked |
+
+| Test surfaces added | Cases | Lines |
+| --- | --- | --- |
+| wrap-console snapshot + benign patterns | T1-T3 | ~80 |
+| helperCtxFor stdoutLog plumbing | T_CTX1-2 | ~50 |
+| emitHaltEventResolved helper | T_HER1-3 | ~95 |
+| drain-faults pair collapse | T4-T6 + load shape | ~180 |
+| review-loop cap off-by-one | T12 | ~30 |
+| BLIND_EXECUTION rollback unblocked | T13, T13b | ~50 |
+| Kimi→Gemini fallback RESOLVED | T7a-c | ~60 |
+| Plan-review cross-run RESOLVED | T8-T11 | ~70 |
+| Legacy snapshot backfill | T_LBF1-4 | ~165 |
+| Total | **22 cases / 9 files** | **~780 LoC test** |
+
+### What this means for builders
+
+If you run `gstack-build drain-faults --queue` and it found stale `gbrain put`, Kimi-fallback, or plan-review CRITICAL events from prior builds, this PR makes the queue consumer collapse them pre-dispatch — codex never sees them. Existing legacy rows on disk can be rehydrated to non-empty `stdoutTail` via `bun gstack-upgrade/scripts/backfill-halt-snapshots.ts` (one-shot, idempotent). Real product bugs caught: the feature review-loop cap no longer logs one cycle past its threshold, and gemini sandbox escapes can now actually be rolled back.
+
+### Itemized changes
+
+#### Added
+
+- `KNOWN_BENIGN_WARN_PATTERNS` in `wrap-console.ts` — suppress warn emits the orchestrator already handles in-band (`local JSON is canonical` first entry).
+- `emitHaltEventResolved(faultId, runId, opts)` in `halt-events.ts` — writes minimal `{event:"SKILL_FAULT_RESOLVED",ts,runId,faultId}` JSON to `pending-investigations/` so the queue consumer can collapse DETECTED+RESOLVED pairs.
+- `loadPendingEntries(opts)` in `halt-events.ts` — discriminated-union view of queue entries (detected vs resolved), backing the pair-collapse pre-pass.
+- `buildPlanReviewCriticalMessage()` exported from `plan-reviewer.ts` — single source of truth for the CRITICAL error string so `cli.ts` can reconstruct the exact bytes wrap-console hashed for cross-run RESOLVED keying.
+- `GSTACK_BUILD_STDOUT_LOG` env var read in `helperCtxFor` (cli.ts) — launchers set this to the path of the orchestrator's stdout log so wrap-console emits carry real `pointers.stdoutLog`.
+- `gstack-upgrade/scripts/backfill-halt-snapshots.ts` — one-shot legacy snapshot rehydrator.
+
+#### Changed
+
+- `wrap-console.ts` console.warn / console.error handlers: now call `buildHaltSnapshot()` instead of hardcoding empty snapshot. Halt events carry the last 200 lines of `agent-stdout.log`.
+- `drainFaultsFromHaltEventsQueue` in `drain-faults.ts`: added pair-collapse pre-pass that moves matched DETECTED+RESOLVED pairs to `processed/` before the per-event dispatch loop. Orphan RESOLVEDs are silently moved out of pending. Existing `loadPendingInvestigations` is a back-compat wrapper filtering down to detected entries.
+- `runConfiguredRoleTask` in `sub-agents.ts`: on Kimi→Gemini fallback success (exitCode 0 + !timedOut), emits `emitHaltEventResolved` with the precomputed faultId of the wrap-console DETECTED row.
+- `cli.ts` plan-review handler: on `critical_exit`, persists `state.planReview.faultId + .stateSlug` so the next run can emit RESOLVED on re-synthesis success. Orphan stateSlug (operator switched plans) leaves the field alone.
+
+#### Fixed
+
+- `cli.ts` feature-review loop: log message no longer prints `cycle ${currentIter + 1}/${cap}` (off-by-one that produced "cycle 6/5" before the cap-extension prompt fired). Now prints `cycle ${currentIter}/${cap}`.
+- `cli.ts` gate hygiene: `captureGitSnapshot(opts.cwd)` upstream of `applyGateHygiene` now passes `{captureContents: true}`. This unblocks `discardBlindExecutionChanges` from refusing on `before.workTreeContents not captured` — gemini sandbox escapes can be rolled back cleanly.
+
+#### For contributors
+
+The DETECTED+RESOLVED pair-collapse pattern works on TWO paths:
+
+- Log-stream side: `parseFaultLog` at `drain-faults.ts:424` collapses pairs from manifest-mode `agent-stdout.log` content.
+- Queue side: the new pair-collapse pre-pass at the top of `drainFaultsFromHaltEventsQueue` reads `pending-investigations/` JSON files via `loadPendingEntries`.
+
+These are symmetric but use different inputs. New producers of transient warnings + recovery should call `emitHaltEventResolved` after the recovery succeeds so the queue-side collapse picks it up.
+
 ## [1.40.5.0] - 2026-05-20
 
 **`gstack-build drain-faults --queue` no longer self-enqueues. Manual-recovery audit events short-circuit instead of paying codex (~$0.30) to investigate the recovery sink invoking itself.**
