@@ -110,7 +110,7 @@ Both should isolate `GSTACK_HOME` for the full describe scope by importing the s
 import { useIsolatedGstackHome } from "../../../test/helpers/test-home";
 ```
 
-Call `useIsolatedGstackHome()` at the top of each affected `describe` block. This matches the lint's canonical pattern and avoids adding another accepted isolation style.
+Update `test/test-isolation-lint.test.ts` so the canonical helper import is recognized from nested test directories as well as top-level `test/`. Then call `useIsolatedGstackHome()` at the top of each affected `describe` block. This keeps one helper-based isolation style instead of forcing nested tests to hand-roll `beforeEach` environment setup.
 
 ## Testing
 
@@ -142,7 +142,7 @@ bun test
 
 - Parser diagnostics could become noisy if they guess too broadly. Keep the split-phase detection narrow: adjacent same-kind non-code phases under one feature, with complementary missing gates.
 - Parent-workspace hygiene could be weakened if snapshots are captured after subagent work starts. Capture immediately before the role invocation, not inside post-run hygiene.
-- Test isolation helper imports may need a relative path from nested orchestrator tests; keep the lint green rather than adding another accepted pattern.
+- The isolation lint currently recognizes only the top-level `./helpers/test-home` import path. Broaden that matcher to relative imports ending in `test/helpers/test-home`, and keep the call-site requirement unchanged.
 
 ## Success Criteria
 
