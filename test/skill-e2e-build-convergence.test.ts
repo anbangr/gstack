@@ -24,9 +24,7 @@ import { runPlanReviewLoop } from "../build/orchestrator/plan-review-loop";
 import { runPlanReview } from "../build/orchestrator/plan-reviewer";
 import type { RoleConfig } from "../build/orchestrator/role-config";
 
-const EVALS = process.env.EVALS === "1";
-const TIER = process.env.EVALS_TIER ?? "periodic";
-const shouldRun = EVALS && (TIER === "gate" || TIER === "all");
+const shouldRun = !!process.env.EVALS && process.env.EVALS_TIER === "gate";
 
 const describeE2E = shouldRun ? describe : describe.skip;
 
@@ -147,15 +145,19 @@ describeE2E("E2E: real Codex respects round-annotation contract", () => {
           reRaises: number[];
         };
 
-        // Round 2 (index 1) should have reRaises === 0:
-        // Codex read the RESOLUTION: applied annotations and did not
-        // re-raise the same objections. This is the annotation-contract
-        // assertion — the prompt addition from Task 8 actually works.
-        if (agg.rounds >= 2 && Array.isArray(agg.reRaises) && agg.reRaises.length >= 2) {
-          expect(agg.reRaises[1]).toBe(0);
-        }
-        // If loop exited after round 1 (APPROVE on first call), that's also valid —
-        // Codex found the plan acceptable. No reRaises assertion needed.
+        // The annotation-contract assertion: round 2 (index 1) must have
+        // reRaises === 0, meaning Codex read the RESOLUTION: applied annotations
+        // and did not re-raise the same objections. This is the core behavioral
+        // contract this E2E test exists to verify.
+        //
+        // We require at least 2 rounds to run. If Codex approves round 1,
+        // the fixture plan is already acceptable — the test fails loudly so we
+        // know the seeded issues weren't strong enough to trigger a REVISE.
+        expect(agg.rounds).toBeGreaterThanOrEqual(2);
+        expect(Array.isArray(agg.reRaises)).toBe(true);
+        expect(agg.reRaises.length).toBeGreaterThanOrEqual(2);
+        // Round 2 should not re-raise round-1 issues that the synth resolved.
+        expect(agg.reRaises[1]).toBe(0);
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }

@@ -127,5 +127,21 @@ describe("integration: bundle-1 trajectory 5→3→2→0", () => {
     expect(planText).toContain("ROUND 1 CRITICAL [Feature 1, Phase 2]: EIP-712");
     expect(planText).toContain("ROUND 2 CRITICAL");
     expect(planText).toContain("ROUND 3 CRITICAL");
+
+    // Rounds 2 and 3 raise objections at Phases 4-7, which don't exist in the
+    // plan fixture (it only has Phases 1-3). The annotation writer falls back
+    // to prepending those annotations above the plan heading. Verify the fallback
+    // fires correctly: round-2 and round-3 annotations appear before "# Living Plan".
+    expect(planText.indexOf("ROUND 2 CRITICAL")).toBeLessThan(
+      planText.indexOf("# Living Plan"),
+    );
+    expect(planText.indexOf("ROUND 3 CRITICAL")).toBeLessThan(
+      planText.indexOf("# Living Plan"),
+    );
+    // Round 1 objections are at Phases 1-3 which exist, so they should be
+    // inserted at (or near) the matching Phase heading, not prepended.
+    expect(planText.indexOf("ROUND 1 CRITICAL [Feature 1, Phase 2]: EIP-712")).toBeGreaterThan(
+      planText.indexOf("# Living Plan"),
+    );
   });
 });

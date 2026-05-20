@@ -123,6 +123,18 @@ describe("runTriageGateTTY", () => {
     expect(result.decisions).toHaveLength(1);
   });
 
+  it("'v' shows the reviewer's assessment prose then re-prompts for a real decision", async () => {
+    const objections = [obj(1)];
+    const input = readableFrom("v\na\n\n"); // view, then accept, then empty rationale
+    const out = captureWriter();
+    await runTriageGateTTY({
+      objections, round: 1, trajectory: [1], historyPath: "/tmp/h.jsonl",
+      input, output: out.stream, reRaisedSet: new Set(),
+      assessmentProse: "The plan is missing error handling in three places.",
+    });
+    expect(out.read()).toContain("The plan is missing error handling in three places");
+  });
+
   it("re-raise framing is shown when objection index is in reRaisedSet", async () => {
     const objections = [obj(1)];
     const input = readableFrom("r\nsame misread\n");

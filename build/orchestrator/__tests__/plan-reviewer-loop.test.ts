@@ -231,6 +231,46 @@ describe("runPlanReviewLoop", () => {
     expect(agg.disputedResolutions[0]).toBe(1);
   });
 
+  it("exits with rounds===maxRounds when reviewer keeps returning REVISE through MAX_ROUNDS", async () => {
+    // Reviewer always returns REVISE with new objections at a unique location each time.
+    let rIdx = 0;
+    const reviewerFn = async (): Promise<PlanReviewVerdict> => ({
+      verdict: "REVISE",
+      objections: [{
+        severity: "CRITICAL",
+        location: `F1, P${++rIdx}`,
+        issue: "x",
+        suggestion: "y",
+      }],
+      assessment: "",
+      reviewedBy: "stub",
+      round: rIdx,
+    });
+    const synthFn = async () => ({ ok: true });
+    const out = captureWriter();
+    const result = await runPlanReviewLoop({
+      planPath,
+      historyPath: path.join(tmpDir, "history.jsonl"),
+      aggregatePath: path.join(tmpDir, "convergence.jsonl"),
+      slug: "max-rounds", branch: "feat/max-rounds",
+      reviewerFn, synthFn,
+      maxRounds: 3,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: false,
+      input: readableFrom(""),
+      output: out.stream,
+      reviewerName: "stub", synthesizerName: "stub-synth",
+    });
+    // Non-TTY stalemate gate returns approve_as_is, so outcome is "approved".
+    // But the rounds === maxRounds confirms we hit the cap.
+    expect(result.rounds).toBe(3);
+    const agg = JSON.parse(
+      fs.readFileSync(path.join(tmpDir, "convergence.jsonl"), "utf8").trim(),
+    );
+    expect(agg.trajectoryRaw.length).toBe(3);
+  });
+
   it("bails out at round 2 when all are re-raises", async () => {
     // Round 1 raises one objection, user accepts, synth pretends to resolve.
     // Round 2 raises same one again, no new. Adaptive cap fires.

@@ -151,6 +151,14 @@ describe("shouldBailAdaptive", () => {
     expect(d.exitReason).toBe("max_rounds_hit");
   });
 
+  it("continues when accepted count decreases but there are new objections (progress in different dimension)", () => {
+    const d = shouldBailAdaptive({
+      round: 3, maxRounds: 5, adaptiveEnabled: true,
+      acceptedCount: 2, priorAcceptedCount: 3, reRaises: 0, newObjections: 2,
+    });
+    expect(d.action).toBe("continue");
+  });
+
   it("adaptive disabled: count regression does NOT bail", () => {
     const d = shouldBailAdaptive({
       round: 3, maxRounds: 5, adaptiveEnabled: false,

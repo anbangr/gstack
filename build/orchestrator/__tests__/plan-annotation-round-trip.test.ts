@@ -134,6 +134,33 @@ describe("writeRoundAnnotation", () => {
     expect(parsed[0]).toEqual(ann);
   });
 
+  it("prepends annotation when the Phase heading is not found in plan text", () => {
+    const plan = `## Feature 1\n### Phase 1: x\n`;
+    const ann: RoundAnnotation = {
+      location: "Feature 1, Phase 99",
+      severity: "CRITICAL",
+      issue: "missing phase",
+      suggestion: "add phase",
+      rounds: [
+        {
+          round: 1,
+          userDecision: "accept",
+          userRationale: "",
+          resolution: "pending",
+        },
+      ],
+    };
+    const updated = writeRoundAnnotation(plan, ann);
+    // The annotation should be prepended (above the Feature heading).
+    expect(updated.indexOf("ROUND 1 CRITICAL [Feature 1, Phase 99]")).toBeLessThan(
+      updated.indexOf("## Feature 1"),
+    );
+    // Round-trip: parse what we wrote and confirm it survives.
+    const parsed = parseRoundAnnotations(updated);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].location).toBe("Feature 1, Phase 99");
+  });
+
   it("does not interpret $& or $1 in annotation fields as replacement patterns", () => {
     const plan = `## Feature 1\n### Phase 2: Impl\n- [ ] task\n`;
     const ann: RoundAnnotation = {
