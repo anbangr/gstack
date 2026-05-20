@@ -2259,6 +2259,30 @@ describe("post-agent hygiene helpers", () => {
     );
   });
 
+  it("allows parent workspace changes that happened before the role snapshot", () => {
+    const workspace = path.join(tmpDir!, "parent-window");
+    fs.mkdirSync(workspace, { recursive: true });
+    git(["init", "--initial-branch=main"], workspace);
+    git(["config", "user.email", "test@test.com"], workspace);
+    git(["config", "user.name", "Test User"], workspace);
+    fs.writeFileSync(path.join(workspace, "README.md"), "root\n");
+    git(["add", "README.md"], workspace);
+    git(["commit", "-m", "root init"], workspace);
+
+    fs.writeFileSync(path.join(workspace, "README.md"), "root changed\n");
+    git(["add", "README.md"], workspace);
+    git(["commit", "-m", "orchestrator-owned parent move"], workspace);
+
+    const beforeRole = captureGitSnapshot(workspace);
+    const verdict = validateParentWorkspaceUnchanged({
+      before: beforeRole,
+      workspaceRoot: workspace,
+      label: "primary implementor",
+    });
+
+    expect(verdict).toEqual({ ok: true, errors: [] });
+  });
+
   // ------------------------------------------------------------------
   // Audit-only phase hygiene (no commit required)
   // ------------------------------------------------------------------
