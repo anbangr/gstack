@@ -118,6 +118,7 @@ import {
 } from "./feature-review";
 import { promptYesNo, buildBlockedFeatureMd } from "./feature-review-prompt";
 import {
+  buildPlanReviewCriticalMessage,
   runPlanReview,
   reconcilePlanReview,
   readPlanReviewRound,
@@ -194,7 +195,13 @@ import {
   recordRetryCapHit,
   rewindPhase,
 } from "./halt-event-helpers";
-import { buildHaltSnapshot, emitHaltEvent, severityFor } from "./halt-events";
+import {
+  buildHaltSnapshot,
+  computeFaultId,
+  emitHaltEvent,
+  emitHaltEventResolved,
+  severityFor,
+} from "./halt-events";
 import {
   autoPromoteDecision,
   dedupeAgainstLearned,
@@ -9796,18 +9803,81 @@ async function main() {
           cwd,
           round: readPlanReviewRound(planReviewReportPath),
         });
+        // Capture any pre-existing critical_exit_pending faultId BEFORE
+        // reconcilePlanReview runs the new review pass. If the new outcome
+        // is NOT critical_exit, this faultId points to a DETECTED row from
+        // the prior run that has now recovered — emit RESOLVED for it.
+        const priorCriticalExitFaultId =
+          state.planReview &&
+          (state.planReview as { status?: string }).status ===
+            "critical_exit_pending"
+            ? (state.planReview as { faultId?: string }).faultId
+            : undefined;
+        const priorCriticalExitStateSlug =
+          state.planReview &&
+          (state.planReview as { status?: string }).status ===
+            "critical_exit_pending"
+            ? (state.planReview as { stateSlug?: string }).stateSlug
+            : undefined;
+
         const outcome = await reconcilePlanReview(verdict, args.planFile, {
           planReviewReportPath,
         });
         if (outcome === "critical_exit") {
+          // Class 5: compute the faultId for the wrap-console DETECTED row
+          // that just landed in pending-investigations/ (when wrap-console
+          // captured the console.error from reconcilePlanReview). The
+          // buildPlanReviewCriticalMessage helper formats the exact string
+          // wrap-console hashed, so computeFaultId here matches the existing
+          // queue entry. wrap-console emits with kind=SOFT_HALT_ERROR (the
+          // line was console.error not console.warn) per the classifier.
+          const criticalMsg = buildPlanReviewCriticalMessage({
+            criticalCount: verdict.objections.filter(
+              (o) => o.severity === "CRITICAL",
+            ).length,
+            reportPath: planReviewReportPath,
+            round: verdict.round,
+          });
+          const criticalFaultId = computeFaultId({
+            kind: "SOFT_HALT_ERROR",
+            runId: state.launch?.runId ?? state.slug,
+            stateSlug: state.slug,
+            severity: "MEDIUM",
+            message: criticalMsg.slice(0, 500),
+            pointers: {
+              stateFile: statePath(state.slug),
+              stdoutLog: process.env.GSTACK_BUILD_STDOUT_LOG ?? "",
+              livingPlan: state.planFile,
+              worktreePath: state.launch?.projectRoot ?? "",
+            },
+            snapshot: { stdoutTail: "" },
+          });
           // Persist sentinel so the gate re-fires on resume instead of looping infinitely.
+          // Carry the faultId + stateSlug so the next run can emit RESOLVED on
+          // re-synth success (and the orphan-stateSlug guard works correctly).
           state.planReview = {
             ...verdict,
             status: "critical_exit_pending",
+            faultId: criticalFaultId,
+            stateSlug: state.slug,
           } as any;
           saveState(state, { noGbrain: args.noGbrain, log: console.warn });
           // Throw ExitError so the finally block can release the lock before exit.
           throw new ExitError(3);
+        }
+        // Non-critical outcome: if a prior critical_exit_pending matched the
+        // current run (stateSlug check guards against cross-plan emissions),
+        // the prior CRITICAL has now recovered — emit RESOLVED so the queue
+        // consumer collapses the DETECTED+RESOLVED pair on the next drain.
+        // Skip on stateSlug mismatch (different plan; let its owner resume).
+        if (
+          priorCriticalExitFaultId &&
+          priorCriticalExitStateSlug === state.slug
+        ) {
+          emitHaltEventResolved(
+            priorCriticalExitFaultId,
+            state.launch?.runId ?? state.slug,
+          );
         }
         state.planReview = verdict;
         saveState(state, { noGbrain: args.noGbrain, log: console.warn });
