@@ -1283,28 +1283,67 @@ export async function drainFaultsFromHaltEventsQueue(
     // analytics. Closes the drain-faults --queue self-enqueue loop where
     // the queue consumer would otherwise pay codex (~$0.30) to investigate
     // its own invocation.
-    if (he.investigate === false) {
+    //
+    // Gates (post-codex-adversarial hardening):
+    //   - kind === MANUAL_RECOVERY_INVOKED (M1 fix): the flag is scoped to
+    //     manual-recovery audit events. A corrupted PHASE_FAILED row with
+    //     investigate:false must NOT bypass investigation.
+    //   - dryRun honored BEFORE the move (L1 fix): --dry-run is read-only.
+    //   - markInvestigated success required before recording the skip
+    //     (H3 fix): the previous shape swallowed every error and still
+    //     reported a successful short-circuit. Concurrent-drain losers
+    //     correctly increment shortCircuited because the rename did move
+    //     the file (just by the other process); but EACCES / bad queue
+    //     paths leave the file in pending/ and must NOT be counted as
+    //     skipped or appended to analytics.
+    if (he.investigate === false && he.kind === "MANUAL_RECOVERY_INVOKED") {
+      if (opts.dryRun) {
+        // Dry-run mode is read-only: report the intent without moving the
+        // file or writing analytics. Count under shortCircuited so the
+        // caller's accounting matches the production behavior they're
+        // simulating.
+        result.shortCircuited += 1;
+        continue;
+      }
+      let moved = false;
       try {
         markInvestigated(he.runId, he.faultId, "audit-skipped", { queueDir });
-      } catch {
-        // ignore — file may have been moved by a concurrent drain
-      }
-      try {
-        const analyticsDir = path.join(getGstackHome(), "analytics");
-        fs.mkdirSync(analyticsDir, { recursive: true });
-        const analyticsPath = path.join(analyticsDir, "skill-faults.jsonl");
-        const row = JSON.stringify({
-          ts: new Date().toISOString(),
-          faultId: he.faultId,
-          outcome: "audit-skipped",
-        });
-        fs.appendFileSync(analyticsPath, row + "\n");
+        moved = true;
       } catch (err) {
-        process.stderr.write(
-          `[drain-faults] analytics audit-skipped sink failed for ${he.faultId}: ${(err as Error).message}\n`,
-        );
+        // The file may have been moved by a concurrent drain (ENOENT is
+        // expected in that case — the other process won the race and the
+        // skip has effectively happened, so still count it). For other
+        // errors (EACCES, EROFS, bad queue path), the file is still in
+        // pending/ and reporting a skip would silently lose the event.
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") {
+          moved = true;
+        } else {
+          process.stderr.write(
+            `[drain-faults] markInvestigated failed for audit event ${he.faultId}: ${(err as Error).message}; leaving in pending-investigations/\n`,
+          );
+          result.failed += 1;
+          continue;
+        }
       }
-      result.shortCircuited += 1;
+      if (moved) {
+        try {
+          const analyticsDir = path.join(getGstackHome(), "analytics");
+          fs.mkdirSync(analyticsDir, { recursive: true });
+          const analyticsPath = path.join(analyticsDir, "skill-faults.jsonl");
+          const row = JSON.stringify({
+            ts: new Date().toISOString(),
+            faultId: he.faultId,
+            outcome: "audit-skipped",
+          });
+          fs.appendFileSync(analyticsPath, row + "\n");
+        } catch (err) {
+          process.stderr.write(
+            `[drain-faults] analytics audit-skipped sink failed for ${he.faultId}: ${(err as Error).message}\n`,
+          );
+        }
+        result.shortCircuited += 1;
+      }
       continue;
     }
 

@@ -186,10 +186,13 @@ describe("migration v1.40.5.0 — flag legacy MANUAL_RECOVERY_INVOKED rows as au
     }
   });
 
-  it("T13: malformed JSON row is skipped with a warn; other rows still migrated", () => {
+  it("T13: malformed JSON row is skipped with a warn; other rows still migrated; marker NOT written", () => {
+    // Codex H1+H2 hardening: while there are malformed rows, the marker
+    // MUST NOT be written. The good rows still get migrated (so progress
+    // is real), but the next gstack-upgrade retries to give the user a
+    // chance to fix the source of corruption.
     const env = makeEnv();
     try {
-      // One good row + one malformed file in the same dir
       const goodId = "MANUAL_RECOVERY_INVOKED:all:t13-good";
       const goodPath = writeLegacyRow(env.pending, goodId, baseLegacyRow(goodId));
       const badPath = join(env.pending, "drain-faults-broken.json");
@@ -205,8 +208,10 @@ describe("migration v1.40.5.0 — flag legacy MANUAL_RECOVERY_INVOKED rows as au
       expect(result.stderr).toContain("malformed");
       expect(result.stderr).toContain("drain-faults-broken.json");
 
-      // Marker still written — partial coverage is the intended outcome
-      expect(existsSync(env.doneMarker)).toBe(true);
+      // Marker NOT written — re-run after fixing the bad row will complete
+      expect(existsSync(env.doneMarker)).toBe(false);
+      // Exit non-zero so wrapper scripts know to retry
+      expect(result.status).not.toBe(0);
     } finally {
       env.cleanup();
     }
@@ -273,6 +278,116 @@ describe("migration v1.40.5.0 — flag legacy MANUAL_RECOVERY_INVOKED rows as au
       const after = JSON.parse(readFileSync(path, "utf8"));
       // No investigate field added — this is a real PHASE_FAILED and must dispatch
       expect(after.investigate).toBeUndefined();
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("H2: per-file write failure prevents the marker from being written", () => {
+    // Codex adversarial H2: if any rewrite fails (permissions, disk, race),
+    // the marker MUST NOT be written so the next gstack-upgrade retries.
+    const env = makeEnv();
+    try {
+      const faultId = "MANUAL_RECOVERY_INVOKED:all:h2";
+      writeLegacyRow(env.pending, faultId, baseLegacyRow(faultId));
+
+      // Make pending/ read-only so the mv inside the migration fails.
+      const fs = require("fs");
+      fs.chmodSync(env.pending, 0o500);
+
+      try {
+        const result = runMigration(env);
+
+        // Migration exits non-zero on rewrite failure
+        expect(result.status).not.toBe(0);
+        // Marker MUST NOT be written
+        expect(existsSync(env.doneMarker)).toBe(false);
+        // Stderr surfaces the failure
+        expect(result.stderr).toContain("write failed");
+      } finally {
+        fs.chmodSync(env.pending, 0o755);
+      }
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("M3: row whose message is NOT a known recovery-sink prefix is left untouched", () => {
+    // Codex adversarial M3: a custom MANUAL_RECOVERY_INVOKED row from
+    // outside the three production cli sites (e.g., an external tool that
+    // emits MANUAL_RECOVERY_INVOKED for genuine investigative purposes)
+    // must NOT be silently reclassified as audit-only.
+    const env = makeEnv();
+    try {
+      const faultId = "MANUAL_RECOVERY_INVOKED:all:m3";
+      const customPath = writeLegacyRow(env.pending, faultId, {
+        ...baseLegacyRow(faultId),
+        message: "custom external recovery — please investigate",
+      });
+
+      const result = runMigration(env);
+      expect(result.status).toBe(0);
+
+      const after = JSON.parse(readFileSync(customPath, "utf8"));
+      // No investigate field added — message gate prevented the rewrite.
+      expect(after.investigate).toBeUndefined();
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("M3 (mark-shipped): message 'mark-shipped subcommand invoked' is flagged", () => {
+    // M3 complement: the migration MUST still flag rows from all three
+    // production cli sites, identified by their message prefixes.
+    const env = makeEnv();
+    try {
+      const faultId = "MANUAL_RECOVERY_INVOKED:all:m3-ship";
+      const p = writeLegacyRow(env.pending, faultId, {
+        ...baseLegacyRow(faultId),
+        runId: "mark-shipped",
+        message: "mark-shipped subcommand invoked for feature 3 (PR #42)",
+      });
+      runMigration(env);
+      const after = JSON.parse(readFileSync(p, "utf8"));
+      expect(after.investigate).toBe(false);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("M3 (mark-phase-committed): message '--mark-phase-committed invoked' is flagged", () => {
+    const env = makeEnv();
+    try {
+      const faultId = "MANUAL_RECOVERY_INVOKED:all:m3-mpc";
+      const p = writeLegacyRow(env.pending, faultId, {
+        ...baseLegacyRow(faultId),
+        runId: "build-something",
+        message: "--mark-phase-committed invoked for phase 2.1",
+      });
+      runMigration(env);
+      const after = JSON.parse(readFileSync(p, "utf8"));
+      expect(after.investigate).toBe(false);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("malformed-row presence prevents the marker (don't lock out retry while bad rows exist)", () => {
+    // Same anti-lockout invariant as H2: as long as there are malformed
+    // rows, the marker MUST NOT be written so a future run can retry once
+    // the source of corruption is fixed.
+    const env = makeEnv();
+    try {
+      const goodId = "MANUAL_RECOVERY_INVOKED:all:soft-good";
+      writeLegacyRow(env.pending, goodId, baseLegacyRow(goodId));
+      const badPath = require("path").join(env.pending, "drain-faults-broken.json");
+      require("fs").writeFileSync(badPath, "{ not valid json,");
+
+      const result = runMigration(env);
+
+      // Good row migrated, marker NOT written, exit non-zero
+      expect(result.status).not.toBe(0);
+      expect(existsSync(env.doneMarker)).toBe(false);
     } finally {
       env.cleanup();
     }
