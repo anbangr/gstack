@@ -64,7 +64,7 @@ function fileIsolatesGstackHome(src: string): boolean {
   // Pattern 1: file-level helper. The import line proves a real binding
   // (not a comment match); the call line proves it actually fires.
   const importsHelper =
-    /import\s*\{[^}]*\buseIsolatedGstackHome\b[^}]*\}\s*from\s*["']\.\/helpers\/test-home["']/.test(
+    /import\s*\{[^}]*\buseIsolatedGstackHome\b[^}]*\}\s*from\s*["'](?:\.\/helpers\/test-home|(?:\.\.\/)+test\/helpers\/test-home)["']/.test(
       src,
     );
   const callsHelper = /^\s*useIsolatedGstackHome\s*\(/m.test(src);
@@ -106,6 +106,20 @@ function collectFiles(dir: string): { dir: string; name: string }[] {
 }
 
 describe("test isolation lint", () => {
+  test("recognizes useIsolatedGstackHome imported from nested test directories", () => {
+    const src = [
+      'import { describe } from "bun:test";',
+      'import { useIsolatedGstackHome } from "../../../test/helpers/test-home";',
+      'import { detectSkillFaults } from "../skill-fault-detector";',
+      'describe("nested", () => {',
+      '  useIsolatedGstackHome("nested-");',
+      '  test("case", () => detectSkillFaults({} as any));',
+      "});",
+    ].join("\n");
+
+    expect(fileIsolatesGstackHome(src)).toBe(true);
+  });
+
   test("every test that writes to ~/.gstack/ also isolates GSTACK_HOME", () => {
     const entries = [
       ...collectFiles(TEST_DIR),

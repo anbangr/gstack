@@ -9,6 +9,7 @@ import {
   processedDir,
 } from "../halt-events";
 import { detectSkillFaults } from "../skill-fault-detector";
+import { useIsolatedGstackHome } from "../../../test/helpers/test-home";
 
 /**
  * Gate-tier E2E pin for the 2026-05-17 polis hand-merged-feature regression.
@@ -19,6 +20,8 @@ import { detectSkillFaults } from "../skill-fault-detector";
  * detector pipeline.
  */
 describe("halt-events e2e: polis HAND_MERGED_FEATURE regression", () => {
+  useIsolatedGstackHome("halt-events-e2e-");
+
   let tmp: string;
 
   beforeEach(() => {
