@@ -188,6 +188,7 @@ import {
 } from "./escalation-streak";
 import { renderPlanStatusTable, resolvePlanSelection } from "./plan-selection";
 import {
+  emitManualRecoveryInvoked,
   markFeatureFailed,
   markPhaseFailed,
   recordRetryCapHit,
@@ -9331,13 +9332,11 @@ async function main() {
   }
 
   if (args.mode === "drain-faults") {
-    emitHaltEvent({
-      kind: "MANUAL_RECOVERY_INVOKED",
+    emitManualRecoveryInvoked({
       runId: args.runId ?? "drain-faults",
       stateSlug: args.planFile
         ? deriveStateSlug(args.planFile)
         : "drain-faults-no-plan",
-      severity: severityFor("MANUAL_RECOVERY_INVOKED"),
       message:
         `drain-faults subcommand invoked` +
         (args.drainFaultsBuildTmpDir
@@ -9351,18 +9350,15 @@ async function main() {
         livingPlan: args.planFile ?? "",
         worktreePath: process.cwd(),
       },
-      snapshot: { stdoutTail: "" },
     });
     const exitCode = await runDrainFaultsMode(args);
     process.exit(exitCode);
   }
 
   if (args.mode === "mark-shipped") {
-    emitHaltEvent({
-      kind: "MANUAL_RECOVERY_INVOKED",
+    emitManualRecoveryInvoked({
       runId: args.runId ?? "mark-shipped",
       stateSlug: deriveStateSlug(args.planFile),
-      severity: severityFor("MANUAL_RECOVERY_INVOKED"),
       message:
         `mark-shipped subcommand invoked for feature ${args.markShippedFeature}` +
         (args.markShippedPr ? ` (PR #${args.markShippedPr})` : ""),
@@ -9372,7 +9368,6 @@ async function main() {
         livingPlan: args.planFile,
         worktreePath: process.cwd(),
       },
-      snapshot: { stdoutTail: "" },
     });
     const result = await runMarkShipped({
       planFile: args.planFile,
@@ -9655,11 +9650,9 @@ async function main() {
     if (!setupFailed && state && args.markPhaseCommitted) {
       {
         const ctx = helperCtxFor(state);
-        emitHaltEvent({
-          kind: "MANUAL_RECOVERY_INVOKED",
+        emitManualRecoveryInvoked({
           runId: ctx.runId,
           stateSlug: ctx.stateSlug,
-          severity: severityFor("MANUAL_RECOVERY_INVOKED"),
           message: `--mark-phase-committed invoked for phase ${args.markPhaseCommitted}`,
           pointers: ctx.pointers,
           snapshot: buildHaltSnapshot({

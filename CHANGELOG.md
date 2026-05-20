@@ -1,5 +1,58 @@
 # Changelog
 
+## [1.40.5.0] - 2026-05-20
+
+**`gstack-build drain-faults --queue` no longer self-enqueues. Manual-recovery audit events short-circuit instead of paying codex (~$0.30) to investigate the recovery sink invoking itself.**
+
+PR #57 added the queue-mode drain-faults consumer. PR 2 (#54) added a `MANUAL_RECOVERY_INVOKED` halt event at every recovery entry point for observability. The two changes collided: when `drain-faults --queue` ran, its own emit landed in `pending-investigations/`, the consumer read it on the same invocation, and codex investigated the recovery sink invoking itself. Every future `drain-faults --queue` re-paid the same investigation cost because the faultId was deterministic.
+
+The fix adds an `investigate?: boolean` property to `HaltEvent`. The three cli manual-recovery sites (`drain-faults`, `mark-shipped`, `--mark-phase-committed`) now route through a single helper that pins `investigate: false`. The drain-faults consumer short-circuits any event with `investigate === false`: moves the file straight to `processed/`, records `outcome: "audit-skipped"` in analytics, never dispatches codex. A one-shot `/gstack-upgrade` migration (`v1.40.5.0.sh`) retroactively flags legacy rows so the next drain on existing installs is also cost-free.
+
+### The numbers that matter
+
+End-to-end verified on a real `~/.gstack/skill-faults/` directory with 9 pending halt events (2 legacy `MANUAL_RECOVERY_INVOKED` + 3 `SOFT_HALT_ERROR` + 4 `SOFT_HALT_WARN`).
+
+| Metric | Before fix | After fix | Δ |
+| --- | --- | --- | --- |
+| Codex calls per `drain-faults --queue` (when only audit events queued) | 1+ per stale event | 0 | -100% |
+| Cost per redundant audit drain | ~$0.30 | $0.00 | -$0.30/run |
+| `MANUAL_RECOVERY_INVOKED` events re-investigated | every run | never | — |
+| `pending-investigations/` self-feed loop | open | closed | — |
+
+| Phase | Source lines | Test lines | Tests added |
+| --- | --- | --- | --- |
+| Phase 1 (schema + consumer gate) | ~40 | ~250 | 4 |
+| Phase 2 (emit-site wiring + helper) | ~50 | ~85 | 3 |
+| Phase 3 (migration script + tests) | ~110 | ~280 | 8 |
+| Total | ~200 | ~615 | 15 |
+
+Single self-emitted audit event from a fresh `drain-faults --queue` invocation now short-circuits to processed/ on the same run with `shortCircuited: 1`, codex untouched. Real-disk verification: `processed/drain-faults-MANUAL_RECOVERY_INVOKED:all:276ba8b1.json` (yesterday's accidental self-investigation) and `pending-investigations/agnt2-prototype-...-:e0792c37.json` (a `--mark-phase-committed` audit from another build) both gained `investigate: false` via the migration and short-circuited cleanly on the post-fix run.
+
+### What this means for builders
+
+If you've been running `gstack-build drain-faults --queue` manually to drain the halt-events backlog, every prior run paid codex for at least one redundant audit event (the recovery sink's own invocation, deterministic faultId so it could only be drained once per state, but the cost accrued every time you re-ran). After v1.40.5.0 those audit events are first-class observability data in the analytics log (`outcome: "audit-skipped"`) but cost zero codex spend. The auto-drain hook at end-of-build (PR #59) inherits the same short-circuit through the shared consumer code path — no separate code change needed there. Run `/gstack-upgrade` to flag your existing legacy rows.
+
+### Itemized changes
+
+#### Added
+
+- New `HaltEvent.investigate?: boolean` property in `build/orchestrator/halt-events.ts`. Absent or `true` means dispatch normally (back-compat); `false` means audit-only, short-circuit at consumer.
+- New `emitManualRecoveryInvoked()` helper in `build/orchestrator/halt-event-helpers.ts`. Single source of truth for the three cli manual-recovery emit sites — guarantees `investigate: false` is set on every audit event by construction.
+- New consumer short-circuit branch in `drainFaultsFromHaltEventsQueue` at `build/orchestrator/drain-faults.ts`. Records `outcome: "audit-skipped"` analytics row, moves event to `processed/`, increments `result.shortCircuited`, never dispatches codex.
+- New `/gstack-upgrade` migration `gstack-upgrade/migrations/v1.40.5.0.sh`. Scans `pending-investigations/` and `processed/` for `MANUAL_RECOVERY_INVOKED` rows lacking `investigate`, adds `investigate: false` via atomic `jq` tmp+rename. Idempotent via marker file at `~/.gstack/skill-faults/.migrations/v1.40.5.0.done`. Crash-safe: mid-flight Ctrl+C resumes cleanly. Defensive: malformed JSON rows logged and skipped without aborting.
+- New regression test suite `build/orchestrator/__tests__/drain-halt-events-audit-skip.test.ts` (4 tests, T1-T4): audit short-circuit, non-audit dispatch, mixed queue, legacy-row back-compat.
+- New helper test `build/orchestrator/__tests__/manual-recovery-emit-site.test.ts` (3 tests, T5-T7): flag pinning, field preservation, static guard against raw `kind:` literals re-appearing in cli.ts.
+- New migration test `test/gstack-upgrade-migration-v1_40_5_0.test.ts` (8 tests, T9-T16): pending/processed rewrite, pre-flagged untouched, idempotent re-run, malformed row skip, fresh install no-op, crash resume, non-MANUAL_RECOVERY rows untouched.
+
+#### Changed
+
+- The three `kind: "MANUAL_RECOVERY_INVOKED"` emit blocks in `build/orchestrator/cli.ts` (drain-faults entry, mark-shipped entry, --mark-phase-committed entry) collapsed to single-line `emitManualRecoveryInvoked()` calls. No behavior change for production sites apart from the new flag.
+- `markInvestigated` outcome union in `halt-events.ts` extended with `"audit-skipped"`. Function still ignores the parameter (logging happens at the call site), so no downstream branching needed.
+
+### For contributors
+
+The helper-based architecture chosen over a per-call gate at `cli.ts:9333` was the eng-review's final synthesis: it future-proofs against a hypothetical second recovery sink with queue-consumer semantics without forcing schema churn (no kind split, no faultId regeneration). The codex outside-voice review pushed back on the original review's expanded scope (kind split + cli-startup-hook migration) and forced the simpler shape: one flag, no kind split, migration only at `/gstack-upgrade` time. Static test T7 (`cli.ts` MUST NOT contain raw `kind: "MANUAL_RECOVERY_INVOKED"` literals) guards against future emit sites bypassing the helper and forgetting the flag.
+
 ## [1.40.4.2] - 2026-05-19
 
 **Gemini staging-path fix now matches Gemini's actual `projects.json` key sanitization. Worktrees with `_`, `.`, or uppercase in the basename no longer fall through the same hole the v1.40.4.1 fix tried to plug.**
