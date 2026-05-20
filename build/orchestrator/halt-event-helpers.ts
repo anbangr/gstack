@@ -112,3 +112,41 @@ export function recordRetryCapHit(
     phaseIdx,
   );
 }
+
+/**
+ * Emit a MANUAL_RECOVERY_INVOKED audit event with investigate:false.
+ *
+ * Every manual-recovery cli entry point (drain-faults, mark-shipped,
+ * --mark-phase-committed) calls this helper instead of emitting a raw
+ * HaltEvent. Centralizing the emit ensures investigate:false is set in
+ * exactly one place — the consumer's short-circuit will move every event
+ * straight to processed/ without paying codex.
+ *
+ * Why no BuildState parameter: the drain-faults entry point fires before
+ * any plan is loaded, so it has no state object. Callers that DO have
+ * state can pass it via a future overload if a snapshot becomes useful;
+ * today the audit event needs no per-phase context.
+ */
+export function emitManualRecoveryInvoked(opts: {
+  runId: string;
+  stateSlug: string;
+  message: string;
+  pointers: HaltEvent["pointers"];
+  /** Optional richer snapshot for sites that have BuildState context. */
+  snapshot?: HaltEvent["snapshot"];
+  queueDir?: string;
+}): string {
+  return emitHaltEvent(
+    {
+      kind: "MANUAL_RECOVERY_INVOKED",
+      runId: opts.runId,
+      stateSlug: opts.stateSlug,
+      severity: severityFor("MANUAL_RECOVERY_INVOKED"),
+      message: opts.message,
+      investigate: false,
+      pointers: opts.pointers,
+      snapshot: opts.snapshot ?? { stdoutTail: "" },
+    },
+    { queueDir: opts.queueDir },
+  );
+}
