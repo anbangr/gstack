@@ -4,7 +4,9 @@
 
 **Halt-events pipeline drain. Codex no longer investigates transient warnings; every halt event now carries real log context; two real product bugs in the orchestrator fixed.**
 
-This entry covers the 15-event backlog in `~/.gstack/skill-faults/pending-investigations/` that surfaced after the halt-events pipeline shipped in PRs #54-#62. Five distinct failure classes plus one underlying observability bug that made every codex investigation run blind. No top-level VERSION bump per the fork versioning rule (this is fork-local orchestrator work, not an upstream sync).
+This entry covers the 15-event backlog in `~/.gstack/skill-faults/pending-investigations/` that surfaced after the halt-events pipeline shipped in PRs #54-#62. Four distinct failure classes (plus one underlying observability bug) and two real product bugs. No top-level VERSION bump per the fork versioning rule (this is fork-local orchestrator work, not an upstream sync).
+
+A fifth failure class (plan-review CRITICAL → re-synthesis cross-run RESOLVED) was originally scoped here, but the build-skill 1.25.0 entry below replaced the `reconcilePlanReview` call path with an in-process convergence loop that does not emit a DETECTED via wrap-console. The cross-run pairing logic was removed during the merge; the per-objection orphan fix in legacy `reconcilePlanReview` was kept defensively for any caller still using that function.
 
 ### The numbers that matter
 
@@ -15,7 +17,7 @@ End-to-end verified on the dev machine. Numbers from `bun test build/orchestrato
 | `snapshot.stdoutTail` on emitted halt events | always `""` | last 200 lines of `agent-stdout.log` | real context restored |
 | Codex investigations of `gbrain put canonical` noise | every drain | never (`KNOWN_BENIGN_WARN_PATTERNS` skips) | -3 events from current backlog |
 | Codex investigations of Kimi→Gemini fallback success warns | every drain | never (paired RESOLVED collapses pre-dispatch) | future events |
-| Codex investigations of plan-review CRITICAL after re-synthesis success | every resume | never (cross-run RESOLVED) | future events |
+| Codex investigations of broader runRoleTask primary→backup recoveries | every drain | never (Class 4 applied to non-Configured path too) | future events |
 | Review-loop overrun log | "cycle 6/5" before the prompt fires | "cycle 5/5" then prompt | off-by-one closed |
 | `discardBlindExecutionChanges` on gemini sandbox escape | refuses ("workTreeContents not captured") | rolls back cleanly | rollback unblocked |
 
@@ -28,14 +30,13 @@ End-to-end verified on the dev machine. Numbers from `bun test build/orchestrato
 | review-loop cap off-by-one | T12 | ~30 |
 | BLIND_EXECUTION rollback unblocked | T13, T13b | ~50 |
 | Kimi→Gemini fallback RESOLVED | T7a-c | ~60 |
-| Plan-review cross-run RESOLVED | T8-T11b | ~110 |
 | runRoleTask Class 4 + runId chain | T7d-i | ~100 |
 | Legacy snapshot backfill | T_LBF1-4 | ~165 |
-| Total | **30 cases / 10 files** | **~920 LoC test** |
+| Total | **26 cases / 9 files** | **~810 LoC test** |
 
 ### What this means for builders
 
-If you run `gstack-build drain-faults --queue` and it found stale `gbrain put`, Kimi-fallback, or plan-review CRITICAL events from prior builds, this PR makes the queue consumer collapse them pre-dispatch — codex never sees them. Existing legacy rows on disk can be rehydrated to non-empty `stdoutTail` via `bun gstack-upgrade/scripts/backfill-halt-snapshots.ts` (one-shot, idempotent). Real product bugs caught: the feature review-loop cap no longer logs one cycle past its threshold, and gemini sandbox escapes can now actually be rolled back.
+If you run `gstack-build drain-faults --queue` and it finds stale `gbrain put` noise or Kimi-fallback warnings from prior builds, the queue consumer now collapses them pre-dispatch — codex never sees them. Existing legacy rows on disk can be rehydrated to non-empty `stdoutTail` via `bun gstack-upgrade/scripts/backfill-halt-snapshots.ts` (one-shot, idempotent). Real product bugs caught: the feature review-loop cap no longer logs one cycle past its threshold, and gemini sandbox escapes can now actually be rolled back.
 
 ### Itemized changes
 
@@ -44,8 +45,8 @@ If you run `gstack-build drain-faults --queue` and it found stale `gbrain put`, 
 - `KNOWN_BENIGN_WARN_PATTERNS` in `wrap-console.ts` — suppress warn emits the orchestrator already handles in-band (`local JSON is canonical` first entry).
 - `emitHaltEventResolved(faultId, runId, opts)` in `halt-events.ts` — writes minimal `{event:"SKILL_FAULT_RESOLVED",ts,runId,faultId}` JSON to `pending-investigations/` so the queue consumer can collapse DETECTED+RESOLVED pairs.
 - `loadPendingEntries(opts)` in `halt-events.ts` — discriminated-union view of queue entries (detected vs resolved), backing the pair-collapse pre-pass.
-- `buildPlanReviewCriticalMessage()` exported from `plan-reviewer.ts` — single source of truth for the CRITICAL error string so `cli.ts` can reconstruct the exact bytes wrap-console hashed for cross-run RESOLVED keying.
 - `GSTACK_BUILD_STDOUT_LOG` env var read in `helperCtxFor` (cli.ts) — launchers set this to the path of the orchestrator's stdout log so wrap-console emits carry real `pointers.stdoutLog`.
+- `GSTACK_BUILD_RUN_ID` env var published by cli.ts at launch — sub-agent fallback paths read it so producer-side faultId keys match wrap-console's DETECTED keys.
 - `gstack-upgrade/scripts/backfill-halt-snapshots.ts` — one-shot legacy snapshot rehydrator.
 
 #### Changed
@@ -54,9 +55,8 @@ If you run `gstack-build drain-faults --queue` and it found stale `gbrain put`, 
 - `drainFaultsFromHaltEventsQueue` in `drain-faults.ts`: added pair-collapse pre-pass that moves matched DETECTED+RESOLVED pairs to `processed/` before the per-event dispatch loop. Orphan RESOLVEDs are silently moved out of pending. Existing `loadPendingInvestigations` is a back-compat wrapper filtering down to detected entries.
 - `runConfiguredRoleTask` in `sub-agents.ts`: on Kimi→Gemini fallback success (exitCode 0 + !timedOut), emits `emitHaltEventResolved` with the precomputed faultId of the wrap-console DETECTED row.
 - `runRoleTask` in `cli.ts` (the non-Configured variant — core phase / feature-review / merge-fixer flows): now mirrors the same Class 4 pattern. Precomputes faultId before `console.warn`, emits RESOLVED on backup success gated on `exitCode === 0 && !timedOut`. This was the broader unpaired surface — every successful primary→backup recovery on those paths used to leave an orphan DETECTED.
-- Fallback runId resolution chain (both `runRoleTask` and `runConfiguredRoleTask`): `opts.runId ?? process.env.GSTACK_BUILD_RUN_ID ?? opts.slug`. `cli.ts` publishes `GSTACK_BUILD_RUN_ID` once at launch from `state.launch.runId` so producer-side faultId keys match wrap-console's DETECTED keys (which use `state.launch?.runId ?? state.slug`). Without this match, pair-collapse keys diverged when `launch.runId !== slug` and the RESOLVED never collapsed its DETECTED.
-- `plan-reviewer.ts` `reconcilePlanReview`: per-objection bullet lines now print via `console.log` instead of `console.error`. `wrap-console.ts` only shims warn/error, so the previous code was creating one orphan `SOFT_HALT_ERROR` row per bullet that Class 5's single RESOLVED could never collapse. The aggregate `criticalMsg` still goes through `console.error` (one DETECTED, one RESOLVED, clean pair).
-- `cli.ts` plan-review handler: on `critical_exit`, persists `state.planReview.faultId + .stateSlug` so the next run can emit RESOLVED on re-synthesis success. Orphan stateSlug (operator switched plans) leaves the field alone.
+- Fallback runId resolution chain (both `runRoleTask` and `runConfiguredRoleTask`): `opts.runId ?? process.env.GSTACK_BUILD_RUN_ID ?? opts.slug`. Producer-side faultId keys match wrap-console's DETECTED keys (which use `state.launch?.runId ?? state.slug`). Without this match, pair-collapse keys diverged when `launch.runId !== slug` and the RESOLVED never collapsed its DETECTED.
+- `plan-reviewer.ts` legacy `reconcilePlanReview`: per-objection bullet lines now print via `console.log` instead of `console.error`. `wrap-console.ts` only shims warn/error, so the previous code created one orphan `SOFT_HALT_ERROR` row per bullet. The aggregate critical message still goes through `console.error` (one DETECTED). Note: the build-skill 1.25.0 entry below replaced the cli.ts caller of this function with an in-process convergence loop, so this fix is now defensive — it protects any future caller that uses the legacy function directly.
 
 #### Fixed
 
@@ -72,6 +72,58 @@ The DETECTED+RESOLVED pair-collapse pattern works on TWO paths:
 
 These are symmetric but use different inputs. New producers of transient warnings + recovery should call `emitHaltEventResolved` after the recovery succeeds so the queue-side collapse picks it up.
 
+## [build skill 1.25.0] — 2026-05-20
+
+**Plan review now brings you in at round 1, and it bails when it stalls.**
+The `/build` skill's planReviewer loop used to run autonomously for up to 3 rounds before asking you anything — and every round cost ~$1-2 of API spend. Now the loop runs in-process, asks you to triage each CRITICAL objection after the very first round, gives you up to 5 rounds when convergence is working, and bails early when the synth keeps failing to address the same concern.
+
+### The numbers that matter
+
+These are projections from the bundle-1 case study (real production build, 4 rounds, 5→3→2→0 trajectory) compared to what the new loop will do on the same shape. Verify by running `bin/gstack-convergence-stats` after 10+ builds with the new loop.
+
+| Metric                         | Before                 | After (projected)     | Δ                   |
+| ------------------------------ | ---------------------- | --------------------- | ------------------- |
+| User involvement               | Round 3 stalemate only | Round 1 onward        | 3x earlier          |
+| Per-round re-launch overhead   | ~5-10s                 | 0s (in-process)       | -100%               |
+| Max rounds (clean convergence) | 3                      | 5                     | +67%                |
+| Stuck-loop early exit          | Round 3 (cap)          | Round 2 (adaptive)    | 50% faster bail-out |
+| Cross-round reviewer memory    | None                   | Plan-file annotations | new                 |
+
+### What changed for you
+
+- After each round's reviewer call, you see each CRITICAL objection one at a time. Press `a` to accept, `r` to reject as a false positive, `d` to defer, `v` to see the reviewer's full prose, `A` / `R` to fast-path the rest, `s` to stop triage, or `q` to quit (state preserved, resume later).
+- Each decision can carry an optional one-line rationale — it gets annotated into the plan file so the next round's reviewer (and the synth) see what was already settled.
+- The synth honors your accepts and rejects via the new annotation contract. If the synth thinks your accept is wrong, it can mark the resolution `disputed — <reason>` and you'll see it in the next round's triage instead of the synth silently complying.
+- Stalemate at round 5 (or earlier adaptive bail) hands you four options: approve-as-is, continue one more round, drop to manual mode (exit 3, edit by hand, re-launch), or abort cleanly (exit 4, state preserved).
+- CI builds default to `auto-accept` (existing IMPORTANT-objection behavior extended to CRITICAL). Use `--plan-review-noninteractive=fail-fast` for stricter CI gating or `--plan-review-noninteractive=auto-reject` as an escape hatch.
+
+### Itemized changes
+
+**Added**
+
+- In-process plan-review loop in [build/orchestrator/plan-review-loop.ts](build/orchestrator/plan-review-loop.ts) — replaces the exit-3-and-re-launch cycle for CRITICAL-objection rounds
+- TTY triage gate with per-objection accept/reject/defer/view/accept-all/reject-all/stop/quit keys
+- Non-TTY triage modes: `auto-accept` (default), `fail-fast`, `auto-reject`
+- Plan-file annotation contract: `<!-- ROUND N CRITICAL [...] -->` blocks above each `### Phase N` heading carry triage decisions and synth resolutions; top-of-plan `<!-- gstack-plan-review-history -->` block carries the per-round summary
+- Set-aware adaptive cap: bails when re-raises > 0 AND new objections == 0, or when accepted count regresses
+- New exit code 4 (user abort)
+- New CLI flags: `--plan-review-max-rounds=N`, `--plan-review-no-adaptive-cap`, `--plan-review-noninteractive=<mode>`
+- Per-build history at `~/.gstack/build-state/<slug>/plan-review-history.jsonl`
+- Cross-build aggregate at `~/.gstack/analytics/convergence.jsonl`
+
+**Changed**
+
+- Default max rounds: 3 → 5
+- `build/SKILL.md.tmpl` Step 5.5 shrinks to handle exit codes only; the synthesizer revision prompt moves to a TypeScript constant `SYNTH_REVISION_PROMPT` exported from [build/orchestrator/plan-reviewer.ts](build/orchestrator/plan-reviewer.ts)
+- `PLAN_REVIEW_PROMPT` extended with a paragraph teaching the reviewer to read prior-round annotations and not re-raise settled concerns
+
+**For contributors**
+
+- New tests: `plan-reviewer-loop.test.ts`, `plan-reviewer-triage-tty.test.ts`, `plan-reviewer-triage-non-tty.test.ts`, `plan-annotation-round-trip.test.ts`, `plan-review-history-jsonl.test.ts`, `adaptive-cap-set-aware.test.ts`, `convergence-jsonl.test.ts`, `plan-review-prompts.test.ts` (snapshot)
+- Integration tests in `build/orchestrator/__tests__/integration/`: bundle-1 trajectory, adaptive bail on re-raises, synth disputes path
+- Layer 4 E2E in `test/skill-e2e-build-convergence.test.ts` (gate tier, ~$0.50/run with real Codex)
+- Design spec: [docs/superpowers/specs/2026-05-19-build-plan-review-convergence-design.md](docs/superpowers/specs/2026-05-19-build-plan-review-convergence-design.md)
+
 ## [1.40.5.0] - 2026-05-20
 
 **`gstack-build drain-faults --queue` no longer self-enqueues. Manual-recovery audit events short-circuit instead of paying codex (~$0.30) to investigate the recovery sink invoking itself.**
@@ -84,19 +136,19 @@ The fix adds an `investigate?: boolean` property to `HaltEvent`. The three cli m
 
 End-to-end verified on a real `~/.gstack/skill-faults/` directory with 9 pending halt events (2 legacy `MANUAL_RECOVERY_INVOKED` + 3 `SOFT_HALT_ERROR` + 4 `SOFT_HALT_WARN`).
 
-| Metric | Before fix | After fix | Δ |
-| --- | --- | --- | --- |
-| Codex calls per `drain-faults --queue` (when only audit events queued) | 1+ per stale event | 0 | -100% |
-| Cost per redundant audit drain | ~$0.30 | $0.00 | -$0.30/run |
-| `MANUAL_RECOVERY_INVOKED` events re-investigated | every run | never | — |
-| `pending-investigations/` self-feed loop | open | closed | — |
+| Metric                                                                 | Before fix         | After fix | Δ          |
+| ---------------------------------------------------------------------- | ------------------ | --------- | ---------- |
+| Codex calls per `drain-faults --queue` (when only audit events queued) | 1+ per stale event | 0         | -100%      |
+| Cost per redundant audit drain                                         | ~$0.30             | $0.00     | -$0.30/run |
+| `MANUAL_RECOVERY_INVOKED` events re-investigated                       | every run          | never     | —          |
+| `pending-investigations/` self-feed loop                               | open               | closed    | —          |
 
-| Phase | Source lines | Test lines | Tests added |
-| --- | --- | --- | --- |
-| Phase 1 (schema + consumer gate) | ~40 | ~250 | 4 |
-| Phase 2 (emit-site wiring + helper) | ~50 | ~85 | 3 |
-| Phase 3 (migration script + tests) | ~110 | ~280 | 8 |
-| Total | ~200 | ~615 | 15 |
+| Phase                               | Source lines | Test lines | Tests added |
+| ----------------------------------- | ------------ | ---------- | ----------- |
+| Phase 1 (schema + consumer gate)    | ~40          | ~250       | 4           |
+| Phase 2 (emit-site wiring + helper) | ~50          | ~85        | 3           |
+| Phase 3 (migration script + tests)  | ~110         | ~280       | 8           |
+| Total                               | ~200         | ~615       | 15          |
 
 Single self-emitted audit event from a fresh `drain-faults --queue` invocation now short-circuits to processed/ on the same run with `shortCircuited: 1`, codex untouched. Real-disk verification: `processed/drain-faults-MANUAL_RECOVERY_INVOKED:all:276ba8b1.json` (yesterday's accidental self-investigation) and `pending-investigations/agnt2-prototype-...-:e0792c37.json` (a `--mark-phase-committed` audit from another build) both gained `investigate: false` via the migration and short-circuited cleanly on the post-fix run.
 
@@ -133,13 +185,13 @@ v1.40.4.1 keyed the Gemini staging dir on `path.basename(opts.cwd)` raw. Gemini'
 
 ### The numbers that matter
 
-| Basename observed in projects.json | Raw `basename(cwd)` (v1.40.4.1) | Gemini's actual key | Match? |
-| --- | --- | --- | --- |
-| `socc26-v022a-schema-v3_1-behavior-subtree-...` | `...v3_1...` | `...v3-1...` | NO |
-| `MyObs` | `MyObs` | `myobs` | NO |
-| `AGIL-paper` | `AGIL-paper` | `agil-paper` | NO |
-| `the-Big-Paper` | `the-Big-Paper` | `the-big-paper` | NO |
-| `mitosis-control-plane-impl-plan-anbang-20260518-...` | (same) | (same) | yes (accidental) |
+| Basename observed in projects.json                    | Raw `basename(cwd)` (v1.40.4.1) | Gemini's actual key | Match?           |
+| ----------------------------------------------------- | ------------------------------- | ------------------- | ---------------- |
+| `socc26-v022a-schema-v3_1-behavior-subtree-...`       | `...v3_1...`                    | `...v3-1...`        | NO               |
+| `MyObs`                                               | `MyObs`                         | `myobs`             | NO               |
+| `AGIL-paper`                                          | `AGIL-paper`                    | `agil-paper`        | NO               |
+| `the-Big-Paper`                                       | `the-Big-Paper`                 | `the-big-paper`     | NO               |
+| `mitosis-control-plane-impl-plan-anbang-20260518-...` | (same)                          | (same)              | yes (accidental) |
 
 Four out of five real worktrees on this machine produce divergent staging vs allowlist paths under v1.40.4.1. Only the v1.40.4.1 happy-path case (already-lowercase, alphanumeric+hyphen) matches.
 
@@ -176,10 +228,10 @@ When kimi (primary implementor) failed and the orchestrator fell back to Gemini,
 
 Observed on `mitosis-control-plane-impl-plan-anbang-20260518-154933-bee3aea0` Phase 3.3 (`streamPodLogs`), 2026-05-18. Both directories exist on disk after the failing run:
 
-| Path | Contents | Used by |
-| --- | --- | --- |
-| `~/.gemini/tmp/build-mitosis-control-plane-impl-plan-anbang-.../` | empty (orchestrator cleanup ran) | orchestrator stage write |
-| `~/.gemini/tmp/mitosis-control-plane-impl-plan-anbang-.../` | `chats/`, `.project_root` | Gemini's actual workspace |
+| Path                                                              | Contents                         | Used by                   |
+| ----------------------------------------------------------------- | -------------------------------- | ------------------------- |
+| `~/.gemini/tmp/build-mitosis-control-plane-impl-plan-anbang-.../` | empty (orchestrator cleanup ran) | orchestrator stage write  |
+| `~/.gemini/tmp/mitosis-control-plane-impl-plan-anbang-.../`       | `chats/`, `.project_root`        | Gemini's actual workspace |
 
 Same regression observed 2026-05-17 on `agnt2-prototype-plan4` (T111646 fault report). Commit `67480efe` dropped a `gstack/` segment in the same helper but kept `opts.slug` as the directory key, so the `build-` prefix from `deriveSlug` still mismatched. This release closes the remaining gap. The concurrent-collision path was caught by adversarial review (both Claude subagent and Codex independently flagged it as the most exploitable finding in the original patch).
 

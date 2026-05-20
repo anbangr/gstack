@@ -466,8 +466,42 @@ export interface PlanReviewVerdict {
   assessment: string;
   /** Model name, e.g. "gpt-5.5". "skipped-unavailable" when review was bypassed. */
   reviewedBy: string;
-  /** 1 or 2 — for re-synthesis round tracking in SKILL.md Step 5.5. */
+  /** 1-based round counter; survives cross-launch resume via readPlanReviewRound. */
   round: number;
+  /** Per-objection user triage decisions for this round. Absent on APPROVE rounds. */
+  triageDecisions?: TriageDecision[];
+  /** Absolute path to the append-only per-build history JSONL. */
+  roundHistoryPath?: string;
+  /** Convergence snapshot for this round. */
+  convergence?: ConvergenceSnapshot;
+  /** When set, the user interrupted triage mid-round at this objection (0-based). */
+  interruptedAtObjection?: number;
+}
+
+export interface TriageDecision {
+  /** Index into the round's objections array. */
+  objectionIndex: number;
+  /** User disposition: accept feeds into convergence count, reject/defer do not. */
+  decision: "accept" | "reject" | "defer";
+  /** Optional one-line user rationale. Empty string when not provided. */
+  rationale?: string;
+}
+
+export interface ConvergenceSnapshot {
+  /** CRITICAL count returned by reviewer before triage. */
+  objectionCountRaw: number;
+  /** CRITICAL count the user accepted in this round's triage. */
+  objectionCountAccepted: number;
+  /** Accepted CRITICAL count from round k-1. null on round 1. */
+  priorRoundAccepted: number | null;
+  /** objectionCountAccepted - priorRoundAccepted. null on round 1. */
+  delta: number | null;
+  /** Count of round-k accepted objections matching a round-(k-1) accepted-and-resolved entry by (location, severity). */
+  reRaises: number;
+  /** Count of round-k objections that don't match any prior-round annotation. */
+  newObjections: number;
+  /** True when adaptive-cap rule fires (see plan-review-loop.ts). */
+  noForwardProgress: boolean;
 }
 
 export interface BuildState {

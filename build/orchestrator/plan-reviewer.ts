@@ -422,7 +422,7 @@ export async function reconcilePlanReview(
 // Sub-agent invocation
 // ---------------------------------------------------------------------------
 
-const PLAN_REVIEW_PROMPT = `Review this living implementation plan before autonomous TDD execution begins.
+export const PLAN_REVIEW_PROMPT = `Review this living implementation plan before autonomous TDD execution begins.
 
 Review for:
 1. COMPLETENESS — Does it cover all features from the source intent?
@@ -440,6 +440,32 @@ Review for:
      (no concrete inputs/outputs named), or no edge cases listed.
    - Flag SUGGESTION if the coverage target line is missing (add \`**Coverage target: ≥80%**\`).
 
+The plan file may contain annotation blocks (HTML comments) above each
+\`### Phase N\` heading that record prior review rounds. They look like:
+
+  <!-- ROUND 1 CRITICAL [Feature 3, Phase 2]: issue → suggestion
+       ROUND 1 USER: accept ("rationale")
+       ROUND 1 RESOLUTION: synth added chainId per suggestion
+       ROUND 2 REVIEWER: not re-raised -->
+
+Use this history:
+
+1. If a prior round raised an objection and the user REJECTED it
+   ("USER: reject"), do NOT re-raise the same objection unless you have
+   NEW evidence the plan doesn't address. The user explicitly considered
+   and rejected this concern. Repeating it wastes a round.
+
+2. If a prior round raised an objection and the synth's RESOLUTION
+   appears to actually address the issue, do not re-raise. Check the
+   resolution against the plan text — if the plan reflects the fix, the
+   objection is settled.
+
+3. If a prior round's RESOLUTION says "disputed" or doesn't fully address
+   the concern, you SHOULD re-raise it. The user will re-triage.
+
+4. New objections (not in any prior round's annotations) follow normal
+   severity rules.
+
 Output format (strict, machine-parsed):
 PLAN_REVIEW: APPROVE | REVISE
 
@@ -450,6 +476,48 @@ PLAN_REVIEW: APPROVE | REVISE
 
 ## Overall Assessment
 <1-2 paragraph assessment>
+`;
+
+export const SYNTH_REVISION_PROMPT = `You previously synthesized a living implementation plan. A second-opinion
+reviewer raised CRITICAL objections, and the user has triaged them.
+
+Your task: revise the plan to address ONLY the user-accepted objections.
+Do NOT address objections the user rejected. Do NOT modify sections without
+accepted objections.
+
+The plan file contains annotation blocks immediately above each
+\`### Phase N\` heading that look like:
+
+  <!-- ROUND <N> CRITICAL [<location>]: <issue> → <suggestion>
+       ROUND <N> USER: accept ("<rationale>")
+       ROUND <N> RESOLUTION: <YOUR PRIOR WORK or 'pending'> -->
+
+For each annotation with \`USER: accept\` and \`RESOLUTION: pending\`:
+  1. Apply the suggested fix (or a better fix you can defend).
+  2. Replace \`RESOLUTION: pending\` with \`RESOLUTION: <one-line description
+     of what you changed and where>\`. The reviewer will read this next round.
+  3. If you decide the suggestion is wrong even though the user accepted
+     it, do NOT make the change. Replace \`RESOLUTION: pending\` with
+     \`RESOLUTION: disputed — <one-line reason>\`. The user will see this
+     in next round's triage.
+
+For each annotation with \`USER: reject\`:
+  Do NOT change the plan around it. Leave the annotation in place.
+
+For each annotation with \`USER: defer\`:
+  Do NOT change the plan, but keep the annotation attached to the right
+  phase heading.
+
+Annotation history from prior rounds is informational — read for context
+on what was already resolved. Do not re-resolve already-resolved items.
+
+If the plan file's \`<!-- gstack-plan-review-history -->\` header indicates
+this is round 3 or later, you may collapse stale RESOLUTION lines from
+rounds 1+ to keep the plan readable, but preserve the annotation header
+counts so the reviewer can see the trajectory.
+
+Return only the path of the updated plan and a single-line summary of
+what you changed.
 `;
 
 /**
@@ -558,4 +626,428 @@ export async function runPlanReview(opts: {
     reviewedBy: opts.role.model,
     round,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Round annotation read/write (cross-round memory contract)
+// ---------------------------------------------------------------------------
+
+export interface RoundAnnotationEntry {
+  round: number;
+  userDecision?: "accept" | "reject" | "defer";
+  userRationale?: string;
+  /** Synth-written. Possible values: "pending", "disputed — <reason>", or "<one-line description>". */
+  resolution?: string;
+  /** Parser-written when comparing round N to round N-1. "re-raised" | "not re-raised". */
+  reviewerOutcome?: string;
+}
+
+export interface RoundAnnotation {
+  location: string;
+  severity: "CRITICAL" | "IMPORTANT" | "SUGGESTION";
+  issue: string;
+  suggestion: string;
+  rounds: RoundAnnotationEntry[];
+}
+
+/**
+ * Match a full annotation block. Lazy body up to first `-->`.
+ * `[^\]\n]+` for location prevents the bracket-group from spanning lines,
+ * which would cause malformed blocks to be glued to the next valid block.
+ */
+const ANNOTATION_BLOCK_RE =
+  /<!--\s*ROUND\s+\d+\s+(CRITICAL|IMPORTANT|SUGGESTION)\s+\[([^\]\n]+)\]:\s+([\s\S]*?)-->/gm;
+
+const ROUND_HEADER_RE =
+  /ROUND\s+(\d+)\s+(CRITICAL|IMPORTANT|SUGGESTION)\s+\[([^\]\n]+)\]:\s+(.+?)\s+→\s+(.+?)$/m;
+
+/**
+ * Factory functions returning fresh `/g` regex instances per call.
+ *
+ * Module-level `/g` constants carry mutable `lastIndex` state across calls.
+ * `parseRoundAnnotations` is called recursively by `writeRoundAnnotation`
+ * (which re-parses each candidate block to compare against the new
+ * annotation), so a single shared regex could have its `lastIndex` reset
+ * mid-iteration by the inner call. Even setting `.lastIndex = 0` before
+ * each loop is racy under any future concurrent use. Defensive pattern:
+ * mint a fresh regex per call.
+ */
+function getRoundUserRe(): RegExp {
+  return /ROUND\s+(\d+)\s+USER:\s+(accept|reject|defer)(?:\s+\("([^"]*)"\))?/g;
+}
+
+/** Stop before trailing ` -->` when the field is the last line in the block. */
+function getRoundResolutionRe(): RegExp {
+  return /ROUND\s+(\d+)\s+RESOLUTION:\s+(.+?)(?:\s+-->)?$/gm;
+}
+
+function getRoundReviewerRe(): RegExp {
+  return /ROUND\s+(\d+)\s+REVIEWER:\s+(.+?)(?:\s+-->)?$/gm;
+}
+
+/**
+ * Encode an annotation field for round-trip-safe serialization into the HTML
+ * comment block. Several characters/sequences would otherwise corrupt the block
+ * syntax silently:
+ *
+ *   `&`     — must be escaped first so user input containing literal `&#93;`
+ *             cannot impersonate one of our own escape sequences.
+ *   `]`     — closes the `[location]` bracket group early; parser drops the
+ *             entire annotation.
+ *   `"`     — terminates the `("rationale")` inner-quote class in
+ *             ROUND_USER_RE; parser drops the rationale.
+ *   `→`     — used as the field separator between issue and suggestion in
+ *             ROUND_HEADER_RE; an LLM-written issue containing `→` (natural
+ *             in prose like "A → B then B → C") splits at the first arrow
+ *             and corrupts both fields.
+ *   `\n`    — line-anchored regexes (ROUND_USER_RE, ROUND_RESOLUTION_RE,
+ *             ROUND_REVIEWER_RE) walk the body line-by-line; an embedded
+ *             newline in a rationale lets a malicious or careless rationale
+ *             forge a fake `ROUND N RESOLUTION: ...` line that overrides
+ *             the genuine synth-written resolution.
+ *   `\r`    — CRLF defense; same issue as `\n` when a plan is written on
+ *             Windows or by an editor that uses CRLF.
+ *   `-->`   — closes the outer HTML comment; parser truncates the body and
+ *             drops every field after the injection point.
+ *
+ * The encoding is intentionally HTML-entity-shaped. It is visible to humans
+ * reading the plan but harmless to readers (the encoded form names what it
+ * stands for: `&#93;` is the unicode codepoint for `]`).
+ */
+function encodeAnnField(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/\]/g, "&#93;")
+    .replace(/"/g, "&#34;")
+    .replace(/→/g, "&rarr;")
+    .replace(/\r/g, "&#13;")
+    .replace(/\n/g, "&#10;")
+    .replace(/-->/g, "--&gt;");
+}
+
+/** Inverse of `encodeAnnField`. `&amp;` MUST decode last so user input
+ * containing literal `&#93;` (encoded as `&amp;#93;`) round-trips correctly. */
+function decodeAnnField(s: string): string {
+  return s
+    .replace(/--&gt;/g, "-->")
+    .replace(/&#10;/g, "\n")
+    .replace(/&#13;/g, "\r")
+    .replace(/&rarr;/g, "→")
+    .replace(/&#34;/g, '"')
+    .replace(/&#93;/g, "]")
+    .replace(/&amp;/g, "&");
+}
+
+/** Returns true if any character that would corrupt the comment-block syntax
+ * is present in the input. Used to log a one-line operator warning when
+ * encoding is actually applied (so silent data is never silently encoded
+ * without an audit trail). */
+function fieldNeedsEncoding(s: string): boolean {
+  return (
+    s.includes("]") ||
+    s.includes('"') ||
+    s.includes("-->") ||
+    s.includes("&") ||
+    s.includes("→") ||
+    s.includes("\n") ||
+    s.includes("\r")
+  );
+}
+
+/**
+ * Parse all round-annotation blocks out of a plan file's text.
+ * Skips malformed blocks (logs to console.warn) instead of throwing.
+ */
+export function parseRoundAnnotations(planText: string): RoundAnnotation[] {
+  const results: RoundAnnotation[] = [];
+  let m: RegExpExecArray | null;
+  ANNOTATION_BLOCK_RE.lastIndex = 0;
+  while ((m = ANNOTATION_BLOCK_RE.exec(planText)) !== null) {
+    const body = m[0];
+    // The header is the first line inside the comment.
+    const headerMatch = body.match(ROUND_HEADER_RE);
+    if (!headerMatch) {
+      console.warn(
+        "[plan-review] malformed annotation block (no header); skipping",
+      );
+      continue;
+    }
+    const severity = headerMatch[2] as RoundAnnotation["severity"];
+    const location = decodeAnnField(headerMatch[3].trim());
+    const issue = decodeAnnField(headerMatch[4].trim());
+    const suggestion = decodeAnnField(headerMatch[5].trim());
+
+    // Collect every ROUND N USER / RESOLUTION / REVIEWER line into a per-round map.
+    const byRound = new Map<number, RoundAnnotationEntry>();
+    const ensure = (round: number): RoundAnnotationEntry => {
+      let entry = byRound.get(round);
+      if (!entry) {
+        entry = { round };
+        byRound.set(round, entry);
+      }
+      return entry;
+    };
+    // The header names the round this annotation was first written in; track it.
+    ensure(parseInt(headerMatch[1], 10));
+
+    const userRe = getRoundUserRe();
+    let u: RegExpExecArray | null;
+    while ((u = userRe.exec(body)) !== null) {
+      const entry = ensure(parseInt(u[1], 10));
+      entry.userDecision = u[2] as RoundAnnotationEntry["userDecision"];
+      if (u[3] !== undefined) entry.userRationale = decodeAnnField(u[3]);
+    }
+
+    const resolutionRe = getRoundResolutionRe();
+    let r: RegExpExecArray | null;
+    while ((r = resolutionRe.exec(body)) !== null) {
+      const entry = ensure(parseInt(r[1], 10));
+      entry.resolution = decodeAnnField(r[2].trim());
+    }
+
+    // ROUND N REVIEWER attaches to round N's own entry: it records the
+    // reviewer's observation IN round N (e.g., "re-raised" / "not re-raised")
+    // about a prior-round objection, paired with round N's USER decision if
+    // present. The round number on the line names the round in which the
+    // observation happened, not the round being observed. See the design
+    // spec §"Why the format" bullet 4.
+    const reviewerRe = getRoundReviewerRe();
+    let v: RegExpExecArray | null;
+    while ((v = reviewerRe.exec(body)) !== null) {
+      const entry = ensure(parseInt(v[1], 10));
+      entry.reviewerOutcome = decodeAnnField(v[2].trim());
+    }
+
+    const rounds = Array.from(byRound.values()).sort((a, b) => a.round - b.round);
+    results.push({ location, severity, issue, suggestion, rounds });
+  }
+  return results;
+}
+
+/**
+ * Serialize a single RoundAnnotation back to the canonical HTML comment.
+ *
+ * Every user-derived field is run through `encodeAnnField` first to neutralize
+ * the four characters that would otherwise break the round-trip: `]`, `"`,
+ * `-->`, and `&`. When encoding fires, we log a one-line warning so an
+ * operator inspecting the plan understands why entity-shaped tokens appear.
+ */
+function serializeAnnotation(ann: RoundAnnotation): string {
+  // One-shot encoding-applied check across every user-derived field. We warn
+  // once per serialize (not once per field) so a single suspicious annotation
+  // doesn't blast the log with N copies of the same notice.
+  const anyNeeds =
+    fieldNeedsEncoding(ann.location) ||
+    fieldNeedsEncoding(ann.issue) ||
+    fieldNeedsEncoding(ann.suggestion) ||
+    ann.rounds.some(
+      (r) =>
+        (r.userRationale && fieldNeedsEncoding(r.userRationale)) ||
+        (r.resolution && fieldNeedsEncoding(r.resolution)) ||
+        (r.reviewerOutcome && fieldNeedsEncoding(r.reviewerOutcome)),
+    );
+  if (anyNeeds) {
+    console.warn(
+      `[plan-review] annotation field contains one of &, ], ", →, \\n, \\r, --> — applying HTML-entity encoding for round-trip safety (location=${JSON.stringify(ann.location)})`,
+    );
+  }
+
+  const lines: string[] = [];
+  const head = ann.rounds[0].round;
+  lines.push(
+    `<!-- ROUND ${head} ${ann.severity} [${encodeAnnField(ann.location)}]: ${encodeAnnField(ann.issue)} → ${encodeAnnField(ann.suggestion)}`,
+  );
+  for (const r of ann.rounds) {
+    if (r.userDecision) {
+      const rat = r.userRationale
+        ? ` ("${encodeAnnField(r.userRationale)}")`
+        : "";
+      lines.push(`     ROUND ${r.round} USER: ${r.userDecision}${rat}`);
+    }
+    if (r.resolution) {
+      lines.push(
+        `     ROUND ${r.round} RESOLUTION: ${encodeAnnField(r.resolution)}`,
+      );
+    }
+    if (r.reviewerOutcome) {
+      lines.push(
+        `     ROUND ${r.round} REVIEWER: ${encodeAnnField(r.reviewerOutcome)}`,
+      );
+    }
+  }
+  lines[lines.length - 1] += " -->";
+  return lines.join("\n");
+}
+
+/**
+ * Insert or merge an annotation into the plan text.
+ *
+ * - If an existing annotation matches by (location, severity, issue), merge the new round's entries into it.
+ * - Otherwise insert a new annotation block immediately above the matching `### Phase` heading.
+ * - If no matching phase heading is found, prepend the annotation to the file (before any feature).
+ */
+export function writeRoundAnnotation(
+  planText: string,
+  ann: RoundAnnotation,
+): string {
+  // Merge path: walk the regex over `planText` directly so we get the actual
+  // byte range of each existing block (not the canonical serialization). This
+  // matters because the stored block may have non-canonical whitespace, CRLF
+  // endings, or extra spaces introduced by an external editor or a synth
+  // round-trip. Using `planText.replace(serializeAnnotation(existing), ...)`
+  // would silently no-op in any of those cases — the canonical form simply
+  // wouldn't appear as a substring of the actual plan text. That was the
+  // round-2-decision-lost bug class.
+  //
+  // We build a fresh local regex (not the shared `ANNOTATION_BLOCK_RE`) so
+  // that `parseRoundAnnotations(bm[0])` below — which uses the shared regex
+  // and resets its `lastIndex` to 0 — cannot smash our outer iterator's
+  // position. Reusing the shared regex here caused an infinite loop where
+  // the inner reset + advance left `lastIndex` inside the just-matched
+  // block, so the outer `exec` kept re-matching the same span forever.
+  const matches: Array<{
+    start: number;
+    end: number;
+    ann: RoundAnnotation;
+  }> = [];
+  const blockRe = new RegExp(
+    ANNOTATION_BLOCK_RE.source,
+    ANNOTATION_BLOCK_RE.flags,
+  );
+  let bm: RegExpExecArray | null;
+  while ((bm = blockRe.exec(planText)) !== null) {
+    // Re-parse the single block we just matched. parseRoundAnnotations runs
+    // the shared regex (different instance from `blockRe`), so feeding it
+    // the matched substring yields exactly one result (or zero on a
+    // malformed header, which we then skip).
+    const parsed = parseRoundAnnotations(bm[0]);
+    if (parsed.length === 1) {
+      matches.push({
+        start: bm.index,
+        end: bm.index + bm[0].length,
+        ann: parsed[0],
+      });
+    }
+  }
+  // Merge predicate: (location, severity) only. `issue` is freeform LLM text
+  // and wording drifts across rounds ("missing chainId in handler" in round 1
+  // vs. "handler doesn't validate chainId" in round 2). Including `issue` in
+  // the key would orphan the round-2 annotation as a fresh block, breaking
+  // the cross-round history that the reviewer prompt depends on. Aligns with
+  // `computeConvergenceSnapshot` in plan-review-loop.ts which keys on the
+  // same pair. Known limitation: two genuinely distinct issues at the same
+  // (location, severity) in a single round cannot be distinguished, but the
+  // current downstream and writer cannot distinguish them anyway.
+  const hit = matches.find(
+    (mt) =>
+      mt.ann.location === ann.location &&
+      mt.ann.severity === ann.severity,
+  );
+  if (hit) {
+    const merged: RoundAnnotation = {
+      ...hit.ann,
+      rounds: [...hit.ann.rounds, ...ann.rounds],
+    };
+    const newText = serializeAnnotation(merged);
+    return planText.slice(0, hit.start) + newText + planText.slice(hit.end);
+  }
+
+  // Insert path: place above `### Phase <phaseId>` for the location.
+  const phaseMatch = ann.location.match(/Phase\s+(\S+)/i);
+  const newBlock = serializeAnnotation(ann);
+  if (phaseMatch) {
+    const phaseRe = new RegExp(
+      `(^###\\s*Phase\\s+${escapeRegExp(phaseMatch[1])}(?!\\d)[^\\n]*$)`,
+      "m",
+    );
+    if (phaseRe.test(planText)) {
+      return planText.replace(phaseRe, (_match, heading) => `${newBlock}\n${heading}`);
+    }
+  }
+  // Fallback: prepend.
+  return `${newBlock}\n${planText}`;
+}
+
+// ---------------------------------------------------------------------------
+// Round-history header (top-of-plan block)
+// ---------------------------------------------------------------------------
+
+/**
+ * One row inside the top-of-plan `<!-- gstack-plan-review-history -->` block.
+ * Captures the per-round summary that the next reviewer reads to see the trajectory.
+ */
+export interface RoundHistoryEntry {
+  round: number;
+  /** ISO 8601 UTC timestamp of when this round completed. */
+  ts: string;
+  /** Reviewer identifier — model name from runConfiguredRoleTask, e.g. "gpt-5.5". */
+  reviewer: string;
+  verdict: "APPROVE" | "REVISE";
+  /** Raw CRITICAL count returned by the reviewer (pre-triage). */
+  criticalCount: number;
+  accepted: number;
+  rejected: number;
+  deferred: number;
+}
+
+const HISTORY_BLOCK_RE =
+  /<!--\s*gstack-plan-review-history\s*\n([\s\S]*?)-->\s*/m;
+
+/**
+ * Parse the top-of-plan history block (if present) into per-round entries.
+ * Returns an empty array when the block is absent or contains no parseable rows.
+ * Skips malformed rows; never throws.
+ */
+export function parseRoundHistoryHeader(planText: string): RoundHistoryEntry[] {
+  const m = planText.match(HISTORY_BLOCK_RE);
+  if (!m) return [];
+  const lines = m[1].split("\n").filter((l) => l.trim().startsWith("round "));
+  const entries: RoundHistoryEntry[] = [];
+  for (const line of lines) {
+    const parsed = line.match(
+      /^round\s+(\d+)\s+\(([^)]+)\):\s+(\S+)\s+→\s+(APPROVE|REVISE)\s+—\s+(\d+)\s+CRITICAL\s+\((\d+)\s+accepted,\s+(\d+)\s+rejected(?:,\s+(\d+)\s+deferred)?\)/,
+    );
+    if (!parsed) continue;
+    entries.push({
+      round: parseInt(parsed[1], 10),
+      ts: parsed[2],
+      reviewer: parsed[3],
+      verdict: parsed[4] as "APPROVE" | "REVISE",
+      criticalCount: parseInt(parsed[5], 10),
+      accepted: parseInt(parsed[6], 10),
+      rejected: parseInt(parsed[7], 10),
+      deferred: parsed[8] ? parseInt(parsed[8], 10) : 0,
+    });
+  }
+  return entries;
+}
+
+/**
+ * Append a new round entry to the top-of-plan history block and return the updated plan text.
+ *
+ * Behavior:
+ * - If the block already exists, parses its rows, appends `newEntry`, and rewrites the block in place.
+ * - If the block does not exist, prepends a new block to the plan.
+ * - `opts.finalLine` (optional): a terminal line appended after all round rows (used for
+ *   `final: APPROVED after N rounds, ...` on loop exit). Caller is responsible for the line's content.
+ *
+ * Atomic in the file-level sense via single string write at the call site (no mid-write corruption).
+ */
+export function updateRoundHistoryHeader(
+  planText: string,
+  newEntry: RoundHistoryEntry,
+  opts?: { finalLine?: string },
+): string {
+  const entries = parseRoundHistoryHeader(planText);
+  entries.push(newEntry);
+  const lines = entries.map(
+    (e) =>
+      `round ${e.round} (${e.ts}): ${e.reviewer} → ${e.verdict} — ${e.criticalCount} CRITICAL (${e.accepted} accepted, ${e.rejected} rejected${e.deferred ? `, ${e.deferred} deferred` : ""})`,
+  );
+  if (opts?.finalLine) lines.push(opts.finalLine);
+  const newBlock = `<!-- gstack-plan-review-history\n${lines.join("\n")}\n-->\n`;
+  if (HISTORY_BLOCK_RE.test(planText)) {
+    return planText.replace(HISTORY_BLOCK_RE, newBlock);
+  }
+  return newBlock + planText;
 }

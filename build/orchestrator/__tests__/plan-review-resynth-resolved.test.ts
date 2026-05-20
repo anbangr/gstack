@@ -28,18 +28,25 @@ describe("plan-review CRITICAL → re-synth RESOLVED pairing (class 5)", () => {
     expect(planReviewerSrc).toMatch(/export\s+function\s+buildPlanReviewCriticalMessage/);
   });
 
-  test("T9: cli.ts captures faultId on critical_exit (persisted in state.planReview)", () => {
+  test("T9 (post-merge): cli.ts no longer wires Class 5 around reconcilePlanReview — PR #63's in-process plan-review-loop replaced that call path", () => {
+    // The legacy reconcilePlanReview call path (where Class 5 RESOLVED was
+    // wired) was removed from cli.ts during the origin/main merge. PR #63
+    // (build skill 1.25.0) introduced runPlanReviewLoop which emits via
+    // input.output.write (not console.error), so wrap-console.ts no longer
+    // writes a DETECTED row for the CRITICAL exit. With no DETECTED to
+    // pair against, the Class 5 cross-run RESOLVED logic was dropped from
+    // cli.ts. The legacy reconcilePlanReview function + its per-objection
+    // orphan fix stay in plan-reviewer.ts for any caller that still uses
+    // it (T11b below).
     cliSrc = fs.readFileSync(
       path.resolve(import.meta.dir, "..", "cli.ts"),
       "utf8",
     );
-    // The critical_exit branch must compute faultId from buildPlanReviewCriticalMessage
-    const criticalIdx = cliSrc.indexOf('"critical_exit"');
-    expect(criticalIdx).toBeGreaterThan(-1);
-    const window = cliSrc.slice(criticalIdx, criticalIdx + 1500);
-    expect(window).toContain("buildPlanReviewCriticalMessage");
-    expect(window).toContain("computeFaultId");
-    expect(window).toContain("faultId");
+    // The new path uses runPlanReviewLoop, not reconcilePlanReview.
+    expect(cliSrc).toContain("runPlanReviewLoop");
+    // critical_exit_pending state still gets persisted on loopResult.exitCode === 3,
+    // but without the faultId/stateSlug fields (no DETECTED to pair with).
+    expect(cliSrc).toContain('"critical_exit_pending"');
   });
 
   test("T10: cli.ts emits RESOLVED + clears state.planReview.faultId on re-synth success", () => {
@@ -54,17 +61,28 @@ describe("plan-review CRITICAL → re-synth RESOLVED pairing (class 5)", () => {
     expect(cliSrc).toMatch(/emitHaltEventResolved/);
   });
 
-  test("T11: state shape allows critical_exit_pending entries to carry an optional faultId", () => {
-    // The persisted critical_exit_pending row is now typed to include faultId.
+  test("T11 (post-merge): critical_exit_pending persistence works without faultId — PR #63's loop owns the exit-3 path", () => {
+    // After the merge with PR #63 (build skill 1.25.0), the critical_exit_pending
+    // marker no longer carries faultId/stateSlug fields. Those fields were
+    // wired for cross-run RESOLVED pairing against a DETECTED row that
+    // wrap-console used to write when reconcilePlanReview called console.error.
+    // PR #63's runPlanReviewLoop emits via input.output.write instead, so the
+    // DETECTED doesn't exist anymore and the fields would be orphans.
     cliSrc =
       cliSrc ??
       fs.readFileSync(path.resolve(import.meta.dir, "..", "cli.ts"), "utf8");
-    const pendingIdx = cliSrc.indexOf("critical_exit_pending");
-    expect(pendingIdx).toBeGreaterThan(-1);
-    // Look in a wider window so the persisted-shape and the read-shape
-    // both fall within our regex view.
-    const window = cliSrc.slice(pendingIdx, pendingIdx + 3000);
-    expect(window).toMatch(/faultId/);
+    // Find the PERSISTENCE site (status: "critical_exit_pending"), not the
+    // gate-entry READ site (state.planReview.status === ...).
+    const persistIdx = cliSrc.indexOf('status: "critical_exit_pending"');
+    expect(persistIdx).toBeGreaterThan(-1);
+    const window = cliSrc.slice(
+      Math.max(0, persistIdx - 300),
+      persistIdx + 200,
+    );
+    expect(window).toMatch(/loopResult\.finalVerdict/);
+    // Field should NOT carry faultId/stateSlug anymore (the Class 5 wiring
+    // was removed during the PR #63 merge).
+    expect(window).not.toMatch(/\bfaultId:\s*criticalFaultId/);
   });
 
   test("T11b: per-objection bullets use console.log, NOT console.error (no orphan DETECTED rows)", () => {
