@@ -1737,6 +1737,23 @@ Shipped in v0.6.5. TemplateContext in gen-skill-docs.ts bakes skill name into pr
 **Effort:** S (human: ~1 hour / CC: ~10 min)
 **Priority:** P2
 
+### Build orchestrator — `release_queued` integration test times out at ~27s
+
+**What:** The test `integration.test.ts > release_queued without shippedAt/prNumber is detected as manual patch and reset` consistently times out at ~27s on both the pre-change baseline and post-change worktrees. Surfaced repeatedly across PR #62 ship + the fork-local halt-events drain PR's eng review.
+
+**Why fix:** Every `/ship` and `/land-and-deploy` triages this as a "pre-existing failure" and skips it. The triage takes time, the test sits broken, signal-to-noise on the orchestrator suite degrades. The bug is probably in the test setup (spawning a release-daemon child that never terminates within the test budget), not in the production code under test, but nobody has investigated.
+
+**Pros:** Removes the recurring triage tax on every ship. Restores a green baseline so a future regression surfaces immediately. May expose a real bug in release-daemon child-process cleanup.
+
+**Cons:** Investigation requires reproducing the timeout reliably, which has historically been flaky on its own.
+
+**Context:** First flagged during PR #62 ship (2026-05-20 02:13 UTC). Re-confirmed during the fork-local inbox-drain eng review. The test file is in `build/orchestrator/__tests__/integration.test.ts`. The 27s timeout suggests a child process spawning + waiting for an HTTP server that never starts, or a daemon awaiting a SIGTERM that never arrives.
+
+**Depends on / blocked by:** Nothing — investigation can start immediately. Best done in an isolated worktree so the timeout doesn't pollute other test runs.
+
+**Effort:** M (human: ~2-3 hours / CC: ~30 min)
+**Priority:** P1
+
 ## Completed
 
 ### Dual Implementor foundation + fix loops + hardening notes (v1.15.0.0 – v1.23.0.0)

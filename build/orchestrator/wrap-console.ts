@@ -1,9 +1,26 @@
 import {
+  buildHaltSnapshot,
   emitHaltEvent,
   type HaltEvent,
   type HaltEventKind,
   type HaltSeverity,
 } from "./halt-events";
+
+/**
+ * Patterns that match KNOWN-BENIGN warnings the orchestrator already
+ * handles in-band. When console.warn matches one of these, wrap-console
+ * skips the emit entirely — the orchestrator's existing logic owns the
+ * recovery (e.g., state.ts:542 logs "local JSON is canonical" when the
+ * gbrain put fails but the local JSON write already succeeded).
+ *
+ * The bar for inclusion: the warning itself documents that nothing is
+ * broken. Don't add patterns where the warning hides a real problem.
+ */
+const KNOWN_BENIGN_WARN_PATTERNS: RegExp[] = [
+  // state.ts:542 — gbrain put is best-effort; the local JSON write is
+  // canonical so this is purely a cross-machine-sync miss, not a fault.
+  /local JSON is canonical/,
+];
 
 export interface WrapConsoleContext {
   runId: string;
@@ -99,6 +116,7 @@ export function installWrapConsole(ctx: WrapConsoleContext): () => void {
   console.warn = (...args: unknown[]) => {
     origWarn.apply(console, args as any);
     const msg = args.map(String).join(" ");
+    if (KNOWN_BENIGN_WARN_PATTERNS.some((re) => re.test(msg))) return;
     const c = classifyConsoleLine("warn", msg);
     try {
       emitHaltEvent(
@@ -109,7 +127,11 @@ export function installWrapConsole(ctx: WrapConsoleContext): () => void {
           severity: c.severity,
           message: msg.slice(0, 500),
           pointers: ctx.pointers,
-          snapshot: { stdoutTail: "" },
+          snapshot: buildHaltSnapshot({
+            state: null,
+            stdoutLogPath: ctx.pointers.stdoutLog,
+            worktreePath: ctx.pointers.worktreePath,
+          }),
         },
         { queueDir: ctx.queueDir },
       );
@@ -131,7 +153,11 @@ export function installWrapConsole(ctx: WrapConsoleContext): () => void {
           severity: c.severity,
           message: msg.slice(0, 500),
           pointers: ctx.pointers,
-          snapshot: { stdoutTail: "" },
+          snapshot: buildHaltSnapshot({
+            state: null,
+            stdoutLogPath: ctx.pointers.stdoutLog,
+            worktreePath: ctx.pointers.worktreePath,
+          }),
         },
         { queueDir: ctx.queueDir },
       );

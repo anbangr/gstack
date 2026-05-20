@@ -29,6 +29,15 @@ export interface HaltEvent {
   severity: HaltSeverity;
   timestamp: string;
   message: string;
+  /**
+   * When false, drainFaultsFromHaltEventsQueue short-circuits this event:
+   * the file moves to processed/ without dispatching the codex investigator,
+   * and analytics records outcome: "audit-skipped". Used for manual-recovery
+   * sites (drain-faults / mark-shipped / --mark-phase-committed) that are
+   * audit signals, not investigation requests. Absent OR true means dispatch
+   * normally — preserves back-compat for rows filed before this field existed.
+   */
+  investigate?: boolean;
   pointers: {
     stateFile: string;
     stdoutLog: string;
@@ -124,17 +133,97 @@ export function emitHaltEvent(
   return faultId;
 }
 
-export function loadPendingInvestigations(opts?: {
+/**
+ * Minimal "this fault recovered" marker. Written to the same
+ * pending-investigations/ queue as DETECTED rows so the queue consumer
+ * (drainFaultsFromHaltEventsQueue) can collapse DETECTED+RESOLVED pairs
+ * by (runId, faultId) before dispatching codex. The on-disk filename
+ * pattern `<safeRunId>-RESOLVED-<faultId>.json` distinguishes resolution
+ * rows from emit rows so the consumer can classify each file in one pass.
+ *
+ * Returns true on successful write, false on failure (with stderr warn).
+ * Callers SHOULD check the return value so a missing RESOLVED row never
+ * silently leaves a DETECTED row in the queue.
+ */
+export function emitHaltEventResolved(
+  faultId: string,
+  runId: string,
+  opts?: { queueDir?: string; now?: Date },
+): boolean {
+  try {
+    const timestamp = (opts?.now ?? new Date()).toISOString();
+    const dir = pendingInvestigationsDir(opts);
+    fs.mkdirSync(dir, { recursive: true });
+    const safeRun = safeRegistryRunId(runId);
+    const finalPath = path.join(dir, `${safeRun}-RESOLVED-${faultId}.json`);
+    const tmpPath = `${finalPath}.tmp.${process.pid}`;
+    const body = {
+      event: "SKILL_FAULT_RESOLVED" as const,
+      timestamp,
+      runId,
+      faultId,
+    };
+    fs.writeFileSync(tmpPath, JSON.stringify(body, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmpPath, finalPath);
+    return true;
+  } catch (err) {
+    process.stderr.write(
+      `[emitHaltEventResolved] failed to write RESOLVED for faultId=${faultId} runId=${runId}: ${(err as Error).message}\n`,
+    );
+    return false;
+  }
+}
+
+/**
+ * Discriminated-union view of a single pending-investigations/ entry.
+ * `detected` rows are full HaltEvent JSON (what emitHaltEvent writes);
+ * `resolved` rows are minimal-shape pairs (what emitHaltEventResolved
+ * writes). The queue consumer uses `kind` to route each entry.
+ */
+export type PendingEntry =
+  | { kind: "detected"; file: string; event: HaltEvent }
+  | { kind: "resolved"; file: string; runId: string; faultId: string };
+
+/**
+ * Surface every JSON row under pending-investigations/, classifying each
+ * by event field. Detected (HaltEvent) rows have no `event` field at
+ * the top level; resolved rows have `event: "SKILL_FAULT_RESOLVED"`.
+ * Malformed JSON is silently skipped.
+ *
+ * Use this in the queue consumer when you need to see RESOLVED markers
+ * (e.g., for DETECTED+RESOLVED pair collapse). Use the back-compat
+ * loadPendingInvestigations() when callers only want detected events.
+ */
+export function loadPendingEntries(opts?: {
   queueDir?: string;
-}): HaltEvent[] {
+}): PendingEntry[] {
   const dir = pendingInvestigationsDir(opts);
   if (!fs.existsSync(dir)) return [];
-  const out: HaltEvent[] = [];
+  const out: PendingEntry[] = [];
   for (const name of fs.readdirSync(dir)) {
     if (!name.endsWith(".json")) continue;
     try {
       const raw = fs.readFileSync(path.join(dir, name), "utf8");
-      out.push(JSON.parse(raw) as HaltEvent);
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      if (parsed.event === "SKILL_FAULT_RESOLVED") {
+        if (
+          typeof parsed.runId === "string" &&
+          typeof parsed.faultId === "string"
+        ) {
+          out.push({
+            kind: "resolved",
+            file: name,
+            runId: parsed.runId,
+            faultId: parsed.faultId,
+          });
+        }
+      } else {
+        out.push({
+          kind: "detected",
+          file: name,
+          event: parsed as unknown as HaltEvent,
+        });
+      }
     } catch {
       // skip malformed
     }
@@ -142,11 +231,24 @@ export function loadPendingInvestigations(opts?: {
   return out;
 }
 
+/**
+ * Back-compat wrapper: returns only the HaltEvent rows from the queue,
+ * filtering out RESOLVED markers. Callers that need to see RESOLVED
+ * rows for pair-collapse should use loadPendingEntries() instead.
+ */
+export function loadPendingInvestigations(opts?: {
+  queueDir?: string;
+}): HaltEvent[] {
+  return loadPendingEntries(opts)
+    .filter((e): e is Extract<PendingEntry, { kind: "detected" }> => e.kind === "detected")
+    .map((e) => e.event);
+}
+
 export function markInvestigated(
   runId: string,
   faultId: string,
   // _outcome is reserved for future use; logging happens at the call site.
-  _outcome: "investigated" | "skipped-no-context" | "self-healed",
+  _outcome: "investigated" | "skipped-no-context" | "self-healed" | "audit-skipped",
   opts?: { queueDir?: string },
 ): void {
   const safeRun = safeRegistryRunId(runId);

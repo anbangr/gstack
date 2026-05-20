@@ -117,11 +117,8 @@ import {
   type ParsedFeatureVerdict,
 } from "./feature-review";
 import { promptYesNo, buildBlockedFeatureMd } from "./feature-review-prompt";
-import {
-  runPlanReview,
-  reconcilePlanReview,
-  readPlanReviewRound,
-} from "./plan-reviewer";
+import { runPlanReview, SYNTH_REVISION_PROMPT } from "./plan-reviewer";
+import { runPlanReviewLoop } from "./plan-review-loop";
 import { shipAndDeploy, shipOnly } from "./ship";
 import { runReleaseDaemon, retryReleaseQueueRecord } from "./release-daemon";
 import {
@@ -188,12 +185,19 @@ import {
 } from "./escalation-streak";
 import { renderPlanStatusTable, resolvePlanSelection } from "./plan-selection";
 import {
+  emitManualRecoveryInvoked,
   markFeatureFailed,
   markPhaseFailed,
   recordRetryCapHit,
   rewindPhase,
 } from "./halt-event-helpers";
-import { buildHaltSnapshot, emitHaltEvent, severityFor } from "./halt-events";
+import {
+  buildHaltSnapshot,
+  computeFaultId,
+  emitHaltEvent,
+  emitHaltEventResolved,
+  severityFor,
+} from "./halt-events";
 import {
   autoPromoteDecision,
   dedupeAgainstLearned,
@@ -216,12 +220,20 @@ import { installWrapConsole } from "./wrap-console";
  * string and downstream tests stay structural.
  */
 function helperCtxFor(state: BuildState) {
+  // GSTACK_BUILD_STDOUT_LOG is set by the launcher (monitor / SKILL.md.tmpl
+  // launch block) to the path of the agent-stdout.log the orchestrator's
+  // own stdout is being piped to. Reading it here lets wrap-console emit
+  // halt events with a real log path so buildHaltSnapshot can populate
+  // snapshot.stdoutTail with actual context. When unset (early startup,
+  // tests, or legacy launcher), falls back to "" — buildHaltSnapshot
+  // handles the empty path via its try/catch and the emit succeeds with
+  // an empty stdoutTail.
   return {
     runId: state.launch?.runId ?? state.slug,
     stateSlug: state.slug,
     pointers: {
       stateFile: statePath(state.slug),
-      stdoutLog: "",
+      stdoutLog: process.env.GSTACK_BUILD_STDOUT_LOG ?? "",
       livingPlan: state.planFile,
       worktreePath: state.launch?.projectRoot ?? "",
     },
@@ -721,6 +733,12 @@ export interface Args {
   noPlanReview: boolean;
   /** Override the planReviewer model for this run (e.g. a-provider-model). */
   planReviewerModel?: string;
+  /** Max plan-review rounds before stalemate (1..20). Default 5. */
+  planReviewMaxRounds?: number;
+  /** Disable the adaptive "no forward progress" bail-out trigger. */
+  planReviewNoAdaptiveCap?: boolean;
+  /** CI behavior when a CRITICAL objection lands without a TTY. */
+  planReviewNoninteractive?: "auto-accept" | "fail-fast" | "auto-reject";
   /** Manifest path for gstack-build monitor mode. */
   monitorManifest?: string;
   /** Evaluate the monitor once, primarily for tests/debug. */
@@ -891,6 +909,9 @@ export function parseArgs(argv: string[]): Args {
     featureReviewMaxIter: DEFAULT_FEATURE_REVIEW_MAX_ITER,
     noPlanReview: false,
     planReviewerModel: undefined,
+    planReviewMaxRounds: 5,
+    planReviewNoAdaptiveCap: false,
+    planReviewNoninteractive: "auto-accept",
     monitorManifest: undefined,
     monitorOnce: false,
     monitorWatch: false,
@@ -944,7 +965,8 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.learnFaultPatternsPromote = next;
-    } else if (a === "--auto-promote") args.learnFaultPatternsAutoPromote = true;
+    } else if (a === "--auto-promote")
+      args.learnFaultPatternsAutoPromote = true;
     else if (a === "--skip-ship") args.skipShip = true;
     else if (a === "--single-branch") args.singleBranch = true;
     else if (a === "--ship-on-plan-complete") args.shipOnPlanComplete = true;
@@ -976,6 +998,45 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.planReviewerModel = next;
+    } else if (a === "--plan-review-no-adaptive-cap") {
+      args.planReviewNoAdaptiveCap = true;
+    } else if (a.startsWith("--plan-review-max-rounds=")) {
+      const v = parseInt(a.split("=")[1] ?? "", 10);
+      if (!Number.isFinite(v) || v < 1 || v > 20) {
+        console.error("--plan-review-max-rounds requires an integer 1..20");
+        process.exit(2);
+      }
+      args.planReviewMaxRounds = v;
+    } else if (a === "--plan-review-max-rounds") {
+      const v = parseInt(argv[++i] ?? "", 10);
+      if (!Number.isFinite(v) || v < 1 || v > 20) {
+        console.error("--plan-review-max-rounds requires an integer 1..20");
+        process.exit(2);
+      }
+      args.planReviewMaxRounds = v;
+    } else if (a.startsWith("--plan-review-noninteractive=")) {
+      const m = a.split("=")[1] ?? "";
+      if (m !== "auto-accept" && m !== "fail-fast" && m !== "auto-reject") {
+        // Throw rather than process.exit so tests can assert this branch
+        // without tearing down the runner. The top-level main() catches
+        // and exits non-zero for the real CLI path.
+        throw new Error(
+          "--plan-review-noninteractive must be one of: auto-accept, fail-fast, auto-reject",
+        );
+      }
+      args.planReviewNoninteractive = m;
+    } else if (a === "--plan-review-noninteractive") {
+      const next = argv[++i];
+      if (
+        next !== "auto-accept" &&
+        next !== "fail-fast" &&
+        next !== "auto-reject"
+      ) {
+        throw new Error(
+          "--plan-review-noninteractive must be one of: auto-accept, fail-fast, auto-reject",
+        );
+      }
+      args.planReviewNoninteractive = next;
     } else if (a === "--allow-submodule-recovery") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
@@ -2742,6 +2803,11 @@ Flags:
   --monitor-agent-model <m>        Default: ${DEFAULT_ROLE_CONFIGS.monitorAgent.model}.
   --plan-reviewer-model <m>        Default: ${DEFAULT_ROLE_CONFIGS.planReviewer.model}.
   --no-plan-review         Skip the planReviewer second-opinion pass at startup.
+  --plan-review-max-rounds <N>     Default: 5. Maximum rounds before stalemate. Bump for legit deep convergence.
+  --plan-review-no-adaptive-cap    Disable the no-forward-progress bail-out trigger.
+  --plan-review-noninteractive <m> Default: auto-accept. CI behavior on CRITICAL objections:
+                                   auto-accept (accept all, re-synth), fail-fast (exit 3 immediately),
+                                   auto-reject (reject all, proceed annotated).
   --<role>-provider <p>            claude|codex|gemini|kimi. Dual-impl implementors and judge are model-agnostic.
   --<role>-reasoning <r>           low|medium|high|xhigh.
   --<role>-command <cmd>           For review, review-secondary, qa, ship, and land.
@@ -3631,7 +3697,12 @@ export function restartFeatureFromOriginIssues(args: {
     // Emit PHASE_REWIND so the halt-events pipeline can observe that a
     // committed phase was rewound (signal of origin verification failure).
     // rewindPhase sets phaseState.status to the target value (and emits).
-    rewindPhase(args.state, phaseIndex, "tests_green", helperCtxFor(args.state));
+    rewindPhase(
+      args.state,
+      phaseIndex,
+      "tests_green",
+      helperCtxFor(args.state),
+    );
   } else {
     phaseState.status = "tests_green";
   }
@@ -4328,6 +4399,14 @@ export async function runRoleTask(opts: {
   iteration: number;
   logPrefix: string;
   timeoutMs?: number;
+  /**
+   * Run identifier matching wrap-console.ts's keying
+   * (`state.launch?.runId ?? state.slug`). Threaded so the Class 4 RESOLVED
+   * emit's pair key matches the DETECTED row wrap-console wrote for the
+   * fallback warn. When undefined, defaults to opts.slug — same fallback
+   * helperCtxFor uses.
+   */
+  runId?: string;
 }): Promise<SubAgentResult> {
   const resolved = resolveRoleTimeouts(opts.role, opts.timeoutMs);
   const effectiveTimeoutMs = resolved.primaryMs;
@@ -4391,15 +4470,48 @@ export async function runRoleTask(opts: {
   // internal phase dispatcher and the slash-command dispatcher accept
   // different opt shapes (codexDefaultCommand, sandbox).
   if ((result.timedOut || result.exitCode !== 0) && opts.role.backupProvider) {
-    console.warn(
+    // Class 4 pairing for the non-Configured variant. Build the warn
+    // message and compute its faultId BEFORE console.warn fires so the
+    // RESOLVED emit (on backup success) can collapse against the DETECTED
+    // wrap-console writes here. runId MUST match wrap-console's keying
+    // (`state.launch?.runId ?? state.slug`) — opts.slug is the same
+    // fallback helperCtxFor uses when launch.runId is unset.
+    const fallbackMsg =
       `[gstack-build] ${opts.logPrefix}: primary ${opts.role.provider} failed ` +
-        `(exit=${result.exitCode ?? "null"}, timedOut=${result.timedOut}); ` +
-        `falling back to ${opts.role.backupProvider} with timeout ${resolved.backupMs}ms (single-shot)`,
-    );
+      `(exit=${result.exitCode ?? "null"}, timedOut=${result.timedOut}); ` +
+      `falling back to ${opts.role.backupProvider} with timeout ${resolved.backupMs}ms (single-shot)`;
+    // Resolution order matches wrap-console's helperCtxFor:
+    //   1. opts.runId (caller explicitly threaded it),
+    //   2. GSTACK_BUILD_RUN_ID (set once at launch in cli.ts:9750-ish),
+    //   3. opts.slug (back-compat default — same as state.slug fallback
+    //      helperCtxFor uses when state.launch.runId is unset).
+    const fallbackRunId =
+      opts.runId ?? process.env.GSTACK_BUILD_RUN_ID ?? opts.slug;
+    const fallbackFaultId = computeFaultId({
+      kind: "SOFT_HALT_WARN",
+      runId: fallbackRunId,
+      stateSlug: opts.slug,
+      severity: "LOW",
+      message: fallbackMsg.slice(0, 500),
+      pointers: {
+        stateFile: "",
+        stdoutLog: "",
+        livingPlan: "",
+        worktreePath: opts.cwd,
+      },
+      snapshot: { stdoutTail: "" },
+    });
+    console.warn(fallbackMsg);
     // Zero stale primary output before backup runs. If backup also fails, the
     // caller gets an empty outputFilePath plus the backup's non-zero exit code.
     fs.writeFileSync(opts.outputFilePath, "");
-    return runRoleTask(resolveFallbackForRoleTask(opts, resolved));
+    const backupResult = await runRoleTask(
+      resolveFallbackForRoleTask(opts, resolved),
+    );
+    if (backupResult.exitCode === 0 && !backupResult.timedOut) {
+      emitHaltEventResolved(fallbackFaultId, fallbackRunId);
+    }
+    return backupResult;
   }
 
   return result;
@@ -4525,7 +4637,12 @@ async function runReviewGates(opts: {
   };
 
   for (const { name, role } of plan.gates) {
-    const before = captureGitSnapshot(opts.cwd);
+    // captureContents:true is REQUIRED so discardBlindExecutionChanges
+    // can roll back if applyGateHygiene detects a sandbox escape.
+    // Without it, the gate's BLIND_EXECUTION_DETECTED handler refuses to
+    // discard ("before.workTreeContents not captured") and the orphan
+    // edits stay on the worktree. Class 2 fix.
+    const before = captureGitSnapshot(opts.cwd, { captureContents: true });
     let result = await runGate(name, role);
     result = applyGateHygiene({
       result,
@@ -5684,11 +5801,9 @@ export function markPhaseCommittedAfterManualRecovery(args: {
         // hooks are a real quality signal; if they fail, the operator sees
         // the hook output and can decide whether to fix or fall back to
         // --force-dirty.
-        const stageR = spawnSync(
-          "git",
-          ["-C", args.cwd, "add", "--", "."],
-          { encoding: "utf8" },
-        );
+        const stageR = spawnSync("git", ["-C", args.cwd, "add", "--", "."], {
+          encoding: "utf8",
+        });
         if (stageR.status !== 0) {
           return {
             ok: false,
@@ -6757,12 +6872,7 @@ async function runPhase(args: {
           mockResult({ exitCode: 1, stderr: msg }),
         );
         state.phases[phase.index] = phaseState;
-        markPhaseFailed(
-          state,
-          phaseState.index,
-          msg,
-          helperCtxFor(state),
-        );
+        markPhaseFailed(state, phaseState.index, msg, helperCtxFor(state));
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -7130,12 +7240,7 @@ async function runPhase(args: {
       } catch (err) {
         const msg = `Dual implementation crashed unexpectedly: ${(err as Error).message}`;
         state.phases[phase.index] = phaseState;
-        markPhaseFailed(
-          state,
-          phaseState.index,
-          msg,
-          helperCtxFor(state),
-        );
+        markPhaseFailed(state, phaseState.index, msg, helperCtxFor(state));
         saveState(state, { noGbrain, log: console.warn });
       } finally {
         if (!dualImplOk) {
@@ -9180,7 +9285,10 @@ async function runLearnFaultPatternsMode(args: Args): Promise<number> {
 
   if (args.learnFaultPatternsPromote) {
     const ids = new Set(
-      args.learnFaultPatternsPromote.split(",").map((s) => s.trim()).filter(Boolean),
+      args.learnFaultPatternsPromote
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
     );
     const toPromote = keep.filter((p) => ids.has(p.faultId));
     const deferred = keep.filter((p) => !ids.has(p.faultId));
@@ -9331,13 +9439,11 @@ async function main() {
   }
 
   if (args.mode === "drain-faults") {
-    emitHaltEvent({
-      kind: "MANUAL_RECOVERY_INVOKED",
+    emitManualRecoveryInvoked({
       runId: args.runId ?? "drain-faults",
       stateSlug: args.planFile
         ? deriveStateSlug(args.planFile)
         : "drain-faults-no-plan",
-      severity: severityFor("MANUAL_RECOVERY_INVOKED"),
       message:
         `drain-faults subcommand invoked` +
         (args.drainFaultsBuildTmpDir
@@ -9346,23 +9452,22 @@ async function main() {
         (args.monitorManifest ? ` (manifest=${args.monitorManifest})` : "") +
         (args.drainFaultsQueueMode ? ` (queue)` : ""),
       pointers: {
-        stateFile: args.planFile ? statePath(deriveStateSlug(args.planFile)) : "",
+        stateFile: args.planFile
+          ? statePath(deriveStateSlug(args.planFile))
+          : "",
         stdoutLog: "",
         livingPlan: args.planFile ?? "",
         worktreePath: process.cwd(),
       },
-      snapshot: { stdoutTail: "" },
     });
     const exitCode = await runDrainFaultsMode(args);
     process.exit(exitCode);
   }
 
   if (args.mode === "mark-shipped") {
-    emitHaltEvent({
-      kind: "MANUAL_RECOVERY_INVOKED",
+    emitManualRecoveryInvoked({
       runId: args.runId ?? "mark-shipped",
       stateSlug: deriveStateSlug(args.planFile),
-      severity: severityFor("MANUAL_RECOVERY_INVOKED"),
       message:
         `mark-shipped subcommand invoked for feature ${args.markShippedFeature}` +
         (args.markShippedPr ? ` (PR #${args.markShippedPr})` : ""),
@@ -9372,7 +9477,6 @@ async function main() {
         livingPlan: args.planFile,
         worktreePath: process.cwd(),
       },
-      snapshot: { stdoutTail: "" },
     });
     const result = await runMarkShipped({
       planFile: args.planFile,
@@ -9655,11 +9759,9 @@ async function main() {
     if (!setupFailed && state && args.markPhaseCommitted) {
       {
         const ctx = helperCtxFor(state);
-        emitHaltEvent({
-          kind: "MANUAL_RECOVERY_INVOKED",
+        emitManualRecoveryInvoked({
           runId: ctx.runId,
           stateSlug: ctx.stateSlug,
-          severity: severityFor("MANUAL_RECOVERY_INVOKED"),
           message: `--mark-phase-committed invoked for phase ${args.markPhaseCommitted}`,
           pointers: ctx.pointers,
           snapshot: buildHaltSnapshot({
@@ -9701,6 +9803,19 @@ async function main() {
     if (!setupFailed && state) {
       state.launch = launch;
       saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+
+      // Publish the run identity for the sub-agent fallback paths
+      // (cli.ts::runRoleTask, sub-agents.ts::runConfiguredRoleTask). Those
+      // functions compute a faultId on the primary→backup fallback warn so
+      // the paired RESOLVED can collapse it pre-dispatch. To match what
+      // wrap-console writes for the DETECTED row, the producer-side faultId
+      // must key on the same runId helperCtxFor uses
+      // (`state.launch?.runId ?? state.slug`). Threading runId through every
+      // sub-agent call site is invasive (11+ in cli.ts); the env-var hook
+      // mirrors how GSTACK_BUILD_STDOUT_LOG already plumbs launch metadata
+      // to the same layer, and keeps the back-compat default
+      // (`opts.runId ?? opts.slug`) intact for direct test callers.
+      process.env.GSTACK_BUILD_RUN_ID = launch.runId ?? state.slug;
 
       // Install the wrapConsole shim now that state is loaded and the build
       // run loop is about to start. The shim classifies every console.warn /
@@ -9769,11 +9884,17 @@ async function main() {
 
       // Plan review: second-opinion pass before Phase 1 of Feature 1.
       // Skipped in dry-run, when --no-plan-review is set, or on resume (already reviewed).
+      // Resume re-runs the loop when prior session left a pending status:
+      //   - critical_exit_pending: stalemate at exit 3 → user picked manual mode
+      //   - user_aborted: user picked [q] / SIGINT → docs promise resume picks up
+      //   - synth_failure: synth crashed → loop never reached APPROVE
       if (
         !args.dryRun &&
         !args.noPlanReview &&
         (!state.planReview ||
-          (state.planReview as any).status === "critical_exit_pending")
+          (state.planReview as any).status === "critical_exit_pending" ||
+          (state.planReview as any).status === "user_aborted" ||
+          (state.planReview as any).status === "synth_failure")
       ) {
         const reviewRole = { ...args.roles.planReviewer };
         if (args.planReviewerModel) reviewRole.model = args.planReviewerModel;
@@ -9781,29 +9902,165 @@ async function main() {
           logDir(slug),
           "plan-review-report.json",
         );
-        const verdict = await runPlanReview({
+        const historyPath = path.join(
+          logDir(slug),
+          "plan-review-history.jsonl",
+        );
+        // Resolve aggregatePath with a layered HOME fallback. Containers and
+        // some Lambda-style runtimes have HOME unset; if both process.env.HOME
+        // and os.homedir() come back empty, path.join("", ...) produces a
+        // relative path that lands inside the project worktree (polluting it
+        // with analytics data). Fall back to os.tmpdir() and warn loudly so
+        // operators can fix their env.
+        const aggregatePath = (() => {
+          const home = process.env.HOME || os.homedir();
+          if (!home) {
+            const fallback = path.join(
+              os.tmpdir(),
+              ".gstack-analytics",
+              "convergence.jsonl",
+            );
+            console.warn(
+              `[plan-review] HOME and os.homedir() both empty; convergence telemetry will go to ${fallback}`,
+            );
+            return fallback;
+          }
+          return path.join(home, ".gstack", "analytics", "convergence.jsonl");
+        })();
+
+        const reviewerFn = async (round: number) =>
+          runPlanReview({
+            planPath: args.planFile,
+            role: reviewRole,
+            slug,
+            timeoutMs: BUILD_DEFAULTS.timeoutsMs.planReview,
+            logDirPath: logDir(slug),
+            cwd,
+            round,
+          });
+
+        // No dedicated planSynthesizer role exists yet (Task 10 lands ahead of
+        // that). Fall back to planReviewer's role config so the synth step uses
+        // a Claude with a sane prompt budget and timeout. Once the role is
+        // added in a later task, swap `(args.roles as any).planSynthesizer` in.
+        const synthRole =
+          (args.roles as any).planSynthesizer ?? args.roles.planReviewer;
+        const synthFn = async () => {
+          const synthInputPath = path.join(
+            logDir(slug),
+            "plan-synth-revise-input.md",
+          );
+          const synthOutputPath = path.join(
+            logDir(slug),
+            "plan-synth-revise-output.md",
+          );
+          fs.writeFileSync(
+            synthInputPath,
+            `${SYNTH_REVISION_PROMPT}\n\nPlan file path: ${args.planFile}\n`,
+            "utf8",
+          );
+          fs.writeFileSync(synthOutputPath, "", "utf8");
+          // H2: propagate the SubAgentResult's exit-code as `ok`. A synth
+          // that hit a timeout (timedOut/stallKilled), a non-zero exit
+          // (model-not-found, prompt-too-large, transport error), or any
+          // other failure mode must NOT silently masquerade as success.
+          // runPlanReviewLoop checks `ok` and routes ok:false through the
+          // synth_failure exit reason.
+          const synthResult = await runConfiguredRoleTask({
+            inputFilePath: synthInputPath,
+            outputFilePath: synthOutputPath,
+            cwd,
+            slug,
+            phaseNumber: "plan",
+            iteration: 1,
+            logPrefix: "plan-synth-revise",
+            role: synthRole,
+            timeoutMs:
+              (BUILD_DEFAULTS.timeoutsMs as any).planSynthesizer ??
+              BUILD_DEFAULTS.timeoutsMs.planReview,
+            gate: false,
+          });
+          return {
+            ok: synthResult.exitCode === 0 && !synthResult.timedOut,
+          };
+        };
+
+        const loopResult = await runPlanReviewLoop({
           planPath: args.planFile,
-          role: reviewRole,
+          historyPath,
+          aggregatePath,
           slug,
-          timeoutMs: BUILD_DEFAULTS.timeoutsMs.planReview,
-          logDirPath: logDir(slug),
-          cwd,
-          round: readPlanReviewRound(planReviewReportPath),
+          branch: getCurrentBranch(cwd) || "unknown",
+          reviewerFn,
+          synthFn,
+          maxRounds: args.planReviewMaxRounds ?? 5,
+          adaptiveEnabled: !args.planReviewNoAdaptiveCap,
+          nonInteractiveMode: args.planReviewNoninteractive ?? "auto-accept",
+          isTTY: !!process.stdin.isTTY,
+          input: process.stdin,
+          output: process.stdout,
+          reviewerName: reviewRole.model,
+          synthesizerName: synthRole.model,
         });
-        const outcome = await reconcilePlanReview(verdict, args.planFile, {
+
+        // Persist legacy plan-review-report.json so SKILL.md.tmpl Step 5.5
+        // stalemate handler keeps working until Task 16 shrinks it.
+        fs.writeFileSync(
           planReviewReportPath,
-        });
-        if (outcome === "critical_exit") {
-          // Persist sentinel so the gate re-fires on resume instead of looping infinitely.
+          JSON.stringify(loopResult.finalVerdict, null, 2),
+          "utf8",
+        );
+
+        if (loopResult.exitCode === 3) {
+          // Stalemate (user picked [m] / non-TTY fail-fast on CRITICAL).
+          // NOTE: PR #63's runPlanReviewLoop replaced the legacy
+          // reconcilePlanReview path. The loop emits via input.output.write
+          // (not console.error), so wrap-console.ts no longer writes a
+          // DETECTED row for the CRITICAL exit. The Class 5 cross-run
+          // RESOLVED pairing this branch wired up therefore has nothing to
+          // pair with on the new path. The legacy reconcilePlanReview
+          // function still exists in plan-reviewer.ts with the per-objection
+          // orphan fix intact for any caller that still uses it.
           state.planReview = {
-            ...verdict,
+            ...loopResult.finalVerdict,
             status: "critical_exit_pending",
           } as any;
           saveState(state, { noGbrain: args.noGbrain, log: console.warn });
-          // Throw ExitError so the finally block can release the lock before exit.
           throw new ExitError(3);
         }
-        state.planReview = verdict;
+        if (loopResult.exitCode === 4) {
+          // User abort at gate.
+          state.planReview = {
+            ...loopResult.finalVerdict,
+            status: "user_aborted",
+          } as any;
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+          throw new ExitError(4);
+        }
+        if (loopResult.exitCode === 130) {
+          // SIGINT during triage.
+          state.planReview = {
+            ...loopResult.finalVerdict,
+            status: "user_aborted",
+          } as any;
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+          throw new ExitError(130);
+        }
+        if (loopResult.exitCode === 1) {
+          // synth_failure or runtime error. The plan was NOT successfully
+          // reviewed (synth crashed mid-loop, model unavailable, etc.). Do
+          // not let the build proceed into implementation as if review
+          // succeeded — that would silently bypass the plan-review gate
+          // on runtime failure. Persist the marker so resume re-runs the
+          // loop, then exit 1.
+          state.planReview = {
+            ...loopResult.finalVerdict,
+            status: "synth_failure",
+          } as any;
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+          throw new ExitError(1);
+        }
+        state.planReview = loopResult.finalVerdict;
         saveState(state, { noGbrain: args.noGbrain, log: console.warn });
       }
 
@@ -10319,8 +10576,14 @@ async function main() {
               // iteration counter has already been incremented by
               // runFeatureReviewIteration, so the cap check at the
               // top of the next pass will fire.
+              //
+              // Off-by-one note: this log fires AFTER the iteration ran.
+              // currentIter was set at the top of the loop as the cycle
+              // we just executed; show that value (not currentIter+1)
+              // so cap=5 prints "cycle 5/5" instead of "cycle 6/5"
+              // before the cap-extension prompt fires next iteration.
               console.warn(
-                `  → review verdict was UNCLEAR; retrying (cycle ${currentIter + 1}/${cap})`,
+                `  → review verdict was UNCLEAR; retrying (cycle ${currentIter}/${cap})`,
               );
             }
 
