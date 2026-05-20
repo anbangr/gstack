@@ -460,7 +460,7 @@ The orchestrator stops at any of these and writes the failure reason into the st
 | `git status failed in <cwd> — cannot inspect worktree state`              | Stale `.git/index.lock`, corrupted repo, or permission error during `--mark-phase-committed` recovery                                                                   | Resolve the underlying git error (often `rm .git/index.lock` after confirming no live git process), then retry. Pass `--force-dirty` only if you accept that the worktree state is unknown.                                                                      |
 | `plan markdown drift — could not un-flip checkboxes for phase X`          | Origin-verification rewind hit a plan file that was hand-edited between parse and rewind; one or more of the three checkbox lines no longer matches the expected marker | The feature is paused with an explicit reason. Re-flip `[x] → [ ]` for the named phase's test-spec, implementation, and review lines in the plan markdown, then resume.                                                                                          |
 
-Exit codes: `0` clean run, `1` phase failed, `2` bad args, `3` lock contention, `130` SIGINT.
+Exit codes: `0` clean run, `1` phase failed, `2` bad args, `3` lock contention (startup) OR plan-review stalemate, `4` user abort at plan-review gate, `130` SIGINT.
 
 ## Running inside Claude Code or other supervisors
 
@@ -501,7 +501,7 @@ started on inconsistent state. The guard makes you choose a policy:
 
 - `--commit-dirty` — stage everything and commit with a standard
   `fix(recovery): <phase> auto-commit of agent-left changes during
---mark-phase-committed` message. Pre-commit hooks still run; if a hook
+  --mark-phase-committed` message. Pre-commit hooks still run; if a hook
   fails, the commit fails and the mark refuses (you see the hook output
   and decide).
 - `--force-dirty` — preserve the dirty state, warn-only. The next phase
