@@ -951,7 +951,8 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.learnFaultPatternsPromote = next;
-    } else if (a === "--auto-promote") args.learnFaultPatternsAutoPromote = true;
+    } else if (a === "--auto-promote")
+      args.learnFaultPatternsAutoPromote = true;
     else if (a === "--skip-ship") args.skipShip = true;
     else if (a === "--single-branch") args.singleBranch = true;
     else if (a === "--ship-on-plan-complete") args.shipOnPlanComplete = true;
@@ -3682,7 +3683,12 @@ export function restartFeatureFromOriginIssues(args: {
     // Emit PHASE_REWIND so the halt-events pipeline can observe that a
     // committed phase was rewound (signal of origin verification failure).
     // rewindPhase sets phaseState.status to the target value (and emits).
-    rewindPhase(args.state, phaseIndex, "tests_green", helperCtxFor(args.state));
+    rewindPhase(
+      args.state,
+      phaseIndex,
+      "tests_green",
+      helperCtxFor(args.state),
+    );
   } else {
     phaseState.status = "tests_green";
   }
@@ -5735,11 +5741,9 @@ export function markPhaseCommittedAfterManualRecovery(args: {
         // hooks are a real quality signal; if they fail, the operator sees
         // the hook output and can decide whether to fix or fall back to
         // --force-dirty.
-        const stageR = spawnSync(
-          "git",
-          ["-C", args.cwd, "add", "--", "."],
-          { encoding: "utf8" },
-        );
+        const stageR = spawnSync("git", ["-C", args.cwd, "add", "--", "."], {
+          encoding: "utf8",
+        });
         if (stageR.status !== 0) {
           return {
             ok: false,
@@ -6808,12 +6812,7 @@ async function runPhase(args: {
           mockResult({ exitCode: 1, stderr: msg }),
         );
         state.phases[phase.index] = phaseState;
-        markPhaseFailed(
-          state,
-          phaseState.index,
-          msg,
-          helperCtxFor(state),
-        );
+        markPhaseFailed(state, phaseState.index, msg, helperCtxFor(state));
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -7181,12 +7180,7 @@ async function runPhase(args: {
       } catch (err) {
         const msg = `Dual implementation crashed unexpectedly: ${(err as Error).message}`;
         state.phases[phase.index] = phaseState;
-        markPhaseFailed(
-          state,
-          phaseState.index,
-          msg,
-          helperCtxFor(state),
-        );
+        markPhaseFailed(state, phaseState.index, msg, helperCtxFor(state));
         saveState(state, { noGbrain, log: console.warn });
       } finally {
         if (!dualImplOk) {
@@ -9231,7 +9225,10 @@ async function runLearnFaultPatternsMode(args: Args): Promise<number> {
 
   if (args.learnFaultPatternsPromote) {
     const ids = new Set(
-      args.learnFaultPatternsPromote.split(",").map((s) => s.trim()).filter(Boolean),
+      args.learnFaultPatternsPromote
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
     );
     const toPromote = keep.filter((p) => ids.has(p.faultId));
     const deferred = keep.filter((p) => !ids.has(p.faultId));
@@ -9395,7 +9392,9 @@ async function main() {
         (args.monitorManifest ? ` (manifest=${args.monitorManifest})` : "") +
         (args.drainFaultsQueueMode ? ` (queue)` : ""),
       pointers: {
-        stateFile: args.planFile ? statePath(deriveStateSlug(args.planFile)) : "",
+        stateFile: args.planFile
+          ? statePath(deriveStateSlug(args.planFile))
+          : "",
         stdoutLog: "",
         livingPlan: args.planFile ?? "",
         worktreePath: process.cwd(),
@@ -9882,7 +9881,13 @@ async function main() {
             "utf8",
           );
           fs.writeFileSync(synthOutputPath, "", "utf8");
-          await runConfiguredRoleTask({
+          // H2: propagate the SubAgentResult's exit-code as `ok`. A synth
+          // that hit a timeout (timedOut/stallKilled), a non-zero exit
+          // (model-not-found, prompt-too-large, transport error), or any
+          // other failure mode must NOT silently masquerade as success.
+          // runPlanReviewLoop checks `ok` and routes ok:false through the
+          // synth_failure exit reason.
+          const synthResult = await runConfiguredRoleTask({
             inputFilePath: synthInputPath,
             outputFilePath: synthOutputPath,
             cwd,
@@ -9896,7 +9901,9 @@ async function main() {
               BUILD_DEFAULTS.timeoutsMs.planReview,
             gate: false,
           });
-          return { ok: true };
+          return {
+            ok: synthResult.exitCode === 0 && !synthResult.timedOut,
+          };
         };
 
         const loopResult = await runPlanReviewLoop({

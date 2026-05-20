@@ -23,7 +23,10 @@ function captureWriter() {
   let buf = "";
   return {
     stream: new Writable({
-      write(c, _e, cb) { buf += c.toString(); cb(); },
+      write(c, _e, cb) {
+        buf += c.toString();
+        cb();
+      },
     }),
     read: () => buf,
   };
@@ -142,9 +145,7 @@ describe("runPlanReviewLoop", () => {
       return { ok: true };
     };
     // Each round in TTY mode: accept-ALL the objections (single uppercase A).
-    const input = readableFrom(
-      "A\nA\nA\n",
-    );
+    const input = readableFrom("A\nA\nA\n");
     const out = captureWriter();
     const result = await runPlanReviewLoop({
       planPath,
@@ -166,10 +167,9 @@ describe("runPlanReviewLoop", () => {
     expect(result.outcome).toBe("approved");
     expect(result.rounds).toBe(4);
     expect(synthCalls).toBe(3);
-    const aggLine = fs.readFileSync(
-      path.join(tmpDir, "convergence.jsonl"),
-      "utf8",
-    ).trim();
+    const aggLine = fs
+      .readFileSync(path.join(tmpDir, "convergence.jsonl"), "utf8")
+      .trim();
     const agg = JSON.parse(aggLine);
     expect(agg.trajectoryRaw).toEqual([5, 3, 2, 0]);
     expect(agg.finalVerdict).toBe("APPROVE");
@@ -183,13 +183,29 @@ describe("runPlanReviewLoop", () => {
       {
         verdict: "REVISE",
         objections: [
-          { severity: "CRITICAL", location: "F1, P1", issue: "x", suggestion: "y" },
-          { severity: "CRITICAL", location: "F1, P2", issue: "x", suggestion: "y" },
+          {
+            severity: "CRITICAL",
+            location: "F1, P1",
+            issue: "x",
+            suggestion: "y",
+          },
+          {
+            severity: "CRITICAL",
+            location: "F1, P2",
+            issue: "x",
+            suggestion: "y",
+          },
         ],
-        assessment: "", reviewedBy: "stub", round: 1,
+        assessment: "",
+        reviewedBy: "stub",
+        round: 1,
       },
       {
-        verdict: "APPROVE", objections: [], assessment: "", reviewedBy: "stub", round: 2,
+        verdict: "APPROVE",
+        objections: [],
+        assessment: "",
+        reviewedBy: "stub",
+        round: 2,
       },
     ];
     let rIdx = 0;
@@ -219,12 +235,18 @@ describe("runPlanReviewLoop", () => {
       planPath,
       historyPath: path.join(tmpDir, "history.jsonl"),
       aggregatePath: path.join(tmpDir, "convergence.jsonl"),
-      slug: "test", branch: "feat/x",
-      reviewerFn, synthFn,
-      maxRounds: 5, adaptiveEnabled: true,
-      nonInteractiveMode: "auto-accept", isTTY: true,
-      input, output: out.stream,
-      reviewerName: "stub", synthesizerName: "stub-synth",
+      slug: "test",
+      branch: "feat/x",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: true,
+      input,
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
     });
     const agg = JSON.parse(
       fs.readFileSync(path.join(tmpDir, "convergence.jsonl"), "utf8").trim(),
@@ -238,12 +260,14 @@ describe("runPlanReviewLoop", () => {
     let rIdx = 0;
     const reviewerFn = async (): Promise<PlanReviewVerdict> => ({
       verdict: "REVISE",
-      objections: [{
-        severity: "CRITICAL",
-        location: `F1, P${++rIdx}`,
-        issue: "x",
-        suggestion: "y",
-      }],
+      objections: [
+        {
+          severity: "CRITICAL",
+          location: `F1, P${++rIdx}`,
+          issue: "x",
+          suggestion: "y",
+        },
+      ],
       assessment: "",
       reviewedBy: "stub",
       round: rIdx,
@@ -254,15 +278,18 @@ describe("runPlanReviewLoop", () => {
       planPath,
       historyPath: path.join(tmpDir, "history.jsonl"),
       aggregatePath: path.join(tmpDir, "convergence.jsonl"),
-      slug: "max-rounds", branch: "feat/max-rounds",
-      reviewerFn, synthFn,
+      slug: "max-rounds",
+      branch: "feat/max-rounds",
+      reviewerFn,
+      synthFn,
       maxRounds: 3,
       adaptiveEnabled: true,
       nonInteractiveMode: "auto-accept",
       isTTY: false,
       input: readableFrom(""),
       output: out.stream,
-      reviewerName: "stub", synthesizerName: "stub-synth",
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
     });
     // Non-TTY stalemate gate returns approve_as_is, so outcome is "approved".
     // But the rounds === maxRounds confirms we hit the cap.
@@ -279,13 +306,31 @@ describe("runPlanReviewLoop", () => {
     const verdicts: PlanReviewVerdict[] = [
       {
         verdict: "REVISE",
-        objections: [{ severity: "CRITICAL", location: "F1, P1", issue: "x", suggestion: "y" }],
-        assessment: "r1", reviewedBy: "stub", round: 1,
+        objections: [
+          {
+            severity: "CRITICAL",
+            location: "F1, P1",
+            issue: "x",
+            suggestion: "y",
+          },
+        ],
+        assessment: "r1",
+        reviewedBy: "stub",
+        round: 1,
       },
       {
         verdict: "REVISE",
-        objections: [{ severity: "CRITICAL", location: "F1, P1", issue: "x", suggestion: "y" }],
-        assessment: "r2", reviewedBy: "stub", round: 2,
+        objections: [
+          {
+            severity: "CRITICAL",
+            location: "F1, P1",
+            issue: "x",
+            suggestion: "y",
+          },
+        ],
+        assessment: "r2",
+        reviewedBy: "stub",
+        round: 2,
       },
     ];
     let rIdx = 0;
@@ -293,7 +338,10 @@ describe("runPlanReviewLoop", () => {
     // Synth simulates fixing by replacing "RESOLUTION: pending" with a real value.
     const synthFn = async () => {
       const text = fs.readFileSync(planPath, "utf8");
-      const updated = text.replace(/RESOLUTION: pending/g, "RESOLUTION: synth fixed");
+      const updated = text.replace(
+        /RESOLUTION: pending/g,
+        "RESOLUTION: synth fixed",
+      );
       fs.writeFileSync(planPath, updated, "utf8");
       return { ok: true };
     };
@@ -305,12 +353,18 @@ describe("runPlanReviewLoop", () => {
       planPath,
       historyPath: path.join(tmpDir, "history.jsonl"),
       aggregatePath: path.join(tmpDir, "convergence.jsonl"),
-      slug: "test", branch: "feat/x",
-      reviewerFn, synthFn,
-      maxRounds: 5, adaptiveEnabled: true,
-      nonInteractiveMode: "auto-accept", isTTY: true,
-      input, output: out.stream,
-      reviewerName: "stub", synthesizerName: "stub-synth",
+      slug: "test",
+      branch: "feat/x",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: true,
+      input,
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
     });
     expect(result.outcome).toBe("user_manual");
     expect(result.exitCode).toBe(3);
@@ -323,9 +377,24 @@ describe("runPlanReviewLoop", () => {
       {
         verdict: "REVISE",
         objections: [
-          { severity: "IMPORTANT", location: "F1, P1", issue: "imp-1", suggestion: "fix-1" },
-          { severity: "IMPORTANT", location: "F1, P2", issue: "imp-2", suggestion: "fix-2" },
-          { severity: "SUGGESTION", location: "F1, P3", issue: "sug-1", suggestion: "fix-3" },
+          {
+            severity: "IMPORTANT",
+            location: "F1, P1",
+            issue: "imp-1",
+            suggestion: "fix-1",
+          },
+          {
+            severity: "IMPORTANT",
+            location: "F1, P2",
+            issue: "imp-2",
+            suggestion: "fix-2",
+          },
+          {
+            severity: "SUGGESTION",
+            location: "F1, P3",
+            issue: "sug-1",
+            suggestion: "fix-3",
+          },
         ],
         assessment: "",
         reviewedBy: "stub",
@@ -375,9 +444,24 @@ describe("runPlanReviewLoop", () => {
       {
         verdict: "REVISE",
         objections: [
-          { severity: "IMPORTANT", location: "F1, P1", issue: "imp-1", suggestion: "fix-1" },
-          { severity: "IMPORTANT", location: "F1, P2", issue: "imp-2", suggestion: "fix-2" },
-          { severity: "IMPORTANT", location: "F1, P3", issue: "imp-3", suggestion: "fix-3" },
+          {
+            severity: "IMPORTANT",
+            location: "F1, P1",
+            issue: "imp-1",
+            suggestion: "fix-1",
+          },
+          {
+            severity: "IMPORTANT",
+            location: "F1, P2",
+            issue: "imp-2",
+            suggestion: "fix-2",
+          },
+          {
+            severity: "IMPORTANT",
+            location: "F1, P3",
+            issue: "imp-3",
+            suggestion: "fix-3",
+          },
         ],
         assessment: "",
         reviewedBy: "stub",
@@ -421,8 +505,18 @@ describe("runPlanReviewLoop", () => {
       {
         verdict: "REVISE",
         objections: [
-          { severity: "IMPORTANT", location: "F1, P1", issue: "imp-1", suggestion: "fix-1" },
-          { severity: "SUGGESTION", location: "F1, P3", issue: "sug-1", suggestion: "fix-3" },
+          {
+            severity: "IMPORTANT",
+            location: "F1, P1",
+            issue: "imp-1",
+            suggestion: "fix-1",
+          },
+          {
+            severity: "SUGGESTION",
+            location: "F1, P3",
+            issue: "sug-1",
+            suggestion: "fix-3",
+          },
         ],
         assessment: "",
         reviewedBy: "stub",
@@ -556,20 +650,13 @@ describe("runPlanReviewLoop", () => {
     expect(agg.disputedResolutions.length).toBe(3);
   });
 
-  it("synthFn rejection is caught and the loop continues to the next round", async () => {
+  it("synthFn throw routes through synth_failure exit (H2: thrown synth no longer silently survives)", async () => {
+    // H2 contract: a synth that throws is a runtime failure. The loop must
+    // exit with outcome=synth_failure and exit code 1 rather than silently
+    // continuing to a round that would re-review the un-resynthed plan.
     let reviewCalls = 0;
     const reviewerFn = async (round: number): Promise<PlanReviewVerdict> => {
       reviewCalls += 1;
-      if (round >= 2) {
-        // Second call: approve so the loop terminates cleanly.
-        return {
-          verdict: "APPROVE",
-          objections: [],
-          assessment: "",
-          reviewedBy: "stub",
-          round,
-        };
-      }
       return {
         verdict: "REVISE",
         objections: [
@@ -608,15 +695,241 @@ describe("runPlanReviewLoop", () => {
       reviewerName: "stub",
       synthesizerName: "stub-synth",
     });
-    // Loop survived the synth failure and continued to round 2's APPROVE.
-    expect(result.outcome).toBe("approved");
+    expect(result.outcome).toBe("synth_failure");
+    expect(result.exitCode).toBe(1);
     expect(synthCalls).toBe(1);
-    expect(reviewCalls).toBe(2);
-    expect(result.rounds).toBe(2);
+    // Only the round-1 reviewer call ran — no wasted round-2 spend on a plan
+    // the synth never got to revise.
+    expect(reviewCalls).toBe(1);
+    expect(result.rounds).toBe(1);
     // Convergence aggregate must still be written.
-    expect(
-      fs.existsSync(path.join(tmpDir, "convergence.jsonl")),
-    ).toBe(true);
+    expect(fs.existsSync(path.join(tmpDir, "convergence.jsonl"))).toBe(true);
+  });
+
+  it("H2: synthFn returning ok:false exits with synth_failure (no silent success)", async () => {
+    // If runConfiguredRoleTask exits non-zero or times out, the cli.ts wrapper
+    // returns { ok: false }. The loop must NOT silently treat that as a
+    // successful round — it must route through synth_failure / exit 1.
+    const reviewerFn = async (round: number): Promise<PlanReviewVerdict> => ({
+      verdict: "REVISE",
+      objections: [
+        {
+          severity: "CRITICAL",
+          location: "F1, P1",
+          issue: "x",
+          suggestion: "y",
+        },
+      ],
+      assessment: "",
+      reviewedBy: "stub",
+      round,
+    });
+    let synthCalls = 0;
+    const synthFn = async () => {
+      synthCalls += 1;
+      return { ok: false };
+    };
+    const out = captureWriter();
+    const result = await runPlanReviewLoop({
+      planPath,
+      historyPath: path.join(tmpDir, "history.jsonl"),
+      aggregatePath: path.join(tmpDir, "convergence.jsonl"),
+      slug: "synth-ok-false",
+      branch: "feat/synth-ok-false",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: false,
+      input: readableFrom(""),
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
+    });
+    expect(result.outcome).toBe("synth_failure");
+    expect(result.exitCode).toBe(1);
+    // Synth was invoked exactly once — the loop didn't burn an additional
+    // reviewer round after the failure.
+    expect(synthCalls).toBe(1);
+    expect(result.rounds).toBe(1);
+  });
+
+  it("H3: [c] Continue anyway at adaptive bail invokes synth before looping", async () => {
+    // Round 1 raises objection X; user accepts; synth pretends to resolve.
+    // Round 2 raises the same X (re-raise, no new objections). Adaptive bail
+    // fires; user picks [c]ontinue. The loop MUST invoke synth on the
+    // already-annotated plan so round 3's reviewer sees a fresh resolution
+    // — without that, round 3 just re-raises the same X and burns spend.
+    // Round 3 then approves.
+    const verdicts: PlanReviewVerdict[] = [
+      {
+        verdict: "REVISE",
+        objections: [
+          {
+            severity: "CRITICAL",
+            location: "F1, P1",
+            issue: "x",
+            suggestion: "y",
+          },
+        ],
+        assessment: "r1",
+        reviewedBy: "stub",
+        round: 1,
+      },
+      {
+        verdict: "REVISE",
+        objections: [
+          {
+            severity: "CRITICAL",
+            location: "F1, P1",
+            issue: "x",
+            suggestion: "y",
+          },
+        ],
+        assessment: "r2",
+        reviewedBy: "stub",
+        round: 2,
+      },
+      {
+        verdict: "APPROVE",
+        objections: [],
+        assessment: "approved",
+        reviewedBy: "stub",
+        round: 3,
+      },
+    ];
+    let rIdx = 0;
+    const reviewerFn = async () => verdicts[rIdx++];
+    let synthCalls = 0;
+    const synthFn = async () => {
+      synthCalls += 1;
+      // Resolve all "pending" → "synth fixed" so successive re-raises track.
+      const text = fs.readFileSync(planPath, "utf8");
+      const updated = text.replace(
+        /RESOLUTION: pending/g,
+        "RESOLUTION: synth fixed",
+      );
+      fs.writeFileSync(planPath, updated, "utf8");
+      return { ok: true };
+    };
+    // TTY input:
+    //   Round 1: a (accept) + rationale ("ok")
+    //   Round 2: a (accept) + rationale ("ok") → triggers adaptive bail
+    //   Bail gate: c (continue anyway)
+    //   Round 3: APPROVE (no triage)
+    const input = readableFrom("a\nok\na\nok\nc\n");
+    const out = captureWriter();
+    const result = await runPlanReviewLoop({
+      planPath,
+      historyPath: path.join(tmpDir, "history.jsonl"),
+      aggregatePath: path.join(tmpDir, "convergence.jsonl"),
+      slug: "h3-continue-runs-synth",
+      branch: "feat/h3",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: true,
+      input,
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
+    });
+    expect(result.outcome).toBe("approved");
+    expect(result.rounds).toBe(3);
+    // Synth must have been invoked THREE times:
+    //   1. After round 1 triage (normal path)
+    //   2. After [c]ontinue at the adaptive bail gate following round 2
+    //   3. NOT after round 3 — round 3 is APPROVE which skips synth
+    // So expect exactly 2 synth calls total. (Round 1 + continue-after-round-2.)
+    expect(synthCalls).toBe(2);
+  });
+
+  it("H4: resume with startRound > maxRounds returns approved with synthetic verdict", async () => {
+    // Seed history.jsonl with maxRounds entries so deriveRoundNumber returns
+    // startRound = maxRounds + 1. The for-loop must NOT execute (which
+    // would leave lastVerdict null and the lastVerdict! assertion would
+    // produce undefined). Instead the guard synthesizes an APPROVE verdict
+    // and returns cleanly.
+    const historyPath = path.join(tmpDir, "history.jsonl");
+    const seed: any[] = [];
+    for (let i = 1; i <= 5; i++) {
+      seed.push({
+        round: i,
+        ts: new Date().toISOString(),
+        reviewedBy: "stub",
+        verdict: "REVISE",
+        objectionCountRaw: 1,
+        critical: 1,
+        important: 0,
+        suggestion: 0,
+        triage: { accepted: [0], rejected: [], deferred: [] },
+        convergence: {
+          delta: null,
+          noForwardProgress: false,
+          reRaises: 0,
+          newObjections: 1,
+        },
+      });
+    }
+    fs.writeFileSync(
+      historyPath,
+      seed.map((e) => JSON.stringify(e)).join("\n") + "\n",
+      "utf8",
+    );
+
+    let reviewCalls = 0;
+    const reviewerFn = async (): Promise<PlanReviewVerdict> => {
+      reviewCalls += 1;
+      // Should never be called — the H4 guard skips the loop entirely.
+      return {
+        verdict: "REVISE",
+        objections: [],
+        assessment: "should not reach",
+        reviewedBy: "stub",
+        round: 99,
+      };
+    };
+    let synthCalls = 0;
+    const synthFn = async () => {
+      synthCalls += 1;
+      return { ok: true };
+    };
+    const out = captureWriter();
+    const result = await runPlanReviewLoop({
+      planPath,
+      historyPath,
+      aggregatePath: path.join(tmpDir, "convergence.jsonl"),
+      slug: "resume-past-cap",
+      branch: "feat/resume-past-cap",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: false,
+      input: readableFrom(""),
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
+    });
+    expect(result.outcome).toBe("approved");
+    expect(result.exitCode).toBe(0);
+    // Neither reviewer nor synth was called — the guard short-circuits.
+    expect(reviewCalls).toBe(0);
+    expect(synthCalls).toBe(0);
+    // finalVerdict must be non-null (the H4 fix specifically avoids the
+    // lastVerdict! → undefined coercion).
+    expect(result.finalVerdict).toBeDefined();
+    expect(result.finalVerdict.verdict).toBe("APPROVE");
+    expect(result.finalVerdict.reviewedBy).toBe("resume-past-cap");
+    // rounds is reported as startRound - 1 (i.e. the last round the prior
+    // session actually executed).
+    expect(result.rounds).toBe(5);
+    // Convergence aggregate written.
+    expect(fs.existsSync(path.join(tmpDir, "convergence.jsonl"))).toBe(true);
   });
 });
 
@@ -798,22 +1111,19 @@ describe("resume: priorRejectRationale hydration", () => {
     );
 
     // Write the round-1 rejection annotation into the plan file.
-    const seededPlan = writeRoundAnnotation(
-      fs.readFileSync(planPath, "utf8"),
-      {
-        location: "F1, P1",
-        severity: "CRITICAL",
-        issue: "x",
-        suggestion: "y",
-        rounds: [
-          {
-            round: 1,
-            userDecision: "reject",
-            userRationale: "intentional design choice from round 1",
-          },
-        ],
-      },
-    );
+    const seededPlan = writeRoundAnnotation(fs.readFileSync(planPath, "utf8"), {
+      location: "F1, P1",
+      severity: "CRITICAL",
+      issue: "x",
+      suggestion: "y",
+      rounds: [
+        {
+          round: 1,
+          userDecision: "reject",
+          userRationale: "intentional design choice from round 1",
+        },
+      ],
+    });
     fs.writeFileSync(planPath, seededPlan, "utf8");
 
     // Round 2 reviewer raises the same objection again.

@@ -835,6 +835,86 @@ export async function runPlanReviewLoop(
     });
   };
 
+  // H4: Resume past maxRounds. If the prior session already ran maxRounds
+  // (history.jsonl has e.g. 5 entries with maxRounds=5), deriveRoundNumber
+  // returns startRound=6 > maxRounds=5. The for-loop below would never
+  // execute, lastVerdict stays null, and the `lastVerdict!` assertion at
+  // the bottom would coerce to undefined — silently propagating into
+  // state.planReview and the legacy plan-review-report.json.
+  //
+  // The right semantics on resume past the cap: the prior session already
+  // hit the stalemate gate at round=maxRounds, the user must have picked
+  // [m] or [q] (otherwise we wouldn't be resuming), then made manual edits
+  // and re-launched. Treat the re-launch as an approval — the user has
+  // taken ownership of the plan. Synthesize an APPROVE verdict and skip
+  // the loop entirely.
+  if (startRound > input.maxRounds) {
+    input.output.write(
+      `[plan-review] Resume past maxRounds (startRound=${startRound}, maxRounds=${input.maxRounds}). Skipping review.\n`,
+    );
+    const syntheticVerdict: PlanReviewVerdict = {
+      verdict: "APPROVE",
+      objections: [],
+      assessment: "Resume past maxRounds; review skipped.",
+      reviewedBy: "resume-past-cap",
+      round: startRound,
+    };
+    writeAggregate({
+      outcome: "approved",
+      round: startRound - 1,
+      verdict: "APPROVE",
+    });
+    return finalResult("approved", startRound - 1, 0, syntheticVerdict);
+  }
+
+  // Helper: invoke synthFn, count disputed-resolution annotations afterward,
+  // and accumulate the synth wall-time. Returns whether synth succeeded.
+  // Shared between the normal post-triage synth call and the [c]ontinue path
+  // at the adaptive-bail gate so both paths route disputed counting + ok-check
+  // through one place. H2/H3.
+  const invokeSynth = async (roundForLog: number): Promise<{ ok: boolean }> => {
+    const synthStart = Date.now();
+    let synthOk = false;
+    try {
+      const synthResult = await input.synthFn();
+      synthOk = synthResult.ok;
+    } catch (err) {
+      console.warn(
+        `[plan-review-loop] synth failed at round ${roundForLog}: ${(err as Error).message}`,
+      );
+      synthOk = false;
+    }
+    synthWallTimeS += Math.round((Date.now() - synthStart) / 1000);
+
+    // Count disputed resolutions written this round. Skipped on synth failure
+    // because the plan file may be half-written from a crashed synth.
+    let disputedThisRound = 0;
+    if (synthOk) {
+      try {
+        const postSynthText = fs.readFileSync(input.planPath, "utf8");
+        const postSynthAnns = parseRoundAnnotations(postSynthText);
+        for (const ann of postSynthAnns) {
+          for (const r of ann.rounds) {
+            if (
+              r.round === roundForLog &&
+              r.resolution !== undefined &&
+              /^disputed\b/i.test(r.resolution)
+            ) {
+              disputedThisRound += 1;
+            }
+          }
+        }
+      } catch (err) {
+        annotationParseErrors += 1;
+        console.warn(
+          `[plan-review-loop] annotation parse error after synth round ${roundForLog}: ${(err as Error).message}`,
+        );
+      }
+    }
+    disputedResolutions.push(disputedThisRound);
+    return { ok: synthOk };
+  };
+
   for (let round = startRound; round <= input.maxRounds; round++) {
     // 1. Reviewer call.
     const reviewStart = Date.now();
@@ -1285,7 +1365,30 @@ export async function runPlanReviewLoop(
         askFn: sharedAsk,
       });
       if (userChoice === "continue") {
-        disputedResolutions.push(0); // synth not invoked this iteration
+        // H3: [c] Continue anyway must invoke synth before looping.
+        // Previously the `continue` statement jumped straight to the next
+        // round iteration, skipping synth dispatch entirely. The next paid
+        // reviewer round then reviewed the same unresolved plan (with
+        // RESOLUTION: pending unchanged), virtually guaranteeing the same
+        // objections get re-raised and burning the round. Invoking synth
+        // here gives the next reviewer call fresh resolutions to look at.
+        const { ok: continueSynthOk } = await invokeSynth(round);
+        if (!continueSynthOk) {
+          // Synth failed on the continue path — exit with synth_failure
+          // rather than push on. The next reviewer round can't make
+          // progress against an un-resynthed plan, and synth failed
+          // deterministically once, so retrying without action is just
+          // burning spend.
+          console.warn(
+            `[plan-review-loop] synth returned ok:false at round ${round} (continue path)`,
+          );
+          writeAggregate({
+            outcome: "synth_failure",
+            round,
+            verdict: "STALEMATE",
+          });
+          return finalResult("synth_failure", round, 1, verdict);
+        }
         continue;
       }
       let exitCode: 0 | 3 | 4 = 0;
@@ -1311,55 +1414,25 @@ export async function runPlanReviewLoop(
       return finalResult(outcome, round, exitCode, verdict);
     }
 
-    // 9. Invoke synthesizer.
+    // 9. Invoke synthesizer via shared helper.
     //
-    // Wrap in try/catch so a synth failure doesn't crash the entire loop
-    // mid-iteration (which would leave convergence.jsonl unwritten and the
-    // plan file in whatever state the synth left it). Instead, log + push
-    // a telemetry sentinel + continue. The next round's reviewer will re-read
-    // the plan file and surface any structural damage as fresh objections.
-    const synthStart = Date.now();
-    try {
-      await input.synthFn();
-    } catch (err) {
+    // H2: The helper checks the SubAgentResult's ok flag (propagated by
+    // cli.ts synthFn). A synth that hit a timeout, model-not-found error,
+    // or non-zero exit must NOT silently masquerade as a successful round —
+    // route it through the synth_failure exit reason added in c5e7b3ea.
+    // Throws in synthFn also resolve to ok:false (helper catches).
+    const { ok: synthOk } = await invokeSynth(round);
+    if (!synthOk) {
       console.warn(
-        `[plan-review-loop] synth failed at round ${round}: ${(err as Error).message}`,
+        `[plan-review-loop] synth returned ok:false at round ${round}`,
       );
-      synthWallTimeS += Math.round((Date.now() - synthStart) / 1000);
-      // Push placeholder for telemetry parity. Skip step 9a (annotation
-      // parse) because the plan file may be half-written from a crashed synth.
-      disputedResolutions.push(0);
-      continue;
+      writeAggregate({
+        outcome: "synth_failure",
+        round,
+        verdict: "STALEMATE",
+      });
+      return finalResult("synth_failure", round, 1, verdict);
     }
-    synthWallTimeS += Math.round((Date.now() - synthStart) / 1000);
-
-    // 9a. Count disputed resolutions in this round's annotations.
-    // The synth writes RESOLUTION: disputed — <reason> when it disagrees
-    // with a user-accepted objection. Each disputed entry surfaces in the
-    // next round's triage so the user can re-decide; the aggregate count
-    // is a tuning signal for "how often does synth disagree with user accepts".
-    let disputedThisRound = 0;
-    try {
-      const postSynthText = fs.readFileSync(input.planPath, "utf8");
-      const postSynthAnns = parseRoundAnnotations(postSynthText);
-      for (const ann of postSynthAnns) {
-        for (const r of ann.rounds) {
-          if (
-            r.round === round &&
-            r.resolution !== undefined &&
-            /^disputed\b/i.test(r.resolution)
-          ) {
-            disputedThisRound += 1;
-          }
-        }
-      }
-    } catch (err) {
-      annotationParseErrors += 1;
-      console.warn(
-        `[plan-review-loop] annotation parse error after synth round ${round}: ${(err as Error).message}`,
-      );
-    }
-    disputedResolutions.push(disputedThisRound);
   }
 
   // MAX_ROUNDS reached without hitting earlier exits — fire stalemate gate.
