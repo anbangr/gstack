@@ -338,9 +338,17 @@ export async function reconcilePlanReview(
       reportPath: opts.planReviewReportPath,
       round: verdict.round,
     });
+    // Single console.error so wrap-console emits one DETECTED row whose
+    // faultId matches what reconcilePlanReview's recovery path resolves
+    // on the next run. The per-objection bullets must NOT go through
+    // console.error — each bullet would otherwise become its own
+    // SOFT_HALT_ERROR with a distinct faultId, leaving N-1 orphans in
+    // pending-investigations/ that the Class 5 cross-run RESOLVED can
+    // never collapse. Bullets stay visible via console.log (which
+    // wrap-console.ts does not shim).
     console.error(criticalMsg);
     for (const c of critical) {
-      console.error(`  • [${c.location}] ${c.issue}`);
+      console.log(`  • [${c.location}] ${c.issue}`);
     }
     return "critical_exit";
   }

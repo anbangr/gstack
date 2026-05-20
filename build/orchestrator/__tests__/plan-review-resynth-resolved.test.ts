@@ -66,4 +66,40 @@ describe("plan-review CRITICAL → re-synth RESOLVED pairing (class 5)", () => {
     const window = cliSrc.slice(pendingIdx, pendingIdx + 3000);
     expect(window).toMatch(/faultId/);
   });
+
+  test("T11b: per-objection bullets use console.log, NOT console.error (no orphan DETECTED rows)", () => {
+    // CRITICAL OBSERVABILITY BUG: reconcilePlanReview was emitting the
+    // aggregate criticalMsg via console.error AND looping per-objection
+    // bullets through console.error too. wrap-console.ts shims warn/error
+    // (not log), so each bullet became its own SOFT_HALT_ERROR with a
+    // distinct faultId, leaving N-1 orphan DETECTED rows that the Class 5
+    // recovery path's single RESOLVED could never collapse.
+    //
+    // Fix: aggregate emits via console.error (single DETECTED, faultId
+    // matched by recovery path), bullets emit via console.log (visible to
+    // humans, NOT shimmed by wrap-console, no orphan rows).
+    planReviewerSrc =
+      planReviewerSrc ??
+      fs.readFileSync(
+        path.resolve(import.meta.dir, "..", "plan-reviewer.ts"),
+        "utf8",
+      );
+    // Locate the per-objection bullet loop in reconcilePlanReview's
+    // critical-exit branch.
+    const criticalMsgIdx = planReviewerSrc.indexOf(
+      "buildPlanReviewCriticalMessage({",
+    );
+    expect(criticalMsgIdx).toBeGreaterThan(-1);
+    // Search forward for the bullet loop. The window must be tight enough
+    // to actually contain the loop and the console call inside it.
+    const window = planReviewerSrc.slice(criticalMsgIdx, criticalMsgIdx + 1000);
+    expect(window).toMatch(/for\s*\(const\s+c\s+of\s+critical\)/);
+    // Inside the loop body, the bullet print must go through console.log.
+    // We extract the loop body to assert this precisely.
+    const loopIdx = window.search(/for\s*\(const\s+c\s+of\s+critical\)/);
+    expect(loopIdx).toBeGreaterThan(-1);
+    const loopBody = window.slice(loopIdx, loopIdx + 200);
+    expect(loopBody).toMatch(/console\.log\(/);
+    expect(loopBody).not.toMatch(/console\.error\(\s*`\s*•/);
+  });
 });
