@@ -136,7 +136,7 @@ contain both required checkboxes for its kind:
 - [ ] **Verify Completion**: Confirm the setup is complete.
 ```
 
-Feature and phase numbers can be `N` or `N.M`. The orchestrator processes features in document order, and phases in document order within each feature. Phases missing the `**Implementation` or `**Review` checkbox are skipped with a warning. TDD format phases without a `**Test Specification` checkbox are treated as legacy and skip the Red/Green steps; keep that compatibility for old plans, but do not generate new living plans in the legacy shape.
+Feature and phase numbers can be `N` or `N.M`. The orchestrator processes features in document order, and phases in document order within each feature. Phases missing their kind-specific implementation/action gate or kind-specific review/verification gate are skipped with a warning. Code phases missing a `**Test Specification` checkbox are treated as legacy and skip the Red/Green steps; keep that compatibility for old plans, but do not generate new living plans in the legacy shape.
 
 ## Feature Workflow
 

@@ -36,9 +36,19 @@ describe("SYNTH_REVISION_PROMPT (synthesizer)", () => {
 
   it("preserves the one-phase two-gate contract for non-code phases", () => {
     expect(SYNTH_REVISION_PROMPT).toContain("Do NOT split a non-code phase");
+    expect(SYNTH_REVISION_PROMPT).toContain(
+      "Each executable phase must contain both required checkboxes",
+    );
     expect(SYNTH_REVISION_PROMPT).toContain("[writing]");
     expect(SYNTH_REVISION_PROMPT).toContain("**Draft**");
     expect(SYNTH_REVISION_PROMPT).toContain("**Review**");
+    expect(SYNTH_REVISION_PROMPT).toContain("[experiment]");
+    expect(SYNTH_REVISION_PROMPT).toContain("**Execute**");
+    expect(SYNTH_REVISION_PROMPT).toContain("[research]");
+    expect(SYNTH_REVISION_PROMPT).toContain("**Explore**");
+    expect(SYNTH_REVISION_PROMPT).toContain("[manual]");
+    expect(SYNTH_REVISION_PROMPT).toContain("**Action Required**");
+    expect(SYNTH_REVISION_PROMPT).toContain("**Verify Completion**");
     expect(SYNTH_REVISION_PROMPT).toContain("one phase");
   });
 
