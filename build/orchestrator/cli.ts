@@ -191,7 +191,13 @@ import {
   recordRetryCapHit,
   rewindPhase,
 } from "./halt-event-helpers";
-import { buildHaltSnapshot, emitHaltEvent, severityFor } from "./halt-events";
+import {
+  buildHaltSnapshot,
+  computeFaultId,
+  emitHaltEvent,
+  emitHaltEventResolved,
+  severityFor,
+} from "./halt-events";
 import {
   autoPromoteDecision,
   dedupeAgainstLearned,
@@ -214,12 +220,20 @@ import { installWrapConsole } from "./wrap-console";
  * string and downstream tests stay structural.
  */
 function helperCtxFor(state: BuildState) {
+  // GSTACK_BUILD_STDOUT_LOG is set by the launcher (monitor / SKILL.md.tmpl
+  // launch block) to the path of the agent-stdout.log the orchestrator's
+  // own stdout is being piped to. Reading it here lets wrap-console emit
+  // halt events with a real log path so buildHaltSnapshot can populate
+  // snapshot.stdoutTail with actual context. When unset (early startup,
+  // tests, or legacy launcher), falls back to "" — buildHaltSnapshot
+  // handles the empty path via its try/catch and the emit succeeds with
+  // an empty stdoutTail.
   return {
     runId: state.launch?.runId ?? state.slug,
     stateSlug: state.slug,
     pointers: {
       stateFile: statePath(state.slug),
-      stdoutLog: "",
+      stdoutLog: process.env.GSTACK_BUILD_STDOUT_LOG ?? "",
       livingPlan: state.planFile,
       worktreePath: state.launch?.projectRoot ?? "",
     },
@@ -4385,6 +4399,14 @@ export async function runRoleTask(opts: {
   iteration: number;
   logPrefix: string;
   timeoutMs?: number;
+  /**
+   * Run identifier matching wrap-console.ts's keying
+   * (`state.launch?.runId ?? state.slug`). Threaded so the Class 4 RESOLVED
+   * emit's pair key matches the DETECTED row wrap-console wrote for the
+   * fallback warn. When undefined, defaults to opts.slug — same fallback
+   * helperCtxFor uses.
+   */
+  runId?: string;
 }): Promise<SubAgentResult> {
   const resolved = resolveRoleTimeouts(opts.role, opts.timeoutMs);
   const effectiveTimeoutMs = resolved.primaryMs;
@@ -4448,15 +4470,48 @@ export async function runRoleTask(opts: {
   // internal phase dispatcher and the slash-command dispatcher accept
   // different opt shapes (codexDefaultCommand, sandbox).
   if ((result.timedOut || result.exitCode !== 0) && opts.role.backupProvider) {
-    console.warn(
+    // Class 4 pairing for the non-Configured variant. Build the warn
+    // message and compute its faultId BEFORE console.warn fires so the
+    // RESOLVED emit (on backup success) can collapse against the DETECTED
+    // wrap-console writes here. runId MUST match wrap-console's keying
+    // (`state.launch?.runId ?? state.slug`) — opts.slug is the same
+    // fallback helperCtxFor uses when launch.runId is unset.
+    const fallbackMsg =
       `[gstack-build] ${opts.logPrefix}: primary ${opts.role.provider} failed ` +
-        `(exit=${result.exitCode ?? "null"}, timedOut=${result.timedOut}); ` +
-        `falling back to ${opts.role.backupProvider} with timeout ${resolved.backupMs}ms (single-shot)`,
-    );
+      `(exit=${result.exitCode ?? "null"}, timedOut=${result.timedOut}); ` +
+      `falling back to ${opts.role.backupProvider} with timeout ${resolved.backupMs}ms (single-shot)`;
+    // Resolution order matches wrap-console's helperCtxFor:
+    //   1. opts.runId (caller explicitly threaded it),
+    //   2. GSTACK_BUILD_RUN_ID (set once at launch in cli.ts:9750-ish),
+    //   3. opts.slug (back-compat default — same as state.slug fallback
+    //      helperCtxFor uses when state.launch.runId is unset).
+    const fallbackRunId =
+      opts.runId ?? process.env.GSTACK_BUILD_RUN_ID ?? opts.slug;
+    const fallbackFaultId = computeFaultId({
+      kind: "SOFT_HALT_WARN",
+      runId: fallbackRunId,
+      stateSlug: opts.slug,
+      severity: "LOW",
+      message: fallbackMsg.slice(0, 500),
+      pointers: {
+        stateFile: "",
+        stdoutLog: "",
+        livingPlan: "",
+        worktreePath: opts.cwd,
+      },
+      snapshot: { stdoutTail: "" },
+    });
+    console.warn(fallbackMsg);
     // Zero stale primary output before backup runs. If backup also fails, the
     // caller gets an empty outputFilePath plus the backup's non-zero exit code.
     fs.writeFileSync(opts.outputFilePath, "");
-    return runRoleTask(resolveFallbackForRoleTask(opts, resolved));
+    const backupResult = await runRoleTask(
+      resolveFallbackForRoleTask(opts, resolved),
+    );
+    if (backupResult.exitCode === 0 && !backupResult.timedOut) {
+      emitHaltEventResolved(fallbackFaultId, fallbackRunId);
+    }
+    return backupResult;
   }
 
   return result;
@@ -4582,7 +4637,12 @@ async function runReviewGates(opts: {
   };
 
   for (const { name, role } of plan.gates) {
-    const before = captureGitSnapshot(opts.cwd);
+    // captureContents:true is REQUIRED so discardBlindExecutionChanges
+    // can roll back if applyGateHygiene detects a sandbox escape.
+    // Without it, the gate's BLIND_EXECUTION_DETECTED handler refuses to
+    // discard ("before.workTreeContents not captured") and the orphan
+    // edits stay on the worktree. Class 2 fix.
+    const before = captureGitSnapshot(opts.cwd, { captureContents: true });
     let result = await runGate(name, role);
     result = applyGateHygiene({
       result,
@@ -9744,6 +9804,19 @@ async function main() {
       state.launch = launch;
       saveState(state, { noGbrain: args.noGbrain, log: console.warn });
 
+      // Publish the run identity for the sub-agent fallback paths
+      // (cli.ts::runRoleTask, sub-agents.ts::runConfiguredRoleTask). Those
+      // functions compute a faultId on the primary→backup fallback warn so
+      // the paired RESOLVED can collapse it pre-dispatch. To match what
+      // wrap-console writes for the DETECTED row, the producer-side faultId
+      // must key on the same runId helperCtxFor uses
+      // (`state.launch?.runId ?? state.slug`). Threading runId through every
+      // sub-agent call site is invasive (11+ in cli.ts); the env-var hook
+      // mirrors how GSTACK_BUILD_STDOUT_LOG already plumbs launch metadata
+      // to the same layer, and keeps the back-compat default
+      // (`opts.runId ?? opts.slug`) intact for direct test callers.
+      process.env.GSTACK_BUILD_RUN_ID = launch.runId ?? state.slug;
+
       // Install the wrapConsole shim now that state is loaded and the build
       // run loop is about to start. The shim classifies every console.warn /
       // console.error line into a halt-event kind (SOFT_HALT_WARN /
@@ -9940,6 +10013,14 @@ async function main() {
 
         if (loopResult.exitCode === 3) {
           // Stalemate (user picked [m] / non-TTY fail-fast on CRITICAL).
+          // NOTE: PR #63's runPlanReviewLoop replaced the legacy
+          // reconcilePlanReview path. The loop emits via input.output.write
+          // (not console.error), so wrap-console.ts no longer writes a
+          // DETECTED row for the CRITICAL exit. The Class 5 cross-run
+          // RESOLVED pairing this branch wired up therefore has nothing to
+          // pair with on the new path. The legacy reconcilePlanReview
+          // function still exists in plan-reviewer.ts with the per-objection
+          // orphan fix intact for any caller that still uses it.
           state.planReview = {
             ...loopResult.finalVerdict,
             status: "critical_exit_pending",
@@ -10495,8 +10576,14 @@ async function main() {
               // iteration counter has already been incremented by
               // runFeatureReviewIteration, so the cap check at the
               // top of the next pass will fire.
+              //
+              // Off-by-one note: this log fires AFTER the iteration ran.
+              // currentIter was set at the top of the loop as the cycle
+              // we just executed; show that value (not currentIter+1)
+              // so cap=5 prints "cycle 5/5" instead of "cycle 6/5"
+              // before the cap-extension prompt fires next iteration.
               console.warn(
-                `  → review verdict was UNCLEAR; retrying (cycle ${currentIter + 1}/${cap})`,
+                `  → review verdict was UNCLEAR; retrying (cycle ${currentIter}/${cap})`,
               );
             }
 

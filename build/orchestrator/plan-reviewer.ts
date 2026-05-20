@@ -247,6 +247,27 @@ async function promptImportantObjections(
 }
 
 /**
+ * Format the exact warn message that reconcilePlanReview emits via
+ * console.error on the critical_exit branch. Exported so the orchestrator
+ * (cli.ts) can pass the same string into computeFaultId — guaranteeing
+ * the cross-run RESOLVED emit keys on the same hash wrap-console used
+ * when it captured the console.error and produced the DETECTED row.
+ *
+ * Keep this in lockstep with the actual console.error call below.
+ */
+export function buildPlanReviewCriticalMessage(opts: {
+  criticalCount: number;
+  reportPath: string;
+  round: number;
+}): string {
+  return (
+    `[plan-review] ✗ CRITICAL objections found (${opts.criticalCount}) — exiting with code 3.\n` +
+    `  Report: ${opts.reportPath}\n` +
+    `  Re-synthesis round: ${opts.round}`
+  );
+}
+
+/**
  * Route the parsed verdict to the appropriate action.
  *
  * Returns "proceed" or "critical_exit". Caller does process.exit(3) on
@@ -312,13 +333,22 @@ export async function reconcilePlanReview(
     fs.writeFileSync(tmp, JSON.stringify(verdict, null, 2), "utf8");
     fs.renameSync(tmp, opts.planReviewReportPath);
 
-    console.error(
-      `[plan-review] ✗ CRITICAL objections found (${critical.length}) — exiting with code 3.\n` +
-        `  Report: ${opts.planReviewReportPath}\n` +
-        `  Re-synthesis round: ${verdict.round}`,
-    );
+    const criticalMsg = buildPlanReviewCriticalMessage({
+      criticalCount: critical.length,
+      reportPath: opts.planReviewReportPath,
+      round: verdict.round,
+    });
+    // Single console.error so wrap-console emits one DETECTED row whose
+    // faultId matches what reconcilePlanReview's recovery path resolves
+    // on the next run. The per-objection bullets must NOT go through
+    // console.error — each bullet would otherwise become its own
+    // SOFT_HALT_ERROR with a distinct faultId, leaving N-1 orphans in
+    // pending-investigations/ that the Class 5 cross-run RESOLVED can
+    // never collapse. Bullets stay visible via console.log (which
+    // wrap-console.ts does not shim).
+    console.error(criticalMsg);
     for (const c of critical) {
-      console.error(`  • [${c.location}] ${c.issue}`);
+      console.log(`  • [${c.location}] ${c.issue}`);
     }
     return "critical_exit";
   }

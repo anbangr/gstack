@@ -48,9 +48,11 @@ import * as path from "node:path";
 import { spawn, spawnSync, type ChildProcess } from "./child-registry";
 import { attachStallWatchdog, killProcessAndGroup } from "./stall-watchdog";
 import {
+  loadPendingEntries,
   loadPendingInvestigations,
   markInvestigated,
   pendingInvestigationsDir,
+  processedDir,
   type HaltEvent,
   type HaltSeverity,
 } from "./halt-events";
@@ -1246,7 +1248,77 @@ export async function drainFaultsFromHaltEventsQueue(
   const minRank = SEVERITY_RANK[severityMin];
   const timeoutMs =
     opts.investigatorTimeoutMs ?? DEFAULT_INVESTIGATOR_TIMEOUT_MS;
-  const events = loadPendingInvestigations({ queueDir });
+
+  // ---- DETECTED + RESOLVED pair-collapse pre-pass ----
+  // The wrap-console emitter writes a DETECTED row, and code paths that
+  // detect their own recovery (Kimi→Gemini fallback success in
+  // sub-agents.ts; plan-reviewer.ts critical_exit_pending resolution in
+  // cli.ts) call emitHaltEventResolved to write a paired RESOLVED row.
+  // Before dispatching codex, collapse every pair by (runId, faultId):
+  // move both files to processed/ and skip the per-event loop entirely.
+  // Orphan RESOLVED rows (no matching DETECTED) get moved to processed/
+  // silently — they represent transient faults whose DETECTED already
+  // drained on a prior run.
+  const pendingDir = pendingInvestigationsDir({ queueDir });
+  const processedTo = processedDir({ queueDir });
+  const allEntries = loadPendingEntries({ queueDir });
+  const detectedByKey = new Map<
+    string,
+    Extract<typeof allEntries[number], { kind: "detected" }>
+  >();
+  for (const e of allEntries) {
+    if (e.kind === "detected") {
+      const key = `${e.event.runId}|${e.event.faultId}`;
+      detectedByKey.set(key, e);
+    }
+  }
+  const collapsedDetectedKeys = new Set<string>();
+  for (const e of allEntries) {
+    if (e.kind !== "resolved") continue;
+    const key = `${e.runId}|${e.faultId}`;
+    const detected = detectedByKey.get(key);
+    if (detected) {
+      // Pair found: move BOTH files to processed/.
+      try {
+        fs.mkdirSync(processedTo, { recursive: true });
+        fs.renameSync(
+          path.join(pendingDir, detected.file),
+          path.join(processedTo, detected.file),
+        );
+        fs.renameSync(
+          path.join(pendingDir, e.file),
+          path.join(processedTo, e.file),
+        );
+        collapsedDetectedKeys.add(key);
+      } catch (err) {
+        // Best-effort: a concurrent drain may have moved one side already.
+        process.stderr.write(
+          `[drain-faults] pair-collapse rename failed for ${key}: ${(err as Error).message}\n`,
+        );
+      }
+    } else {
+      // Orphan RESOLVED: no DETECTED to collapse. Move to processed/ so
+      // the queue doesn't accumulate stale resolution markers. No
+      // analytics row — orphan RESOLVEDs are silent.
+      try {
+        fs.mkdirSync(processedTo, { recursive: true });
+        fs.renameSync(
+          path.join(pendingDir, e.file),
+          path.join(processedTo, e.file),
+        );
+      } catch {
+        // ignore — concurrent drain race or already moved
+      }
+    }
+  }
+
+  // Now load the surviving detected events for the normal dispatch loop.
+  // Filter out any whose key was just collapsed (defensive: the rename
+  // above already removed the file, but loadPendingInvestigations was
+  // taken before the renames in the unlikely case of a future re-order).
+  const events = loadPendingInvestigations({ queueDir }).filter(
+    (he) => !collapsedDetectedKeys.has(`${he.runId}|${he.faultId}`),
+  );
 
   // Existing learned-pattern categories — passed to the prompt so the
   // investigator doesn't propose duplicates.

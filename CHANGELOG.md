@@ -1,5 +1,77 @@
 # Changelog
 
+## [Unreleased - fork-local] - 2026-05-20
+
+**Halt-events pipeline drain. Codex no longer investigates transient warnings; every halt event now carries real log context; two real product bugs in the orchestrator fixed.**
+
+This entry covers the 15-event backlog in `~/.gstack/skill-faults/pending-investigations/` that surfaced after the halt-events pipeline shipped in PRs #54-#62. Four distinct failure classes (plus one underlying observability bug) and two real product bugs. No top-level VERSION bump per the fork versioning rule (this is fork-local orchestrator work, not an upstream sync).
+
+A fifth failure class (plan-review CRITICAL → re-synthesis cross-run RESOLVED) was originally scoped here, but the build-skill 1.25.0 entry below replaced the `reconcilePlanReview` call path with an in-process convergence loop that does not emit a DETECTED via wrap-console. The cross-run pairing logic was removed during the merge; the per-objection orphan fix in legacy `reconcilePlanReview` was kept defensively for any caller still using that function.
+
+### The numbers that matter
+
+End-to-end verified on the dev machine. Numbers from `bun test build/orchestrator/__tests__/` and from the inbox drain itself.
+
+| Surface | Before | After | Δ |
+| --- | --- | --- | --- |
+| `snapshot.stdoutTail` on emitted halt events | always `""` | last 200 lines of `agent-stdout.log` | real context restored |
+| Codex investigations of `gbrain put canonical` noise | every drain | never (`KNOWN_BENIGN_WARN_PATTERNS` skips) | -3 events from current backlog |
+| Codex investigations of Kimi→Gemini fallback success warns | every drain | never (paired RESOLVED collapses pre-dispatch) | future events |
+| Codex investigations of broader runRoleTask primary→backup recoveries | every drain | never (Class 4 applied to non-Configured path too) | future events |
+| Review-loop overrun log | "cycle 6/5" before the prompt fires | "cycle 5/5" then prompt | off-by-one closed |
+| `discardBlindExecutionChanges` on gemini sandbox escape | refuses ("workTreeContents not captured") | rolls back cleanly | rollback unblocked |
+
+| Test surfaces added | Cases | Lines |
+| --- | --- | --- |
+| wrap-console snapshot + benign patterns | T1-T3 | ~80 |
+| helperCtxFor stdoutLog plumbing | T_CTX1-2 | ~50 |
+| emitHaltEventResolved helper | T_HER1-3 | ~95 |
+| drain-faults pair collapse | T4-T6 + load shape | ~180 |
+| review-loop cap off-by-one | T12 | ~30 |
+| BLIND_EXECUTION rollback unblocked | T13, T13b | ~50 |
+| Kimi→Gemini fallback RESOLVED | T7a-c | ~60 |
+| runRoleTask Class 4 + runId chain | T7d-i | ~100 |
+| Legacy snapshot backfill | T_LBF1-4 | ~165 |
+| Total | **26 cases / 9 files** | **~810 LoC test** |
+
+### What this means for builders
+
+If you run `gstack-build drain-faults --queue` and it finds stale `gbrain put` noise or Kimi-fallback warnings from prior builds, the queue consumer now collapses them pre-dispatch — codex never sees them. Existing legacy rows on disk can be rehydrated to non-empty `stdoutTail` via `bun gstack-upgrade/scripts/backfill-halt-snapshots.ts` (one-shot, idempotent). Real product bugs caught: the feature review-loop cap no longer logs one cycle past its threshold, and gemini sandbox escapes can now actually be rolled back.
+
+### Itemized changes
+
+#### Added
+
+- `KNOWN_BENIGN_WARN_PATTERNS` in `wrap-console.ts` — suppress warn emits the orchestrator already handles in-band (`local JSON is canonical` first entry).
+- `emitHaltEventResolved(faultId, runId, opts)` in `halt-events.ts` — writes minimal `{event:"SKILL_FAULT_RESOLVED",ts,runId,faultId}` JSON to `pending-investigations/` so the queue consumer can collapse DETECTED+RESOLVED pairs.
+- `loadPendingEntries(opts)` in `halt-events.ts` — discriminated-union view of queue entries (detected vs resolved), backing the pair-collapse pre-pass.
+- `GSTACK_BUILD_STDOUT_LOG` env var read in `helperCtxFor` (cli.ts) — launchers set this to the path of the orchestrator's stdout log so wrap-console emits carry real `pointers.stdoutLog`.
+- `GSTACK_BUILD_RUN_ID` env var published by cli.ts at launch — sub-agent fallback paths read it so producer-side faultId keys match wrap-console's DETECTED keys.
+- `gstack-upgrade/scripts/backfill-halt-snapshots.ts` — one-shot legacy snapshot rehydrator.
+
+#### Changed
+
+- `wrap-console.ts` console.warn / console.error handlers: now call `buildHaltSnapshot()` instead of hardcoding empty snapshot. Halt events carry the last 200 lines of `agent-stdout.log`.
+- `drainFaultsFromHaltEventsQueue` in `drain-faults.ts`: added pair-collapse pre-pass that moves matched DETECTED+RESOLVED pairs to `processed/` before the per-event dispatch loop. Orphan RESOLVEDs are silently moved out of pending. Existing `loadPendingInvestigations` is a back-compat wrapper filtering down to detected entries.
+- `runConfiguredRoleTask` in `sub-agents.ts`: on Kimi→Gemini fallback success (exitCode 0 + !timedOut), emits `emitHaltEventResolved` with the precomputed faultId of the wrap-console DETECTED row.
+- `runRoleTask` in `cli.ts` (the non-Configured variant — core phase / feature-review / merge-fixer flows): now mirrors the same Class 4 pattern. Precomputes faultId before `console.warn`, emits RESOLVED on backup success gated on `exitCode === 0 && !timedOut`. This was the broader unpaired surface — every successful primary→backup recovery on those paths used to leave an orphan DETECTED.
+- Fallback runId resolution chain (both `runRoleTask` and `runConfiguredRoleTask`): `opts.runId ?? process.env.GSTACK_BUILD_RUN_ID ?? opts.slug`. Producer-side faultId keys match wrap-console's DETECTED keys (which use `state.launch?.runId ?? state.slug`). Without this match, pair-collapse keys diverged when `launch.runId !== slug` and the RESOLVED never collapsed its DETECTED.
+- `plan-reviewer.ts` legacy `reconcilePlanReview`: per-objection bullet lines now print via `console.log` instead of `console.error`. `wrap-console.ts` only shims warn/error, so the previous code created one orphan `SOFT_HALT_ERROR` row per bullet. The aggregate critical message still goes through `console.error` (one DETECTED). Note: the build-skill 1.25.0 entry below replaced the cli.ts caller of this function with an in-process convergence loop, so this fix is now defensive — it protects any future caller that uses the legacy function directly.
+
+#### Fixed
+
+- `cli.ts` feature-review loop: log message no longer prints `cycle ${currentIter + 1}/${cap}` (off-by-one that produced "cycle 6/5" before the cap-extension prompt fired). Now prints `cycle ${currentIter}/${cap}`.
+- `cli.ts` gate hygiene: `captureGitSnapshot(opts.cwd)` upstream of `applyGateHygiene` now passes `{captureContents: true}`. This unblocks `discardBlindExecutionChanges` from refusing on `before.workTreeContents not captured` — gemini sandbox escapes can be rolled back cleanly.
+
+#### For contributors
+
+The DETECTED+RESOLVED pair-collapse pattern works on TWO paths:
+
+- Log-stream side: `parseFaultLog` at `drain-faults.ts:424` collapses pairs from manifest-mode `agent-stdout.log` content.
+- Queue side: the new pair-collapse pre-pass at the top of `drainFaultsFromHaltEventsQueue` reads `pending-investigations/` JSON files via `loadPendingEntries`.
+
+These are symmetric but use different inputs. New producers of transient warnings + recovery should call `emitHaltEventResolved` after the recovery succeeds so the queue-side collapse picks it up.
+
 ## [build skill 1.25.0] — 2026-05-20
 
 **Plan review now brings you in at round 1, and it bails when it stalls.**
