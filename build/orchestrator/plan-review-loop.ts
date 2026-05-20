@@ -24,6 +24,22 @@ import {
 } from "./plan-reviewer";
 
 /**
+ * Atomic file write via tmp-rename. The standard fs.writeFileSync is not
+ * crash-safe: SIGINT (or any signal) between the open and the kernel buffer
+ * flush leaves a half-written file. The plan file is read by parsers that
+ * silently skip malformed annotation blocks, so a half-write becomes silent
+ * data loss on the next round.
+ *
+ * Pattern: write to a sibling tmp file, then rename. rename(2) is atomic on
+ * the same filesystem on every Unix and on Windows when the target exists.
+ */
+function atomicWriteFile(filePath: string, content: string): void {
+  const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+  fs.writeFileSync(tmp, content, "utf8");
+  fs.renameSync(tmp, filePath);
+}
+
+/**
  * Set up a readline-based ask() helper that handles Bun's ERR_USE_AFTER_CLOSE
  * on multi-question sequences by using a lineQueue/waiter pattern instead of
  * rl.question(). Returns { ask, close }.
@@ -145,7 +161,9 @@ export type ExitReason =
   | "max_rounds_hit"
   | "user_manual"
   | "user_abort"
-  | "reviewer_unavailable";
+  | "reviewer_unavailable"
+  /** synthFn rejected or returned ok:false — runtime failure, exit code 1. */
+  | "synth_failure";
 
 /**
  * One row written to `~/.gstack/analytics/convergence.jsonl` per completed build.
@@ -490,8 +508,18 @@ export async function runTriageGateTTY(
           close?.();
           return { decisions, quitEarly: false, fastPathed: true };
         case "s":
+          // User wants to stop interacting. Default the current and all
+          // remaining objections to accept WITHOUT prompting for a rationale —
+          // the whole point of [s]top is "no more keystrokes from me." Push
+          // the current decision directly and continue the outer loop.
           stopRemaining = true;
-          decision = "accept";
+          decisions.push({
+            objectionIndex: i,
+            decision: "accept",
+            rationale: "stop-and-default-accept",
+          });
+          // Use a sentinel that skips the rationale prompt below.
+          decision = "__stop_no_rationale__" as TriageDecision["decision"];
           break;
         case "q":
           quitEarly = true;
@@ -501,6 +529,9 @@ export async function runTriageGateTTY(
           opts.output.write(`  Invalid input '${ans}'. Try again.\n`);
       }
     }
+
+    // [s]top path already pushed its decision; skip the rationale prompt.
+    if ((decision as string) === "__stop_no_rationale__") continue;
 
     const rationale = (await ask("  Rationale (optional, one line): ")).trim();
     decisions.push({ objectionIndex: i, decision, rationale });
@@ -659,6 +690,35 @@ export async function runPlanReviewLoop(
   // Key: `${location}|${severity}`. Value: rationale string the user provided.
   const priorRejectRationale = new Map<string, string>();
 
+  // Resume support: if history.jsonl already has entries (because a prior
+  // invocation exited via code 3 / user_manual / max_rounds_hit and the user
+  // re-launched), derive the next round number AND rehydrate the per-round
+  // telemetry arrays so the convergence aggregate's trajectory isn't reset.
+  //
+  // Without this, every resume restarts round=1 and produces duplicate
+  // round numbers in history.jsonl + truncated trajectory arrays in
+  // convergence.jsonl — breaking re-raise detection (priorAnnotations
+  // looks at the plan file, which IS persisted, so re-raise still fires;
+  // but the trajectory analysis loses prior-round signal).
+  //
+  // Full reRejected / disputedResolutions preservation across resume
+  // requires extending HistoryEntry (out of scope here); default to 0
+  // for missing fields.
+  const priorEntries = readHistoryEntries(input.historyPath);
+  const startRound = deriveRoundNumber(priorEntries);
+  for (const e of priorEntries) {
+    trajectoryRaw.push(e.critical);
+    trajectoryAccepted.push(e.triage?.accepted.length ?? 0);
+    reRaisesArr.push(e.convergence.reRaises);
+    reRejectedArr.push(0);
+    disputedResolutions.push(0);
+    if (e.triage) {
+      totalAccepted += e.triage.accepted.length;
+      totalRejected += e.triage.rejected.length;
+      totalDeferred += e.triage.deferred.length;
+    }
+  }
+
   const finalResult = (
     outcome: LoopOutcome,
     rounds: number,
@@ -700,7 +760,7 @@ export async function runPlanReviewLoop(
     });
   };
 
-  for (let round = 1; round <= input.maxRounds; round++) {
+  for (let round = startRound; round <= input.maxRounds; round++) {
     // 1. Reviewer call.
     const reviewStart = Date.now();
     const verdict = await input.reviewerFn(round);
@@ -745,12 +805,114 @@ export async function runPlanReviewLoop(
     // inline (annotate-and-proceed), write history, write aggregate, exit clean.
     if (verdict.verdict === "APPROVE" || critical.length === 0) {
       // Annotate IMPORTANT/SUGGESTION objections so the reviewer sees them next
-      // round and the plan file has a record. This mirrors the pre-loop
-      // reconcilePlanReview contract: auto-accept (annotate-and-proceed)
-      // IMPORTANT/SUGGESTION at this severity.
+      // round and the plan file has a record.
+      //
+      // Contract (mirrors pre-loop reconcilePlanReview):
+      // - SUGGESTION: always auto-accepted (annotate-and-proceed), no prompt.
+      // - IMPORTANT in non-TTY: auto-accept (CI / scripts contract).
+      // - IMPORTANT in TTY: prompt per-objection [y]es/[n]o/[a]ll/[s]kip-all.
+      //   Reject -> annotate with userDecision: "reject" (matches CRITICAL reject behavior).
+      //
+      // The prior version unconditionally wrote userDecision: "accept" in TTY,
+      // which silently bypassed the interactive contract the user expects from
+      // the pre-loop path (promptImportantObjections in plan-reviewer.ts).
       if (important.length > 0 || suggestion.length > 0) {
+        // Resolve per-IMPORTANT decisions first (TTY prompt or auto-accept).
+        type ImportantDecision = "accept" | "reject";
+        const importantDecisions: ImportantDecision[] = new Array(
+          important.length,
+        ).fill("accept");
+
+        if (input.isTTY && important.length > 0) {
+          // Use shared readline if available; otherwise stand up a local one.
+          let localClose: (() => void) | null = null;
+          let ask: (q: string) => Promise<string>;
+          if (sharedAsk) {
+            ask = sharedAsk;
+          } else {
+            const helper = makeReadlineAsk(input.input, input.output);
+            ask = helper.ask;
+            localClose = helper.close;
+          }
+          let acceptAll = false;
+          let skipAll = false;
+          for (let i = 0; i < important.length; i++) {
+            if (acceptAll) {
+              importantDecisions[i] = "accept";
+              continue;
+            }
+            if (skipAll) {
+              importantDecisions[i] = "reject";
+              continue;
+            }
+            const o = important[i];
+            input.output.write(
+              `\n[plan-review] IMPORTANT objection ${i + 1} of ${important.length}\n` +
+                `  Location:   ${o.location}\n` +
+                `  Issue:      ${o.issue}\n` +
+                `  Fix:        ${o.suggestion}\n`,
+            );
+            let resolved = false;
+            while (!resolved) {
+              const ans = (
+                await ask(
+                  `  Apply? [y]es / [n]o / [a]ll / [s]kip-all: `,
+                )
+              )
+                .trim()
+                .toLowerCase();
+              if (ans === "y" || ans === "yes") {
+                importantDecisions[i] = "accept";
+                resolved = true;
+              } else if (ans === "n" || ans === "no") {
+                importantDecisions[i] = "reject";
+                resolved = true;
+              } else if (ans === "a" || ans === "all") {
+                importantDecisions[i] = "accept";
+                acceptAll = true;
+                resolved = true;
+              } else if (ans === "s" || ans === "skip" || ans === "skip-all") {
+                importantDecisions[i] = "reject";
+                skipAll = true;
+                resolved = true;
+              } else {
+                input.output.write(`  Invalid '${ans}'. Try again.\n`);
+              }
+            }
+          }
+          localClose?.();
+        }
+
         let updatedPlan = fs.readFileSync(input.planPath, "utf8");
-        for (const o of [...important, ...suggestion]) {
+        let importantAccepted = 0;
+        let importantRejected = 0;
+
+        // Annotate IMPORTANTs with the resolved decision.
+        for (let i = 0; i < important.length; i++) {
+          const o = important[i];
+          const dec = importantDecisions[i];
+          const ann: RoundAnnotation = {
+            location: o.location,
+            severity: o.severity,
+            issue: o.issue,
+            suggestion: o.suggestion,
+            rounds: [
+              {
+                round,
+                userDecision: dec,
+                userRationale: "",
+                resolution: dec === "accept" ? undefined : undefined,
+                reviewerOutcome: undefined,
+              },
+            ],
+          };
+          updatedPlan = writeRoundAnnotation(updatedPlan, ann);
+          if (dec === "accept") importantAccepted += 1;
+          else importantRejected += 1;
+        }
+
+        // SUGGESTIONs always auto-accept (no prompt).
+        for (const o of suggestion) {
           const ann: RoundAnnotation = {
             location: o.location,
             severity: o.severity,
@@ -768,9 +930,10 @@ export async function runPlanReviewLoop(
           };
           updatedPlan = writeRoundAnnotation(updatedPlan, ann);
         }
-        fs.writeFileSync(input.planPath, updatedPlan, "utf8");
+
+        atomicWriteFile(input.planPath, updatedPlan);
         input.output.write(
-          `[plan-review] ${important.length} IMPORTANT + ${suggestion.length} SUGGESTION annotated inline.\n`,
+          `[plan-review] IMPORTANT: ${importantAccepted} accepted, ${importantRejected} rejected. SUGGESTION: ${suggestion.length} annotated.\n`,
         );
       }
 
@@ -778,8 +941,8 @@ export async function runPlanReviewLoop(
         round,
         ts: new Date().toISOString(),
         reviewedBy: verdict.reviewedBy,
-        verdict: "APPROVE",
-        objectionCountRaw: critical.length + important.length + suggestion.length,
+        verdict: verdict.verdict === "APPROVE" ? "APPROVE" : "REVISE",
+        objectionCountRaw: critical.length,
         critical: 0,
         important: important.length,
         suggestion: suggestion.length,
@@ -859,6 +1022,12 @@ export async function runPlanReviewLoop(
             newObjections: 0,
           },
         });
+        // Maintain parallel-array invariant on convergence aggregate.
+        // trajectoryRaw already pushed above; pad the rest with sentinels.
+        trajectoryAccepted.push(0);
+        reRaisesArr.push(0);
+        reRejectedArr.push(0);
+        disputedResolutions.push(0);
         writeAggregate({ outcome: "user_manual", round, verdict: "STALEMATE" });
         return finalResult("user_manual", round, 3, verdict);
       }
@@ -866,6 +1035,12 @@ export async function runPlanReviewLoop(
     }
 
     if (triageResult.quitEarly) {
+      // Maintain parallel-array invariant on convergence aggregate.
+      // trajectoryRaw already pushed above; pad the rest with sentinels.
+      trajectoryAccepted.push(0);
+      reRaisesArr.push(0);
+      reRejectedArr.push(0);
+      disputedResolutions.push(0);
       writeAggregate({ outcome: "user_abort", round, verdict: "ABORTED" });
       return finalResult("user_abort", round, 4, verdict);
     }
@@ -903,7 +1078,7 @@ export async function runPlanReviewLoop(
       }
       if (d.decision === "defer") deferredIdx.push(d.objectionIndex);
     }
-    fs.writeFileSync(input.planPath, updatedPlan, "utf8");
+    atomicWriteFile(input.planPath, updatedPlan);
     totalAccepted += acceptedIdx.length;
     totalRejected += rejectedIdx.length;
     totalDeferred += deferredIdx.length;
@@ -957,7 +1132,7 @@ export async function runPlanReviewLoop(
     };
     // updatedPlan was just written to disk; reuse the in-memory string.
     const planAfterHistory = updateRoundHistoryHeader(updatedPlan, histEntry);
-    fs.writeFileSync(input.planPath, planAfterHistory, "utf8");
+    atomicWriteFile(input.planPath, planAfterHistory);
 
     // 8. Check adaptive cap.
     const decision = shouldBailAdaptive({
@@ -1007,8 +1182,25 @@ export async function runPlanReviewLoop(
     }
 
     // 9. Invoke synthesizer.
+    //
+    // Wrap in try/catch so a synth failure doesn't crash the entire loop
+    // mid-iteration (which would leave convergence.jsonl unwritten and the
+    // plan file in whatever state the synth left it). Instead, log + push
+    // a telemetry sentinel + continue. The next round's reviewer will re-read
+    // the plan file and surface any structural damage as fresh objections.
     const synthStart = Date.now();
-    await input.synthFn();
+    try {
+      await input.synthFn();
+    } catch (err) {
+      console.warn(
+        `[plan-review-loop] synth failed at round ${round}: ${(err as Error).message}`,
+      );
+      synthWallTimeS += Math.round((Date.now() - synthStart) / 1000);
+      // Push placeholder for telemetry parity. Skip step 9a (annotation
+      // parse) because the plan file may be half-written from a crashed synth.
+      disputedResolutions.push(0);
+      continue;
+    }
     synthWallTimeS += Math.round((Date.now() - synthStart) / 1000);
 
     // 9a. Count disputed resolutions in this round's annotations.

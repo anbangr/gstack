@@ -313,4 +313,307 @@ describe("runPlanReviewLoop", () => {
     expect(result.outcome).toBe("user_manual");
     expect(result.exitCode).toBe(3);
   });
+
+  it("TTY mode prompts per-IMPORTANT objection on REVISE-with-no-CRITICAL (not silent auto-accept)", async () => {
+    // Reviewer returns REVISE with 2 IMPORTANT, 1 SUGGESTION, 0 CRITICAL.
+    // Loop should hit the early-return branch but prompt the user in TTY mode.
+    const verdicts: PlanReviewVerdict[] = [
+      {
+        verdict: "REVISE",
+        objections: [
+          { severity: "IMPORTANT", location: "F1, P1", issue: "imp-1", suggestion: "fix-1" },
+          { severity: "IMPORTANT", location: "F1, P2", issue: "imp-2", suggestion: "fix-2" },
+          { severity: "SUGGESTION", location: "F1, P3", issue: "sug-1", suggestion: "fix-3" },
+        ],
+        assessment: "",
+        reviewedBy: "stub",
+        round: 1,
+      },
+    ];
+    let rIdx = 0;
+    const reviewerFn = async () => verdicts[rIdx++];
+    const synthFn = async () => ({ ok: true });
+    // User answers: y (accept imp-1), n (reject imp-2). SUGGESTION auto-accepts.
+    const input = readableFrom("y\nn\n");
+    const out = captureWriter();
+    const result = await runPlanReviewLoop({
+      planPath,
+      historyPath: path.join(tmpDir, "history.jsonl"),
+      aggregatePath: path.join(tmpDir, "convergence.jsonl"),
+      slug: "tty-important",
+      branch: "feat/tty-important",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: true,
+      input,
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
+    });
+    expect(result.outcome).toBe("approved");
+    expect(result.rounds).toBe(1);
+    // Output must show the per-objection prompt (proves we didn't silently auto-accept).
+    const written = out.read();
+    expect(written).toContain("IMPORTANT objection 1 of 2");
+    expect(written).toContain("IMPORTANT objection 2 of 2");
+    expect(written).toContain("Apply?");
+    // Plan must contain annotations for both IMPORTANTs (one accept, one reject)
+    // plus the SUGGESTION (auto-accept). Read raw plan and check the USER: values.
+    const plan = fs.readFileSync(planPath, "utf8");
+    // The annotation block format includes "ROUND N USER: accept|reject".
+    expect(plan).toMatch(/USER:\s*accept/);
+    expect(plan).toMatch(/USER:\s*reject/);
+  });
+
+  it("TTY mode: [a]ll on IMPORTANT prompt accepts all remaining without further prompts", async () => {
+    const verdicts: PlanReviewVerdict[] = [
+      {
+        verdict: "REVISE",
+        objections: [
+          { severity: "IMPORTANT", location: "F1, P1", issue: "imp-1", suggestion: "fix-1" },
+          { severity: "IMPORTANT", location: "F1, P2", issue: "imp-2", suggestion: "fix-2" },
+          { severity: "IMPORTANT", location: "F1, P3", issue: "imp-3", suggestion: "fix-3" },
+        ],
+        assessment: "",
+        reviewedBy: "stub",
+        round: 1,
+      },
+    ];
+    let rIdx = 0;
+    const reviewerFn = async () => verdicts[rIdx++];
+    const synthFn = async () => ({ ok: true });
+    // Only one keystroke: "a" (accept all). Subsequent IMPORTANTs must not prompt.
+    const input = readableFrom("a\n");
+    const out = captureWriter();
+    const result = await runPlanReviewLoop({
+      planPath,
+      historyPath: path.join(tmpDir, "history.jsonl"),
+      aggregatePath: path.join(tmpDir, "convergence.jsonl"),
+      slug: "tty-all",
+      branch: "feat/tty-all",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: true,
+      input,
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
+    });
+    expect(result.outcome).toBe("approved");
+    const plan = fs.readFileSync(planPath, "utf8");
+    // All three IMPORTANTs accepted; no rejects.
+    const accepts = (plan.match(/USER:\s*accept/g) ?? []).length;
+    const rejects = (plan.match(/USER:\s*reject/g) ?? []).length;
+    expect(accepts).toBe(3);
+    expect(rejects).toBe(0);
+  });
+
+  it("non-TTY auto-accept on REVISE-with-no-CRITICAL still annotates without prompting", async () => {
+    const verdicts: PlanReviewVerdict[] = [
+      {
+        verdict: "REVISE",
+        objections: [
+          { severity: "IMPORTANT", location: "F1, P1", issue: "imp-1", suggestion: "fix-1" },
+          { severity: "SUGGESTION", location: "F1, P3", issue: "sug-1", suggestion: "fix-3" },
+        ],
+        assessment: "",
+        reviewedBy: "stub",
+        round: 1,
+      },
+    ];
+    let rIdx = 0;
+    const reviewerFn = async () => verdicts[rIdx++];
+    const synthFn = async () => ({ ok: true });
+    const out = captureWriter();
+    const result = await runPlanReviewLoop({
+      planPath,
+      historyPath: path.join(tmpDir, "history.jsonl"),
+      aggregatePath: path.join(tmpDir, "convergence.jsonl"),
+      slug: "nonTty",
+      branch: "feat/nonTty",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: false,
+      input: readableFrom(""),
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
+    });
+    expect(result.outcome).toBe("approved");
+    const written = out.read();
+    expect(written).not.toContain("Apply?");
+  });
+
+  it("resume after exit-3: starts round numbering from prior history.jsonl max + 1", async () => {
+    // Seed history.jsonl with two prior round entries (as if a prior exit-3
+    // run wrote them, then user re-launched).
+    const historyPath = path.join(tmpDir, "history.jsonl");
+    const seed = [
+      {
+        round: 1,
+        ts: new Date().toISOString(),
+        reviewedBy: "stub",
+        verdict: "REVISE" as const,
+        objectionCountRaw: 2,
+        critical: 2,
+        important: 0,
+        suggestion: 0,
+        triage: { accepted: [0, 1], rejected: [], deferred: [] },
+        convergence: {
+          delta: null,
+          noForwardProgress: false,
+          reRaises: 0,
+          newObjections: 2,
+        },
+      },
+      {
+        round: 2,
+        ts: new Date().toISOString(),
+        reviewedBy: "stub",
+        verdict: "REVISE" as const,
+        objectionCountRaw: 1,
+        critical: 1,
+        important: 0,
+        suggestion: 0,
+        triage: { accepted: [0], rejected: [], deferred: [] },
+        convergence: {
+          delta: -1,
+          noForwardProgress: false,
+          reRaises: 0,
+          newObjections: 1,
+        },
+      },
+    ];
+    fs.writeFileSync(
+      historyPath,
+      seed.map((e) => JSON.stringify(e)).join("\n") + "\n",
+      "utf8",
+    );
+
+    // Reviewer returns APPROVE immediately on the next call (round 3).
+    const reviewerFn = async (): Promise<PlanReviewVerdict> => ({
+      verdict: "APPROVE",
+      objections: [],
+      assessment: "",
+      reviewedBy: "stub",
+      round: 3,
+    });
+    const synthFn = async () => ({ ok: true });
+    const out = captureWriter();
+    const result = await runPlanReviewLoop({
+      planPath,
+      historyPath,
+      aggregatePath: path.join(tmpDir, "convergence.jsonl"),
+      slug: "resume",
+      branch: "feat/resume",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: false,
+      input: readableFrom(""),
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
+    });
+    expect(result.outcome).toBe("approved");
+    // result.rounds is the round number at exit; with prior entries 1+2,
+    // the resumed APPROVE call must have been round 3.
+    expect(result.rounds).toBe(3);
+
+    // History should now have 3 lines (the 2 seeded + 1 new). All round
+    // numbers must be unique and sequential (no duplicate "1" or "2").
+    const lines = fs
+      .readFileSync(historyPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as { round: number });
+    expect(lines.length).toBe(3);
+    const rounds = lines.map((l) => l.round).sort((a, b) => a - b);
+    expect(rounds).toEqual([1, 2, 3]);
+
+    // Convergence aggregate should have trajectory of length 3 (prior 2
+    // rehydrated + this round's 0). Verifies INFO #8 parity AND CRITICAL #6
+    // rehydration.
+    const agg = JSON.parse(
+      fs.readFileSync(path.join(tmpDir, "convergence.jsonl"), "utf8").trim(),
+    );
+    expect(agg.trajectoryRaw.length).toBe(3);
+    expect(agg.trajectoryAccepted.length).toBe(3);
+    expect(agg.reRaises.length).toBe(3);
+    expect(agg.disputedResolutions.length).toBe(3);
+  });
+
+  it("synthFn rejection is caught and the loop continues to the next round", async () => {
+    let reviewCalls = 0;
+    const reviewerFn = async (round: number): Promise<PlanReviewVerdict> => {
+      reviewCalls += 1;
+      if (round >= 2) {
+        // Second call: approve so the loop terminates cleanly.
+        return {
+          verdict: "APPROVE",
+          objections: [],
+          assessment: "",
+          reviewedBy: "stub",
+          round,
+        };
+      }
+      return {
+        verdict: "REVISE",
+        objections: [
+          {
+            severity: "CRITICAL",
+            location: "F1, P1",
+            issue: "x",
+            suggestion: "y",
+          },
+        ],
+        assessment: "",
+        reviewedBy: "stub",
+        round,
+      };
+    };
+    let synthCalls = 0;
+    const synthFn = async () => {
+      synthCalls += 1;
+      throw new Error("synth boom");
+    };
+    const out = captureWriter();
+    const result = await runPlanReviewLoop({
+      planPath,
+      historyPath: path.join(tmpDir, "history.jsonl"),
+      aggregatePath: path.join(tmpDir, "convergence.jsonl"),
+      slug: "synthfail",
+      branch: "feat/synthfail",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: false,
+      input: readableFrom(""),
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
+    });
+    // Loop survived the synth failure and continued to round 2's APPROVE.
+    expect(result.outcome).toBe("approved");
+    expect(synthCalls).toBe(1);
+    expect(reviewCalls).toBe(2);
+    expect(result.rounds).toBe(2);
+    // Convergence aggregate must still be written.
+    expect(
+      fs.existsSync(path.join(tmpDir, "convergence.jsonl")),
+    ).toBe(true);
+  });
 });

@@ -9835,12 +9835,27 @@ async function main() {
           logDir(slug),
           "plan-review-history.jsonl",
         );
-        const aggregatePath = path.join(
-          process.env.HOME ?? "",
-          ".gstack",
-          "analytics",
-          "convergence.jsonl",
-        );
+        // Resolve aggregatePath with a layered HOME fallback. Containers and
+        // some Lambda-style runtimes have HOME unset; if both process.env.HOME
+        // and os.homedir() come back empty, path.join("", ...) produces a
+        // relative path that lands inside the project worktree (polluting it
+        // with analytics data). Fall back to os.tmpdir() and warn loudly so
+        // operators can fix their env.
+        const aggregatePath = (() => {
+          const home = process.env.HOME || os.homedir();
+          if (!home) {
+            const fallback = path.join(
+              os.tmpdir(),
+              ".gstack-analytics",
+              "convergence.jsonl",
+            );
+            console.warn(
+              `[plan-review] HOME and os.homedir() both empty; convergence telemetry will go to ${fallback}`,
+            );
+            return fallback;
+          }
+          return path.join(home, ".gstack", "analytics", "convergence.jsonl");
+        })();
 
         const reviewerFn = async (round: number) =>
           runPlanReview({
