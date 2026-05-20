@@ -133,6 +133,47 @@ export function emitHaltEvent(
   return faultId;
 }
 
+/**
+ * Minimal "this fault recovered" marker. Written to the same
+ * pending-investigations/ queue as DETECTED rows so the queue consumer
+ * (drainFaultsFromHaltEventsQueue) can collapse DETECTED+RESOLVED pairs
+ * by (runId, faultId) before dispatching codex. The on-disk filename
+ * pattern `<safeRunId>-RESOLVED-<faultId>.json` distinguishes resolution
+ * rows from emit rows so the consumer can classify each file in one pass.
+ *
+ * Returns true on successful write, false on failure (with stderr warn).
+ * Callers SHOULD check the return value so a missing RESOLVED row never
+ * silently leaves a DETECTED row in the queue.
+ */
+export function emitHaltEventResolved(
+  faultId: string,
+  runId: string,
+  opts?: { queueDir?: string; now?: Date },
+): boolean {
+  try {
+    const timestamp = (opts?.now ?? new Date()).toISOString();
+    const dir = pendingInvestigationsDir(opts);
+    fs.mkdirSync(dir, { recursive: true });
+    const safeRun = safeRegistryRunId(runId);
+    const finalPath = path.join(dir, `${safeRun}-RESOLVED-${faultId}.json`);
+    const tmpPath = `${finalPath}.tmp.${process.pid}`;
+    const body = {
+      event: "SKILL_FAULT_RESOLVED" as const,
+      timestamp,
+      runId,
+      faultId,
+    };
+    fs.writeFileSync(tmpPath, JSON.stringify(body, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmpPath, finalPath);
+    return true;
+  } catch (err) {
+    process.stderr.write(
+      `[emitHaltEventResolved] failed to write RESOLVED for faultId=${faultId} runId=${runId}: ${(err as Error).message}\n`,
+    );
+    return false;
+  }
+}
+
 export function loadPendingInvestigations(opts?: {
   queueDir?: string;
 }): HaltEvent[] {

@@ -217,12 +217,20 @@ import { installWrapConsole } from "./wrap-console";
  * string and downstream tests stay structural.
  */
 function helperCtxFor(state: BuildState) {
+  // GSTACK_BUILD_STDOUT_LOG is set by the launcher (monitor / SKILL.md.tmpl
+  // launch block) to the path of the agent-stdout.log the orchestrator's
+  // own stdout is being piped to. Reading it here lets wrap-console emit
+  // halt events with a real log path so buildHaltSnapshot can populate
+  // snapshot.stdoutTail with actual context. When unset (early startup,
+  // tests, or legacy launcher), falls back to "" — buildHaltSnapshot
+  // handles the empty path via its try/catch and the emit succeeds with
+  // an empty stdoutTail.
   return {
     runId: state.launch?.runId ?? state.slug,
     stateSlug: state.slug,
     pointers: {
       stateFile: statePath(state.slug),
-      stdoutLog: "",
+      stdoutLog: process.env.GSTACK_BUILD_STDOUT_LOG ?? "",
       livingPlan: state.planFile,
       worktreePath: state.launch?.projectRoot ?? "",
     },
