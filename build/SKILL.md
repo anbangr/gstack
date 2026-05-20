@@ -1605,29 +1605,32 @@ prior commit.
    _mark_manifest_claims_manifested
    ```
 
-5.5. **Second Opinion — planReviewer exit handling**: The normal `gstack-build` launch (Step M1/M2 below) runs the configured `planReviewer` role at startup before Phase 1 of Feature 1. When it exits with **code 3** (`PLAN_REVIEW_CRITICAL`), handle it here:
+5.5. **Second Opinion — planReviewer exit handling**: The `gstack-build` startup (Step M1/M2 below) runs the configured `planReviewer` role at startup before Phase 1 of Feature 1, looping in-process with user triage gates and an adaptive cap. Most rounds resolve inside the CLI — this step only handles three exit codes:
 
-   1. Read `~/.gstack/build-state/<stateSlug>/plan-review-report.json` (where `stateSlug` is `runs[0].stateSlug` from the manifest). Extract the `objections` array (CRITICAL severity only) and the `round` field.
+   - **Exit 0 (APPROVED)**: The annotation header is already written to the plan file. Proceed to Phase M1.
+   - **Exit 1 (runtime error)**: Existing error path. See Step M3.
+   - **Exit 2 (test failure)**: Existing test-fix path. See Step M3.
 
-   2. Based on `round`:
-      - **Round 1 or 2**: Re-invoke the `planSynthesizer` (same provider/model as Step 5) with a targeted revision prompt:
-        ```
-        You previously synthesized a living plan. A second-opinion reviewer flagged CRITICAL objections.
-        Revise ONLY the sections with CRITICAL objections listed below. Keep everything else unchanged.
-        Write the revised plan to the same living-plan file path.
+   - **Exit 3 (STALEMATE)**: User picked `[m]anual mode` at the bail-out or stalemate gate, OR the non-TTY `fail-fast` mode fired on a CRITICAL round.
 
-        CRITICAL objections:
-        <paste objections from plan-review-report.json>
-        ```
-        Then re-launch `gstack-build` (go back to Step M1/M2). The reviewer will run again on the revised plan.
-      - **Round 3 stalemate**: AskUser with options:
-        - A) Override — proceed with the current plan as-is (pass `--no-plan-review` to skip the reviewer)
-        - B) Accept the reviewer's suggested fixes — manually edit the living plan, then re-launch
-        - C) Edit manually — open the living plan file and resolve the objections yourself
+     1. Read `~/.gstack/build-state/<stateSlug>/plan-review-report.json` (where `stateSlug` is `runs[0].stateSlug` from the manifest). Extract the `objections` array (CRITICAL severity only) and the `round` field. Also read `~/.gstack/build-state/<stateSlug>/plan-review-history.jsonl` for the full trajectory.
 
-   If `gstack-build` exits with **code 0**: the reviewer approved or auto-accepted IMPORTANT objections, and the annotation header was already written to the plan file. Proceed normally.
+     2. AskUser with options:
+        - A) **Override** — proceed with the current plan as-is (re-launch `gstack-build` with `--no-plan-review`)
+        - B) **Apply suggested fixes** — read the CRITICAL objections, edit the plan file manually, then re-launch (the loop will restart from round 1 because the plan changed substantively; alternatively keep history.jsonl and the next reviewer call will see the prior rounds)
+        - C) **Edit manually** — open the living plan file in `$EDITOR`, resolve the objections by hand, then re-launch
 
-   If `gstack-build` exits with **code 1** (runtime error) or **code 2** (test failure): handle as usual (see Step M3).
+   - **Exit 4 (USER ABORT)**: User picked `[q]uit` at the triage gate or stalemate gate.
+
+     1. Print the state paths: plan file, `plan-review-report.json`, `plan-review-history.jsonl`.
+     2. Tell the user: "State left intact. When ready, run `gstack-build resume --gstack-repo <repo> --project-root <repo>` and the loop will pick up from where you stopped."
+     3. Exit without prompting further. The user resumes on their own schedule.
+
+   - **Exit 130 (SIGINT)**: User Ctrl+C'd during triage.
+
+     1. Print the resume command (same as Exit 4) and exit.
+
+   The cross-round annotation history is already in the plan file as `<!-- gstack-plan-review-history -->` and per-phase `<!-- ROUND N -->` blocks. The reviewer reads them automatically on the next launch. Manual edits to the plan should preserve these annotations so the next round's reviewer has context.
 
 5.7. **Branch Strategy Decision**: Read the living plan file (path from `build-synthesis-output.md`). Reason holistically about the features: are they tightly coupled and form one coherent deliverable, or do they have independent shipping value?
 

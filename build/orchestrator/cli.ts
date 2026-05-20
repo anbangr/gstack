@@ -117,11 +117,8 @@ import {
   type ParsedFeatureVerdict,
 } from "./feature-review";
 import { promptYesNo, buildBlockedFeatureMd } from "./feature-review-prompt";
-import {
-  runPlanReview,
-  reconcilePlanReview,
-  readPlanReviewRound,
-} from "./plan-reviewer";
+import { runPlanReview, SYNTH_REVISION_PROMPT } from "./plan-reviewer";
+import { runPlanReviewLoop } from "./plan-review-loop";
 import { shipAndDeploy, shipOnly } from "./ship";
 import { runReleaseDaemon, retryReleaseQueueRecord } from "./release-daemon";
 import {
@@ -722,6 +719,12 @@ export interface Args {
   noPlanReview: boolean;
   /** Override the planReviewer model for this run (e.g. a-provider-model). */
   planReviewerModel?: string;
+  /** Max plan-review rounds before stalemate (1..20). Default 5. */
+  planReviewMaxRounds?: number;
+  /** Disable the adaptive "no forward progress" bail-out trigger. */
+  planReviewNoAdaptiveCap?: boolean;
+  /** CI behavior when a CRITICAL objection lands without a TTY. */
+  planReviewNoninteractive?: "auto-accept" | "fail-fast" | "auto-reject";
   /** Manifest path for gstack-build monitor mode. */
   monitorManifest?: string;
   /** Evaluate the monitor once, primarily for tests/debug. */
@@ -892,6 +895,9 @@ export function parseArgs(argv: string[]): Args {
     featureReviewMaxIter: DEFAULT_FEATURE_REVIEW_MAX_ITER,
     noPlanReview: false,
     planReviewerModel: undefined,
+    planReviewMaxRounds: 5,
+    planReviewNoAdaptiveCap: false,
+    planReviewNoninteractive: "auto-accept",
     monitorManifest: undefined,
     monitorOnce: false,
     monitorWatch: false,
@@ -945,7 +951,8 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.learnFaultPatternsPromote = next;
-    } else if (a === "--auto-promote") args.learnFaultPatternsAutoPromote = true;
+    } else if (a === "--auto-promote")
+      args.learnFaultPatternsAutoPromote = true;
     else if (a === "--skip-ship") args.skipShip = true;
     else if (a === "--single-branch") args.singleBranch = true;
     else if (a === "--ship-on-plan-complete") args.shipOnPlanComplete = true;
@@ -977,6 +984,45 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.planReviewerModel = next;
+    } else if (a === "--plan-review-no-adaptive-cap") {
+      args.planReviewNoAdaptiveCap = true;
+    } else if (a.startsWith("--plan-review-max-rounds=")) {
+      const v = parseInt(a.split("=")[1] ?? "", 10);
+      if (!Number.isFinite(v) || v < 1 || v > 20) {
+        console.error("--plan-review-max-rounds requires an integer 1..20");
+        process.exit(2);
+      }
+      args.planReviewMaxRounds = v;
+    } else if (a === "--plan-review-max-rounds") {
+      const v = parseInt(argv[++i] ?? "", 10);
+      if (!Number.isFinite(v) || v < 1 || v > 20) {
+        console.error("--plan-review-max-rounds requires an integer 1..20");
+        process.exit(2);
+      }
+      args.planReviewMaxRounds = v;
+    } else if (a.startsWith("--plan-review-noninteractive=")) {
+      const m = a.split("=")[1] ?? "";
+      if (m !== "auto-accept" && m !== "fail-fast" && m !== "auto-reject") {
+        // Throw rather than process.exit so tests can assert this branch
+        // without tearing down the runner. The top-level main() catches
+        // and exits non-zero for the real CLI path.
+        throw new Error(
+          "--plan-review-noninteractive must be one of: auto-accept, fail-fast, auto-reject",
+        );
+      }
+      args.planReviewNoninteractive = m;
+    } else if (a === "--plan-review-noninteractive") {
+      const next = argv[++i];
+      if (
+        next !== "auto-accept" &&
+        next !== "fail-fast" &&
+        next !== "auto-reject"
+      ) {
+        throw new Error(
+          "--plan-review-noninteractive must be one of: auto-accept, fail-fast, auto-reject",
+        );
+      }
+      args.planReviewNoninteractive = next;
     } else if (a === "--allow-submodule-recovery") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
@@ -2743,6 +2789,11 @@ Flags:
   --monitor-agent-model <m>        Default: ${DEFAULT_ROLE_CONFIGS.monitorAgent.model}.
   --plan-reviewer-model <m>        Default: ${DEFAULT_ROLE_CONFIGS.planReviewer.model}.
   --no-plan-review         Skip the planReviewer second-opinion pass at startup.
+  --plan-review-max-rounds <N>     Default: 5. Maximum rounds before stalemate. Bump for legit deep convergence.
+  --plan-review-no-adaptive-cap    Disable the no-forward-progress bail-out trigger.
+  --plan-review-noninteractive <m> Default: auto-accept. CI behavior on CRITICAL objections:
+                                   auto-accept (accept all, re-synth), fail-fast (exit 3 immediately),
+                                   auto-reject (reject all, proceed annotated).
   --<role>-provider <p>            claude|codex|gemini|kimi. Dual-impl implementors and judge are model-agnostic.
   --<role>-reasoning <r>           low|medium|high|xhigh.
   --<role>-command <cmd>           For review, review-secondary, qa, ship, and land.
@@ -3632,7 +3683,12 @@ export function restartFeatureFromOriginIssues(args: {
     // Emit PHASE_REWIND so the halt-events pipeline can observe that a
     // committed phase was rewound (signal of origin verification failure).
     // rewindPhase sets phaseState.status to the target value (and emits).
-    rewindPhase(args.state, phaseIndex, "tests_green", helperCtxFor(args.state));
+    rewindPhase(
+      args.state,
+      phaseIndex,
+      "tests_green",
+      helperCtxFor(args.state),
+    );
   } else {
     phaseState.status = "tests_green";
   }
@@ -5685,11 +5741,9 @@ export function markPhaseCommittedAfterManualRecovery(args: {
         // hooks are a real quality signal; if they fail, the operator sees
         // the hook output and can decide whether to fix or fall back to
         // --force-dirty.
-        const stageR = spawnSync(
-          "git",
-          ["-C", args.cwd, "add", "--", "."],
-          { encoding: "utf8" },
-        );
+        const stageR = spawnSync("git", ["-C", args.cwd, "add", "--", "."], {
+          encoding: "utf8",
+        });
         if (stageR.status !== 0) {
           return {
             ok: false,
@@ -6758,12 +6812,7 @@ async function runPhase(args: {
           mockResult({ exitCode: 1, stderr: msg }),
         );
         state.phases[phase.index] = phaseState;
-        markPhaseFailed(
-          state,
-          phaseState.index,
-          msg,
-          helperCtxFor(state),
-        );
+        markPhaseFailed(state, phaseState.index, msg, helperCtxFor(state));
         saveState(state, { noGbrain, log: console.warn });
         continue;
       }
@@ -7131,12 +7180,7 @@ async function runPhase(args: {
       } catch (err) {
         const msg = `Dual implementation crashed unexpectedly: ${(err as Error).message}`;
         state.phases[phase.index] = phaseState;
-        markPhaseFailed(
-          state,
-          phaseState.index,
-          msg,
-          helperCtxFor(state),
-        );
+        markPhaseFailed(state, phaseState.index, msg, helperCtxFor(state));
         saveState(state, { noGbrain, log: console.warn });
       } finally {
         if (!dualImplOk) {
@@ -9181,7 +9225,10 @@ async function runLearnFaultPatternsMode(args: Args): Promise<number> {
 
   if (args.learnFaultPatternsPromote) {
     const ids = new Set(
-      args.learnFaultPatternsPromote.split(",").map((s) => s.trim()).filter(Boolean),
+      args.learnFaultPatternsPromote
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
     );
     const toPromote = keep.filter((p) => ids.has(p.faultId));
     const deferred = keep.filter((p) => !ids.has(p.faultId));
@@ -9345,7 +9392,9 @@ async function main() {
         (args.monitorManifest ? ` (manifest=${args.monitorManifest})` : "") +
         (args.drainFaultsQueueMode ? ` (queue)` : ""),
       pointers: {
-        stateFile: args.planFile ? statePath(deriveStateSlug(args.planFile)) : "",
+        stateFile: args.planFile
+          ? statePath(deriveStateSlug(args.planFile))
+          : "",
         stdoutLog: "",
         livingPlan: args.planFile ?? "",
         worktreePath: process.cwd(),
@@ -9762,11 +9811,17 @@ async function main() {
 
       // Plan review: second-opinion pass before Phase 1 of Feature 1.
       // Skipped in dry-run, when --no-plan-review is set, or on resume (already reviewed).
+      // Resume re-runs the loop when prior session left a pending status:
+      //   - critical_exit_pending: stalemate at exit 3 → user picked manual mode
+      //   - user_aborted: user picked [q] / SIGINT → docs promise resume picks up
+      //   - synth_failure: synth crashed → loop never reached APPROVE
       if (
         !args.dryRun &&
         !args.noPlanReview &&
         (!state.planReview ||
-          (state.planReview as any).status === "critical_exit_pending")
+          (state.planReview as any).status === "critical_exit_pending" ||
+          (state.planReview as any).status === "user_aborted" ||
+          (state.planReview as any).status === "synth_failure")
       ) {
         const reviewRole = { ...args.roles.planReviewer };
         if (args.planReviewerModel) reviewRole.model = args.planReviewerModel;
@@ -9774,29 +9829,157 @@ async function main() {
           logDir(slug),
           "plan-review-report.json",
         );
-        const verdict = await runPlanReview({
+        const historyPath = path.join(
+          logDir(slug),
+          "plan-review-history.jsonl",
+        );
+        // Resolve aggregatePath with a layered HOME fallback. Containers and
+        // some Lambda-style runtimes have HOME unset; if both process.env.HOME
+        // and os.homedir() come back empty, path.join("", ...) produces a
+        // relative path that lands inside the project worktree (polluting it
+        // with analytics data). Fall back to os.tmpdir() and warn loudly so
+        // operators can fix their env.
+        const aggregatePath = (() => {
+          const home = process.env.HOME || os.homedir();
+          if (!home) {
+            const fallback = path.join(
+              os.tmpdir(),
+              ".gstack-analytics",
+              "convergence.jsonl",
+            );
+            console.warn(
+              `[plan-review] HOME and os.homedir() both empty; convergence telemetry will go to ${fallback}`,
+            );
+            return fallback;
+          }
+          return path.join(home, ".gstack", "analytics", "convergence.jsonl");
+        })();
+
+        const reviewerFn = async (round: number) =>
+          runPlanReview({
+            planPath: args.planFile,
+            role: reviewRole,
+            slug,
+            timeoutMs: BUILD_DEFAULTS.timeoutsMs.planReview,
+            logDirPath: logDir(slug),
+            cwd,
+            round,
+          });
+
+        // No dedicated planSynthesizer role exists yet (Task 10 lands ahead of
+        // that). Fall back to planReviewer's role config so the synth step uses
+        // a Claude with a sane prompt budget and timeout. Once the role is
+        // added in a later task, swap `(args.roles as any).planSynthesizer` in.
+        const synthRole =
+          (args.roles as any).planSynthesizer ?? args.roles.planReviewer;
+        const synthFn = async () => {
+          const synthInputPath = path.join(
+            logDir(slug),
+            "plan-synth-revise-input.md",
+          );
+          const synthOutputPath = path.join(
+            logDir(slug),
+            "plan-synth-revise-output.md",
+          );
+          fs.writeFileSync(
+            synthInputPath,
+            `${SYNTH_REVISION_PROMPT}\n\nPlan file path: ${args.planFile}\n`,
+            "utf8",
+          );
+          fs.writeFileSync(synthOutputPath, "", "utf8");
+          // H2: propagate the SubAgentResult's exit-code as `ok`. A synth
+          // that hit a timeout (timedOut/stallKilled), a non-zero exit
+          // (model-not-found, prompt-too-large, transport error), or any
+          // other failure mode must NOT silently masquerade as success.
+          // runPlanReviewLoop checks `ok` and routes ok:false through the
+          // synth_failure exit reason.
+          const synthResult = await runConfiguredRoleTask({
+            inputFilePath: synthInputPath,
+            outputFilePath: synthOutputPath,
+            cwd,
+            slug,
+            phaseNumber: "plan",
+            iteration: 1,
+            logPrefix: "plan-synth-revise",
+            role: synthRole,
+            timeoutMs:
+              (BUILD_DEFAULTS.timeoutsMs as any).planSynthesizer ??
+              BUILD_DEFAULTS.timeoutsMs.planReview,
+            gate: false,
+          });
+          return {
+            ok: synthResult.exitCode === 0 && !synthResult.timedOut,
+          };
+        };
+
+        const loopResult = await runPlanReviewLoop({
           planPath: args.planFile,
-          role: reviewRole,
+          historyPath,
+          aggregatePath,
           slug,
-          timeoutMs: BUILD_DEFAULTS.timeoutsMs.planReview,
-          logDirPath: logDir(slug),
-          cwd,
-          round: readPlanReviewRound(planReviewReportPath),
+          branch: getCurrentBranch(cwd) || "unknown",
+          reviewerFn,
+          synthFn,
+          maxRounds: args.planReviewMaxRounds ?? 5,
+          adaptiveEnabled: !args.planReviewNoAdaptiveCap,
+          nonInteractiveMode: args.planReviewNoninteractive ?? "auto-accept",
+          isTTY: !!process.stdin.isTTY,
+          input: process.stdin,
+          output: process.stdout,
+          reviewerName: reviewRole.model,
+          synthesizerName: synthRole.model,
         });
-        const outcome = await reconcilePlanReview(verdict, args.planFile, {
+
+        // Persist legacy plan-review-report.json so SKILL.md.tmpl Step 5.5
+        // stalemate handler keeps working until Task 16 shrinks it.
+        fs.writeFileSync(
           planReviewReportPath,
-        });
-        if (outcome === "critical_exit") {
-          // Persist sentinel so the gate re-fires on resume instead of looping infinitely.
+          JSON.stringify(loopResult.finalVerdict, null, 2),
+          "utf8",
+        );
+
+        if (loopResult.exitCode === 3) {
+          // Stalemate (user picked [m] / non-TTY fail-fast on CRITICAL).
           state.planReview = {
-            ...verdict,
+            ...loopResult.finalVerdict,
             status: "critical_exit_pending",
           } as any;
           saveState(state, { noGbrain: args.noGbrain, log: console.warn });
-          // Throw ExitError so the finally block can release the lock before exit.
           throw new ExitError(3);
         }
-        state.planReview = verdict;
+        if (loopResult.exitCode === 4) {
+          // User abort at gate.
+          state.planReview = {
+            ...loopResult.finalVerdict,
+            status: "user_aborted",
+          } as any;
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+          throw new ExitError(4);
+        }
+        if (loopResult.exitCode === 130) {
+          // SIGINT during triage.
+          state.planReview = {
+            ...loopResult.finalVerdict,
+            status: "user_aborted",
+          } as any;
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+          throw new ExitError(130);
+        }
+        if (loopResult.exitCode === 1) {
+          // synth_failure or runtime error. The plan was NOT successfully
+          // reviewed (synth crashed mid-loop, model unavailable, etc.). Do
+          // not let the build proceed into implementation as if review
+          // succeeded — that would silently bypass the plan-review gate
+          // on runtime failure. Persist the marker so resume re-runs the
+          // loop, then exit 1.
+          state.planReview = {
+            ...loopResult.finalVerdict,
+            status: "synth_failure",
+          } as any;
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+          throw new ExitError(1);
+        }
+        state.planReview = loopResult.finalVerdict;
         saveState(state, { noGbrain: args.noGbrain, log: console.warn });
       }
 
