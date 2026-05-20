@@ -62,12 +62,12 @@ const HOME_WRITERS = [
  */
 function fileIsolatesGstackHome(src: string): boolean {
   // Pattern 1: file-level helper. The import line proves a real binding
-  // (not a comment match); the call line proves it actually fires.
+  // (not a comment match); the call scan proves it fires before test bodies.
   const importsHelper =
     /import\s*\{[^}]*\buseIsolatedGstackHome\b[^}]*\}\s*from\s*["'](?:\.\/helpers\/test-home|(?:\.\.\/)+test\/helpers\/test-home)["']/.test(
       src,
     );
-  const callsHelper = /^\s*useIsolatedGstackHome\s*\(/m.test(src);
+  const callsHelper = callsGstackHomeHelperOutsideTestBody(src);
   if (importsHelper && callsHelper) return true;
 
   // Pattern 2: a beforeEach block that sets GSTACK_HOME. Find every
@@ -91,6 +91,75 @@ function fileIsolatesGstackHome(src: string): boolean {
     if (/process\.env\.GSTACK_HOME\s*=/.test(body)) return true;
   }
   return false;
+}
+
+function callsGstackHomeHelperOutsideTestBody(src: string): boolean {
+  if (hasTopLevelHelperCall(src)) return true;
+
+  const describeRe = /\bdescribe\s*\([^=]*?=>\s*\{/g;
+  let m: RegExpExecArray | null;
+  while ((m = describeRe.exec(src)) !== null) {
+    const blockStart = m.index + m[0].length;
+    const blockEnd = findMatchingBrace(src, blockStart);
+    if (blockEnd == null) continue;
+    if (describeBodyCallsHelperBeforeTests(src.slice(blockStart, blockEnd))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasTopLevelHelperCall(src: string): boolean {
+  let depth = 0;
+  for (const line of src.split("\n")) {
+    if (
+      depth === 0 &&
+      /^useIsolatedGstackHome\s*\(/.test(stripLineComment(line).trim())
+    ) {
+      return true;
+    }
+    depth += braceDelta(line);
+  }
+  return false;
+}
+
+function describeBodyCallsHelperBeforeTests(body: string): boolean {
+  let depth = 0;
+  for (const line of body.split("\n")) {
+    const code = stripLineComment(line).trim();
+    if (depth === 0) {
+      if (/^(?:test|it)\s*\(/.test(code)) return false;
+      if (/^useIsolatedGstackHome\s*\(/.test(code)) return true;
+    }
+    depth += braceDelta(line);
+  }
+  return false;
+}
+
+function findMatchingBrace(src: string, blockStart: number): number | null {
+  let depth = 1;
+  for (let i = blockStart; i < src.length; i++) {
+    const c = src[i];
+    if (c === "{") depth++;
+    else if (c === "}") depth--;
+    if (depth === 0) return i;
+  }
+  return null;
+}
+
+function stripLineComment(line: string): string {
+  return line.replace(/\/\/.*$/, "");
+}
+
+function braceDelta(line: string): number {
+  const code = stripLineComment(line);
+  let delta = 0;
+  for (const c of code) {
+    if (c === "{") delta++;
+    else if (c === "}") delta--;
+  }
+  return delta;
 }
 
 // This file itself names every home-writer symbol in `HOME_WRITERS` so the lint
@@ -118,6 +187,22 @@ describe("test isolation lint", () => {
     ].join("\n");
 
     expect(fileIsolatesGstackHome(src)).toBe(true);
+  });
+
+  test("rejects useIsolatedGstackHome called inside an individual test", () => {
+    const src = [
+      'import { describe, test } from "bun:test";',
+      'import { useIsolatedGstackHome } from "../../../test/helpers/test-home";',
+      'import { detectSkillFaults } from "../skill-fault-detector";',
+      'describe("nested", () => {',
+      '  test("case", () => {',
+      '    useIsolatedGstackHome("bad-");',
+      "    detectSkillFaults({} as any);",
+      "  });",
+      "});",
+    ].join("\n");
+
+    expect(fileIsolatesGstackHome(src)).toBe(false);
   });
 
   test("every test that writes to ~/.gstack/ also isolates GSTACK_HOME", () => {
