@@ -23,6 +23,38 @@ import {
   type RoundHistoryEntry,
 } from "./plan-reviewer";
 
+/**
+ * Set up a readline-based ask() helper that handles Bun's ERR_USE_AFTER_CLOSE
+ * on multi-question sequences by using a lineQueue/waiter pattern instead of
+ * rl.question(). Returns { ask, close }.
+ */
+function makeReadlineAsk(
+  input: NodeJS.ReadableStream,
+  output: NodeJS.WritableStream,
+): { ask: (q: string) => Promise<string>; close: () => void } {
+  const rl = readline.createInterface({ input, terminal: false });
+  const lineQueue: string[] = [];
+  const waiters: Array<(line: string) => void> = [];
+  let streamClosed = false;
+  rl.on("line", (line) => {
+    if (waiters.length > 0) waiters.shift()!(line);
+    else lineQueue.push(line);
+  });
+  rl.on("close", () => {
+    streamClosed = true;
+    while (waiters.length > 0) waiters.shift()!("");
+  });
+  const ask = (q: string): Promise<string> => {
+    output.write(q);
+    return new Promise((resolve) => {
+      if (lineQueue.length > 0) resolve(lineQueue.shift()!);
+      else if (streamClosed) resolve("");
+      else waiters.push(resolve);
+    });
+  };
+  return { ask, close: () => rl.close() };
+}
+
 export interface HistoryEntry {
   round: number;
   /** ISO 8601 UTC timestamp. */
@@ -113,7 +145,6 @@ export type ExitReason =
   | "max_rounds_hit"
   | "user_manual"
   | "user_abort"
-  | "sigint"
   | "reviewer_unavailable";
 
 /**
@@ -149,7 +180,6 @@ export interface ConvergenceAggregate {
   reviewerWallTimeS: number;
   synthWallTimeS: number;
   planFileSizeBytes: number[];
-  interrupted: boolean;
   annotationParseErrors: number;
 }
 
@@ -384,44 +414,14 @@ export async function runTriageGateTTY(
   // When the caller injected askFn (runPlanReviewLoop case), reuse it so the
   // shared readline doesn't get torn down between rounds. Otherwise stand up
   // a local readline for backwards-compat with standalone-call tests.
-  let rl: readline.Interface | null = null;
+  let close: (() => void) | null = null;
   let ask: (q: string) => Promise<string>;
   if (opts.askFn) {
     ask = opts.askFn;
   } else {
-    rl = readline.createInterface({ input: opts.input, terminal: false });
-    // Buffer lines as they arrive so ask() can dequeue synchronously or wait.
-    const lineQueue: string[] = [];
-    const waiters: Array<(line: string) => void> = [];
-    let streamClosed = false;
-    rl.on("line", (line) => {
-      if (waiters.length > 0) {
-        const resolve = waiters.shift()!;
-        resolve(line);
-      } else {
-        lineQueue.push(line);
-      }
-    });
-    rl.on("close", () => {
-      streamClosed = true;
-      // Drain any pending waiters with empty string (EOF).
-      while (waiters.length > 0) {
-        const resolve = waiters.shift()!;
-        resolve("");
-      }
-    });
-    ask = (q: string): Promise<string> => {
-      opts.output.write(q);
-      return new Promise((resolve) => {
-        if (lineQueue.length > 0) {
-          resolve(lineQueue.shift()!);
-        } else if (streamClosed) {
-          resolve("");
-        } else {
-          waiters.push(resolve);
-        }
-      });
-    };
+    const helper = makeReadlineAsk(opts.input, opts.output);
+    ask = helper.ask;
+    close = helper.close;
   }
 
   const decisions: TriageDecision[] = [];
@@ -479,7 +479,7 @@ export async function runTriageGateTTY(
           for (let j = i + 1; j < opts.objections.length; j++) {
             decisions.push({ objectionIndex: j, decision: "accept", rationale: "" });
           }
-          rl?.close();
+          close?.();
           return { decisions, quitEarly: false, fastPathed: true };
         case "R":
           fastPathed = true;
@@ -487,7 +487,7 @@ export async function runTriageGateTTY(
           for (let j = i + 1; j < opts.objections.length; j++) {
             decisions.push({ objectionIndex: j, decision: "reject", rationale: "" });
           }
-          rl?.close();
+          close?.();
           return { decisions, quitEarly: false, fastPathed: true };
         case "s":
           stopRemaining = true;
@@ -495,7 +495,7 @@ export async function runTriageGateTTY(
           break;
         case "q":
           quitEarly = true;
-          rl?.close();
+          close?.();
           return { decisions, quitEarly: true, fastPathed: false };
         default:
           opts.output.write(`  Invalid input '${ans}'. Try again.\n`);
@@ -506,7 +506,7 @@ export async function runTriageGateTTY(
     decisions.push({ objectionIndex: i, decision, rationale });
   }
 
-  rl?.close();
+  close?.();
   opts.output.write(
     `\n═══════════════════════════════════════════════════════════════════════\n` +
       `[plan-review] Round ${opts.round} triage complete.\n` +
@@ -596,15 +596,7 @@ export interface RunPlanReviewLoopInput {
   synthesizerName: string;
 }
 
-export type LoopOutcome =
-  | "approved"
-  | "adaptive_cap_re_raises_only"
-  | "adaptive_cap_regression"
-  | "max_rounds_hit"
-  | "user_manual"
-  | "user_abort"
-  | "sigint"
-  | "reviewer_unavailable";
+export type LoopOutcome = ExitReason;
 
 export interface RunPlanReviewLoopResult {
   outcome: LoopOutcome;
@@ -638,29 +630,12 @@ export async function runPlanReviewLoop(
   // and torn down between rounds — a per-call readline would drain the
   // whole buffered stream on the first close, starving later rounds. Only
   // created when isTTY; non-TTY paths never call ask().
-  let sharedRl: readline.Interface | null = null;
+  let sharedClose: (() => void) | null = null;
   let sharedAsk: ((q: string) => Promise<string>) | undefined;
   if (input.isTTY) {
-    sharedRl = readline.createInterface({ input: input.input, terminal: false });
-    const lineQueue: string[] = [];
-    const waiters: Array<(line: string) => void> = [];
-    let streamClosed = false;
-    sharedRl.on("line", (line) => {
-      if (waiters.length > 0) waiters.shift()!(line);
-      else lineQueue.push(line);
-    });
-    sharedRl.on("close", () => {
-      streamClosed = true;
-      while (waiters.length > 0) waiters.shift()!("");
-    });
-    sharedAsk = (q: string): Promise<string> => {
-      input.output.write(q);
-      return new Promise((resolve) => {
-        if (lineQueue.length > 0) resolve(lineQueue.shift()!);
-        else if (streamClosed) resolve("");
-        else waiters.push(resolve);
-      });
-    };
+    const helper = makeReadlineAsk(input.input, input.output);
+    sharedAsk = helper.ask;
+    sharedClose = helper.close;
   }
 
   const startMs = Date.now();
@@ -668,7 +643,8 @@ export async function runPlanReviewLoop(
   const trajectoryAccepted: number[] = [];
   const reRaisesArr: number[] = [];
   const reRejectedArr: number[] = [];
-  // disputed_resolutions placeholder — Task 11 wires the real count after synth.
+  // Per-round count of synth-marked "disputed — <reason>" resolutions.
+  // Populated in step 9a after each synthFn call.
   const disputedResolutions: number[] = [];
   const planFileSizeBytes: number[] = [];
   let totalAccepted = 0;
@@ -677,7 +653,6 @@ export async function runPlanReviewLoop(
   let reviewerWallTimeS = 0;
   let synthWallTimeS = 0;
   let annotationParseErrors = 0;
-  const interrupted = false;
   let lastVerdict: PlanReviewVerdict | null = null;
 
   // Track per-objection rejection rationales across rounds for re-raise framing.
@@ -690,7 +665,7 @@ export async function runPlanReviewLoop(
     exitCode: 0 | 1 | 3 | 4 | 130,
     finalVerdict: PlanReviewVerdict,
   ): RunPlanReviewLoopResult => {
-    sharedRl?.close();
+    sharedClose?.();
     return { outcome, rounds, exitCode, finalVerdict };
   };
 
@@ -706,7 +681,7 @@ export async function runPlanReviewLoop(
       branch: input.branch,
       rounds: args.round,
       finalVerdict: args.verdict,
-      exitReason: args.outcome as ExitReason,
+      exitReason: args.outcome,
       trajectoryRaw,
       trajectoryAccepted,
       reRaises: reRaisesArr,
@@ -721,7 +696,6 @@ export async function runPlanReviewLoop(
       reviewerWallTimeS,
       synthWallTimeS,
       planFileSizeBytes,
-      interrupted,
       annotationParseErrors,
     });
   };
@@ -733,9 +707,11 @@ export async function runPlanReviewLoop(
     reviewerWallTimeS += Math.round((Date.now() - reviewStart) / 1000);
     lastVerdict = verdict;
 
-    planFileSizeBytes.push(
-      fs.existsSync(input.planPath) ? fs.statSync(input.planPath).size : 0,
-    );
+    try {
+      planFileSizeBytes.push(fs.statSync(input.planPath).size);
+    } catch {
+      planFileSizeBytes.push(0);
+    }
 
     // Reviewer unavailable: exit clean as APPROVE (existing semantics).
     if (verdict.reviewedBy === "skipped-unavailable") {
@@ -761,19 +737,52 @@ export async function runPlanReviewLoop(
     }
 
     const critical = verdict.objections.filter((o) => o.severity === "CRITICAL");
+    const important = verdict.objections.filter((o) => o.severity === "IMPORTANT");
+    const suggestion = verdict.objections.filter((o) => o.severity === "SUGGESTION");
     trajectoryRaw.push(critical.length);
 
-    // APPROVE round — write history, write aggregate, exit clean.
+    // APPROVE round (or REVISE with no CRITICAL) — handle IMPORTANT/SUGGESTION
+    // inline (annotate-and-proceed), write history, write aggregate, exit clean.
     if (verdict.verdict === "APPROVE" || critical.length === 0) {
+      // Annotate IMPORTANT/SUGGESTION objections so the reviewer sees them next
+      // round and the plan file has a record. This mirrors the pre-loop
+      // reconcilePlanReview contract: auto-accept (annotate-and-proceed)
+      // IMPORTANT/SUGGESTION at this severity.
+      if (important.length > 0 || suggestion.length > 0) {
+        let updatedPlan = fs.readFileSync(input.planPath, "utf8");
+        for (const o of [...important, ...suggestion]) {
+          const ann: RoundAnnotation = {
+            location: o.location,
+            severity: o.severity,
+            issue: o.issue,
+            suggestion: o.suggestion,
+            rounds: [
+              {
+                round,
+                userDecision: "accept",
+                userRationale: `non-critical (${o.severity})`,
+                resolution: undefined,
+                reviewerOutcome: undefined,
+              },
+            ],
+          };
+          updatedPlan = writeRoundAnnotation(updatedPlan, ann);
+        }
+        fs.writeFileSync(input.planPath, updatedPlan, "utf8");
+        input.output.write(
+          `[plan-review] ${important.length} IMPORTANT + ${suggestion.length} SUGGESTION annotated inline.\n`,
+        );
+      }
+
       appendHistoryEntry(input.historyPath, {
         round,
         ts: new Date().toISOString(),
         reviewedBy: verdict.reviewedBy,
         verdict: "APPROVE",
-        objectionCountRaw: 0,
+        objectionCountRaw: critical.length + important.length + suggestion.length,
         critical: 0,
-        important: 0,
-        suggestion: 0,
+        important: important.length,
+        suggestion: suggestion.length,
         triage: null,
         convergence: {
           delta: null,
@@ -840,8 +849,8 @@ export async function runPlanReviewLoop(
           verdict: "REVISE",
           objectionCountRaw: critical.length,
           critical: critical.length,
-          important: 0,
-          suggestion: 0,
+          important: important.length,
+          suggestion: suggestion.length,
           triage: null,
           convergence: {
             delta: null,
@@ -861,8 +870,9 @@ export async function runPlanReviewLoop(
       return finalResult("user_abort", round, 4, verdict);
     }
 
-    // 4. Apply triage decisions to plan annotations.
-    let updatedPlan = fs.readFileSync(input.planPath, "utf8");
+    // 4. Apply triage decisions to plan annotations. Reuse planText (read above
+    //    for re-raise detection) — no writes happened in between.
+    let updatedPlan = planText;
     const acceptedIdx: number[] = [];
     const rejectedIdx: number[] = [];
     const deferredIdx: number[] = [];
@@ -919,8 +929,8 @@ export async function runPlanReviewLoop(
       verdict: "REVISE",
       objectionCountRaw: critical.length,
       critical: critical.length,
-      important: 0,
-      suggestion: 0,
+      important: important.length,
+      suggestion: suggestion.length,
       triage: {
         accepted: acceptedIdx,
         rejected: rejectedIdx,
@@ -945,10 +955,8 @@ export async function runPlanReviewLoop(
       rejected: rejectedIdx.length,
       deferred: deferredIdx.length,
     };
-    const planAfterHistory = updateRoundHistoryHeader(
-      fs.readFileSync(input.planPath, "utf8"),
-      histEntry,
-    );
+    // updatedPlan was just written to disk; reuse the in-memory string.
+    const planAfterHistory = updateRoundHistoryHeader(updatedPlan, histEntry);
     fs.writeFileSync(input.planPath, planAfterHistory, "utf8");
 
     // 8. Check adaptive cap.
@@ -1121,31 +1129,14 @@ export async function runStalemateGate(opts: {
 
   // Bun readline workaround: don't pass output, use a line-queue/waiter so
   // we can call ask() multiple times without ERR_USE_AFTER_CLOSE.
-  let rl: readline.Interface | null = null;
+  let close: (() => void) | null = null;
   let ask: (q: string) => Promise<string>;
   if (opts.askFn) {
     ask = opts.askFn;
   } else {
-    rl = readline.createInterface({ input: opts.input, terminal: false });
-    const lineQueue: string[] = [];
-    const waiters: Array<(line: string) => void> = [];
-    let streamClosed = false;
-    rl.on("line", (line) => {
-      if (waiters.length > 0) waiters.shift()!(line);
-      else lineQueue.push(line);
-    });
-    rl.on("close", () => {
-      streamClosed = true;
-      while (waiters.length > 0) waiters.shift()!("");
-    });
-    ask = (q: string): Promise<string> => {
-      opts.output.write(q);
-      return new Promise((resolve) => {
-        if (lineQueue.length > 0) resolve(lineQueue.shift()!);
-        else if (streamClosed) resolve("");
-        else waiters.push(resolve);
-      });
-    };
+    const helper = makeReadlineAsk(opts.input, opts.output);
+    ask = helper.ask;
+    close = helper.close;
   }
 
   const validKeys = isMaxRounds ? ["a", "m", "q"] : ["a", "c", "m", "q"];
@@ -1162,6 +1153,6 @@ export async function runStalemateGate(opts: {
       if (ans === "q") return "abort";
     }
   } finally {
-    rl?.close();
+    close?.();
   }
 }

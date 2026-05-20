@@ -504,9 +504,6 @@ export interface ConvergenceSnapshot {
   noForwardProgress: boolean;
 }
 
-/** Round-history annotation format version. Bump if the contract in plan-reviewer.ts changes. */
-export const ROUND_HISTORY_FORMAT_VERSION = 1;
-
 export interface BuildState {
   /** Absolute path to the plan markdown. */
   planFile: string;

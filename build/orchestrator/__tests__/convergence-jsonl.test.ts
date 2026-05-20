@@ -42,7 +42,6 @@ describe("writeConvergenceAggregate", () => {
       reviewerWallTimeS: 487,
       synthWallTimeS: 542,
       planFileSizeBytes: [4821, 5103, 5410, 5398],
-      interrupted: false,
       annotationParseErrors: 0,
     };
     writeConvergenceAggregate(aggPath, agg);
@@ -59,7 +58,7 @@ describe("writeConvergenceAggregate", () => {
       totalAccepted: 0, totalRejected: 0, totalDeferred: 0,
       reviewer: "x", synthesizer: "y", wallTimeS: 1,
       reviewerWallTimeS: 1, synthWallTimeS: 0,
-      planFileSizeBytes: [100], interrupted: false, annotationParseErrors: 0,
+      planFileSizeBytes: [100], annotationParseErrors: 0,
     };
     writeConvergenceAggregate(aggPath, { ...base, slug: "build-1" });
     writeConvergenceAggregate(aggPath, { ...base, slug: "build-2" });
@@ -81,7 +80,7 @@ describe("writeConvergenceAggregate", () => {
       totalAccepted: 0, totalRejected: 0, totalDeferred: 0,
       reviewer: "x", synthesizer: "y", wallTimeS: 1,
       reviewerWallTimeS: 1, synthWallTimeS: 0,
-      planFileSizeBytes: [100], interrupted: false, annotationParseErrors: 0,
+      planFileSizeBytes: [100], annotationParseErrors: 0,
     };
     expect(() => writeConvergenceAggregate(bad, agg)).not.toThrow();
   });
