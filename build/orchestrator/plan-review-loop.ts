@@ -249,7 +249,9 @@ export interface RoundConvergenceSnapshot {
  * that the synth was supposed to resolve. These are the entries that, if re-raised,
  * indicate the synth isn't getting the fixes done.
  */
-function isPriorAcceptedResolutionAttempt(rounds: RoundAnnotationEntry[]): boolean {
+function isPriorAcceptedResolutionAttempt(
+  rounds: RoundAnnotationEntry[],
+): boolean {
   // Any round where user accepted AND the synth produced a non-pending resolution.
   return rounds.some(
     (r) =>
@@ -481,9 +483,15 @@ export async function runTriageGateTTY(
     while (decision === null) {
       const ans = (await ask("  Decision (a/r/d/v/A/R/s/q): ")).trim();
       switch (ans) {
-        case "a": decision = "accept"; break;
-        case "r": decision = "reject"; break;
-        case "d": decision = "defer"; break;
+        case "a":
+          decision = "accept";
+          break;
+        case "r":
+          decision = "reject";
+          break;
+        case "d":
+          decision = "defer";
+          break;
         case "v":
           opts.output.write(
             `\n  Reviewer's Overall Assessment:\n` +
@@ -493,17 +501,33 @@ export async function runTriageGateTTY(
           break;
         case "A":
           fastPathed = true;
-          decisions.push({ objectionIndex: i, decision: "accept", rationale: "" });
+          decisions.push({
+            objectionIndex: i,
+            decision: "accept",
+            rationale: "",
+          });
           for (let j = i + 1; j < opts.objections.length; j++) {
-            decisions.push({ objectionIndex: j, decision: "accept", rationale: "" });
+            decisions.push({
+              objectionIndex: j,
+              decision: "accept",
+              rationale: "",
+            });
           }
           close?.();
           return { decisions, quitEarly: false, fastPathed: true };
         case "R":
           fastPathed = true;
-          decisions.push({ objectionIndex: i, decision: "reject", rationale: "" });
+          decisions.push({
+            objectionIndex: i,
+            decision: "reject",
+            rationale: "",
+          });
           for (let j = i + 1; j < opts.objections.length; j++) {
-            decisions.push({ objectionIndex: j, decision: "reject", rationale: "" });
+            decisions.push({
+              objectionIndex: j,
+              decision: "reject",
+              rationale: "",
+            });
           }
           close?.();
           return { decisions, quitEarly: false, fastPathed: true };
@@ -526,6 +550,16 @@ export async function runTriageGateTTY(
           close?.();
           return { decisions, quitEarly: true, fastPathed: false };
         default:
+          if (ans === "") {
+            // Stream closed (Ctrl+D, pipe end, terminal disconnect). The
+            // readline `close` event has set streamClosed=true and ask()
+            // is now resolving with "" immediately. Without this guard,
+            // the while-loop spins at 100% CPU forever printing "Invalid
+            // input ''. Try again.". Treat as [q]uit.
+            quitEarly = true;
+            close?.();
+            return { decisions, quitEarly: true, fastPathed: false };
+          }
           opts.output.write(`  Invalid input '${ans}'. Try again.\n`);
       }
     }
@@ -792,13 +826,32 @@ export async function runPlanReviewLoop(
           newObjections: 0,
         },
       });
-      writeAggregate({ outcome: "reviewer_unavailable", round, verdict: "APPROVE" });
+      // Maintain parallel-array length invariants with planFileSizeBytes
+      // (pushed above unconditionally). Without these, downstream consumers
+      // that zip these arrays by index walk off the end on the
+      // reviewer_unavailable exit branch.
+      trajectoryRaw.push(0);
+      trajectoryAccepted.push(0);
+      reRaisesArr.push(0);
+      reRejectedArr.push(0);
+      disputedResolutions.push(0);
+      writeAggregate({
+        outcome: "reviewer_unavailable",
+        round,
+        verdict: "APPROVE",
+      });
       return finalResult("reviewer_unavailable", round, 0, verdict);
     }
 
-    const critical = verdict.objections.filter((o) => o.severity === "CRITICAL");
-    const important = verdict.objections.filter((o) => o.severity === "IMPORTANT");
-    const suggestion = verdict.objections.filter((o) => o.severity === "SUGGESTION");
+    const critical = verdict.objections.filter(
+      (o) => o.severity === "CRITICAL",
+    );
+    const important = verdict.objections.filter(
+      (o) => o.severity === "IMPORTANT",
+    );
+    const suggestion = verdict.objections.filter(
+      (o) => o.severity === "SUGGESTION",
+    );
     trajectoryRaw.push(critical.length);
 
     // APPROVE round (or REVISE with no CRITICAL) — handle IMPORTANT/SUGGESTION
@@ -855,9 +908,7 @@ export async function runPlanReviewLoop(
             let resolved = false;
             while (!resolved) {
               const ans = (
-                await ask(
-                  `  Apply? [y]es / [n]o / [a]ll / [s]kip-all: `,
-                )
+                await ask(`  Apply? [y]es / [n]o / [a]ll / [s]kip-all: `)
               )
                 .trim()
                 .toLowerCase();
@@ -872,6 +923,13 @@ export async function runPlanReviewLoop(
                 acceptAll = true;
                 resolved = true;
               } else if (ans === "s" || ans === "skip" || ans === "skip-all") {
+                importantDecisions[i] = "reject";
+                skipAll = true;
+                resolved = true;
+              } else if (ans === "") {
+                // EOF on stdin (Ctrl+D, pipe closed) — treat as skip-all so
+                // the loop doesn't spin forever printing "Invalid ''" once
+                // makeReadlineAsk resolves with "" indefinitely.
                 importantDecisions[i] = "reject";
                 skipAll = true;
                 resolved = true;
@@ -998,7 +1056,10 @@ export async function runPlanReviewLoop(
         assessmentProse: verdict.assessment,
         askFn: sharedAsk,
       });
-      triageResult = { decisions: ttyResult.decisions, quitEarly: ttyResult.quitEarly };
+      triageResult = {
+        decisions: ttyResult.decisions,
+        quitEarly: ttyResult.quitEarly,
+      };
     } else {
       const ntty = runTriageGateNonTTY({
         objections: critical,
@@ -1074,7 +1135,10 @@ export async function runPlanReviewLoop(
       if (d.decision === "accept") acceptedIdx.push(d.objectionIndex);
       if (d.decision === "reject") {
         rejectedIdx.push(d.objectionIndex);
-        priorRejectRationale.set(`${o.location}|${o.severity}`, d.rationale ?? "");
+        priorRejectRationale.set(
+          `${o.location}|${o.severity}`,
+          d.rationale ?? "",
+        );
       }
       if (d.decision === "defer") deferredIdx.push(d.objectionIndex);
     }
@@ -1174,8 +1238,11 @@ export async function runPlanReviewLoop(
         exitCode = 4;
       }
       const aggVerdict =
-        outcome === "approved" ? "APPROVE" :
-        outcome === "user_abort" ? "ABORTED" : "STALEMATE";
+        outcome === "approved"
+          ? "APPROVE"
+          : outcome === "user_abort"
+            ? "ABORTED"
+            : "STALEMATE";
       disputedResolutions.push(0);
       writeAggregate({ outcome, round, verdict: aggVerdict });
       return finalResult(outcome, round, exitCode, verdict);
@@ -1258,9 +1325,11 @@ export async function runPlanReviewLoop(
     exitCode = 4;
   }
   const aggVerdict =
-    outcome === "approved" ? "APPROVE" :
-    outcome === "user_abort" ? "ABORTED" :
-    "STALEMATE";
+    outcome === "approved"
+      ? "APPROVE"
+      : outcome === "user_abort"
+        ? "ABORTED"
+        : "STALEMATE";
   writeAggregate({ outcome, round: input.maxRounds, verdict: aggVerdict });
   return finalResult(outcome, input.maxRounds, exitCode, lastVerdict!);
 }
@@ -1335,6 +1404,12 @@ export async function runStalemateGate(opts: {
   try {
     while (true) {
       const ans = (await ask(`  Decision (${validKeys.join("/")}): `)).trim();
+      if (ans === "") {
+        // EOF on stdin — treat as abort so the loop doesn't spin forever
+        // printing "Invalid ''" once makeReadlineAsk's streamClosed flag
+        // makes ask() resolve with "" indefinitely.
+        return "abort";
+      }
       if (!validKeys.includes(ans)) {
         opts.output.write(`  Invalid '${ans}'. Try again.\n`);
         continue;
