@@ -18,6 +18,18 @@ describe("PLAN_REVIEW_PROMPT (reviewer)", () => {
     expect(PLAN_REVIEW_PROMPT).toContain("do NOT re-raise");
   });
 
+  it("exempts non-code phases from code/TDD test spec requirements", () => {
+    expect(PLAN_REVIEW_PROMPT).toContain(
+      "For code/TDD phases, does every phase have a `#### Test Spec` section?",
+    );
+    expect(PLAN_REVIEW_PROMPT).toContain(
+      "Non-code phases are exempt from `#### Test Spec` requirements",
+    );
+    expect(PLAN_REVIEW_PROMPT).toContain("kind-specific two-gate shape");
+    expect(PLAN_REVIEW_PROMPT).toContain("[writing]");
+    expect(PLAN_REVIEW_PROMPT).toContain("[manual]");
+  });
+
   it("snapshot — fails if prompt drifts", () => {
     expect(PLAN_REVIEW_PROMPT).toMatchSnapshot();
   });
