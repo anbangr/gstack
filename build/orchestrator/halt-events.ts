@@ -29,6 +29,15 @@ export interface HaltEvent {
   severity: HaltSeverity;
   timestamp: string;
   message: string;
+  /**
+   * When false, drainFaultsFromHaltEventsQueue short-circuits this event:
+   * the file moves to processed/ without dispatching the codex investigator,
+   * and analytics records outcome: "audit-skipped". Used for manual-recovery
+   * sites (drain-faults / mark-shipped / --mark-phase-committed) that are
+   * audit signals, not investigation requests. Absent OR true means dispatch
+   * normally — preserves back-compat for rows filed before this field existed.
+   */
+  investigate?: boolean;
   pointers: {
     stateFile: string;
     stdoutLog: string;
@@ -146,7 +155,7 @@ export function markInvestigated(
   runId: string,
   faultId: string,
   // _outcome is reserved for future use; logging happens at the call site.
-  _outcome: "investigated" | "skipped-no-context" | "self-healed",
+  _outcome: "investigated" | "skipped-no-context" | "self-healed" | "audit-skipped",
   opts?: { queueDir?: string },
 ): void {
   const safeRun = safeRegistryRunId(runId);

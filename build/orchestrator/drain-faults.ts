@@ -1276,6 +1276,38 @@ export async function drainFaultsFromHaltEventsQueue(
     }
     processedCount += 1;
 
+    // investigate:false short-circuit — audit events from manual-recovery
+    // sites (drain-faults / mark-shipped / --mark-phase-committed) are
+    // observability signals, not investigation requests. Skip dispatch,
+    // move directly to processed/, record outcome: "audit-skipped" in
+    // analytics. Closes the drain-faults --queue self-enqueue loop where
+    // the queue consumer would otherwise pay codex (~$0.30) to investigate
+    // its own invocation.
+    if (he.investigate === false) {
+      try {
+        markInvestigated(he.runId, he.faultId, "audit-skipped", { queueDir });
+      } catch {
+        // ignore — file may have been moved by a concurrent drain
+      }
+      try {
+        const analyticsDir = path.join(getGstackHome(), "analytics");
+        fs.mkdirSync(analyticsDir, { recursive: true });
+        const analyticsPath = path.join(analyticsDir, "skill-faults.jsonl");
+        const row = JSON.stringify({
+          ts: new Date().toISOString(),
+          faultId: he.faultId,
+          outcome: "audit-skipped",
+        });
+        fs.appendFileSync(analyticsPath, row + "\n");
+      } catch (err) {
+        process.stderr.write(
+          `[drain-faults] analytics audit-skipped sink failed for ${he.faultId}: ${(err as Error).message}\n`,
+        );
+      }
+      result.shortCircuited += 1;
+      continue;
+    }
+
     // Learned-pattern short-circuit
     const lpMatch = learnedPatternMatch(he);
     if (lpMatch) {
