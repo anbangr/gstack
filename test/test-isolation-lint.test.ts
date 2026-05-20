@@ -48,8 +48,9 @@ const HOME_WRITERS = [
 /**
  * Two recognized isolation patterns:
  *
- *   1. File-level: imports `useIsolatedGstackHome` from `./helpers/test-home`
- *      AND calls it (the canonical pattern).
+ *   1. Helper-level: imports `useIsolatedGstackHome` from `./helpers/test-home`
+ *      (or a nested `test/helpers/test-home` path) AND either calls it at
+ *      top-level or inside every home-writer describe block before tests.
  *
  *   2. beforeEach-level: a `beforeEach(...)` block that assigns
  *      `process.env.GSTACK_HOME = <something>`. The assignment must be
@@ -95,19 +96,31 @@ function fileIsolatesGstackHome(src: string): boolean {
 
 function callsGstackHomeHelperOutsideTestBody(src: string): boolean {
   if (hasTopLevelHelperCall(src)) return true;
+  return everyHomeWriterDescribeHasHelper(src);
+}
 
+function everyHomeWriterDescribeHasHelper(src: string): boolean {
   const describeRe = /\bdescribe\s*\([^=]*?=>\s*\{/g;
   let m: RegExpExecArray | null;
+  const topLevelDescribeRanges: { start: number; end: number }[] = [];
+
   while ((m = describeRe.exec(src)) !== null) {
+    if (braceDepthBefore(src, m.index) !== 0) continue;
     const blockStart = m.index + m[0].length;
     const blockEnd = findMatchingBrace(src, blockStart);
     if (blockEnd == null) continue;
-    if (describeBodyCallsHelperBeforeTests(src.slice(blockStart, blockEnd))) {
-      return true;
+    topLevelDescribeRanges.push({ start: m.index, end: blockEnd + 1 });
+
+    const body = src.slice(blockStart, blockEnd);
+    if (containsHomeWriter(body) && !describeBodyCallsHelperBeforeTests(body)) {
+      return false;
     }
   }
 
-  return false;
+  if (topLevelDescribeRanges.length === 0) return false;
+
+  const outsideDescribes = removeRanges(src, topLevelDescribeRanges);
+  return !containsHomeWriter(outsideDescribes);
 }
 
 function hasTopLevelHelperCall(src: string): boolean {
@@ -115,7 +128,7 @@ function hasTopLevelHelperCall(src: string): boolean {
   for (const line of src.split("\n")) {
     if (
       depth === 0 &&
-      /^useIsolatedGstackHome\s*\(/.test(stripLineComment(line).trim())
+      helperCallRe().test(stripLineComment(line).trim())
     ) {
       return true;
     }
@@ -130,11 +143,46 @@ function describeBodyCallsHelperBeforeTests(body: string): boolean {
     const code = stripLineComment(line).trim();
     if (depth === 0) {
       if (/^(?:test|it)\s*\(/.test(code)) return false;
-      if (/^useIsolatedGstackHome\s*\(/.test(code)) return true;
+      if (helperCallRe().test(code)) return true;
     }
     depth += braceDelta(line);
   }
   return false;
+}
+
+function containsHomeWriter(src: string): boolean {
+  const withoutImports = src.replace(
+    /\bimport\s+[\s\S]*?\s+from\s*["'][^"']+["'];?/g,
+    "",
+  );
+  return HOME_WRITERS.some((sym) =>
+    new RegExp(`\\b${sym}\\b`).test(withoutImports),
+  );
+}
+
+function helperCallRe(): RegExp {
+  return /^(?:(?:const|let|var)\s+\w+\s*=\s*)?useIsolatedGstackHome\s*\(/;
+}
+
+function braceDepthBefore(src: string, end: number): number {
+  let depth = 0;
+  for (const line of src.slice(0, end).split("\n")) {
+    depth += braceDelta(line);
+  }
+  return depth;
+}
+
+function removeRanges(
+  src: string,
+  ranges: { start: number; end: number }[],
+): string {
+  let out = "";
+  let cursor = 0;
+  for (const range of ranges) {
+    out += src.slice(cursor, range.start);
+    cursor = range.end;
+  }
+  return out + src.slice(cursor);
 }
 
 function findMatchingBrace(src: string, blockStart: number): number | null {
@@ -189,6 +237,20 @@ describe("test isolation lint", () => {
     expect(fileIsolatesGstackHome(src)).toBe(true);
   });
 
+  test("recognizes top-level assigned useIsolatedGstackHome calls", () => {
+    const src = [
+      'import { describe, test } from "bun:test";',
+      'import { useIsolatedGstackHome } from "../../../test/helpers/test-home";',
+      'import { detectSkillFaults } from "../skill-fault-detector";',
+      'const home = useIsolatedGstackHome("x-");',
+      'describe("nested", () => {',
+      '  test("case", () => detectSkillFaults({} as any));',
+      "});",
+    ].join("\n");
+
+    expect(fileIsolatesGstackHome(src)).toBe(true);
+  });
+
   test("rejects useIsolatedGstackHome called inside an individual test", () => {
     const src = [
       'import { describe, test } from "bun:test";',
@@ -199,6 +261,23 @@ describe("test isolation lint", () => {
       '    useIsolatedGstackHome("bad-");',
       "    detectSkillFaults({} as any);",
       "  });",
+      "});",
+    ].join("\n");
+
+    expect(fileIsolatesGstackHome(src)).toBe(false);
+  });
+
+  test("rejects sibling home-writer describes without local helper setup", () => {
+    const src = [
+      'import { describe, test } from "bun:test";',
+      'import { useIsolatedGstackHome } from "../../../test/helpers/test-home";',
+      'import { detectSkillFaults } from "../skill-fault-detector";',
+      'describe("isolated", () => {',
+      '  useIsolatedGstackHome("good-");',
+      '  test("case", () => expect(true).toBe(true));',
+      "});",
+      'describe("not isolated", () => {',
+      '  test("case", () => detectSkillFaults({} as any));',
       "});",
     ].join("\n");
 
