@@ -1754,6 +1754,33 @@ Shipped in v0.6.5. TemplateContext in gen-skill-docs.ts bakes skill name into pr
 **Effort:** M (human: ~2-3 hours / CC: ~30 min)
 **Priority:** P1
 
+### Codex host adapter creates duplicate `gstack-upgrade` skill entry
+
+**What:** After `./setup --host codex` runs, `~/.codex/skills/` contains TWO SKILL.md files declaring `name: gstack-upgrade`:
+
+1. `~/.codex/skills/gstack-upgrade/SKILL.md` (top-level namespaced peer, symlink → install dir)
+2. `~/.codex/skills/gstack/gstack-upgrade/SKILL.md` (nested inside the umbrella `gstack/` skill dir, also symlink → install dir)
+
+Codex's skill discovery walks both paths and shows the duplicate in its UI. Confirmed via `grep -l '^name: gstack-upgrade$' ~/.codex/skills/*/SKILL.md ~/.codex/skills/*/*/SKILL.md` returning 2 files.
+
+**Why fix:** Cosmetic but confusing — users see the same skill listed twice and don't know which one Codex routes to when they say "upgrade gstack." Also signals the host adapter is doing something wrong structurally; if more sub-skills end up nested under `gstack/` in future, the dup count grows.
+
+**Root cause:** Looks like `./setup --host codex` (probably in `hosts/codex.ts`) is mirroring both layouts at once. Either:
+
+- The umbrella `gstack` skill source contains a `gstack-upgrade/` sub-skill that's getting symlinked along with the umbrella, OR
+- The host adapter creates the top-level peer correctly but also recursively walks the umbrella source and creates nested copies.
+
+**Pros:** Removes user-visible confusion. Clean Codex skill enumeration. Tightens setup invariants ("no nested SKILL.md inside any host's skill dir").
+
+**Cons:** Touches the host adapter; risk of breaking the gstack-upgrade entry entirely if I get the path resolution wrong. Should add a regression test (assert `find ~/.codex/skills -name SKILL.md -mindepth 3 | wc -l == 0`).
+
+**Manual workaround for affected users:** `rm -rf ~/.codex/skills/gstack/gstack-upgrade` then `./setup --host codex` will recreate it. Until this TODO ships, the manual rm survives until the next `./setup` run.
+
+**Depends on / blocked by:** Nothing.
+
+**Effort:** S (human: ~1-2 hours / CC: ~15 min). Add regression test in `test/setup-host-codex.test.ts` (probably doesn't exist yet) that asserts the structural invariant.
+**Priority:** P2
+
 ## Completed
 
 ### Dual Implementor foundation + fix loops + hardening notes (v1.15.0.0 – v1.23.0.0)
