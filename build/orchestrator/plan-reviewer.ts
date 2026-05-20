@@ -631,26 +631,54 @@ const ANNOTATION_BLOCK_RE =
 const ROUND_HEADER_RE =
   /ROUND\s+(\d+)\s+(CRITICAL|IMPORTANT|SUGGESTION)\s+\[([^\]\n]+)\]:\s+(.+?)\s+→\s+(.+?)$/m;
 
-const ROUND_USER_RE = /ROUND\s+(\d+)\s+USER:\s+(accept|reject|defer)(?:\s+\("([^"]*)"\))?/g;
+/**
+ * Factory functions returning fresh `/g` regex instances per call.
+ *
+ * Module-level `/g` constants carry mutable `lastIndex` state across calls.
+ * `parseRoundAnnotations` is called recursively by `writeRoundAnnotation`
+ * (which re-parses each candidate block to compare against the new
+ * annotation), so a single shared regex could have its `lastIndex` reset
+ * mid-iteration by the inner call. Even setting `.lastIndex = 0` before
+ * each loop is racy under any future concurrent use. Defensive pattern:
+ * mint a fresh regex per call.
+ */
+function getRoundUserRe(): RegExp {
+  return /ROUND\s+(\d+)\s+USER:\s+(accept|reject|defer)(?:\s+\("([^"]*)"\))?/g;
+}
 
 /** Stop before trailing ` -->` when the field is the last line in the block. */
-const ROUND_RESOLUTION_RE = /ROUND\s+(\d+)\s+RESOLUTION:\s+(.+?)(?:\s+-->)?$/gm;
+function getRoundResolutionRe(): RegExp {
+  return /ROUND\s+(\d+)\s+RESOLUTION:\s+(.+?)(?:\s+-->)?$/gm;
+}
 
-const ROUND_REVIEWER_RE = /ROUND\s+(\d+)\s+REVIEWER:\s+(.+?)(?:\s+-->)?$/gm;
+function getRoundReviewerRe(): RegExp {
+  return /ROUND\s+(\d+)\s+REVIEWER:\s+(.+?)(?:\s+-->)?$/gm;
+}
 
 /**
  * Encode an annotation field for round-trip-safe serialization into the HTML
- * comment block. Four characters/sequences would otherwise corrupt the block
+ * comment block. Several characters/sequences would otherwise corrupt the block
  * syntax silently:
  *
+ *   `&`     — must be escaped first so user input containing literal `&#93;`
+ *             cannot impersonate one of our own escape sequences.
  *   `]`     — closes the `[location]` bracket group early; parser drops the
  *             entire annotation.
  *   `"`     — terminates the `("rationale")` inner-quote class in
  *             ROUND_USER_RE; parser drops the rationale.
+ *   `→`     — used as the field separator between issue and suggestion in
+ *             ROUND_HEADER_RE; an LLM-written issue containing `→` (natural
+ *             in prose like "A → B then B → C") splits at the first arrow
+ *             and corrupts both fields.
+ *   `\n`    — line-anchored regexes (ROUND_USER_RE, ROUND_RESOLUTION_RE,
+ *             ROUND_REVIEWER_RE) walk the body line-by-line; an embedded
+ *             newline in a rationale lets a malicious or careless rationale
+ *             forge a fake `ROUND N RESOLUTION: ...` line that overrides
+ *             the genuine synth-written resolution.
+ *   `\r`    — CRLF defense; same issue as `\n` when a plan is written on
+ *             Windows or by an editor that uses CRLF.
  *   `-->`   — closes the outer HTML comment; parser truncates the body and
  *             drops every field after the injection point.
- *   `&`     — must be escaped first so user input containing literal `&#93;`
- *             cannot impersonate one of our own escape sequences.
  *
  * The encoding is intentionally HTML-entity-shaped. It is visible to humans
  * reading the plan but harmless to readers (the encoded form names what it
@@ -661,6 +689,9 @@ function encodeAnnField(s: string): string {
     .replace(/&/g, "&amp;")
     .replace(/\]/g, "&#93;")
     .replace(/"/g, "&#34;")
+    .replace(/→/g, "&rarr;")
+    .replace(/\r/g, "&#13;")
+    .replace(/\n/g, "&#10;")
     .replace(/-->/g, "--&gt;");
 }
 
@@ -669,6 +700,9 @@ function encodeAnnField(s: string): string {
 function decodeAnnField(s: string): string {
   return s
     .replace(/--&gt;/g, "-->")
+    .replace(/&#10;/g, "\n")
+    .replace(/&#13;/g, "\r")
+    .replace(/&rarr;/g, "→")
     .replace(/&#34;/g, '"')
     .replace(/&#93;/g, "]")
     .replace(/&amp;/g, "&");
@@ -679,7 +713,15 @@ function decodeAnnField(s: string): string {
  * encoding is actually applied (so silent data is never silently encoded
  * without an audit trail). */
 function fieldNeedsEncoding(s: string): boolean {
-  return s.includes("]") || s.includes('"') || s.includes("-->") || s.includes("&");
+  return (
+    s.includes("]") ||
+    s.includes('"') ||
+    s.includes("-->") ||
+    s.includes("&") ||
+    s.includes("→") ||
+    s.includes("\n") ||
+    s.includes("\r")
+  );
 }
 
 /**
@@ -718,17 +760,17 @@ export function parseRoundAnnotations(planText: string): RoundAnnotation[] {
     // The header names the round this annotation was first written in; track it.
     ensure(parseInt(headerMatch[1], 10));
 
-    ROUND_USER_RE.lastIndex = 0;
+    const userRe = getRoundUserRe();
     let u: RegExpExecArray | null;
-    while ((u = ROUND_USER_RE.exec(body)) !== null) {
+    while ((u = userRe.exec(body)) !== null) {
       const entry = ensure(parseInt(u[1], 10));
       entry.userDecision = u[2] as RoundAnnotationEntry["userDecision"];
       if (u[3] !== undefined) entry.userRationale = decodeAnnField(u[3]);
     }
 
-    ROUND_RESOLUTION_RE.lastIndex = 0;
+    const resolutionRe = getRoundResolutionRe();
     let r: RegExpExecArray | null;
-    while ((r = ROUND_RESOLUTION_RE.exec(body)) !== null) {
+    while ((r = resolutionRe.exec(body)) !== null) {
       const entry = ensure(parseInt(r[1], 10));
       entry.resolution = decodeAnnField(r[2].trim());
     }
@@ -739,9 +781,9 @@ export function parseRoundAnnotations(planText: string): RoundAnnotation[] {
     // present. The round number on the line names the round in which the
     // observation happened, not the round being observed. See the design
     // spec §"Why the format" bullet 4.
-    ROUND_REVIEWER_RE.lastIndex = 0;
+    const reviewerRe = getRoundReviewerRe();
     let v: RegExpExecArray | null;
-    while ((v = ROUND_REVIEWER_RE.exec(body)) !== null) {
+    while ((v = reviewerRe.exec(body)) !== null) {
       const entry = ensure(parseInt(v[1], 10));
       entry.reviewerOutcome = decodeAnnField(v[2].trim());
     }
@@ -776,7 +818,7 @@ function serializeAnnotation(ann: RoundAnnotation): string {
     );
   if (anyNeeds) {
     console.warn(
-      `[plan-review] annotation field contains one of ], ", -->, & — applying HTML-entity encoding for round-trip safety (location=${JSON.stringify(ann.location)})`,
+      `[plan-review] annotation field contains one of &, ], ", →, \\n, \\r, --> — applying HTML-entity encoding for round-trip safety (location=${JSON.stringify(ann.location)})`,
     );
   }
 
@@ -857,11 +899,19 @@ export function writeRoundAnnotation(
       });
     }
   }
+  // Merge predicate: (location, severity) only. `issue` is freeform LLM text
+  // and wording drifts across rounds ("missing chainId in handler" in round 1
+  // vs. "handler doesn't validate chainId" in round 2). Including `issue` in
+  // the key would orphan the round-2 annotation as a fresh block, breaking
+  // the cross-round history that the reviewer prompt depends on. Aligns with
+  // `computeConvergenceSnapshot` in plan-review-loop.ts which keys on the
+  // same pair. Known limitation: two genuinely distinct issues at the same
+  // (location, severity) in a single round cannot be distinguished, but the
+  // current downstream and writer cannot distinguish them anyway.
   const hit = matches.find(
     (mt) =>
       mt.ann.location === ann.location &&
-      mt.ann.severity === ann.severity &&
-      mt.ann.issue === ann.issue,
+      mt.ann.severity === ann.severity,
   );
   if (hit) {
     const merged: RoundAnnotation = {

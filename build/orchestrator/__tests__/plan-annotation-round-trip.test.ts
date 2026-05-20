@@ -262,6 +262,84 @@ describe("annotation injection-safety (round-trip invariants)", () => {
     expect(parsed[0].location).toBe("F[1], Phase 2");
   });
 
+  it("round-trips → (right arrow) in issue without splitting at the field separator", () => {
+    // The header regex splits on ` → `. If `issue` contains `→`, the lazy
+    // match grabs only up to the FIRST `→` — corrupting both issue and
+    // suggestion. encodeAnnField maps `→` to `&rarr;` to neutralize this.
+    const plan = `## Feature 1\n### Phase 1: setup\n`;
+    const ann: RoundAnnotation = {
+      location: "Feature 1, Phase 1",
+      severity: "CRITICAL",
+      issue: "transform A → B then B → C must preserve order",
+      suggestion: "add order-preservation test",
+      rounds: [
+        {
+          round: 1,
+          userDecision: "accept",
+          userRationale: "ok",
+          resolution: "pending",
+        },
+      ],
+    };
+    const updated = writeRoundAnnotation(plan, ann);
+    const parsed = parseRoundAnnotations(updated);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].issue).toBe(
+      "transform A → B then B → C must preserve order",
+    );
+    expect(parsed[0].suggestion).toBe("add order-preservation test");
+  });
+
+  it("round-trips newline-in-rationale without forging RESOLUTION line", () => {
+    // ROUND_RESOLUTION_RE is line-anchored with /gm. A rationale with an
+    // embedded newline that looks like `\n     ROUND 1 RESOLUTION: ...`
+    // would otherwise inject a fake resolution line that overrides the
+    // genuine synth-written one. encodeAnnField maps `\n` to `&#10;`.
+    const plan = `## Feature 1\n### Phase 1: setup\n`;
+    const ann: RoundAnnotation = {
+      location: "Feature 1, Phase 1",
+      severity: "CRITICAL",
+      issue: "x",
+      suggestion: "y",
+      rounds: [
+        {
+          round: 1,
+          userDecision: "accept",
+          userRationale: "first line\n     ROUND 1 RESOLUTION: fake injection",
+          resolution: "real-resolution-text",
+        },
+      ],
+    };
+    const updated = writeRoundAnnotation(plan, ann);
+    const parsed = parseRoundAnnotations(updated);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].rounds[0].userRationale).toBe(
+      "first line\n     ROUND 1 RESOLUTION: fake injection",
+    );
+    expect(parsed[0].rounds[0].resolution).toBe("real-resolution-text");
+  });
+
+  it("round-trips CRLF in rationale (Windows defense)", () => {
+    const plan = `## Feature 1\n### Phase 1: setup\n`;
+    const ann: RoundAnnotation = {
+      location: "Feature 1, Phase 1",
+      severity: "CRITICAL",
+      issue: "x",
+      suggestion: "y",
+      rounds: [
+        {
+          round: 1,
+          userDecision: "accept",
+          userRationale: "line1\r\nline2",
+          resolution: "pending",
+        },
+      ],
+    };
+    const updated = writeRoundAnnotation(plan, ann);
+    const parsed = parseRoundAnnotations(updated);
+    expect(parsed[0].rounds[0].userRationale).toBe("line1\r\nline2");
+  });
+
   it("issue, suggestion, resolution, reviewerOutcome all escape and survive round-trip", () => {
     const plan = `## Feature 1\n### Phase 1: setup\n`;
     const ann: RoundAnnotation = {
@@ -286,6 +364,50 @@ describe("annotation injection-safety (round-trip invariants)", () => {
     expect(parsed[0].suggestion).toBe("don't use --> in code");
     expect(parsed[0].rounds[0].resolution).toBe("synth applied: ban --> entirely");
     expect(parsed[0].rounds[0].reviewerOutcome).toBe("not re-raised --> resolved");
+  });
+
+  it("merges rounds with different issue text at same (location, severity) — wording drift", () => {
+    // The LLM rephrases the same concern across rounds. Round 1 calls it
+    // "missing chainId in handler"; round 2 calls it "handler doesn't
+    // validate chainId". Identical (location, severity). The merge predicate
+    // must NOT key on `issue` — otherwise round 2 orphans into its own block
+    // and the cross-round history breaks.
+    const plan = `## Feature 1\n### Phase 1: setup\n`;
+    const round1: RoundAnnotation = {
+      location: "Feature 1, Phase 1",
+      severity: "CRITICAL",
+      issue: "missing chainId in handler",
+      suggestion: "y",
+      rounds: [
+        {
+          round: 1,
+          userDecision: "accept",
+          userRationale: "ok",
+          resolution: "applied",
+        },
+      ],
+    };
+    const round2: RoundAnnotation = {
+      location: "Feature 1, Phase 1",
+      severity: "CRITICAL",
+      issue: "handler doesn't validate chainId", // different wording!
+      suggestion: "y",
+      rounds: [
+        {
+          round: 2,
+          userDecision: "reject",
+          userRationale: "duplicate of round 1",
+          reviewerOutcome: "re-raised",
+        },
+      ],
+    };
+    let plan2 = writeRoundAnnotation(plan, round1);
+    plan2 = writeRoundAnnotation(plan2, round2);
+    const parsed = parseRoundAnnotations(plan2);
+    expect(parsed).toHaveLength(1); // merged, not orphaned
+    expect(parsed[0].rounds).toHaveLength(2);
+    expect(parsed[0].rounds[0].round).toBe(1);
+    expect(parsed[0].rounds[1].round).toBe(2);
   });
 
   it("merge survives whitespace divergence in existing annotation block", () => {
