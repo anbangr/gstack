@@ -6,6 +6,7 @@
  * owns single-round parsing/reconciliation.
  */
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
@@ -34,7 +35,12 @@ import {
  * the same filesystem on every Unix and on Windows when the target exists.
  */
 function atomicWriteFile(filePath: string, content: string): void {
-  const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+  // pid+ms+random suffix: pid+ms alone collides in container-in-container
+  // scenarios where the same pid can appear in two namespaces; the 8-byte
+  // random tail makes cross-process collisions cryptographically improbable.
+  const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}.${crypto
+    .randomBytes(8)
+    .toString("hex")}`;
   fs.writeFileSync(tmp, content, "utf8");
   fs.renameSync(tmp, filePath);
 }
@@ -248,16 +254,22 @@ export interface RoundConvergenceSnapshot {
  * Whether a prior-round annotation entry represents a previously-accepted concern
  * that the synth was supposed to resolve. These are the entries that, if re-raised,
  * indicate the synth isn't getting the fixes done.
+ *
+ * Last-round-wins semantics: only the most recent round entry decides. A sequence
+ * "round 1 accept (resolved), round 2 user rejected (changed mind)" classifies as
+ * NOT a re-raise — the user's last decision overrides the earlier accept. This
+ * matches the spec comment in computeConvergenceSnapshot: round-k objections
+ * whose prior LAST match was rejected by the user are neither re-raises nor new.
  */
 function isPriorAcceptedResolutionAttempt(
   rounds: RoundAnnotationEntry[],
 ): boolean {
-  // Any round where user accepted AND the synth produced a non-pending resolution.
-  return rounds.some(
-    (r) =>
-      r.userDecision === "accept" &&
-      r.resolution !== undefined &&
-      r.resolution !== "pending",
+  if (rounds.length === 0) return false;
+  const last = rounds[rounds.length - 1];
+  return (
+    last.userDecision === "accept" &&
+    last.resolution !== undefined &&
+    last.resolution !== "pending"
   );
 }
 
@@ -753,6 +765,35 @@ export async function runPlanReviewLoop(
     }
   }
 
+  // Resume: hydrate priorRejectRationale from existing plan annotations so
+  // re-raise framing in round N+1 shows the most-recent rejection rationale
+  // instead of empty string. Without this, after Ctrl+C and re-launch the
+  // map starts empty even though the plan file's annotations DO carry the
+  // prior rationale text — re-raise prompts then show `""`.
+  if (startRound > 1) {
+    try {
+      const planText = fs.readFileSync(input.planPath, "utf8");
+      const annotations = parseRoundAnnotations(planText);
+      for (const ann of annotations) {
+        // Use the most-recent rejection per (location, severity). Matches
+        // the last-round-wins philosophy applied throughout this loop.
+        const lastReject = [...ann.rounds]
+          .reverse()
+          .find((r) => r.userDecision === "reject");
+        if (lastReject?.userRationale) {
+          priorRejectRationale.set(
+            `${ann.location}|${ann.severity}`,
+            lastReject.userRationale,
+          );
+        }
+      }
+    } catch {
+      // Plan unreadable — proceed without hydration. Re-raise framing will
+      // show empty rationale for resumed objections, which is the pre-fix
+      // behavior, not a regression.
+    }
+  }
+
   const finalResult = (
     outcome: LoopOutcome,
     rounds: number,
@@ -1102,7 +1143,29 @@ export async function runPlanReviewLoop(
       reRaisesArr.push(0);
       reRejectedArr.push(0);
       disputedResolutions.push(0);
-      writeAggregate({ outcome: "user_abort", round, verdict: "ABORTED" });
+      // Write an INTERRUPTED history entry so the per-round JSONL records
+      // the user-quit exit. Without this, the history.jsonl trajectory ends
+      // at round N-1 even though the loop visibly ran round N (the reviewer
+      // call already happened above); resume analytics then under-count the
+      // actual round number reached.
+      appendHistoryEntry(input.historyPath, {
+        round,
+        ts: new Date().toISOString(),
+        reviewedBy: verdict.reviewedBy,
+        verdict: "INTERRUPTED",
+        objectionCountRaw: critical.length,
+        critical: critical.length,
+        important: important.length,
+        suggestion: suggestion.length,
+        triage: null,
+        convergence: {
+          delta: null,
+          noForwardProgress: false,
+          reRaises: 0,
+          newObjections: 0,
+        },
+      });
+      writeAggregate({ outcome: "user_abort", round, verdict: "INTERRUPTED" });
       return finalResult("user_abort", round, 4, verdict);
     }
 
@@ -1284,7 +1347,7 @@ export async function runPlanReviewLoop(
           if (
             r.round === round &&
             r.resolution !== undefined &&
-            /^disputed\b/.test(r.resolution)
+            /^disputed\b/i.test(r.resolution)
           ) {
             disputedThisRound += 1;
           }

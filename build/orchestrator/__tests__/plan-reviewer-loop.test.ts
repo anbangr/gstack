@@ -4,9 +4,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  computeConvergenceSnapshot,
   runPlanReviewLoop,
   type RunPlanReviewLoopResult,
 } from "../plan-review-loop";
+import { writeRoundAnnotation, type RoundAnnotation } from "../plan-reviewer";
 import type { PlanReviewVerdict } from "../types";
 
 function readableFrom(text: string): NodeJS.ReadableStream {
@@ -615,5 +617,259 @@ describe("runPlanReviewLoop", () => {
     expect(
       fs.existsSync(path.join(tmpDir, "convergence.jsonl")),
     ).toBe(true);
+  });
+});
+
+describe("isPriorAcceptedResolutionAttempt semantics (last-round-wins)", () => {
+  it("returns false when last round is reject even if earlier round was accept", () => {
+    // Sequence: round 1 user-accepted + synth-resolved, round 2 user rejected
+    // (changed mind). Round 3 reviewer raises again. Per spec, this is NOT a
+    // re-raise — the user's most-recent decision was reject, so the reviewer
+    // re-raising is a prompt-fidelity signal, not a synth-failure signal.
+    const ann: RoundAnnotation = {
+      location: "F1, P1",
+      severity: "CRITICAL",
+      issue: "x",
+      suggestion: "y",
+      rounds: [
+        {
+          round: 1,
+          userDecision: "accept",
+          userRationale: "",
+          resolution: "synth fixed",
+        },
+        {
+          round: 2,
+          userDecision: "reject",
+          userRationale: "changed mind",
+        },
+      ],
+    };
+    const snap = computeConvergenceSnapshot({
+      round: 3,
+      rawObjections: [
+        {
+          severity: "CRITICAL",
+          location: "F1, P1",
+          issue: "x",
+          suggestion: "y",
+        },
+      ],
+      acceptedIndices: [0],
+      priorAnnotations: [ann],
+    });
+    // Old .some() semantics would classify as re-raise (reRaises=1). New
+    // last-round-wins semantics classify as new (reRaises=0, newObjections=1).
+    expect(snap.reRaises).toBe(0);
+    expect(snap.newObjections).toBe(1);
+  });
+
+  it("still returns true when last round is the accept+resolved entry", () => {
+    // Plain re-raise: round 1 accept+resolved, round 2 reviewer raises again.
+    const ann: RoundAnnotation = {
+      location: "F1, P1",
+      severity: "CRITICAL",
+      issue: "x",
+      suggestion: "y",
+      rounds: [
+        {
+          round: 1,
+          userDecision: "accept",
+          userRationale: "",
+          resolution: "synth fixed",
+        },
+      ],
+    };
+    const snap = computeConvergenceSnapshot({
+      round: 2,
+      rawObjections: [
+        {
+          severity: "CRITICAL",
+          location: "F1, P1",
+          issue: "x",
+          suggestion: "y",
+        },
+      ],
+      acceptedIndices: [0],
+      priorAnnotations: [ann],
+    });
+    expect(snap.reRaises).toBe(1);
+    expect(snap.newObjections).toBe(0);
+  });
+});
+
+describe("disputed-resolution counting (case-insensitive)", () => {
+  it("counts 'Disputed' (capital D) as a disputed resolution", async () => {
+    // Round 1 reviewer raises 1 CRITICAL; user accepts. Synth marks
+    // RESOLUTION: Disputed — wrong (capital D). Round 2 reviewer approves.
+    // The pre-fix /^disputed\b/ regex (no i flag) would miss this and report
+    // disputedResolutions[0] === 0. With the case-insensitive fix it should
+    // report 1.
+    const verdicts: PlanReviewVerdict[] = [
+      {
+        verdict: "REVISE",
+        objections: [
+          {
+            severity: "CRITICAL",
+            location: "F1, P1",
+            issue: "x",
+            suggestion: "y",
+          },
+        ],
+        assessment: "",
+        reviewedBy: "stub",
+        round: 1,
+      },
+      {
+        verdict: "APPROVE",
+        objections: [],
+        assessment: "",
+        reviewedBy: "stub",
+        round: 2,
+      },
+    ];
+    let rIdx = 0;
+    const reviewerFn = async () => verdicts[rIdx++];
+    const synthFn = async () => {
+      const text = fs.readFileSync(planPath, "utf8");
+      // Capital "Disputed" — must still count.
+      const out = text.replace(
+        /RESOLUTION: pending/g,
+        "RESOLUTION: Disputed — wrong suggestion",
+      );
+      fs.writeFileSync(planPath, out, "utf8");
+      return { ok: true };
+    };
+    const input = readableFrom("A\n");
+    const out = captureWriter();
+    await runPlanReviewLoop({
+      planPath,
+      historyPath: path.join(tmpDir, "history.jsonl"),
+      aggregatePath: path.join(tmpDir, "convergence.jsonl"),
+      slug: "test",
+      branch: "feat/x",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: true,
+      input,
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
+    });
+    const agg = JSON.parse(
+      fs.readFileSync(path.join(tmpDir, "convergence.jsonl"), "utf8").trim(),
+    );
+    expect(agg.disputedResolutions[0]).toBe(1);
+  });
+});
+
+describe("resume: priorRejectRationale hydration", () => {
+  it("re-raise framing on resume shows the prior-round rejection rationale", async () => {
+    // Seed plan with a round-1 user-rejected annotation that carries a
+    // non-empty userRationale. Seed history.jsonl so the loop starts at
+    // round 2 (the simulated post-Ctrl+C resume). The reviewer stub raises
+    // the same objection again; the priorRejectRationale map should be
+    // hydrated from the plan, and the TTY triage gate should print the
+    // prior rationale in the re-raise framing.
+    const historyPath = path.join(tmpDir, "history.jsonl");
+    fs.writeFileSync(
+      historyPath,
+      JSON.stringify({
+        round: 1,
+        ts: new Date().toISOString(),
+        reviewedBy: "stub",
+        verdict: "REVISE",
+        objectionCountRaw: 1,
+        critical: 1,
+        important: 0,
+        suggestion: 0,
+        triage: { accepted: [], rejected: [0], deferred: [] },
+        convergence: {
+          delta: null,
+          noForwardProgress: false,
+          reRaises: 0,
+          newObjections: 1,
+        },
+      }) + "\n",
+      "utf8",
+    );
+
+    // Write the round-1 rejection annotation into the plan file.
+    const seededPlan = writeRoundAnnotation(
+      fs.readFileSync(planPath, "utf8"),
+      {
+        location: "F1, P1",
+        severity: "CRITICAL",
+        issue: "x",
+        suggestion: "y",
+        rounds: [
+          {
+            round: 1,
+            userDecision: "reject",
+            userRationale: "intentional design choice from round 1",
+          },
+        ],
+      },
+    );
+    fs.writeFileSync(planPath, seededPlan, "utf8");
+
+    // Round 2 reviewer raises the same objection again.
+    const verdicts: PlanReviewVerdict[] = [
+      {
+        verdict: "REVISE",
+        objections: [
+          {
+            severity: "CRITICAL",
+            location: "F1, P1",
+            issue: "x",
+            suggestion: "y",
+          },
+        ],
+        assessment: "",
+        reviewedBy: "stub",
+        round: 2,
+      },
+      {
+        verdict: "APPROVE",
+        objections: [],
+        assessment: "",
+        reviewedBy: "stub",
+        round: 3,
+      },
+    ];
+    let rIdx = 0;
+    const reviewerFn = async () => verdicts[rIdx++];
+    const synthFn = async () => ({ ok: true });
+    // TTY user accepts the re-raised objection (a + rationale) and APPROVE
+    // terminates the loop.
+    const input = readableFrom("a\nok\n");
+    const out = captureWriter();
+    await runPlanReviewLoop({
+      planPath,
+      historyPath,
+      aggregatePath: path.join(tmpDir, "convergence.jsonl"),
+      slug: "resume-hydrate",
+      branch: "feat/resume-hydrate",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: true,
+      input,
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
+    });
+
+    // The triage gate writes the prior-reject rationale into its prompt when
+    // priorRejectRationale is populated. Without the hydration fix, the map
+    // starts empty on resume and the output contains the empty-string form.
+    const written = out.read();
+    expect(written).toContain("RE-RAISED from prior round");
+    expect(written).toContain("intentional design choice from round 1");
   });
 });
