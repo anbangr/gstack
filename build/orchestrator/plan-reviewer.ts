@@ -639,6 +639,50 @@ const ROUND_RESOLUTION_RE = /ROUND\s+(\d+)\s+RESOLUTION:\s+(.+?)(?:\s+-->)?$/gm;
 const ROUND_REVIEWER_RE = /ROUND\s+(\d+)\s+REVIEWER:\s+(.+?)(?:\s+-->)?$/gm;
 
 /**
+ * Encode an annotation field for round-trip-safe serialization into the HTML
+ * comment block. Four characters/sequences would otherwise corrupt the block
+ * syntax silently:
+ *
+ *   `]`     — closes the `[location]` bracket group early; parser drops the
+ *             entire annotation.
+ *   `"`     — terminates the `("rationale")` inner-quote class in
+ *             ROUND_USER_RE; parser drops the rationale.
+ *   `-->`   — closes the outer HTML comment; parser truncates the body and
+ *             drops every field after the injection point.
+ *   `&`     — must be escaped first so user input containing literal `&#93;`
+ *             cannot impersonate one of our own escape sequences.
+ *
+ * The encoding is intentionally HTML-entity-shaped. It is visible to humans
+ * reading the plan but harmless to readers (the encoded form names what it
+ * stands for: `&#93;` is the unicode codepoint for `]`).
+ */
+function encodeAnnField(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/\]/g, "&#93;")
+    .replace(/"/g, "&#34;")
+    .replace(/-->/g, "--&gt;");
+}
+
+/** Inverse of `encodeAnnField`. `&amp;` MUST decode last so user input
+ * containing literal `&#93;` (encoded as `&amp;#93;`) round-trips correctly. */
+function decodeAnnField(s: string): string {
+  return s
+    .replace(/--&gt;/g, "-->")
+    .replace(/&#34;/g, '"')
+    .replace(/&#93;/g, "]")
+    .replace(/&amp;/g, "&");
+}
+
+/** Returns true if any character that would corrupt the comment-block syntax
+ * is present in the input. Used to log a one-line operator warning when
+ * encoding is actually applied (so silent data is never silently encoded
+ * without an audit trail). */
+function fieldNeedsEncoding(s: string): boolean {
+  return s.includes("]") || s.includes('"') || s.includes("-->") || s.includes("&");
+}
+
+/**
  * Parse all round-annotation blocks out of a plan file's text.
  * Skips malformed blocks (logs to console.warn) instead of throwing.
  */
@@ -657,9 +701,9 @@ export function parseRoundAnnotations(planText: string): RoundAnnotation[] {
       continue;
     }
     const severity = headerMatch[2] as RoundAnnotation["severity"];
-    const location = headerMatch[3].trim();
-    const issue = headerMatch[4].trim();
-    const suggestion = headerMatch[5].trim();
+    const location = decodeAnnField(headerMatch[3].trim());
+    const issue = decodeAnnField(headerMatch[4].trim());
+    const suggestion = decodeAnnField(headerMatch[5].trim());
 
     // Collect every ROUND N USER / RESOLUTION / REVIEWER line into a per-round map.
     const byRound = new Map<number, RoundAnnotationEntry>();
@@ -679,14 +723,14 @@ export function parseRoundAnnotations(planText: string): RoundAnnotation[] {
     while ((u = ROUND_USER_RE.exec(body)) !== null) {
       const entry = ensure(parseInt(u[1], 10));
       entry.userDecision = u[2] as RoundAnnotationEntry["userDecision"];
-      if (u[3] !== undefined) entry.userRationale = u[3];
+      if (u[3] !== undefined) entry.userRationale = decodeAnnField(u[3]);
     }
 
     ROUND_RESOLUTION_RE.lastIndex = 0;
     let r: RegExpExecArray | null;
     while ((r = ROUND_RESOLUTION_RE.exec(body)) !== null) {
       const entry = ensure(parseInt(r[1], 10));
-      entry.resolution = r[2].trim();
+      entry.resolution = decodeAnnField(r[2].trim());
     }
 
     // ROUND N REVIEWER attaches to round N's own entry: it records the
@@ -699,7 +743,7 @@ export function parseRoundAnnotations(planText: string): RoundAnnotation[] {
     let v: RegExpExecArray | null;
     while ((v = ROUND_REVIEWER_RE.exec(body)) !== null) {
       const entry = ensure(parseInt(v[1], 10));
-      entry.reviewerOutcome = v[2].trim();
+      entry.reviewerOutcome = decodeAnnField(v[2].trim());
     }
 
     const rounds = Array.from(byRound.values()).sort((a, b) => a.round - b.round);
@@ -710,23 +754,53 @@ export function parseRoundAnnotations(planText: string): RoundAnnotation[] {
 
 /**
  * Serialize a single RoundAnnotation back to the canonical HTML comment.
+ *
+ * Every user-derived field is run through `encodeAnnField` first to neutralize
+ * the four characters that would otherwise break the round-trip: `]`, `"`,
+ * `-->`, and `&`. When encoding fires, we log a one-line warning so an
+ * operator inspecting the plan understands why entity-shaped tokens appear.
  */
 function serializeAnnotation(ann: RoundAnnotation): string {
+  // One-shot encoding-applied check across every user-derived field. We warn
+  // once per serialize (not once per field) so a single suspicious annotation
+  // doesn't blast the log with N copies of the same notice.
+  const anyNeeds =
+    fieldNeedsEncoding(ann.location) ||
+    fieldNeedsEncoding(ann.issue) ||
+    fieldNeedsEncoding(ann.suggestion) ||
+    ann.rounds.some(
+      (r) =>
+        (r.userRationale && fieldNeedsEncoding(r.userRationale)) ||
+        (r.resolution && fieldNeedsEncoding(r.resolution)) ||
+        (r.reviewerOutcome && fieldNeedsEncoding(r.reviewerOutcome)),
+    );
+  if (anyNeeds) {
+    console.warn(
+      `[plan-review] annotation field contains one of ], ", -->, & — applying HTML-entity encoding for round-trip safety (location=${JSON.stringify(ann.location)})`,
+    );
+  }
+
   const lines: string[] = [];
   const head = ann.rounds[0].round;
   lines.push(
-    `<!-- ROUND ${head} ${ann.severity} [${ann.location}]: ${ann.issue} → ${ann.suggestion}`,
+    `<!-- ROUND ${head} ${ann.severity} [${encodeAnnField(ann.location)}]: ${encodeAnnField(ann.issue)} → ${encodeAnnField(ann.suggestion)}`,
   );
   for (const r of ann.rounds) {
     if (r.userDecision) {
-      const rat = r.userRationale ? ` ("${r.userRationale}")` : "";
+      const rat = r.userRationale
+        ? ` ("${encodeAnnField(r.userRationale)}")`
+        : "";
       lines.push(`     ROUND ${r.round} USER: ${r.userDecision}${rat}`);
     }
     if (r.resolution) {
-      lines.push(`     ROUND ${r.round} RESOLUTION: ${r.resolution}`);
+      lines.push(
+        `     ROUND ${r.round} RESOLUTION: ${encodeAnnField(r.resolution)}`,
+      );
     }
     if (r.reviewerOutcome) {
-      lines.push(`     ROUND ${r.round} REVIEWER: ${r.reviewerOutcome}`);
+      lines.push(
+        `     ROUND ${r.round} REVIEWER: ${encodeAnnField(r.reviewerOutcome)}`,
+      );
     }
   }
   lines[lines.length - 1] += " -->";
@@ -744,22 +818,58 @@ export function writeRoundAnnotation(
   planText: string,
   ann: RoundAnnotation,
 ): string {
-  // Merge path: scan existing annotations, find a match.
-  const existing = parseRoundAnnotations(planText);
-  const matchIdx = existing.findIndex(
-    (e) =>
-      e.location === ann.location &&
-      e.severity === ann.severity &&
-      e.issue === ann.issue,
+  // Merge path: walk the regex over `planText` directly so we get the actual
+  // byte range of each existing block (not the canonical serialization). This
+  // matters because the stored block may have non-canonical whitespace, CRLF
+  // endings, or extra spaces introduced by an external editor or a synth
+  // round-trip. Using `planText.replace(serializeAnnotation(existing), ...)`
+  // would silently no-op in any of those cases — the canonical form simply
+  // wouldn't appear as a substring of the actual plan text. That was the
+  // round-2-decision-lost bug class.
+  //
+  // We build a fresh local regex (not the shared `ANNOTATION_BLOCK_RE`) so
+  // that `parseRoundAnnotations(bm[0])` below — which uses the shared regex
+  // and resets its `lastIndex` to 0 — cannot smash our outer iterator's
+  // position. Reusing the shared regex here caused an infinite loop where
+  // the inner reset + advance left `lastIndex` inside the just-matched
+  // block, so the outer `exec` kept re-matching the same span forever.
+  const matches: Array<{
+    start: number;
+    end: number;
+    ann: RoundAnnotation;
+  }> = [];
+  const blockRe = new RegExp(
+    ANNOTATION_BLOCK_RE.source,
+    ANNOTATION_BLOCK_RE.flags,
   );
-  if (matchIdx >= 0) {
+  let bm: RegExpExecArray | null;
+  while ((bm = blockRe.exec(planText)) !== null) {
+    // Re-parse the single block we just matched. parseRoundAnnotations runs
+    // the shared regex (different instance from `blockRe`), so feeding it
+    // the matched substring yields exactly one result (or zero on a
+    // malformed header, which we then skip).
+    const parsed = parseRoundAnnotations(bm[0]);
+    if (parsed.length === 1) {
+      matches.push({
+        start: bm.index,
+        end: bm.index + bm[0].length,
+        ann: parsed[0],
+      });
+    }
+  }
+  const hit = matches.find(
+    (mt) =>
+      mt.ann.location === ann.location &&
+      mt.ann.severity === ann.severity &&
+      mt.ann.issue === ann.issue,
+  );
+  if (hit) {
     const merged: RoundAnnotation = {
-      ...existing[matchIdx],
-      rounds: [...existing[matchIdx].rounds, ...ann.rounds],
+      ...hit.ann,
+      rounds: [...hit.ann.rounds, ...ann.rounds],
     };
-    const oldText = serializeAnnotation(existing[matchIdx]);
     const newText = serializeAnnotation(merged);
-    return planText.replace(oldText, () => newText);
+    return planText.slice(0, hit.start) + newText + planText.slice(hit.end);
   }
 
   // Insert path: place above `### Phase <phaseId>` for the location.

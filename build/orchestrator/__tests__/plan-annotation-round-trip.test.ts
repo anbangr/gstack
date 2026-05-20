@@ -178,14 +178,151 @@ describe("writeRoundAnnotation", () => {
       ],
     };
     const updated = writeRoundAnnotation(plan, ann);
-    expect(updated).toContain("regex contains $& and $1");
+    // `$1` doesn't include `&`, so it survives verbatim. `$&` triggers the
+    // `&`-encoding rule, so on disk it appears as `$&amp;`. That is correct
+    // behavior — encoding-on-write neutralizes characters that would otherwise
+    // break the comment-block syntax (here `&`, conservatively, to anchor the
+    // escape table). The user-facing invariant is round-trip recovery, not
+    // verbatim on-disk text — see the decoded assertions below.
+    expect(updated).toContain("$1");
     expect(updated).toContain("escape $` and $' literally");
-    expect(updated).toContain('USER: accept ("with $& dollar")');
-    // Round-trip: parse the result and confirm fields survive.
+    // Round-trip: parse the result and confirm fields survive verbatim after decode.
     const parsed = parseRoundAnnotations(updated);
     expect(parsed).toHaveLength(1);
     expect(parsed[0].issue).toBe("regex contains $& and $1");
     expect(parsed[0].suggestion).toBe("escape $` and $' literally");
     expect(parsed[0].rounds[0].userRationale).toBe("with $& dollar");
+  });
+});
+
+describe("annotation injection-safety (round-trip invariants)", () => {
+  it("rationale containing --> round-trips correctly", () => {
+    const plan = `## Feature 1\n### Phase 1: setup\n`;
+    const ann: RoundAnnotation = {
+      location: "Feature 1, Phase 1",
+      severity: "CRITICAL",
+      issue: "x",
+      suggestion: "y",
+      rounds: [
+        {
+          round: 1,
+          userDecision: "accept",
+          userRationale: "evil --> bad",
+          resolution: "pending",
+        },
+      ],
+    };
+    const updated = writeRoundAnnotation(plan, ann);
+    const parsed = parseRoundAnnotations(updated);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].rounds[0].userRationale).toBe("evil --> bad");
+  });
+
+  it("rationale containing double-quotes round-trips correctly", () => {
+    const plan = `## Feature 1\n### Phase 1: setup\n`;
+    const ann: RoundAnnotation = {
+      location: "Feature 1, Phase 1",
+      severity: "CRITICAL",
+      issue: "x",
+      suggestion: "y",
+      rounds: [
+        {
+          round: 1,
+          userDecision: "accept",
+          userRationale: 'they said "hi" loudly',
+          resolution: "pending",
+        },
+      ],
+    };
+    const updated = writeRoundAnnotation(plan, ann);
+    const parsed = parseRoundAnnotations(updated);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].rounds[0].userRationale).toBe('they said "hi" loudly');
+  });
+
+  it("location containing brackets round-trips correctly", () => {
+    const plan = `## Feature 1\n### Phase 2: impl\n`;
+    const ann: RoundAnnotation = {
+      location: "F[1], Phase 2",
+      severity: "CRITICAL",
+      issue: "x",
+      suggestion: "y",
+      rounds: [
+        {
+          round: 1,
+          userDecision: "accept",
+          userRationale: "ok",
+          resolution: "pending",
+        },
+      ],
+    };
+    const updated = writeRoundAnnotation(plan, ann);
+    const parsed = parseRoundAnnotations(updated);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].location).toBe("F[1], Phase 2");
+  });
+
+  it("issue, suggestion, resolution, reviewerOutcome all escape and survive round-trip", () => {
+    const plan = `## Feature 1\n### Phase 1: setup\n`;
+    const ann: RoundAnnotation = {
+      location: "Feature 1, Phase 1",
+      severity: "CRITICAL",
+      issue: "use --> instead of ->",
+      suggestion: "don't use --> in code",
+      rounds: [
+        {
+          round: 1,
+          userDecision: "accept",
+          userRationale: "agreed",
+          resolution: "synth applied: ban --> entirely",
+          reviewerOutcome: "not re-raised --> resolved",
+        },
+      ],
+    };
+    const updated = writeRoundAnnotation(plan, ann);
+    const parsed = parseRoundAnnotations(updated);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].issue).toBe("use --> instead of ->");
+    expect(parsed[0].suggestion).toBe("don't use --> in code");
+    expect(parsed[0].rounds[0].resolution).toBe("synth applied: ban --> entirely");
+    expect(parsed[0].rounds[0].reviewerOutcome).toBe("not re-raised --> resolved");
+  });
+
+  it("merge survives whitespace divergence in existing annotation block", () => {
+    // Simulate a synth (or external editor) that wrote the existing block with
+    // 8-space indent instead of canonical 5-space.
+    const planWith8SpaceIndent = `## Feature 1
+### Phase 1: setup
+<!-- ROUND 1 CRITICAL [Feature 1, Phase 1]: x → y
+        ROUND 1 USER: accept ("round 1 rationale")
+        ROUND 1 RESOLUTION: pending -->
+- [ ] task
+`;
+    const round2: RoundAnnotation = {
+      location: "Feature 1, Phase 1",
+      severity: "CRITICAL",
+      issue: "x",
+      suggestion: "y",
+      rounds: [
+        {
+          round: 2,
+          userDecision: "reject",
+          userRationale: "round 2 wants to reject",
+          reviewerOutcome: "re-raised",
+        },
+      ],
+    };
+    const merged = writeRoundAnnotation(planWith8SpaceIndent, round2);
+    // The output must differ from the input (the silent no-op bug).
+    expect(merged).not.toBe(planWith8SpaceIndent);
+    // The merged result must have BOTH rounds.
+    const parsed = parseRoundAnnotations(merged);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].rounds).toHaveLength(2);
+    expect(parsed[0].rounds[0].round).toBe(1);
+    expect(parsed[0].rounds[0].userRationale).toBe("round 1 rationale");
+    expect(parsed[0].rounds[1].round).toBe(2);
+    expect(parsed[0].rounds[1].userDecision).toBe("reject");
+    expect(parsed[0].rounds[1].userRationale).toBe("round 2 wants to reject");
   });
 });
