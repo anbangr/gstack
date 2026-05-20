@@ -4534,7 +4534,12 @@ async function runReviewGates(opts: {
   };
 
   for (const { name, role } of plan.gates) {
-    const before = captureGitSnapshot(opts.cwd);
+    // captureContents:true is REQUIRED so discardBlindExecutionChanges
+    // can roll back if applyGateHygiene detects a sandbox escape.
+    // Without it, the gate's BLIND_EXECUTION_DETECTED handler refuses to
+    // discard ("before.workTreeContents not captured") and the orphan
+    // edits stay on the worktree. Class 2 fix.
+    const before = captureGitSnapshot(opts.cwd, { captureContents: true });
     let result = await runGate(name, role);
     result = applyGateHygiene({
       result,
@@ -10320,8 +10325,14 @@ async function main() {
               // iteration counter has already been incremented by
               // runFeatureReviewIteration, so the cap check at the
               // top of the next pass will fire.
+              //
+              // Off-by-one note: this log fires AFTER the iteration ran.
+              // currentIter was set at the top of the loop as the cycle
+              // we just executed; show that value (not currentIter+1)
+              // so cap=5 prints "cycle 5/5" instead of "cycle 6/5"
+              // before the cap-extension prompt fires next iteration.
               console.warn(
-                `  → review verdict was UNCLEAR; retrying (cycle ${currentIter + 1}/${cap})`,
+                `  → review verdict was UNCLEAR; retrying (cycle ${currentIter}/${cap})`,
               );
             }
 
