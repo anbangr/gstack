@@ -4684,9 +4684,6 @@ async function runReviewGates(opts: {
         reviewSandboxEnv: process.env.GSTACK_BUILD_CODEX_REVIEW_SANDBOX,
       })
     ) {
-      const parentBeforeRetryGate = refreshParentWorkspaceSnapshot(
-        opts.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
-      );
       const retryResult = await runGate(name, role, {
         sandbox: "danger-full-access",
         suffix: "sandbox-retry",
@@ -4696,7 +4693,7 @@ async function runReviewGates(opts: {
         before,
         cwd: opts.cwd,
         label: `${name} sandbox retry gate`,
-        parentWorkspace: parentBeforeRetryGate,
+        parentWorkspace: parentBeforeGate,
         phaseRef: { phaseNumber: opts.phaseNumber },
       });
       outputs.push(checkedRetryResult);
@@ -6025,6 +6022,10 @@ async function runFeatureReviewIteration(args: {
   fs.writeFileSync(outputFilePath, "");
 
   const before = args.dryRun ? null : captureGitSnapshot(args.cwd);
+  let parentBeforeRole: {
+    workspaceRoot: string | null;
+    snapshot: GitSnapshot | null;
+  };
   let result: SubAgentResult;
   if (args.dryRun) {
     // Default dry-run verdict: PASS so the orchestrator walks the happy
@@ -6033,12 +6034,18 @@ async function runFeatureReviewIteration(args: {
       outputFilePath,
       "## VERDICT\nFEATURE_PASS\n\n## Findings\n- [dry-run] no real review performed\n",
     );
+    parentBeforeRole = refreshParentWorkspaceSnapshot(
+      args.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
+    );
     result = mockResult({
       exitCode: 0,
       stdout: "## VERDICT\nFEATURE_PASS\n",
       logPath: inputFilePath,
     });
   } else {
+    parentBeforeRole = refreshParentWorkspaceSnapshot(
+      args.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
+    );
     result = await runRoleTask({
       role: args.roles.featureReview,
       inputFilePath,
@@ -6055,7 +6062,7 @@ async function runFeatureReviewIteration(args: {
     before,
     cwd: args.cwd,
     label: "feature review",
-    parentWorkspace: args.parentWorkspace,
+    parentWorkspace: parentBeforeRole,
   });
 
   // Persist iteration onto featureState.featureReview.
@@ -6788,8 +6795,13 @@ async function runPhase(args: {
         `phase-${phase.number}-gemini-fix-${action.iteration}-output.md`,
       );
       const before = dryRun ? null : captureGitSnapshot(cwd);
+      let parentBeforeRole: {
+        workspaceRoot: string | null;
+        snapshot: GitSnapshot | null;
+      };
       let result: SubAgentResult;
       if (dryRun) {
+        parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);
         result = mockResult({
           exitCode: 0,
           stdout: `[dry-run] ${roleLabel(args.roles.testFixer)} would fix tests`,
@@ -6804,6 +6816,7 @@ async function runPhase(args: {
           buildGeminiFixPrompt(phase, state.planFile),
         );
         fs.writeFileSync(outputFilePath, "");
+        parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);
         result = await runRoleTask({
           role: args.roles.testFixer,
           inputFilePath,
@@ -6824,7 +6837,7 @@ async function runPhase(args: {
         requireNonEmptyOutput: true,
         requireNewCommit: true,
         allowSubmoduleRecovery: args.allowSubmoduleRecovery,
-        parentWorkspace,
+        parentWorkspace: parentBeforeRole,
       });
       phaseState = applyResult(phaseState, action, result);
       state.phases[phase.index] = phaseState;
