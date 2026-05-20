@@ -33,6 +33,7 @@ const MODULE_TEST_OWNERS: Record<string, string[]> = {
   "halt-event-helpers.ts": ["halt-event-helpers.test.ts"],
   "halt-events.ts": ["halt-events.test.ts"],
   "investigator-dispatch.ts": ["investigator-dispatch.test.ts"],
+  "learn-fault-patterns.ts": ["learn-fault-patterns.test.ts"],
   "monitor-supervisor.ts": [
     "monitor.test.ts",
     "cli.test.ts",

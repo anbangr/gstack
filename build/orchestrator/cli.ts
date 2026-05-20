@@ -191,6 +191,14 @@ import {
   rewindPhase,
 } from "./halt-event-helpers";
 import { buildHaltSnapshot, emitHaltEvent, severityFor } from "./halt-events";
+import {
+  autoPromoteDecision,
+  dedupeAgainstLearned,
+  loadPendingProposals,
+  promoteProposals,
+  type PendingProposal,
+} from "./learn-fault-patterns";
+import { loadLearnedPatterns } from "./skill-fault-detector";
 import { installWrapConsole } from "./wrap-console";
 
 /**
@@ -634,7 +642,14 @@ export interface Args {
     | "reconcile"
     | "doctor"
     | "drain-faults"
-    | "mark-shipped";
+    | "mark-shipped"
+    | "learn-fault-patterns";
+  /** learn-fault-patterns: dry-run only — print diff against learned-patterns.json. */
+  learnFaultPatternsDryRun?: boolean;
+  /** learn-fault-patterns: comma-separated faultIds to promote. */
+  learnFaultPatternsPromote?: string;
+  /** learn-fault-patterns: auto-promote per autoPromoteDecision (spawned sessions). */
+  learnFaultPatternsAutoPromote?: boolean;
   planFile: string;
   printOnly: boolean;
   dryRun: boolean;
@@ -928,6 +943,14 @@ export function parseArgs(argv: string[]): Args {
     else if (a === "--no-resume" || a === "--restart") args.noResume = true;
     else if (a === "--no-gbrain") args.noGbrain = true;
     else if (a === "--no-auto-drain") args.noAutoDrain = true;
+    else if (a === "--promote") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--promote requires a comma-separated list of faultIds");
+        process.exit(2);
+      }
+      args.learnFaultPatternsPromote = next;
+    } else if (a === "--auto-promote") args.learnFaultPatternsAutoPromote = true;
     else if (a === "--skip-ship") args.skipShip = true;
     else if (a === "--single-branch") args.singleBranch = true;
     else if (a === "--ship-on-plan-complete") args.shipOnPlanComplete = true;
@@ -1492,6 +1515,22 @@ export function parseArgs(argv: string[]): Args {
       console.error("gstack-build mark-shipped requires --feature <number>");
       process.exit(2);
     }
+  } else if (positional[0] === "learn-fault-patterns") {
+    if (positional.length !== 1) {
+      console.error(
+        "usage: gstack-build learn-fault-patterns [--dry-run | --promote <faultIds,...> | --auto-promote]   (-h for help)",
+      );
+      process.exit(2);
+    }
+    args.mode = "learn-fault-patterns";
+    // dry-run is the default if no explicit action flag set
+    if (
+      !args.dryRun &&
+      !args.learnFaultPatternsPromote &&
+      !args.learnFaultPatternsAutoPromote
+    ) {
+      args.dryRun = true;
+    }
   } else if (positional.length === 1) {
     args.planFile = path.resolve(positional[0]);
     if (
@@ -1509,7 +1548,7 @@ export function parseArgs(argv: string[]): Args {
     }
   } else {
     console.error(
-      "usage: gstack-build <plan-file> [flags]\n       gstack-build merge [flags]\n       gstack-build monitor --manifest <path> [--once|--watch]\n       gstack-build plan-status --gstack-repo <path> [--project-root <path>] [--json]   (-h for help)",
+      "usage: gstack-build <plan-file> [flags]\n       gstack-build merge [flags]\n       gstack-build monitor --manifest <path> [--once|--watch]\n       gstack-build plan-status --gstack-repo <path> [--project-root <path>] [--json]\n       gstack-build learn-fault-patterns [--dry-run | --promote <ids> | --auto-promote]   (-h for help)",
     );
     process.exit(2);
   }
@@ -9136,6 +9175,84 @@ export async function runStopRun(
  * per-build counts over time. When the queue is empty, the function is
  * fully silent (no stdout line, no telemetry row).
  */
+/**
+ * `gstack-build learn-fault-patterns` subcommand: drain
+ * pending-patterns.jsonl (PR 5's investigator output) through the curator
+ * gate into learned-patterns.json (consumed by the detector).
+ *
+ * Modes:
+ *   --dry-run (default if no other action set): print the proposed promote/
+ *     defer split as JSON. Useful for `build/SKILL.md.tmpl` Step M3.7 to
+ *     surface the diff in an AskUserQuestion.
+ *   --promote <faultIds,...>: commit only the listed faultIds; remaining
+ *     non-duplicates go to rejected-patterns.jsonl with reason="deferred".
+ *   --auto-promote: spawned-session mode. Promotes HIGH+ severity per
+ *     autoPromoteDecision; MEDIUM → rejected with reason="deferred-auto".
+ *
+ * Always exits 0 unless an IO error occurs. Empty pending-patterns.jsonl
+ * is a no-op (prints {keep:[],drop:[]} on dry-run, exits silently otherwise).
+ */
+async function runLearnFaultPatternsMode(args: Args): Promise<number> {
+  const proposals = loadPendingProposals();
+  const learned = loadLearnedPatterns();
+  const { keep, drop } = dedupeAgainstLearned(proposals, learned);
+
+  if (args.dryRun) {
+    console.log(
+      JSON.stringify(
+        {
+          totalProposals: proposals.length,
+          dropDuplicates: drop.length,
+          eligible: keep.length,
+          keep,
+          drop,
+        },
+        null,
+        2,
+      ),
+    );
+    return 0;
+  }
+
+  if (args.learnFaultPatternsAutoPromote) {
+    const decision = autoPromoteDecision(keep);
+    const toReject: Array<{ proposal: PendingProposal; reason: string }> = [
+      ...decision.defer.map((p) => ({ proposal: p, reason: "deferred-auto" })),
+      ...drop.map((p) => ({ proposal: p, reason: "duplicate" })),
+    ];
+    promoteProposals(decision.promote, toReject);
+    console.log(
+      `learn-fault-patterns: promoted ${decision.promote.length}, ` +
+        `deferred ${decision.defer.length}, duplicates ${drop.length}`,
+    );
+    return 0;
+  }
+
+  if (args.learnFaultPatternsPromote) {
+    const ids = new Set(
+      args.learnFaultPatternsPromote.split(",").map((s) => s.trim()).filter(Boolean),
+    );
+    const toPromote = keep.filter((p) => ids.has(p.faultId));
+    const deferred = keep.filter((p) => !ids.has(p.faultId));
+    const toReject: Array<{ proposal: PendingProposal; reason: string }> = [
+      ...deferred.map((p) => ({ proposal: p, reason: "deferred" })),
+      ...drop.map((p) => ({ proposal: p, reason: "duplicate" })),
+    ];
+    promoteProposals(toPromote, toReject);
+    console.log(
+      `learn-fault-patterns: promoted ${toPromote.length}, ` +
+        `deferred ${deferred.length}, duplicates ${drop.length}`,
+    );
+    return 0;
+  }
+
+  // Should not reach here — parser sets dryRun=true if no action flag.
+  console.error(
+    "learn-fault-patterns: no action specified (use --dry-run, --promote, or --auto-promote)",
+  );
+  return 2;
+}
+
 async function runAutoDrainIfEnabled(
   args: Args,
   state: BuildState | null,
@@ -9317,6 +9434,11 @@ async function main() {
       runId: args.runId,
     });
     process.exit(result.exitCode);
+  }
+
+  if (args.mode === "learn-fault-patterns") {
+    const exitCode = await runLearnFaultPatternsMode(args);
+    process.exit(exitCode);
   }
 
   if (

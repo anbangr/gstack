@@ -41,8 +41,14 @@ export interface ReleaseQueueRecord {
 const ALLOWED_TRANSITIONS: Record<ReleaseQueueStatus, ReleaseQueueStatus[]> = {
   queued: ["claiming", "blocked", "abandoned"],
   claiming: ["landing", "queued", "blocked", "abandoned"],
-  landing: ["drift_repairing", "landed", "blocked"],
-  drift_repairing: ["landing", "blocked"],
+  // landing → queued and drift_repairing → queued are signal-induced
+  // revival paths. The release-daemon's SIGTERM handler rewrites
+  // in-flight records back to queued so the next daemon picks them up
+  // instead of orphaning them in landing. Without these transitions,
+  // the revive path throws "invalid release queue transition" and the
+  // lock leaks for the 2h TTL.
+  landing: ["drift_repairing", "landed", "blocked", "queued"],
+  drift_repairing: ["landing", "blocked", "queued"],
   landed: [],
   blocked: ["queued", "abandoned"],
   abandoned: [],
@@ -151,6 +157,57 @@ export function updateReleaseQueueRecord(
 ): ReleaseQueueRecord {
   if (patch.status) assertReleaseQueueTransition(record.status, patch.status);
   return writeReleaseQueueRecord(queueDir, { ...record, ...patch });
+}
+
+/**
+ * Block a record by writing its on-disk file directly, without going
+ * through `releaseQueueRecordPath` → `releaseQueueRecordId` →
+ * `canonicalRepoIdentity` → `git remote get-url origin`. For records
+ * whose `repoPath` has ALREADY been rejected by the daemon's allowlist
+ * (Codex-14 / round-12), invoking git in that repo to derive the file
+ * path would defeat the trust boundary — running .git/config in an
+ * attacker-controlled dir is exactly the failure mode the allowlist
+ * exists to prevent.
+ *
+ * Strategy: scan queueDir for the file whose JSON `runId` matches.
+ * That file is the canonical home for this record; write the blocked
+ * status directly to it without touching the rejected repoPath.
+ *
+ * Returns the updated record on success, or `null` if no matching
+ * file was found (in which case the caller should fall back to the
+ * normal path or log a warning).
+ */
+export function blockReleaseQueueRecordByRunId(
+  queueDir: string,
+  record: ReleaseQueueRecord,
+  lastError: string,
+): ReleaseQueueRecord | null {
+  if (!fs.existsSync(queueDir)) return null;
+  for (const entry of fs.readdirSync(queueDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const filePath = path.join(queueDir, entry.name);
+    try {
+      const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as {
+        runId?: string;
+      };
+      if (parsed.runId !== record.runId) continue;
+    } catch {
+      continue;
+    }
+    // Match. Write blocked status directly.
+    if (record.status !== "blocked") {
+      assertReleaseQueueTransition(record.status, "blocked");
+    }
+    const next: ReleaseQueueRecord = {
+      ...record,
+      status: "blocked",
+      lastError,
+      lastUpdatedAt: new Date().toISOString(),
+    };
+    atomicWriteJson(filePath, next);
+    return next;
+  }
+  return null;
 }
 
 export function queuedMarker(record: ReleaseQueueRecord): string {
