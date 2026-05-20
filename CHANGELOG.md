@@ -28,9 +28,10 @@ End-to-end verified on the dev machine. Numbers from `bun test build/orchestrato
 | review-loop cap off-by-one | T12 | ~30 |
 | BLIND_EXECUTION rollback unblocked | T13, T13b | ~50 |
 | Kimi→Gemini fallback RESOLVED | T7a-c | ~60 |
-| Plan-review cross-run RESOLVED | T8-T11 | ~70 |
+| Plan-review cross-run RESOLVED | T8-T11b | ~110 |
+| runRoleTask Class 4 + runId chain | T7d-i | ~100 |
 | Legacy snapshot backfill | T_LBF1-4 | ~165 |
-| Total | **22 cases / 9 files** | **~780 LoC test** |
+| Total | **30 cases / 10 files** | **~920 LoC test** |
 
 ### What this means for builders
 
@@ -52,6 +53,9 @@ If you run `gstack-build drain-faults --queue` and it found stale `gbrain put`, 
 - `wrap-console.ts` console.warn / console.error handlers: now call `buildHaltSnapshot()` instead of hardcoding empty snapshot. Halt events carry the last 200 lines of `agent-stdout.log`.
 - `drainFaultsFromHaltEventsQueue` in `drain-faults.ts`: added pair-collapse pre-pass that moves matched DETECTED+RESOLVED pairs to `processed/` before the per-event dispatch loop. Orphan RESOLVEDs are silently moved out of pending. Existing `loadPendingInvestigations` is a back-compat wrapper filtering down to detected entries.
 - `runConfiguredRoleTask` in `sub-agents.ts`: on Kimi→Gemini fallback success (exitCode 0 + !timedOut), emits `emitHaltEventResolved` with the precomputed faultId of the wrap-console DETECTED row.
+- `runRoleTask` in `cli.ts` (the non-Configured variant — core phase / feature-review / merge-fixer flows): now mirrors the same Class 4 pattern. Precomputes faultId before `console.warn`, emits RESOLVED on backup success gated on `exitCode === 0 && !timedOut`. This was the broader unpaired surface — every successful primary→backup recovery on those paths used to leave an orphan DETECTED.
+- Fallback runId resolution chain (both `runRoleTask` and `runConfiguredRoleTask`): `opts.runId ?? process.env.GSTACK_BUILD_RUN_ID ?? opts.slug`. `cli.ts` publishes `GSTACK_BUILD_RUN_ID` once at launch from `state.launch.runId` so producer-side faultId keys match wrap-console's DETECTED keys (which use `state.launch?.runId ?? state.slug`). Without this match, pair-collapse keys diverged when `launch.runId !== slug` and the RESOLVED never collapsed its DETECTED.
+- `plan-reviewer.ts` `reconcilePlanReview`: per-objection bullet lines now print via `console.log` instead of `console.error`. `wrap-console.ts` only shims warn/error, so the previous code was creating one orphan `SOFT_HALT_ERROR` row per bullet that Class 5's single RESOLVED could never collapse. The aggregate `criticalMsg` still goes through `console.error` (one DETECTED, one RESOLVED, clean pair).
 - `cli.ts` plan-review handler: on `critical_exit`, persists `state.planReview.faultId + .stateSlug` so the next run can emit RESOLVED on re-synthesis success. Orphan stateSlug (operator switched plans) leaves the field alone.
 
 #### Fixed
