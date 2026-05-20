@@ -842,29 +842,63 @@ export async function runPlanReviewLoop(
   // the bottom would coerce to undefined — silently propagating into
   // state.planReview and the legacy plan-review-report.json.
   //
-  // The right semantics on resume past the cap: the prior session already
-  // hit the stalemate gate at round=maxRounds, the user must have picked
-  // [m] or [q] (otherwise we wouldn't be resuming), then made manual edits
-  // and re-launched. Treat the re-launch as an approval — the user has
-  // taken ownership of the plan. Synthesize an APPROVE verdict and skip
-  // the loop entirely.
+  // Resume-past-cap semantics (post-Codex-structured-review tightening):
+  // the prior session already hit the stalemate gate at round=maxRounds.
+  // The user must have picked [m] or [q], then likely made manual edits
+  // and re-launched. Auto-approving on history-length alone is unsafe:
+  // a user who just typed `gstack-build resume` without actually editing
+  // the plan would bypass the review gate. Run ONE more reviewer call on
+  // the (potentially-edited) plan. If APPROVE → done. If REVISE → exit
+  // STALEMATE; the user must either edit further and re-launch or pass
+  // --no-plan-review to explicitly override.
   if (startRound > input.maxRounds) {
     input.output.write(
-      `[plan-review] Resume past maxRounds (startRound=${startRound}, maxRounds=${input.maxRounds}). Skipping review.\n`,
+      `[plan-review] Resume past maxRounds (startRound=${startRound}, maxRounds=${input.maxRounds}). Running one verification reviewer call.\n`,
     );
-    const syntheticVerdict: PlanReviewVerdict = {
-      verdict: "APPROVE",
-      objections: [],
-      assessment: "Resume past maxRounds; review skipped.",
-      reviewedBy: "resume-past-cap",
+    const verifyVerdict = await input.reviewerFn(startRound);
+    const verifyCritical = verifyVerdict.objections.filter(
+      (o) => o.severity === "CRITICAL",
+    );
+    if (verifyVerdict.verdict === "APPROVE" || verifyCritical.length === 0) {
+      input.output.write(
+        `[plan-review] Verification reviewer cleared the plan. APPROVED.\n`,
+      );
+      writeAggregate({
+        outcome: "approved",
+        round: startRound,
+        verdict: "APPROVE",
+      });
+      return finalResult("approved", startRound, 0, verifyVerdict);
+    }
+    // Verification reviewer still found CRITICAL objections. The user did
+    // not actually fix them. Exit STALEMATE so the user must edit again
+    // or pass --no-plan-review to explicitly override.
+    input.output.write(
+      `[plan-review] Verification reviewer still found ${verifyCritical.length} CRITICAL objection(s). Edit the plan again or pass --no-plan-review to override.\n`,
+    );
+    appendHistoryEntry(input.historyPath, {
       round: startRound,
-    };
-    writeAggregate({
-      outcome: "approved",
-      round: startRound - 1,
-      verdict: "APPROVE",
+      ts: new Date().toISOString(),
+      reviewedBy: verifyVerdict.reviewedBy,
+      verdict: "REVISE",
+      objectionCountRaw: verifyCritical.length,
+      critical: verifyCritical.length,
+      important: 0,
+      suggestion: 0,
+      triage: null,
+      convergence: {
+        delta: null,
+        noForwardProgress: false,
+        reRaises: 0,
+        newObjections: 0,
+      },
     });
-    return finalResult("approved", startRound - 1, 0, syntheticVerdict);
+    writeAggregate({
+      outcome: "user_manual",
+      round: startRound,
+      verdict: "STALEMATE",
+    });
+    return finalResult("user_manual", startRound, 3, verifyVerdict);
   }
 
   // Helper: invoke synthFn, count disputed-resolution annotations afterward,

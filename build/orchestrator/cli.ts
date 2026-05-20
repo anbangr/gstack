@@ -9811,11 +9811,17 @@ async function main() {
 
       // Plan review: second-opinion pass before Phase 1 of Feature 1.
       // Skipped in dry-run, when --no-plan-review is set, or on resume (already reviewed).
+      // Resume re-runs the loop when prior session left a pending status:
+      //   - critical_exit_pending: stalemate at exit 3 → user picked manual mode
+      //   - user_aborted: user picked [q] / SIGINT → docs promise resume picks up
+      //   - synth_failure: synth crashed → loop never reached APPROVE
       if (
         !args.dryRun &&
         !args.noPlanReview &&
         (!state.planReview ||
-          (state.planReview as any).status === "critical_exit_pending")
+          (state.planReview as any).status === "critical_exit_pending" ||
+          (state.planReview as any).status === "user_aborted" ||
+          (state.planReview as any).status === "synth_failure")
       ) {
         const reviewRole = { ...args.roles.planReviewer };
         if (args.planReviewerModel) reviewRole.model = args.planReviewerModel;
@@ -9958,6 +9964,20 @@ async function main() {
           } as any;
           saveState(state, { noGbrain: args.noGbrain, log: console.warn });
           throw new ExitError(130);
+        }
+        if (loopResult.exitCode === 1) {
+          // synth_failure or runtime error. The plan was NOT successfully
+          // reviewed (synth crashed mid-loop, model unavailable, etc.). Do
+          // not let the build proceed into implementation as if review
+          // succeeded — that would silently bypass the plan-review gate
+          // on runtime failure. Persist the marker so resume re-runs the
+          // loop, then exit 1.
+          state.planReview = {
+            ...loopResult.finalVerdict,
+            status: "synth_failure",
+          } as any;
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+          throw new ExitError(1);
         }
         state.planReview = loopResult.finalVerdict;
         saveState(state, { noGbrain: args.noGbrain, log: console.warn });

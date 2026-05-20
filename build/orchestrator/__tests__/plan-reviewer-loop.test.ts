@@ -847,12 +847,13 @@ describe("runPlanReviewLoop", () => {
     expect(synthCalls).toBe(2);
   });
 
-  it("H4: resume with startRound > maxRounds returns approved with synthetic verdict", async () => {
+  it("H4 (post-Codex-P2 tightening): resume past maxRounds runs one verification reviewer call → APPROVE proceeds", async () => {
     // Seed history.jsonl with maxRounds entries so deriveRoundNumber returns
-    // startRound = maxRounds + 1. The for-loop must NOT execute (which
-    // would leave lastVerdict null and the lastVerdict! assertion would
-    // produce undefined). Instead the guard synthesizes an APPROVE verdict
-    // and returns cleanly.
+    // startRound = maxRounds + 1. The for-loop must NOT execute, but per the
+    // Codex structured review P2 finding, auto-approving on history-length
+    // alone is unsafe — a user who just typed `gstack-build resume` without
+    // actually editing the plan would bypass the review gate. The guard
+    // now runs ONE more reviewer call on the (potentially-edited) plan.
     const historyPath = path.join(tmpDir, "history.jsonl");
     const seed: any[] = [];
     for (let i = 1; i <= 5; i++) {
@@ -883,13 +884,12 @@ describe("runPlanReviewLoop", () => {
     let reviewCalls = 0;
     const reviewerFn = async (): Promise<PlanReviewVerdict> => {
       reviewCalls += 1;
-      // Should never be called — the H4 guard skips the loop entirely.
       return {
-        verdict: "REVISE",
+        verdict: "APPROVE",
         objections: [],
-        assessment: "should not reach",
-        reviewedBy: "stub",
-        round: 99,
+        assessment: "verification reviewer cleared the manual edits",
+        reviewedBy: "stub-verify",
+        round: 6,
       };
     };
     let synthCalls = 0;
@@ -917,19 +917,84 @@ describe("runPlanReviewLoop", () => {
     });
     expect(result.outcome).toBe("approved");
     expect(result.exitCode).toBe(0);
-    // Neither reviewer nor synth was called — the guard short-circuits.
-    expect(reviewCalls).toBe(0);
+    // The verification reviewer call DID fire (exactly once); synth did not.
+    expect(reviewCalls).toBe(1);
     expect(synthCalls).toBe(0);
-    // finalVerdict must be non-null (the H4 fix specifically avoids the
-    // lastVerdict! → undefined coercion).
     expect(result.finalVerdict).toBeDefined();
     expect(result.finalVerdict.verdict).toBe("APPROVE");
-    expect(result.finalVerdict.reviewedBy).toBe("resume-past-cap");
-    // rounds is reported as startRound - 1 (i.e. the last round the prior
-    // session actually executed).
-    expect(result.rounds).toBe(5);
-    // Convergence aggregate written.
+    expect(result.finalVerdict.reviewedBy).toBe("stub-verify");
     expect(fs.existsSync(path.join(tmpDir, "convergence.jsonl"))).toBe(true);
+  });
+
+  it("H4-P2: resume past maxRounds with REVISE from verification reviewer exits STALEMATE", async () => {
+    // Same seed as above but the verification reviewer returns REVISE with
+    // a CRITICAL objection — the user did NOT actually fix the plan, so
+    // the loop must NOT auto-approve. Exit STALEMATE (exit code 3) so the
+    // user must edit again or pass --no-plan-review.
+    const historyPath = path.join(tmpDir, "history.jsonl");
+    const seed: any[] = [];
+    for (let i = 1; i <= 5; i++) {
+      seed.push({
+        round: i,
+        ts: new Date().toISOString(),
+        reviewedBy: "stub",
+        verdict: "REVISE",
+        objectionCountRaw: 1,
+        critical: 1,
+        important: 0,
+        suggestion: 0,
+        triage: { accepted: [0], rejected: [], deferred: [] },
+        convergence: {
+          delta: null,
+          noForwardProgress: false,
+          reRaises: 0,
+          newObjections: 1,
+        },
+      });
+    }
+    fs.writeFileSync(
+      historyPath,
+      seed.map((e) => JSON.stringify(e)).join("\n") + "\n",
+      "utf8",
+    );
+
+    const reviewerFn = async (): Promise<PlanReviewVerdict> => ({
+      verdict: "REVISE",
+      objections: [
+        {
+          severity: "CRITICAL",
+          location: "F1, P1",
+          issue: "still missing chainId after user edits",
+          suggestion: "actually add chainId",
+        },
+      ],
+      assessment: "user said they fixed it but didn't",
+      reviewedBy: "stub-verify",
+      round: 6,
+    });
+    const synthFn = async () => ({ ok: true });
+    const out = captureWriter();
+    const result = await runPlanReviewLoop({
+      planPath,
+      historyPath,
+      aggregatePath: path.join(tmpDir, "convergence.jsonl"),
+      slug: "resume-past-cap-revise",
+      branch: "feat/resume-past-cap-revise",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: false,
+      input: readableFrom(""),
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
+    });
+    expect(result.outcome).toBe("user_manual");
+    expect(result.exitCode).toBe(3);
+    expect(result.finalVerdict.verdict).toBe("REVISE");
+    expect(result.finalVerdict.reviewedBy).toBe("stub-verify");
   });
 });
 
