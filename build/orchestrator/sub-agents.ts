@@ -27,7 +27,19 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { logDir, ensureLogDir, deriveGeminiTmpKey } from "./state";
 import type { RoleConfig, RoleProvider, RoleReasoning } from "./role-config";
-import { BUILD_DEFAULTS, envNumberOrDefault } from "./build-config";
+import {
+  BUILD_DEFAULTS,
+  envNumberOrDefault,
+  TOOL_AWARE_STALL_MS,
+  PROGRESS_GAP_MS,
+} from "./build-config";
+import {
+  parseGeminiLine,
+  parseCodexLine,
+  parseKimiLine,
+  parseClaudeLine,
+  type ProgressEvent,
+} from "./subagent-progress-parser";
 import type { DualImplCandidateKey } from "./types";
 import { attachStallWatchdog, type Provider } from "./stall-watchdog";
 import { computeFaultId, emitHaltEventResolved } from "./halt-events";
@@ -436,6 +448,31 @@ function pickProviderForBin(bin: string): Provider {
 }
 
 /**
+ * Pick the parser for a provider, or `null` to disable tool-aware
+ * windowing for this subagent. Null is returned when the env-var kill
+ * switch is set OR the provider has no useful parser (shell etc.).
+ *
+ * Exported for tests in __tests__/sub-agents-parser-pick.test.ts.
+ */
+export function pickParserForProvider(
+  provider: Provider,
+): ((line: string, now: number) => ProgressEvent | null) | null {
+  if (process.env.GSTACK_TOOL_AWARE_WATCHDOG === "0") return null;
+  switch (provider) {
+    case "gemini":
+      return parseGeminiLine;
+    case "codex":
+      return parseCodexLine;
+    case "kimi":
+      return parseKimiLine;
+    case "claude":
+      return parseClaudeLine;
+    default:
+      return null;
+  }
+}
+
+/**
  * Spawn a child, capture stdout+stderr to a log file, and resolve with
  * structured result. Closes stdin if `closeStdin` (Codex needs this).
  *
@@ -704,15 +741,24 @@ export function spawnCaptured(args: {
         "gstack-build: GSTACK_BUILD_WATCHDOG_CPU=1 ignored — `ps` not available on this platform; using stream-mode watchdog instead.\n",
       );
     }
+    const provider = pickProviderForBin(args.bin);
+    const parseProgress = pickParserForProvider(provider);
     const watchdog = attachStallWatchdog(
       useCpuWatchdog ? { mode: "cpu", child } : { mode: "stream", child },
       {
         stallMs: args.timeoutMs,
-        provider: pickProviderForBin(args.bin),
+        provider,
         onStallKill: (silenceMs) => {
           stallKilled = true;
           stallSilenceMs = silenceMs;
         },
+        ...(parseProgress
+          ? {
+              parseProgress,
+              toolStallMs: TOOL_AWARE_STALL_MS,
+              progressGapMs: PROGRESS_GAP_MS,
+            }
+          : {}),
       },
     );
 
