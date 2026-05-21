@@ -156,6 +156,52 @@ export function detectBaseBranch(args: {
   return { baseBranch: "", source: "" };
 }
 
+/**
+ * Resolve the fork-point SHA of the current branch against the detected
+ * base branch. Used as the "branch point" for git diff / git log /
+ * git diff --name-only invocations that the feature-review prompt builder
+ * and T11 skip heuristic feed off of.
+ *
+ * The legacy pattern `featureState.branch^{tree}..HEAD` resolves the
+ * branch's CURRENT tree (post-all-commits), which silently produces an
+ * empty diff against HEAD when the branch hasn't accumulated commits
+ * the tree doesn't already match. This helper returns the actual fork
+ * point so diff scope is correct.
+ *
+ * Returns `null` when base branch can't be detected OR `git merge-base`
+ * fails. Callers fall back to the legacy `branch^{tree}` pattern for
+ * backwards compatibility — bug-compatibility is better than crashing
+ * a /build that's mid-run on a repo without an `origin/main`.
+ */
+export function resolveFeatureBaseRef(args: {
+  cwd: string;
+  runSpawn?: (
+    cmd: string,
+    argv: string[],
+    opts: { cwd: string; encoding: "utf8" },
+  ) => { status: number | null; stdout: string };
+}): string | null {
+  const runSpawn =
+    args.runSpawn ??
+    ((cmd, argv, opts) => {
+      const r = spawnSync(cmd, argv, opts);
+      return {
+        status: r.status,
+        stdout: typeof r.stdout === "string" ? r.stdout : "",
+      };
+    });
+  const base = detectBaseBranch({ cwd: args.cwd, runSpawn });
+  if (!base.baseBranch) return null;
+  const mbR = runSpawn(
+    "git",
+    ["merge-base", `origin/${base.baseBranch}`, "HEAD"],
+    { cwd: args.cwd, encoding: "utf8" },
+  );
+  if (mbR.status !== 0) return null;
+  const sha = (mbR.stdout || "").trim();
+  return sha || null;
+}
+
 /** Dispatcher signature compatible with cli.ts's exported runRoleTask. */
 export interface RoleTaskDispatcher {
   (opts: {

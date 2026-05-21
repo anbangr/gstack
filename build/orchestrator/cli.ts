@@ -120,7 +120,12 @@ import {
   type ParsedFeatureVerdict,
 } from "./feature-review";
 import { promptYesNo, buildBlockedFeatureMd } from "./feature-review-prompt";
-import { runFeatureVerifier } from "./feature-verifier";
+import {
+  runFeatureVerifier,
+  resolveFeatureBaseRef,
+  comparePostMergeTrees,
+  detectBaseBranch,
+} from "./feature-verifier";
 import {
   writeFeatureReviewMetrics,
   watchFirstWrite,
@@ -809,6 +814,15 @@ export interface Args {
    * --dry-run. Useful in CI or when the verifier is misconfigured.
    */
   skipPreMergeVerify: boolean;
+  /**
+   * Treat UNCLEAR verdicts from the pre-merge featureVerifier as failures
+   * that halt ship. By default UNCLEAR (e.g. base-branch undetectable,
+   * subprocess error, output had no VERIFICATION sentinel) is logged and
+   * ship proceeds. Strict mode is for environments where an unaudited
+   * feature must never reach ship — at the cost of needing a working
+   * codex + reachable origin/<base> on every feature.
+   */
+  strictPreMergeVerify: boolean;
   /** Cap on per-feature review cycles. Defaults to BUILD_DEFAULTS.limits.featureReviewMaxIterations (3). */
   featureReviewMaxIter: number;
   /** Skip the planReviewer second-opinion pass at startup. */
@@ -989,6 +1003,7 @@ export function parseArgs(argv: string[]): Args {
     stopRun: undefined,
     skipFeatureReview: false,
     skipPreMergeVerify: false,
+    strictPreMergeVerify: false,
     featureReviewMaxIter: DEFAULT_FEATURE_REVIEW_MAX_ITER,
     noPlanReview: false,
     planReviewerModel: undefined,
@@ -1074,6 +1089,8 @@ export function parseArgs(argv: string[]): Args {
       }
     } else if (a === "--skip-feature-review") args.skipFeatureReview = true;
     else if (a === "--skip-pre-merge-verify") args.skipPreMergeVerify = true;
+    else if (a === "--strict-pre-merge-verify")
+      args.strictPreMergeVerify = true;
     else if (a === "--no-plan-review") args.noPlanReview = true;
     else if (a === "--plan-reviewer-model") {
       const next = argv[++i];
@@ -2874,6 +2891,10 @@ Flags:
   --skip-pre-merge-verify  Skip the pre-/ship featureVerifier acceptance-
                        criteria audit (T12). Useful in CI or when the
                        verifier is misconfigured.
+  --strict-pre-merge-verify  Treat UNCLEAR pre-merge verifier verdicts as
+                       failures that halt ship. Default behavior is to log
+                       and proceed. Use this in environments where an
+                       unaudited feature must never reach ship.
   --feature-review-max-iter N  Cap on per-feature review cycles before
                        hard-fail (F4 will swap this for an interactive
                        prompt to allow a 4th cycle).
@@ -6164,41 +6185,63 @@ async function runFeatureReviewIteration(args: {
       // still produces a key (or "" if phases lack committedSha); a
       // truly missing plan will mismatch any prior key with real body.
     }
+    // Effective reasoning matches the spawn-site override below in this
+    // same function (cycle-1 = medium, cycle 2+ = configured). Without this,
+    // a cycle-1 PASS that ran at medium would get keyed under the configured
+    // reasoning's label, then served back to a configured-high reviewer as
+    // if it were a high-reasoning verdict — silently downgrading safety.
+    const _cacheEffectiveReasoning =
+      args.roles.featureReview.provider === "codex" && args.iteration === 1
+        ? "medium"
+        : args.roles.featureReview.reasoning;
     _cacheKey = computeCacheKey({
       feature: args.feature,
       phaseStates: args.state.phases,
       planBody: _planBody,
-      reviewerRoleLabel: roleLabel(args.roles.featureReview),
+      reviewerRoleLabel: `${args.roles.featureReview.provider}:${args.roles.featureReview.model}:${_cacheEffectiveReasoning}`,
     });
     if (_cacheKey) {
       const hit = lookupCache(_cacheKey, slug);
       if (hit) {
-        console.log(
-          `  ↻ feature-review cache hit (cached PASS from ${hit.cachedAt}, iter ${hit.iteration}); skipping spawn`,
+        // Validate the cached outputFilePath through the same trust-boundary
+        // check live paths use. A poisoned cache JSON could plant a path
+        // that escapes the slug log dir. Out-of-scope paths → cache miss.
+        const validatedHitPath = validateLogPathInScope(
+          hit.outputFilePath,
+          slug,
         );
-        // Persist into featureState so featureReviewAlreadySatisfied catches
-        // it on next iteration too. Reconstruct a minimal ParsedFeatureVerdict
-        // — the caller only consumes verdict + action.
-        if (!args.featureState.featureReview) {
-          args.featureState.featureReview = {
-            iterations: 0,
-            outputLogPaths: [],
-            outputFilePaths: [],
+        if (validatedHitPath === null) {
+          console.warn(
+            `  ↻ feature-review cache entry rejected: outputFilePath ${hit.outputFilePath} is out of slug scope; treating as miss`,
+          );
+        } else {
+          console.log(
+            `  ↻ feature-review cache hit (cached PASS from ${hit.cachedAt}, iter ${hit.iteration}); skipping spawn`,
+          );
+          // Persist into featureState so featureReviewAlreadySatisfied catches
+          // it on next iteration too. Reconstruct a minimal ParsedFeatureVerdict
+          // — the caller only consumes verdict + action.
+          if (!args.featureState.featureReview) {
+            args.featureState.featureReview = {
+              iterations: 0,
+              outputLogPaths: [],
+              outputFilePaths: [],
+            };
+          }
+          const fr = args.featureState.featureReview;
+          fr.iterations += 1;
+          fr.finalVerdict = "FEATURE_PASS";
+          return {
+            verdict: {
+              verdict: "FEATURE_PASS",
+              phasesToRedo: [],
+              additionalPhasesMd: "",
+              findings: "(cached PASS — no fresh review performed)",
+            },
+            action: "ship",
+            outputFilePath: validatedHitPath,
           };
         }
-        const fr = args.featureState.featureReview;
-        fr.iterations += 1;
-        fr.finalVerdict = "FEATURE_PASS";
-        return {
-          verdict: {
-            verdict: "FEATURE_PASS",
-            phasesToRedo: [],
-            additionalPhasesMd: "",
-            findings: "(cached PASS — no fresh review performed)",
-          },
-          action: "ship",
-          outputFilePath: hit.outputFilePath,
-        };
       }
     }
   }
@@ -6214,9 +6257,19 @@ async function runFeatureReviewIteration(args: {
   // Compute feature commits + diff. Best-effort — if either git call
   // fails (no commits yet, detached HEAD, etc) we pass an empty string
   // and the prompt builder embeds a `(no commits captured)` note.
-  const branchPoint = args.featureState.branch
-    ? `${args.featureState.branch}^{tree}` // first commit on the feature branch is fine; we just need an ancestor
-    : "HEAD~10";
+  //
+  // Resolve the actual fork point via `git merge-base origin/<base> HEAD`.
+  // The legacy `branch^{tree}` pattern silently produced empty diffs when
+  // the branch hadn't moved the tree away from main, hiding real changes
+  // from the reviewer (cross-model adversarial review surfaced this).
+  // Fall back to the legacy pattern only when base detection fails (e.g.
+  // no origin/main, no origin/master) so a repo without a canonical base
+  // still gets a non-crashing review.
+  const branchPoint =
+    resolveFeatureBaseRef({ cwd: args.cwd }) ??
+    (args.featureState.branch
+      ? `${args.featureState.branch}^{tree}`
+      : "HEAD~10");
   const commitsR = spawnSync(
     "git",
     ["log", `${branchPoint}..HEAD`, "--oneline", "--no-decorate"],
@@ -10922,9 +10975,16 @@ async function main() {
           let _skipChangedFiles: string[] | undefined = undefined;
           try {
             // Mirror runFeatureReviewIteration's branchPoint resolution.
-            const _bp = featureState.branch
-              ? `${featureState.branch}^{tree}`
-              : "HEAD~10";
+            // Resolve actual fork point via git merge-base; fall back to
+            // the legacy `branch^{tree}` pattern only when base detection
+            // fails. Without this, a clean small diff against a branch
+            // whose tree hash matches main would compute to an empty
+            // file set and bypass the alwaysReviewPaths safety gate.
+            const _bp =
+              resolveFeatureBaseRef({ cwd }) ??
+              (featureState.branch
+                ? `${featureState.branch}^{tree}`
+                : "HEAD~10");
             const _filesR = spawnSync(
               "git",
               ["diff", "--name-only", `${_bp}..HEAD`],
@@ -11388,8 +11448,37 @@ async function main() {
                 break;
               }
               if (verifierResult.verdict === "UNCLEAR") {
+                if (args.strictPreMergeVerify) {
+                  // Strict mode: UNCLEAR halts ship. Use this when codex
+                  // misconfigurations or subprocess failures must NOT slip
+                  // an unaudited feature past the gate.
+                  featureState.status = "paused";
+                  featureState.error = `pre-merge verifier returned UNCLEAR (${verifierResult.reason ?? "no reason"}); strict mode halted ship. Full report: ${verifierResult.outputFilePath}`;
+                  state.failureReason = `Feature ${featureState.number}: pre-merge verifier UNCLEAR in strict mode (see ${verifierResult.outputFilePath})`;
+                  saveState(state, {
+                    noGbrain: args.noGbrain,
+                    log: console.warn,
+                  });
+                  console.error(
+                    `✗ Feature ${featureState.number}: pre-merge verifier UNCLEAR (--strict-pre-merge-verify)`,
+                  );
+                  console.error(
+                    `  Reason: ${verifierResult.reason ?? "no reason given"}`,
+                  );
+                  console.error(
+                    `  Full report: ${verifierResult.outputFilePath}`,
+                  );
+                  console.error(
+                    `  To proceed anyway, drop --strict-pre-merge-verify or use --skip-pre-merge-verify.`,
+                  );
+                  exitCode = 1;
+                  break;
+                }
                 console.warn(
                   `  → pre-merge verify returned UNCLEAR (${verifierResult.reason ?? "no reason"}); proceeding. See ${verifierResult.outputFilePath}`,
+                );
+                console.warn(
+                  `    (Use --strict-pre-merge-verify to halt on UNCLEAR.)`,
                 );
               } else {
                 console.log(`  → pre-merge verify PASS`);
@@ -11401,6 +11490,22 @@ async function main() {
                 ? `\n▶ Feature ${featureState.number} complete. Running /ship and queueing PR for release daemon.`
                 : `\n▶ Feature ${featureState.number} complete. Running /ship + /land-and-deploy.`,
             );
+            // T13 post-merge tree-hash audit. Capture the feature branch's
+            // HEAD tree BEFORE ship+land. After the merge lands (auto-land
+            // mode only — queued mode merges async via release-daemon, so
+            // the audit runs in SKILL.md.tmpl instead), compare the pre-tree
+            // against the merge-commit tree. When they differ, the squash
+            // resolved a conflict in a way that mutated landed behavior —
+            // exactly the case pre-merge verify cannot catch.
+            let _preMergeTree: string | null = null;
+            if (args.releaseMode === "auto-land") {
+              const _ptR = spawnSync("git", ["rev-parse", "HEAD^{tree}"], {
+                cwd,
+                encoding: "utf8",
+              });
+              _preMergeTree =
+                _ptR.status === 0 ? (_ptR.stdout || "").trim() || null : null;
+            }
             const result =
               args.releaseMode === "queued"
                 ? await shipOnly({
@@ -11533,6 +11638,51 @@ async function main() {
               saveState(state, { noGbrain: args.noGbrain, log: console.warn });
               exitCode = 1;
               break;
+            }
+            // T13 post-merge tree-hash audit (auto-land only; queued
+            // mode's merge is async and audited via SKILL.md.tmpl).
+            // Non-blocking: surface the delta to the user; never gate.
+            if (args.releaseMode === "auto-land" && _preMergeTree) {
+              try {
+                const _bbDetect = detectBaseBranch({ cwd });
+                const _postBaseRef = _bbDetect.baseBranch
+                  ? `origin/${_bbDetect.baseBranch}`
+                  : "HEAD"; // fallback: current HEAD's tree
+                const _postR = spawnSync(
+                  "git",
+                  ["rev-parse", `${_postBaseRef}^{tree}`],
+                  { cwd, encoding: "utf8" },
+                );
+                const _postTree =
+                  _postR.status === 0
+                    ? (_postR.stdout || "").trim() || null
+                    : null;
+                const _audit = comparePostMergeTrees(_preMergeTree, _postTree);
+                if (_audit.verdict === "DELTA_DETECTED") {
+                  console.warn(
+                    `  ⚠ POST_MERGE_AUDIT: DELTA_DETECTED — squash mutated landed tree`,
+                  );
+                  console.warn(`    pre:  ${_audit.preTree}`);
+                  console.warn(`    post: ${_audit.postTree}`);
+                  console.warn(
+                    `    Inspect with: git diff ${_audit.preTree} ${_audit.postTree}`,
+                  );
+                } else if (_audit.verdict === "NO_DELTA") {
+                  console.log(
+                    `  ✓ POST_MERGE_AUDIT: NO_DELTA — landed tree matches feature branch`,
+                  );
+                } else if (process.env.GSTACK_BUILD_DEBUG) {
+                  console.log(
+                    `  · POST_MERGE_AUDIT: SKIPPED (${_audit.reason ?? "unknown"})`,
+                  );
+                }
+              } catch (err) {
+                if (process.env.GSTACK_BUILD_DEBUG) {
+                  console.warn(
+                    `  · POST_MERGE_AUDIT: error during audit — ${err instanceof Error ? err.message : String(err)}`,
+                  );
+                }
+              }
             }
             featureState.shippedAt =
               featureState.shippedAt ?? new Date().toISOString();
@@ -11783,6 +11933,14 @@ async function main() {
       } while (exitCode === 0 && rerunAutonomousLoop);
 
       if (exitCode === 0 && args.singleBranch && !args.dryRun) {
+        // T12 pre-merge gate note (--single-branch mode): the per-feature
+        // runFeatureVerifier call lives in the !singleBranch ship-trigger
+        // path. For single-branch mode, the plan-level finalOriginCheck
+        // (verifyOriginPlanFeature) earlier in this block serves the same
+        // role — it audits the FULL plan against landed code before /ship.
+        // Per-feature featureVerifier is intentionally NOT invoked here:
+        // running it on a synthetic "plan" feature would conflict with
+        // finalOriginCheck and double-spend codex budget.
         console.log(
           args.releaseMode === "queued"
             ? "\n▶ Plan complete. Running /ship and queueing PR for release daemon."

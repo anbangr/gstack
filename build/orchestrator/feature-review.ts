@@ -549,12 +549,19 @@ export function buildFeatureReviewPrompt(
     "",
   );
 
-  // T8: when per-phase diffs are present, suppress the mega-diff body — the
-  // per-phase blocks above plus the cross-phase summary cover the same ground
-  // with less context bloat. When phaseDiffs is absent or empty (e.g. pre-T7
-  // state without committedSha, or all rev-parse calls failed), fall back to
-  // the existing mega-diff for backward compat.
-  const hasPhaseDiffs = !!args.phaseDiffs && args.phaseDiffs.size > 0;
+  // T8: when per-phase diffs are present AND at least one entry has non-empty
+  // content, suppress the mega-diff body — the per-phase blocks above plus
+  // the cross-phase summary cover the same ground with less context bloat.
+  // When phaseDiffs is absent, empty, or every entry is blank (e.g. wrong
+  // branchpoint produced bogus empty diffs), fall back to the mega-diff so
+  // the reviewer always has SOMETHING to read. Adversarial review surfaced
+  // the risk of suppressing the mega-diff when per-phase content is bogus.
+  const hasPhaseDiffs =
+    !!args.phaseDiffs &&
+    args.phaseDiffs.size > 0 &&
+    Array.from(args.phaseDiffs.values()).some(
+      (d) => typeof d === "string" && d.trim().length > 0,
+    );
   if (!hasPhaseDiffs) {
     sections.push(
       "## Net diff (feature start → HEAD)",
