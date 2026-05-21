@@ -182,6 +182,27 @@ describe("installWrapConsole", () => {
     uninstall();
   });
 
+  test("STATE_DRIFT warnings are not emitted as halt events", () => {
+    console.warn = () => {}; // silence test output
+    const uninstall = installWrapConsole({
+      runId: "r1",
+      stateSlug: "s1",
+      pointers: {
+        stateFile: "/x",
+        stdoutLog: "/x",
+        livingPlan: "/x",
+        worktreePath: "/x",
+      },
+      queueDir: tmp,
+    });
+    console.warn(
+      'STATE_DRIFT:missing_completedAt feature "Feature One" (feature 1) is committed but has no completedAt. Recover with: gstack-build mark-shipped --plan /x/plan.md --feature 1',
+    );
+    const pending = loadPendingInvestigations({ queueDir: tmp });
+    expect(pending.length).toBe(0);
+    uninstall();
+  });
+
   test("survives emitHaltEvent errors without crashing console.warn", () => {
     // Force a write failure by pointing at a path that can't be a dir
     fs.writeFileSync(path.join(tmp, "blocker"), "");
