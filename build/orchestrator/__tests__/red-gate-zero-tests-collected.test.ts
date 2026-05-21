@@ -307,4 +307,13 @@ describe("red-gate zero-tests-collected edge cases", () => {
       expect(action.type).not.toBe("VERIFY_RED");
     }
   });
+
+  test("edge: cli failure path emits RED_GATE_ZERO_TESTS_COLLECTED instead of generic retry cap", () => {
+    const cliPath = path.resolve(import.meta.dir, "../cli.ts");
+    const content = fs.readFileSync(cliPath, "utf-8");
+    expect(content).toContain("recordRedGateZeroTestsCollected");
+    expect(content).toMatch(
+      /action\.reason\.startsWith\("RED_GATE_ZERO_TESTS_COLLECTED"\)/,
+    );
+  });
 });

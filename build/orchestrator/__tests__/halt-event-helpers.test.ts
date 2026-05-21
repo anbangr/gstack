@@ -6,6 +6,7 @@ import {
   markPhaseFailed,
   markFeatureFailed,
   rewindPhase,
+  recordRedGateZeroTestsCollected,
   recordRetryCapHit,
 } from "../halt-event-helpers";
 import { loadPendingInvestigations } from "../halt-events";
@@ -127,5 +128,30 @@ describe("recordRetryCapHit", () => {
     expect(JSON.stringify(state)).toBe(before);
     const pending = loadPendingInvestigations({ queueDir: tmp });
     expect(pending[0].kind).toBe("RETRY_CAP_HIT");
+  });
+});
+
+describe("recordRedGateZeroTestsCollected", () => {
+  let tmp: string;
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "hh-"));
+  });
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("emits RED_GATE_ZERO_TESTS_COLLECTED with the resolved test command", () => {
+    const state = freshState();
+    recordRedGateZeroTestsCollected(state, 0, "bun test ./missing.test.ts", {
+      runId: "r1",
+      stateSlug: "s1",
+      pointers: fixturePaths(tmp),
+      queueDir: tmp,
+    });
+
+    const pending = loadPendingInvestigations({ queueDir: tmp });
+    expect(pending[0].kind).toBe("RED_GATE_ZERO_TESTS_COLLECTED");
+    expect(pending[0].message).toContain("bun test ./missing.test.ts");
+    expect(pending[0].message).toContain("<!-- testCmd: -->");
   });
 });
