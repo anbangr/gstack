@@ -170,7 +170,9 @@ import {
 import { BUILD_DEFAULTS, warnOnLargeStallWindows } from "./build-config";
 import { evaluateMonitorOnce, monitorExitCode } from "./monitor";
 import {
+  createDrainProgressCounter,
   drainFaults,
+  drainFaultsForBuildRun,
   drainFaultsFromHaltEventsQueue,
   drainFaultsFromMonitor,
   type DrainFaultsResult,
@@ -179,7 +181,11 @@ import {
 import type { HaltSeverity } from "./halt-events";
 import { runMarkShipped } from "./mark-shipped";
 import { buildMonitorAgentEscalation } from "./monitor-supervisor";
-import { startHeartbeat, type HeartbeatController } from "./heartbeat";
+import {
+  removeHeartbeatSidecar,
+  startHeartbeat,
+  type HeartbeatController,
+} from "./heartbeat";
 import {
   recordEscalation,
   resetStreak,
@@ -9515,28 +9521,58 @@ async function runLearnFaultPatternsMode(args: Args): Promise<number> {
 export async function runAutoDrainIfEnabled(
   args: Args,
   state: BuildState | null,
+  drainProgress?: { bump: () => void },
 ): Promise<void> {
   if (args.noAutoDrain) return;
   if (process.env.GSTACK_HALT_EVENTS_OFF === "1") return;
   const runIdFilter = state?.launch?.runId ?? state?.slug;
   if (!runIdFilter) return;
 
+  // No per-call AbortSignal here. End-of-build callers wrap this in
+  // `runWithDeadline(AUTO_DRAIN_DEADLINE_MS, ...)` (PR #70) — the outer
+  // 60-second deadline supersedes any inner budget, and process.exit
+  // below reaps orphaned investigators via the OS. The `signal?` field
+  // on DrainHaltEventsOptions stays available for callers that DO want
+  // explicit child-kill semantics (e.g. a future non-end-of-build use of
+  // drain that runs under a longer-lived host process).
+
   try {
     const startMs = Date.now();
-    const result = await drainFaultsFromHaltEventsQueue({
+    // Production caller passes a BuildState → use drainFaultsForBuildRun so
+    // each processed entry bumps state.lastUpdatedAt + the in-memory drain
+    // counter (visible to the monitor's stall arm via heartbeat sidecar).
+    // The base function (without state) is reserved for the manual
+    // `gstack-build drain-faults --queue` CLI subcommand.
+    const baseOpts = {
       max: 20,
-      severityMin: "MEDIUM",
+      severityMin: "MEDIUM" as HaltSeverity,
       investigatorTimeoutMs: 10 * 60 * 1000,
       runIdFilter,
-    });
+    };
+    const result = state
+      ? await drainFaultsForBuildRun(
+          state,
+          (s) => saveState(s as BuildState, { noGbrain: args.noGbrain, log: console.warn }),
+          baseOpts,
+          drainProgress,
+        )
+      : await drainFaultsFromHaltEventsQueue(baseOpts);
     const durationMs = Date.now() - startMs;
+
+    if (result.aborted) {
+      console.warn(
+        `auto-drain budget exceeded after ${(durationMs / 60_000).toFixed(1)}m; ` +
+          `${result.deferred ?? 0} entries left for next run`,
+      );
+    }
 
     if (
       result.processed === 0 &&
       result.shortCircuited === 0 &&
       result.inboxFiled === 0 &&
       result.proposalsAppended === 0 &&
-      result.failed === 0
+      result.failed === 0 &&
+      !result.aborted
     ) {
       return;
     }
@@ -9546,7 +9582,8 @@ export async function runAutoDrainIfEnabled(
         `shortCircuited ${result.shortCircuited}, ` +
         `skipped ${result.skipped}, ` +
         `inboxFiled ${result.inboxFiled} ` +
-        `(${(durationMs / 1000).toFixed(1)}s)`,
+        `(${(durationMs / 1000).toFixed(1)}s)` +
+        (result.aborted ? ` [aborted, ${result.deferred ?? 0} deferred]` : ""),
     );
 
     try {
@@ -9565,6 +9602,8 @@ export async function runAutoDrainIfEnabled(
           skipped: result.skipped,
           inboxFiled: result.inboxFiled,
           proposalsAppended: result.proposalsAppended,
+          aborted: result.aborted ?? false,
+          deferred: result.deferred ?? 0,
         }) + "\n";
       fs.appendFileSync(
         path.join(analyticsDir, "halt-events-drain.jsonl"),
@@ -9840,15 +9879,35 @@ async function main() {
   let heartbeat: HeartbeatController | null = null;
   let uninstallWrap: (() => void) | null = null;
 
+  // drainProgress counter: bumped by drainFaultsForBuildRun per processed
+  // entry; read by the heartbeat sidecar payload. Lets the monitor's stall
+  // arm distinguish "drain spinning on the same broken entry" from "drain
+  // moving forward" (plan v1.40.7.0 §Change 2, codex finding #6).
+  const drainProgress = createDrainProgressCounter();
+  const heartbeatPath = path.join(
+    path.dirname(statePath(slug)),
+    `${slug}.heartbeat.json`,
+  );
+
   try {
     ensureLogDir(slug);
 
-    // Periodic stdout heartbeat keeps stdoutLog mtime fresh during long
-    // sub-agent waits so the monitor's recentProcessActivity check (in
-    // monitor.ts) doesn't falsely escalate. See heartbeat.ts.
+    // Periodic heartbeat: stdout line keeps stdoutLog mtime fresh (the
+    // cheap noise filter the monitor's existing recentProcessActivity
+    // branch reads) AND atomic-writes a sidecar carrying state.lastUpdatedAt
+    // + drainProcessedCount. The monitor reads the sidecar to detect
+    // "process alive but state has not advanced" stalls. See heartbeat.ts.
     heartbeat = startHeartbeat({
       runId: launch.runId ?? slug,
+      pid: process.pid,
+      stateSlug: slug,
       getPhase: () => state?.currentPhaseIndex,
+      getStateSnapshot: () => ({
+        lastUpdatedAt: state?.lastUpdatedAt,
+        currentPhaseIndex: state?.currentPhaseIndex,
+        drainProcessedCount: drainProgress.count(),
+      }),
+      heartbeatFilePath: heartbeatPath,
     });
 
     currentBranchAtLaunch = getCurrentBranch(projectRoot);
@@ -11458,17 +11517,12 @@ async function main() {
         // a future change makes it non-trivial.
       }
     }
-    // Stop the stdout heartbeat first so we don't write any more lines
-    // while the active-run registry / lock cleanup runs.
-    if (heartbeat) {
-      try {
-        heartbeat.stop();
-      } catch {
-        // stop() is idempotent and swallows its own errors; this catch
-        // is belt-and-braces so an unexpected throw can't shadow the
-        // exit-code reporting below.
-      }
-    }
+    // NOTE: heartbeat.stop() + removeHeartbeatSidecar are deliberately NOT
+    // here. They must run AFTER end-of-build auto-drain (see below), because
+    // the sidecar carries drainProcessedCount and the monitor reads it
+    // throughout the drain. Stopping the heartbeat here would blind the
+    // monitor to drain progress — the exact failure mode this PR fixes.
+    // Cleanup happens after the auto-drain call, in the post-finally block.
     let activeRunRegistryUpdateFailed = false;
     try {
       if (state?.launch?.runId && state.launch.activeRunRegistry) {
@@ -11523,22 +11577,43 @@ async function main() {
   // non-fatal — preserves whatever exitCode the build produced. Opt out
   // via --no-auto-drain or GSTACK_HALT_EVENTS_OFF=1.
   //
-  // Outer deadline (AUTO_DRAIN_DEADLINE_MS): the inner
-  // drainFaultsFromHaltEventsQueue uses a 10-minute investigatorTimeoutMs
-  // (correct for the standalone `gstack-build halt drain` command, where
-  // investigators legitimately take that long). At end-of-build it is the
-  // wrong UX budget — a successful run with halt events queued could
-  // otherwise sit silent for up to 10 minutes between "Archived living
-  // plan" and process exit, looking exactly like a hang. process.exit
-  // below forcibly tears down the event loop, ending any orphaned drain
-  // investigators via OS process tree.
+  // Two reconciled controls layer here (PR #70 + PR #72):
+  //
+  //   - Outer 60-second AUTO_DRAIN_DEADLINE_MS (PR #70). This is the
+  //     end-of-build UX budget. The inner drain's 10-minute per-investigator
+  //     timeout is right for the standalone `gstack-build halt drain`
+  //     subcommand but wrong as a shutdown UX. process.exit below tears
+  //     down the event loop and the OS reaps orphaned investigator
+  //     children. On deadline hit, remaining queue entries stay in
+  //     pending-investigations/ for the next run.
+  //
+  //   - The heartbeat keeps ticking through this window (PR #72). Inside
+  //     the 60-second window, drainFaultsForBuildRun bumps the
+  //     drainProcessedCount counter per processed entry, the heartbeat
+  //     sidecar carries that count, and the monitor's stall arm sees real
+  //     progress. If we stopped the heartbeat BEFORE the drain (as the
+  //     initial PR #72 commit did, before the codex adversarial review
+  //     caught it), the monitor would be blind to drain progress — the
+  //     exact false-alive failure PR #72 is fixing.
   await runWithDeadline(
-    () => runAutoDrainIfEnabled(args, state),
+    () => runAutoDrainIfEnabled(args, state, drainProgress),
     AUTO_DRAIN_DEADLINE_MS,
     `auto-drain: ${AUTO_DRAIN_DEADLINE_MS / 1000}s end-of-build deadline exceeded, skipping ` +
       "(any unprocessed halt events remain queued for next build or " +
       "`gstack-build halt drain`)",
   );
+
+  // Auto-drain done (or deadlined). NOW stop the heartbeat and clean up
+  // the sidecar. Order matters: stop() first so no further ticks race
+  // with the unlink.
+  if (heartbeat) {
+    try {
+      heartbeat.stop();
+    } catch {
+      // stop() is idempotent and swallows its own errors; defensive catch.
+    }
+  }
+  removeHeartbeatSidecar(heartbeatPath);
 
   process.exit(exitCode);
 }

@@ -492,6 +492,368 @@ describe("evaluateMonitorOnce", () => {
     expect(result.terminalEvent.message).toContain("active-run registry owner");
   });
 
+  /**
+   * Helpers for the new stall-arm tests. Sets up a run with:
+   *   - active-run registry entry claiming pid = process.pid
+   *   - state at the given lastUpdatedAt
+   *   - stdoutLog mtime fresh (so recentProcessActivity = true)
+   *   - heartbeat sidecar pre-populated with the given snapshot + runId/pid
+   * Returns the manifest path the test passes to evaluateMonitorOnce.
+   */
+  const setupRunWithSidecar = (
+    sidecarPayload: Partial<{
+      stateLastUpdatedAt: string;
+      drainProcessedCount: number;
+      runId: string;
+      pid: number;
+    }>,
+    opts: {
+      freshStdoutAt: Date;
+      stateAt: string;
+      writeSidecar?: boolean;
+      omitTracker?: boolean;
+    },
+  ) => {
+    const data = manifest();
+    const run = data.runs[0];
+    const registryDir = path.join(tmpDir, "active-runs");
+    fs.mkdirSync(registryDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(registryDir, `${run.runId}.json`),
+      JSON.stringify({
+        runId: run.runId,
+        stateSlug: run.stateSlug,
+        repoPath: run.worktreePath,
+        baseProjectRoot: run.repoPath,
+        planFile: run.livingPlanPath,
+        pid: process.pid,
+        status: "running",
+        startedAt: "2026-05-08T00:00:00.000Z",
+        lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+        branches: [],
+      }),
+    );
+    writeState(run, { lastUpdatedAt: opts.stateAt });
+    fs.mkdirSync(path.dirname(run.stdoutLog), { recursive: true });
+    fs.writeFileSync(run.stdoutLog, "anything\n");
+    fs.writeFileSync(run.pidFile, `${process.pid}\n`);
+    fs.utimesSync(run.stdoutLog, opts.freshStdoutAt, opts.freshStdoutAt);
+    fs.utimesSync(run.pidFile, opts.freshStdoutAt, opts.freshStdoutAt);
+
+    if (opts.writeSidecar !== false) {
+      const sidecarPath = path.join(
+        stateDir,
+        `${run.stateSlug}.heartbeat.json`,
+      );
+      fs.writeFileSync(
+        sidecarPath,
+        JSON.stringify({
+          ts: opts.freshStdoutAt.toISOString(),
+          runId: sidecarPayload.runId ?? run.runId,
+          pid: sidecarPayload.pid ?? process.pid,
+          stateSlug: run.stateSlug,
+          phase: 0,
+          stateLastUpdatedAt: sidecarPayload.stateLastUpdatedAt,
+          drainProcessedCount: sidecarPayload.drainProcessedCount,
+        }),
+      );
+    }
+    return { data, run };
+  };
+
+  it("STALL ARM: escalates USER_ACTION_REQUIRED when heartbeat shows state frozen beyond threshold", () => {
+    // Regression test for the 47-min auto-drain hang. State + drain counter
+    // both unchanged across two polls separated by >threshold ms. Process
+    // pid is alive, stdoutLog mtime is fresh (the heartbeat ticker keeps
+    // writing) — under the OLD logic this would stay at RUN_RUNNING forever.
+    const stateAt = "2026-05-08T00:00:00.000Z";
+    const { data, run } = setupRunWithSidecar(
+      { stateLastUpdatedAt: stateAt, drainProcessedCount: 0 },
+      {
+        freshStdoutAt: new Date("2026-05-08T00:30:00.000Z"),
+        stateAt,
+      },
+    );
+
+    // Pre-seed a tracker so the SECOND poll observes "frozen since" exceeds
+    // the threshold. This mirrors what would happen across two real monitor
+    // ticks (sidecar unchanged → tracker.lastChangedAt sticks → time grows).
+    const trackerPath = path.join(
+      stateDir,
+      `${run.stateSlug}.heartbeat-track.json`,
+    );
+    fs.writeFileSync(
+      trackerPath,
+      JSON.stringify({
+        lastSeenStateLastUpdatedAt: stateAt,
+        lastSeenDrainProcessedCount: 0,
+        // Frozen for 20 minutes when "now" hits 00:30; threshold = 15min.
+        lastChangedAt: Date.parse("2026-05-08T00:10:00.000Z"),
+      }),
+    );
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:30:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+      buildStallThresholdMs: 15 * 60 * 1000,
+    });
+
+    expect(result.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
+    expect(result.terminalEvent.message).toContain(
+      "state has not advanced",
+    );
+    void run;
+  });
+
+  it("STALL ARM: does NOT escalate when state moves between polls", () => {
+    // Counter-test: if either signal is moving, the monitor must NOT
+    // escalate even when stdoutLog is fresh. Pins the "legit long work"
+    // case (a healthy drain processing entries one by one).
+    const stateAt = "2026-05-08T00:00:00.000Z";
+    const { data, run } = setupRunWithSidecar(
+      { stateLastUpdatedAt: stateAt, drainProcessedCount: 5 },
+      {
+        freshStdoutAt: new Date("2026-05-08T00:30:00.000Z"),
+        stateAt,
+      },
+    );
+
+    // Tracker recorded a DIFFERENT drainProcessedCount last poll. The
+    // current sidecar's count differs → evaluateHeartbeatStall sees movement,
+    // bumps lastChangedAt to now, stalledMs = 0. No escalation.
+    const trackerPath = path.join(
+      stateDir,
+      `${run.stateSlug}.heartbeat-track.json`,
+    );
+    fs.writeFileSync(
+      trackerPath,
+      JSON.stringify({
+        lastSeenStateLastUpdatedAt: stateAt,
+        lastSeenDrainProcessedCount: 3,
+        lastChangedAt: Date.parse("2026-05-08T00:10:00.000Z"),
+      }),
+    );
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:30:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+      buildStallThresholdMs: 15 * 60 * 1000,
+    });
+
+    expect(result.terminalEvent.event).toBe("MONITOR_REENTER");
+    const runEvents = result.events.filter(
+      (e) => "runId" in e && e.runId === run.runId,
+    );
+    const last = runEvents[runEvents.length - 1];
+    expect(last.event).toBe("RUN_RUNNING");
+    // Tracker MUST be updated with the new counter — otherwise the next
+    // poll would still see "5" as stale.
+    const updated = JSON.parse(fs.readFileSync(trackerPath, "utf-8"));
+    expect(updated.lastSeenDrainProcessedCount).toBe(5);
+  });
+
+  it("STALL ARM: ignores sidecar with mismatched runId (defense against cross-run files)", () => {
+    // Codex finding #3. If a sidecar file lingers from a crashed prior run
+    // on the same stateSlug, its runId won't match the current run's
+    // active-run registry. Trust gate must null the sidecar.
+    const stateAt = "2026-05-08T00:00:00.000Z";
+    const { data } = setupRunWithSidecar(
+      {
+        stateLastUpdatedAt: stateAt,
+        drainProcessedCount: 0,
+        runId: "DIFFERENT-RUN-ID",
+        pid: process.pid,
+      },
+      {
+        freshStdoutAt: new Date("2026-05-08T00:30:00.000Z"),
+        stateAt,
+      },
+    );
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:30:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+      buildStallThresholdMs: 1, // Tiny threshold — would fire if sidecar trusted.
+    });
+
+    // Sidecar nulled → no stall arm. Falls through to existing
+    // "waiting for state update" branch.
+    expect(result.terminalEvent.event).toBe("MONITOR_REENTER");
+    const runEvents = result.events.filter(
+      (e) => "runId" in e && e.runId === data.runs[0].runId,
+    );
+    const last = runEvents[runEvents.length - 1];
+    expect(last.event).toBe("RUN_RUNNING");
+  });
+
+  it("STALL ARM: ignores sidecar with mismatched pid (PID-reuse defense)", () => {
+    // Codex finding #3 part 2. Same runId, wrong pid → trust gate rejects.
+    const stateAt = "2026-05-08T00:00:00.000Z";
+    const { data } = setupRunWithSidecar(
+      {
+        stateLastUpdatedAt: stateAt,
+        drainProcessedCount: 0,
+        pid: 99999, // A pid the test process can't be.
+      },
+      {
+        freshStdoutAt: new Date("2026-05-08T00:30:00.000Z"),
+        stateAt,
+      },
+    );
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:30:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+      buildStallThresholdMs: 1,
+    });
+
+    expect(result.terminalEvent.event).toBe("MONITOR_REENTER");
+  });
+
+  it("STALL ARM: missing sidecar → falls back to existing decision tree", () => {
+    // Sidecar file just doesn't exist. The new arm must NOT fire; the
+    // existing recentProcessActivity branch (RUN_RUNNING) takes over.
+    // This is the "no new silent failure mode" guarantee.
+    const stateAt = "2026-05-08T00:00:00.000Z";
+    const { data } = setupRunWithSidecar(
+      { stateLastUpdatedAt: stateAt },
+      {
+        freshStdoutAt: new Date("2026-05-08T00:30:00.000Z"),
+        stateAt,
+        writeSidecar: false,
+      },
+    );
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:30:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+      buildStallThresholdMs: 1,
+    });
+
+    expect(result.terminalEvent.event).toBe("MONITOR_REENTER");
+    const runEvents = result.events.filter(
+      (e) => "runId" in e && e.runId === data.runs[0].runId,
+    );
+    const last = runEvents[runEvents.length - 1];
+    expect(last.event).toBe("RUN_RUNNING");
+  });
+
+  it("STALL ARM: tracker persists across monitor restarts (first poll seeds, second poll evaluates)", () => {
+    // The monitor is stateless: each evaluateMonitorOnce() reads + writes
+    // the tracker file on disk. This test simulates two monitor processes
+    // running sequentially against the same on-disk state.
+    const stateAt = "2026-05-08T00:00:00.000Z";
+    const { data, run } = setupRunWithSidecar(
+      { stateLastUpdatedAt: stateAt, drainProcessedCount: 0 },
+      {
+        freshStdoutAt: new Date("2026-05-08T00:14:00.000Z"),
+        stateAt,
+      },
+    );
+
+    // First monitor process: no tracker on disk yet. Should seed one.
+    const trackerPath = path.join(
+      stateDir,
+      `${run.stateSlug}.heartbeat-track.json`,
+    );
+    expect(fs.existsSync(trackerPath)).toBe(false);
+
+    const first = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:14:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+      buildStallThresholdMs: 15 * 60 * 1000,
+    });
+    expect(first.terminalEvent.event).toBe("MONITOR_REENTER");
+    expect(fs.existsSync(trackerPath)).toBe(true);
+
+    // Between polls: stdoutLog mtime is refreshed (the heartbeat ticker
+    // would have written more lines). Without this, recentProcessActivity
+    // goes false and the OTHER existing USER_ACTION_REQUIRED branch fires
+    // first — testing the wrong arm. We want the new stall arm specifically.
+    const between = new Date("2026-05-08T00:29:59.000Z");
+    fs.utimesSync(data.runs[0].stdoutLog, between, between);
+    fs.utimesSync(data.runs[0].pidFile, between, between);
+
+    // Second monitor process: same on-disk state, >threshold ms later.
+    const second = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:30:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+      buildStallThresholdMs: 15 * 60 * 1000,
+    });
+    expect(second.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
+    expect(second.terminalEvent.message).toContain("state has not advanced");
+    void run;
+  });
+
+  it("STALL ARM: threshold defaults to 15 minutes when no override provided", () => {
+    // Hardcoded fallback when no gstack-config knob is wired. 14 minutes of
+    // freeze must NOT escalate; 16 minutes must.
+    const stateAt = "2026-05-08T00:00:00.000Z";
+    const { data, run } = setupRunWithSidecar(
+      { stateLastUpdatedAt: stateAt, drainProcessedCount: 0 },
+      {
+        freshStdoutAt: new Date("2026-05-08T00:14:00.000Z"),
+        stateAt,
+      },
+    );
+
+    const trackerPath = path.join(
+      stateDir,
+      `${run.stateSlug}.heartbeat-track.json`,
+    );
+    // Seed tracker as if it was first observed 14 minutes ago (under
+    // default threshold of 15min). buildStallThresholdMs omitted → uses
+    // default.
+    fs.writeFileSync(
+      trackerPath,
+      JSON.stringify({
+        lastSeenStateLastUpdatedAt: stateAt,
+        lastSeenDrainProcessedCount: 0,
+        lastChangedAt: Date.parse("2026-05-08T00:00:00.000Z"),
+      }),
+    );
+    const under = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:14:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+      // No buildStallThresholdMs override → default 15min applies.
+    });
+    expect(under.terminalEvent.event).toBe("MONITOR_REENTER");
+    void run;
+
+    // 16 minutes since change → over default → escalate.
+    fs.writeFileSync(
+      trackerPath,
+      JSON.stringify({
+        lastSeenStateLastUpdatedAt: stateAt,
+        lastSeenDrainProcessedCount: 0,
+        lastChangedAt: Date.parse("2026-05-08T00:00:00.000Z"),
+      }),
+    );
+    const over = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:16:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+    expect(over.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
+  });
+
   it("emits MONITOR_ERROR instead of crashing when the resume executable is missing", () => {
     const data = manifest({
       launchCommand: [path.join(tmpDir, "missing-gstack-build")],
