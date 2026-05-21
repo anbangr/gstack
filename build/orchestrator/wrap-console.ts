@@ -20,6 +20,9 @@ const KNOWN_BENIGN_WARN_PATTERNS: RegExp[] = [
   // state.ts:542 — gbrain put is best-effort; the local JSON write is
   // canonical so this is purely a cross-machine-sync miss, not a fault.
   /local JSON is canonical/,
+  // state.ts migrateState — STATE_DRIFT is an operator warning with an
+  // explicit recovery command, not an investigation-worthy halt event.
+  /STATE_DRIFT:/,
 ];
 
 export interface WrapConsoleContext {

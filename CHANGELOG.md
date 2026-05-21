@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.40.7.6] - 2026-05-21
+
+**Recovery-boundary cleanup for PR8 Phase 2.** Adds an upgrade migration that scrubs old manual-recovery learned-pattern categories, records a single-line migration note, and surfaces `STATE_DRIFT:missing_completedAt` warnings when committed build-state features lack `completedAt`.
+
+### Changed
+
+- Added `gstack-upgrade/migrations/v1.40.7.6.sh` plus the TypeScript migration it runs.
+- Added load-time `STATE_DRIFT` warnings for malformed feature state without halting the build.
+- Added targeted tests for migration idempotency, fresh-install no-op behavior, and warning-only state drift.
+
 ## [1.40.7.5] - 2026-05-21
 
 **Codex review prompt now tells the reviewer NOT to edit production code. Instead of "fix bugs as you find them," the prompt now says "if you find a bug, write a failing test that pins it; do NOT edit production source files." A DIFF SCOPE block at the end explicitly limits edits to test/spec paths. The hygiene gate also surfaces a clear "the constraint was in the prompt; reviewer edited production paths anyway" diagnostic when the reviewer ignores the rule, so investigators can tell confused-reviewer from real-bug.**
