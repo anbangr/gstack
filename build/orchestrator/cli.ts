@@ -5729,13 +5729,19 @@ function countCommitsSinceBase(
  * Reset a phase's runtime state so the orchestrator's main loop will
  * re-run it. Used by the FEATURE_REDO verdict path. Clears the codex
  * review history, gemini invocation record, test-run/test-fix counters,
- * and committedAt timestamp; flips status back to "pending". Does NOT
- * touch the on-disk plan markdown — checkboxes will be re-flipped when
- * the phase commits again. Mirrors the behavior of the startup
- * `--reset-phase N` flag but operates on a single phase by index for
- * mid-run reset.
+ * and committedAt/committedSha tracking; flips status back to "pending".
+ * Does NOT touch the on-disk plan markdown — checkboxes will be
+ * re-flipped when the phase commits again. Mirrors the behavior of the
+ * startup `--reset-phase N` flag but operates on a single phase by
+ * index for mid-run reset.
+ *
+ * Exported for testability (T7 unit tests). Internal callers in cli.ts
+ * still use it via the same name.
  */
-function resetPhaseStateForRedo(state: BuildState, phaseIndex: number): void {
+export function resetPhaseStateForRedo(
+  state: BuildState,
+  phaseIndex: number,
+): void {
   const ps = state.phases[phaseIndex];
   if (!ps) return;
   ps.status = "pending";
@@ -5746,6 +5752,7 @@ function resetPhaseStateForRedo(state: BuildState, phaseIndex: number): void {
   delete (ps as any).testFix;
   delete (ps as any).originIssueLogPath;
   delete (ps as any).committedAt;
+  delete (ps as any).committedSha;
   delete (ps as any).error;
   delete (ps as any).redSpecAttempts;
   delete (ps as any).dualImpl;
@@ -5977,7 +5984,16 @@ export function markPhaseCommittedAfterManualRecovery(args: {
     const clearsBuildFailure =
       args.state.failedAtPhase === phase.index ||
       (args.state.failedAtPhase == null && phaseState.status === "failed");
-    args.state.phases[phase.index] = markCommitted(phaseState);
+    // T7: capture HEAD sha for per-phase diff blocks (T8). Best-effort —
+    // detached HEAD, no commits, or transient I/O leaves the field
+    // undefined; downstream consumers tolerate that.
+    const _shaR = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: args.cwd,
+      encoding: "utf8",
+    });
+    const _committedSha =
+      _shaR.status === 0 ? (_shaR.stdout || "").trim() || undefined : undefined;
+    args.state.phases[phase.index] = markCommitted(phaseState, _committedSha);
     args.state.currentPhaseIndex = findNextPhaseIndex(args.state.phases);
     if (args.state.failedAtPhase === phase.index) {
       delete args.state.failedAtPhase;
@@ -6563,7 +6579,18 @@ async function runPhase(args: {
           return "failed";
         }
       }
-      phaseState = markCommitted(phaseState);
+      // T7: capture HEAD sha for per-phase diff blocks (T8). Best-effort —
+      // detached HEAD, no commits, or transient I/O leaves the field
+      // undefined; downstream consumers tolerate that.
+      const _shaR = spawnSync("git", ["rev-parse", "HEAD"], {
+        cwd,
+        encoding: "utf8",
+      });
+      const _committedSha =
+        _shaR.status === 0
+          ? (_shaR.stdout || "").trim() || undefined
+          : undefined;
+      phaseState = markCommitted(phaseState, _committedSha);
       state.phases[phase.index] = phaseState;
       state.currentPhaseIndex = phase.index + 1;
       saveState(state, { noGbrain, log: console.warn });

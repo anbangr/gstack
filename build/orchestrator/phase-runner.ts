@@ -861,12 +861,21 @@ export function applyResult(
 /**
  * Mark a phase as committed — called after the plan-mutator successfully
  * flipped the checkboxes. Pure transition.
+ *
+ * `committedSha` is the SHA of HEAD captured by the caller immediately
+ * before this call (best-effort; pass undefined when `git rev-parse HEAD`
+ * fails). When set, downstream tooling (T8 per-phase diff blocks) can
+ * compute `git diff <prev-sha>..<this-sha>` for review prompts.
  */
-export function markCommitted(phaseState: PhaseState): PhaseState {
+export function markCommitted(
+  phaseState: PhaseState,
+  committedSha?: string,
+): PhaseState {
   const next: PhaseState = {
     ...phaseState,
     status: "committed",
     committedAt: new Date().toISOString(),
+    ...(committedSha ? { committedSha } : {}),
   };
   delete next.error;
   return next;

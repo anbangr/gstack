@@ -324,6 +324,15 @@ export interface PhaseState {
     target: number;
   };
   committedAt?: string;
+  /**
+   * Git SHA of HEAD at the moment this phase committed. Captured by the
+   * orchestrator immediately before flipping status → "committed". Used
+   * by per-phase diff blocks (T8) to compute `git diff <prev-sha>..<this-sha>`
+   * for review prompts. Optional and best-effort: if `git rev-parse HEAD`
+   * fails at commit time (detached HEAD, no commits, transient I/O), the
+   * field stays undefined and downstream consumers must tolerate that.
+   */
+  committedSha?: string;
   error?: string;
 }
 
