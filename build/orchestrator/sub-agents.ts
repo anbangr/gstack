@@ -467,41 +467,76 @@ export function spawnCaptured(args: {
         `# stdout_bytes: ${stdoutBytes}\n` +
         `# stderr_bytes: ${stderrBytes}\n`;
 
-      if (ws) {
-        try {
-          ws.end(footer);
-        } catch {
-          // ws already in error state. The console.warn above already
-          // surfaced the underlying cause; no further action.
-        }
-      } else {
-        // No live stream (createWriteStream sync-threw at spawn time). Fall
-        // back to a single best-effort write so the log file at least exists.
-        try {
-          fs.writeFileSync(
-            args.logPath,
-            `# command: ${args.bin} ${args.argv.map(quote).join(" ")}\n` +
-              `# cwd: ${args.cwd || process.cwd()}\n` +
-              `# started: ${new Date(startedAt).toISOString()}\n` +
-              `# WARNING: live log stream unavailable\n` +
-              footer +
-              `\n# ---- stdout (post-mortem) ----\n${stdoutBuf}\n` +
-              `# ---- stderr (post-mortem) ----\n${stderrBuf}\n`,
-          );
-        } catch {
-          // Log file write failures shouldn't sink the orchestrator.
-        }
-      }
+      // Build a promise that resolves when the log file is fully flushed
+      // to disk. This matters because callers (and tests) often read
+      // logPath immediately after awaiting spawnCaptured — if we resolve
+      // before ws.end()'s flush completes, the reader sees a partial file
+      // missing the footer (and possibly the last few stdout/stderr
+      // chunks too). The 'finish' event fires after all buffered writes
+      // are flushed to the OS write buffer (close to but not identical
+      // to fsync; close enough for the post-close read pattern in
+      // practice).
+      //
+      // If the stream already errored before finish(), do NOT await
+      // another event — the stream is destroyed and no further events
+      // will fire. loggedStreamError tracks this so we resolve
+      // immediately rather than hanging on a stream that won't emit.
+      // A 1s safety timeout on the flush promise catches any path where
+      // ws.end() neither flushes nor errors (defense in depth).
+      const logFlushed: Promise<void> =
+        ws && !loggedStreamError
+          ? new Promise<void>((resolveFlush) => {
+              let settled = false;
+              const settle = () => {
+                if (settled) return;
+                settled = true;
+                resolveFlush();
+              };
+              ws!.once("finish", settle);
+              ws!.once("close", settle);
+              ws!.once("error", settle);
+              // Defense in depth: never let a stuck stream block resolve.
+              setTimeout(settle, 1000);
+              try {
+                ws!.end(footer);
+              } catch {
+                // ws already in error state. settle() will fire via the
+                // 'error' listener OR the timeout.
+                settle();
+              }
+            })
+          : (() => {
+              // No live stream (createWriteStream sync-threw at spawn time).
+              // Fall back to a single best-effort sync write so the log
+              // file at least exists.
+              try {
+                fs.writeFileSync(
+                  args.logPath,
+                  `# command: ${args.bin} ${args.argv.map(quote).join(" ")}\n` +
+                    `# cwd: ${args.cwd || process.cwd()}\n` +
+                    `# started: ${new Date(startedAt).toISOString()}\n` +
+                    `# WARNING: live log stream unavailable\n` +
+                    footer +
+                    `\n# ---- stdout (post-mortem) ----\n${stdoutBuf}\n` +
+                    `# ---- stderr (post-mortem) ----\n${stderrBuf}\n`,
+                );
+              } catch {
+                // Log file write failures shouldn't sink the orchestrator.
+              }
+              return Promise.resolve();
+            })();
 
-      resolve({
-        stdout: stdoutBuf,
-        stderr: stderrBuf,
-        exitCode,
-        timedOut,
-        stallKilled,
-        logPath: args.logPath,
-        durationMs: Date.now() - startedAt,
-        retries: 0,
+      logFlushed.then(() => {
+        resolve({
+          stdout: stdoutBuf,
+          stderr: stderrBuf,
+          exitCode,
+          timedOut,
+          stallKilled,
+          logPath: args.logPath,
+          durationMs: Date.now() - startedAt,
+          retries: 0,
+        });
       });
     };
 

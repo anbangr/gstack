@@ -3323,6 +3323,52 @@ describe("spawnCaptured streaming", () => {
   // These tests pin the new contract: header at top, channel-tagged live body,
   // result footer at end, all via a single fd.
 
+  // Liveness assertion. The original A-T1 used a 1s child sleep and a 1s
+  // poll window — the bounds matched, so on a slow CI runner the poll could
+  // finish AFTER the child exits, in which case the [OUT] line is also
+  // visible in the post-close write — i.e. the assertion `observed.includes`
+  // would pass even if streaming were buffered to the end. The fix:
+  // 1. Extend the child's sleep to 3s so the poll-while-alive window is
+  //    unambiguously inside the run.
+  // 2. After observing the streamed line, race the pending promise against
+  //    a setImmediate-resolved promise and require setImmediate wins — this
+  //    proves the child has not yet resolved (i.e. is still running) at the
+  //    moment of observation. Returns the same observed text either way; the
+  //    failure surface is that the pending wins the race when streaming is
+  //    actually buffered-on-close.
+  async function expectStreamingWhileAlive(
+    pending: ReturnType<typeof spawnCaptured>,
+    logPath: string,
+    needle: string,
+  ): Promise<string> {
+    let observed = "";
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      try {
+        observed = fs.readFileSync(logPath, "utf8");
+      } catch {
+        // file not flushed yet, keep polling
+      }
+      if (observed.includes(needle)) break;
+    }
+    expect(observed).toContain(needle);
+
+    // Liveness check: the pending promise must NOT have resolved by the time
+    // we observe the streamed line. If pending wins the race against
+    // setImmediate, the child exited before we observed — meaning the line
+    // could have been written on close, not streamed mid-run.
+    const RACE_SENTINEL = Symbol("setImmediate-won");
+    const livenessRace = await Promise.race([
+      pending.then(() => "pending-resolved" as const),
+      new Promise<typeof RACE_SENTINEL>((r) =>
+        setImmediate(() => r(RACE_SENTINEL)),
+      ),
+    ]);
+    expect(livenessRace).toBe(RACE_SENTINEL);
+
+    return observed;
+  }
+
   it("streams stdout to logPath while the child is still alive (A-T1)", async () => {
     const tmpDir = fs.mkdtempSync(
       path.join(os.tmpdir(), "spawncaptured-stream-"),
@@ -3331,27 +3377,20 @@ describe("spawnCaptured streaming", () => {
     try {
       const pending = spawnCaptured({
         bin: "bash",
-        argv: ["-c", "echo STREAMED; sleep 1"],
+        argv: ["-c", "echo STREAMED; sleep 3"],
         cwd: tmpDir,
-        timeoutMs: 5000,
+        timeoutMs: 10000,
         logPath,
         closeStdin: true,
       });
-      // Poll the log file for the streamed line while the child is still
-      // running. The 1-second sleep gives us a generous window where the
-      // file MUST contain content but the child has NOT yet exited.
-      let observed = "";
-      for (let i = 0; i < 20; i++) {
-        await new Promise((r) => setTimeout(r, 50));
-        try {
-          observed = fs.readFileSync(logPath, "utf8");
-        } catch {
-          // file not flushed yet, keep polling
-        }
-        if (observed.includes("[OUT] STREAMED")) break;
-      }
-      expect(observed).toContain("[OUT] STREAMED");
-      // Also verify the header is at the top (preserves existing format).
+      // Poll up to 1s for the streamed line, then prove the child is still
+      // alive at observation time. The 3s sleep gives us ~2s of headroom.
+      const observed = await expectStreamingWhileAlive(
+        pending,
+        logPath,
+        "[OUT] STREAMED",
+      );
+      // Header is at the top (preserves existing log-format contract).
       expect(observed.split("\n")[0]).toMatch(/^# command: bash/);
       // Let the child finish so we don't leak.
       const result = await pending;
@@ -3369,23 +3408,13 @@ describe("spawnCaptured streaming", () => {
     try {
       const pending = spawnCaptured({
         bin: "bash",
-        argv: ["-c", "echo STREAMED-ERR 1>&2; sleep 1"],
+        argv: ["-c", "echo STREAMED-ERR 1>&2; sleep 3"],
         cwd: tmpDir,
-        timeoutMs: 5000,
+        timeoutMs: 10000,
         logPath,
         closeStdin: true,
       });
-      let observed = "";
-      for (let i = 0; i < 20; i++) {
-        await new Promise((r) => setTimeout(r, 50));
-        try {
-          observed = fs.readFileSync(logPath, "utf8");
-        } catch {
-          // file not flushed yet, keep polling
-        }
-        if (observed.includes("[ERR] STREAMED-ERR")) break;
-      }
-      expect(observed).toContain("[ERR] STREAMED-ERR");
+      await expectStreamingWhileAlive(pending, logPath, "[ERR] STREAMED-ERR");
       await pending;
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
