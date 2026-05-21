@@ -271,6 +271,18 @@ describe("extractTestCount — edge cases", () => {
     expect(result.source).toBe("stdout-fallback");
     expect(result.collected).toBeGreaterThanOrEqual(8);
   });
+
+  test("edge: bun test current stdout uses capitalized Ran", () => {
+    const stdout =
+      "bun test v1.3.12 (700fc117)\n\n 17 pass\n 0 fail\n 35 expect() calls\nRan 17 tests across 1 file. [22.00ms]\n";
+    const result = extractTestCount({ stdout }, "bun");
+    expect(result).toEqual({
+      collected: 17,
+      passed: 17,
+      failed: 0,
+      source: "stdout-fallback",
+    });
+  });
 });
 
 describe("RunnerKind type export", () => {

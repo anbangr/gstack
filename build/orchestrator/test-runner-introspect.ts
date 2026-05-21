@@ -210,7 +210,7 @@ function parsePytestStdout(stdout: string): TestCountResult {
 
 function parseBunStdout(stdout: string): TestCountResult {
   // e.g. "ran 8 tests across 2 files"
-  const m = stdout.match(/ran\s+(\d+)\s+tests?\s+across/);
+  const m = stdout.match(/ran\s+(\d+)\s+tests?\s+across/i);
   const collected = m ? parseInt(m[1], 10) : 0;
   return {
     collected,
