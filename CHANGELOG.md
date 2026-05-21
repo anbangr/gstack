@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.40.7.5] - 2026-05-21
+
+**Codex review prompt now tells the reviewer NOT to edit production code. Instead of "fix bugs as you find them," the prompt now says "if you find a bug, write a failing test that pins it; do NOT edit production source files." A DIFF SCOPE block at the end explicitly limits edits to test/spec paths. The hygiene gate also surfaces a clear "the constraint was in the prompt; reviewer edited production paths anyway" diagnostic when the reviewer ignores the rule, so investigators can tell confused-reviewer from real-bug.**
+
+This is PR2 of the tidy-haven plan — Feature 6 of the 83-fault recurrence program. Hand-shipped via the orchestrator (Kimi/Gemini auth preflight + watchdog auth detector from PR4-rest kept it from stalling); converged after 3 review iterations with the codex reviewer correctly catching its own first-attempt issues. The auto-built diff is 4 files, ~666 lines added, all in test paths plus the prompt + hygiene-diagnostic edits to `cli.ts`.
+
+### What changed for the user
+
+- Codex review iterations on `code` phases no longer treat "found a bug" as an invitation to edit production source. The reviewer now writes a failing test and surfaces the bug in its report as a recommended follow-up phase, exactly as the plan called for.
+- The hygiene gate's "left the working tree dirty" message now includes the diagnostic line "the constraint was in the prompt; reviewer edited production paths anyway" when the dirty files are outside the test-only DIFF SCOPE. Lets investigators tell a confused reviewer from a real production-code bug fast.
+- DIFF SCOPE block at the end of every review prompt: `test/**`, `**/__tests__/**`, `**/*.test.*`, `**/*.spec.*`, `**/conftest.py`, `**/spec/**`, plus committed data outputs. Edits to anything else fail the hygiene gate.
+
+### Itemized changes
+
+#### Added
+
+- `__tests__/review-prompt-scope.test.ts` — 13 unit tests covering the prompt content (DIFF SCOPE present, "do NOT edit production" wording present, every code/writing/experiment/research/manual kind has appropriate guidance), plus the hygiene-diagnostic gate.
+- `test/skill-e2e-review-prompt-scope.test.ts` — 148-line paid eval (ANTHROPIC_API_KEY required, ~$0.20/run) that hands a fixture branch (production bug + failing test) to the new review prompt and asserts the reviewer writes a `*.test.*` file rather than editing the production source. Wired into `test/helpers/touchfiles.ts` for diff-based selection.
+- Diagnostic line in `validatePostAgentHygiene` (cli.ts:2122) — when the dirty file set contains non-test paths AND the call site is the review gate, append "the constraint was in the prompt; reviewer edited production paths anyway" to the error message.
+
+#### Changed
+
+- `buildCodexReviewBody` in `cli.ts:4126` — replaced "Fix bugs as you find them (workspace-write sandbox is enabled)" with two new prompt items: (4) write a failing test for any bug; do NOT edit production source; (5) execute data-generation/corpus-driver scripts and commit their output. Existing items renumbered.
+- Appended DIFF SCOPE block to the end of the review prompt (after the numbered list) so it cannot be missed.
+
+### For contributors
+
+- The orchestrator built and shipped this PR autonomously (3 commits via Kimi + Gemini, converged after 3 codex review iterations). The `gemini-auth-preflight` + `auth-prompt-watchdog` shipped in v1.40.7.4 worked in the orchestrator's favor — no stalls from auth issues this build.
+- The paid E2E eval (`test/skill-e2e-review-prompt-scope.test.ts`) is the canonical regression check for this PR. Run it manually on any change to the review prompt before merging.
+
 ## [1.40.7.4] - 2026-05-21
 
 **Gemini and Codex now skip-or-stop before doing anything destructive. Auth preflight runs once per process — if `gemini auth status` (or `--version` fallback) returns non-zero, the orchestrator halts with a clear "run `gemini auth login`" message instead of letting the stalled subprocess silently burn 25 minutes of watchdog timeout. The stall-watchdog also matches an auth-prompt regex on stdout chunks and kills the child immediately on a match, so mid-build re-auth prompts never silently hang anymore. Gemini stdin defaults to closed, removing one more pre-stdin-prompt hang surface.**
