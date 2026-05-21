@@ -227,4 +227,42 @@ describe("attachStallWatchdog tool-aware", () => {
 
     w.stop();
   });
+
+  it("parser throw does not crash the watchdog", () => {
+    const { clock, advance } = makeFakeClock();
+    const { child, emitStdout } = makeFakeChild();
+    let killed = false;
+
+    const w = attachStallWatchdog(
+      { mode: "stream", child },
+      {
+        stallMs: 60_000,
+        provider: "shell",
+        clock,
+        onStallKill: () => {
+          killed = true;
+        },
+        parseProgress: () => {
+          throw new Error("parser blew up");
+        },
+        toolStallMs: { fast: 90_000, slow: 600_000 },
+        progressGapMs: 300_000,
+      },
+    );
+
+    // Throwing parser must not propagate. stdout still resets
+    // lastActivityAt, so the watchdog should NOT kill in the first 30s.
+    emitStdout("any text\n");
+    advance(30_000);
+    expect(killed).toBe(false);
+    expect(w.stallKilled()).toBe(false);
+
+    // Past legacy stallMs of silence → legacy kill fires (no classified
+    // events ever, so neither tool-aware nor progress-gap path triggers).
+    advance(35_000); // total 65s — past 60s stallMs
+    expect(killed).toBe(true);
+    expect(w.killReason()).toBe("stall"); // legacy reason
+
+    w.stop();
+  });
 });
