@@ -627,7 +627,7 @@ child-registry.ts drop-in spawn wrappers + signal handlers (reap detached childr
 plan-reviewer.ts single-round review: parsing, reconciliation, annotation read/write, prompts
 plan-review-loop.ts multi-round orchestration, triage gates, adaptive cap, history JSONL
 drain-faults.ts skill-fault drain consumer; short-circuits audit events (investigate:false)
-halt-event-helpers.ts emitManualRecoveryInvoked() — pins investigate:false on audit events
+halt-event-helpers.ts emitRecoveryBoundary() — pins investigate:false on audit events
 halt-events.ts  HaltEvent schema, markInvestigated; investigate?: boolean property
 feature-review.ts per-feature meta-review pass; same-shape fingerprint detection; UNCLEAR fail-fast
 feature-review-metrics.ts JSONL instrumentation for cycles, tokens, latency, verdict (T1)

@@ -70,7 +70,11 @@ import {
   parseInvestigationReport,
   type InvestigationReport,
 } from "./investigator-dispatch";
-import { loadLearnedPatterns } from "./skill-fault-detector";
+import {
+  AUDIT_HALT_KINDS,
+  loadLearnedPatterns,
+} from "./skill-fault-detector";
+const AUDIT_HALT_KIND_SET = new Set<string>(AUDIT_HALT_KINDS);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1478,7 +1482,7 @@ export async function drainFaultsFromHaltEventsQueue(
     //     the file (just by the other process); but EACCES / bad queue
     //     paths leave the file in pending/ and must NOT be counted as
     //     skipped or appended to analytics.
-    if (he.investigate === false && he.kind === "RECOVERY_BOUNDARY") {
+    if (he.investigate === false && AUDIT_HALT_KIND_SET.has(he.kind)) {
       if (opts.dryRun) {
         // Dry-run mode is read-only: report the intent without moving the
         // file or writing analytics. Count under shortCircuited so the
@@ -1668,7 +1672,7 @@ export async function drainFaultsFromHaltEventsQueue(
     }
 
     // Pattern proposal
-    if (report.learnedPatternProposal) {
+    if (report.learnedPatternProposal && !AUDIT_HALT_KIND_SET.has(he.kind)) {
       try {
         const proposalPath = path.join(queueDir, "pending-patterns.jsonl");
         fs.mkdirSync(path.dirname(proposalPath), { recursive: true });
