@@ -31,32 +31,33 @@ function safeParseJson(text: string): unknown {
   }
 }
 
-/** Find the first line that looks like a JSON object ({...}). */
-function findJsonLine(stdout: string): string | undefined {
+function numberField(record: Record<string, unknown>, key: string): number {
+  const value = record[key];
+  return typeof value === "number" ? value : 0;
+}
+
+/** Find the first parseable line that looks like a JSON object ({...}). */
+function findJsonObjectLine(stdout: string): Record<string, unknown> | undefined {
   const lines = stdout.split(/\r?\n/);
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-      return trimmed;
+      const parsed = safeParseJson(trimmed);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
     }
   }
   return undefined;
 }
 
 function parseVitestJson(stdout: string): TestCountResult | null {
-  const line = findJsonLine(stdout);
-  if (!line) return null;
-  const data = safeParseJson(line);
-  if (
-    data &&
-    typeof data === "object" &&
-    "numTotalTests" in data &&
-    typeof data.numTotalTests === "number"
-  ) {
+  const data = findJsonObjectLine(stdout);
+  if (data && typeof data.numTotalTests === "number") {
     return {
       collected: data.numTotalTests,
-      passed: (data as Record<string, unknown>).numPassedTests ?? 0,
-      failed: (data as Record<string, unknown>).numFailedTests ?? 0,
+      passed: numberField(data, "numPassedTests"),
+      failed: numberField(data, "numFailedTests"),
       source: "json",
     };
   }
@@ -78,9 +79,9 @@ function parsePytestJson(jsonPath: string): TestCountResult | null {
       const summary = (data.report as Record<string, unknown>)
         .summary as Record<string, unknown>;
       return {
-        collected: (summary.collected as number) ?? 0,
-        passed: (summary.passed as number) ?? 0,
-        failed: (summary.failed as number) ?? 0,
+        collected: numberField(summary, "collected"),
+        passed: numberField(summary, "passed"),
+        failed: numberField(summary, "failed"),
         source: "json",
       };
     }
@@ -91,19 +92,12 @@ function parsePytestJson(jsonPath: string): TestCountResult | null {
 }
 
 function parseJestJson(stdout: string): TestCountResult | null {
-  const line = findJsonLine(stdout);
-  if (!line) return null;
-  const data = safeParseJson(line);
-  if (
-    data &&
-    typeof data === "object" &&
-    "numTotalTests" in data &&
-    typeof data.numTotalTests === "number"
-  ) {
+  const data = findJsonObjectLine(stdout);
+  if (data && typeof data.numTotalTests === "number") {
     return {
       collected: data.numTotalTests,
-      passed: (data as Record<string, unknown>).numPassedTests ?? 0,
-      failed: (data as Record<string, unknown>).numFailedTests ?? 0,
+      passed: numberField(data, "numPassedTests"),
+      failed: numberField(data, "numFailedTests"),
       source: "json",
     };
   }
@@ -117,18 +111,20 @@ function parseBunCoverageJson(coveragePath: string): TestCountResult | null {
     if (
       data &&
       typeof data === "object" &&
-      data.results &&
-      typeof data.results === "object" &&
-      "numTotalTests" in (data.results as Record<string, unknown>) &&
-      typeof (data.results as Record<string, unknown>).numTotalTests === "number"
+      "results" in data &&
+      (data as Record<string, unknown>).results &&
+      typeof (data as Record<string, unknown>).results === "object"
     ) {
-      const results = data.results as Record<string, unknown>;
-      return {
-        collected: results.numTotalTests as number,
-        passed: (results.numPassedTests as number) ?? 0,
-        failed: (results.numFailedTests as number) ?? 0,
-        source: "json",
-      };
+      const results = (data as Record<string, unknown>)
+        .results as Record<string, unknown>;
+      if (typeof results.numTotalTests === "number") {
+        return {
+          collected: results.numTotalTests,
+          passed: numberField(results, "numPassedTests"),
+          failed: numberField(results, "numFailedTests"),
+          source: "json",
+        };
+      }
     }
   } catch {
     // fall through
@@ -232,8 +228,12 @@ export function extractTestCount(
     }
     case "pytest": {
       if (runnerResult.jsonReportPath) {
-        const json = parsePytestJson(runnerResult.jsonReportPath);
-        if (json) return json;
+        try {
+          const json = parsePytestJson(runnerResult.jsonReportPath);
+          if (json) return json;
+        } finally {
+          fs.rmSync(runnerResult.jsonReportPath, { force: true });
+        }
       }
       return parsePytestStdout(runnerResult.stdout);
     }
