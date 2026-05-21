@@ -56,6 +56,15 @@ import {
   type HaltEvent,
   type HaltSeverity,
 } from "./halt-events";
+
+// Provider-halt kinds consumed by the queue printer + dedup key.
+const PROVIDER_HALT_KINDS = [
+  "PROVIDER_TIMEOUT",
+  "PROVIDER_QUOTA_EXHAUSTED",
+  "PROVIDER_OVERLOADED",
+  "PROVIDER_TRANSPORT_ERROR",
+  "PROVIDER_AUTH_REQUIRED",
+] as const;
 import {
   buildInvestigatorPrompt,
   parseInvestigationReport,
@@ -1389,6 +1398,21 @@ export async function drainFaultsFromHaltEventsQueue(
     (he) => !collapsedDetectedKeys.has(`${he.runId}|${he.faultId}`),
   );
 
+  // Dedup provider-halt events by (runId, kind) — same underlying
+  // evidence (timeout, quota, etc.) from the same run should only be
+  // investigated once per drain invocation.
+  const providerKindSet = new Set<string>(PROVIDER_HALT_KINDS);
+  const seenEvents = new Set<string>();
+  const dedupedEvents: HaltEvent[] = [];
+  for (const he of events) {
+    if (providerKindSet.has(he.kind)) {
+      const key = `${he.runId}|${he.kind}`;
+      if (seenEvents.has(key)) continue;
+      seenEvents.add(key);
+    }
+    dedupedEvents.push(he);
+  }
+
   // Existing learned-pattern categories — passed to the prompt so the
   // investigator doesn't propose duplicates.
   let existingCategories: string[] = [];
@@ -1400,7 +1424,7 @@ export async function drainFaultsFromHaltEventsQueue(
 
   let processedCount = 0;
   let abortedDuringLoop = false;
-  for (const he of events) {
+  for (const he of dedupedEvents) {
     // Cooperative cancellation: check BEFORE every entry so the abort
     // doesn't have to wait for a slow investigator to finish. If we just
     // dispatched and the signal fires during the await, spawnInvestigatorCapture

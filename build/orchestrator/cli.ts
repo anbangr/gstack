@@ -10092,7 +10092,9 @@ async function main() {
       // Install the wrapConsole shim now that state is loaded and the build
       // run loop is about to start. The shim classifies every console.warn /
       // console.error line into a halt-event kind (SOFT_HALT_WARN /
-      // SOFT_HALT_ERROR / SILENT_STATE_MUTATION) and emits to the queue.
+      // SOFT_HALT_ERROR / SILENT_STATE_MUTATION /
+      // PROVIDER_TIMEOUT / PROVIDER_QUOTA_EXHAUSTED / PROVIDER_OVERLOADED /
+      // PROVIDER_TRANSPORT_ERROR / PROVIDER_AUTH_REQUIRED) and emits to the queue.
       // Only the build run path gets the shim — drain-faults, mark-shipped,
       // doctor, monitor, etc. all exit before this block. Uninstall happens
       // in the outer finally so the shim is always removed on exit, even

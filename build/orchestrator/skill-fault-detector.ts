@@ -67,6 +67,15 @@ export type LearnedMatcherKind =
   | "plan_regex"
   | "state_jsonpath";
 
+/** Provider-halt kinds recognised by the static detector and consumers. */
+export const PROVIDER_HALT_KINDS = [
+  "PROVIDER_TIMEOUT",
+  "PROVIDER_QUOTA_EXHAUSTED",
+  "PROVIDER_OVERLOADED",
+  "PROVIDER_TRANSPORT_ERROR",
+  "PROVIDER_AUTH_REQUIRED",
+] as const;
+
 export interface LearnedPattern {
   category: string; // UPPER_SNAKE_CASE, unique key
   severity: "CRITICAL" | "HIGH" | "MEDIUM";
@@ -329,29 +338,69 @@ export function detectLearnedFaults(
   }
 }
 
+function sleepMs(ms: number): void {
+  const start = Date.now();
+  while (Date.now() - start < ms) {}
+}
+
+function acquireLock(lockPath: string): void {
+  const spinDelay = 10;
+  const maxWait = 5000;
+  const start = Date.now();
+  while (true) {
+    try {
+      fs.writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+      return;
+    } catch {
+      if (Date.now() - start > maxWait) {
+        throw new Error(`Could not acquire lock: ${lockPath}`);
+      }
+      sleepMs(spinDelay);
+    }
+  }
+}
+
+function releaseLock(lockPath: string): void {
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {}
+}
+
 function persistHitCounts(learnedFaultCategories: string[]): void {
   if (learnedFaultCategories.length === 0) return;
+  const filePath = LEARNED_PATTERNS_PATH();
+  if (!fs.existsSync(filePath)) return; // No file to update — nothing to lock.
+  const lockPath = `${filePath}.lock`;
   try {
-    const filePath = LEARNED_PATTERNS_PATH();
-    const raw = fs.readFileSync(filePath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return;
-    for (const entry of parsed) {
-      if (
-        entry != null &&
-        typeof entry.category === "string" &&
-        learnedFaultCategories.includes(entry.category)
-      ) {
-        entry.hitCount =
-          (typeof entry.hitCount === "number" ? entry.hitCount : 0) + 1;
-        entry.lastHit = new Date().toISOString();
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    acquireLock(lockPath);
+    try {
+      const raw = fs.readFileSync(filePath, "utf8");
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return;
+      for (const entry of parsed) {
+        if (
+          entry != null &&
+          typeof entry.category === "string" &&
+          learnedFaultCategories.includes(entry.category)
+        ) {
+          entry.hitCount =
+            (typeof entry.hitCount === "number" ? entry.hitCount : 0) + 1;
+          entry.lastHit = new Date().toISOString();
+        } else if (entry != null && typeof entry.category !== "string") {
+          console.warn(
+            `[skill-fault-detector] learned-patterns.json entry missing category; skipping hit increment: ${JSON.stringify(entry)}`,
+          );
+        }
       }
+      const tmpPath = `${filePath}.tmp.${process.pid}`;
+      fs.writeFileSync(tmpPath, JSON.stringify(parsed, null, 2) + "\n", {
+        mode: 0o600,
+      });
+      fs.renameSync(tmpPath, filePath);
+    } finally {
+      releaseLock(lockPath);
     }
-    const tmpPath = `${filePath}.tmp.${process.pid}`;
-    fs.writeFileSync(tmpPath, JSON.stringify(parsed, null, 2) + "\n", {
-      mode: 0o600,
-    });
-    fs.renameSync(tmpPath, filePath);
   } catch {
     // Swallow all errors — must not block fault return.
   }
@@ -631,8 +680,9 @@ export function detectSkillFaults(
       stdoutContent,
     );
     faults.push(...learnedFaults);
-    if (learnedFaults.length > 0) {
-      persistHitCounts(learnedFaults.map((f) => f.category));
+    const allCategories = faults.map((f) => f.category);
+    if (allCategories.length > 0) {
+      persistHitCounts(allCategories);
     }
   } catch {
     // Outer safety net: never throw on bad input.
