@@ -60,6 +60,15 @@ export interface HaltEvent {
     };
     worktreeHead?: string;
     stdoutTail: string;
+    /**
+     * Why the watchdog killed. Absent for non-watchdog halts. New in
+     * v1.40.x — see docs/superpowers/specs/2026-05-21-subagent-progress-watchdog-design.md.
+     */
+    killReason?: "silence" | "progress_gap" | "stall" | "auth_required";
+    /** Last classified tool at kill time. Null when never classified. */
+    lastTool?: string | null;
+    /** Last classified bucket at kill time. Null when never classified. */
+    lastBucket?: "fast" | "slow" | null;
   };
 }
 
