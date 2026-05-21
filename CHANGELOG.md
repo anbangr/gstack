@@ -1,5 +1,50 @@
 # Changelog
 
+## [Unreleased - fork-local: build skill 1.27.0] - 2026-05-21
+
+**Orchestrator stall detection: the monitor now catches a wedged build instead of waiting forever, and end-of-build auto-drain has a 30-minute wall-clock budget so a stuck fault queue can no longer hold the orchestrator open for hours.**
+
+This entry pins the fix for a real production hang on 2026-05-21. A `gstack-build --mark-phase-committed` invocation got stuck for 47 minutes inside end-of-build auto-drain processing other projects' faults. The monitor's `recentProcessActivity` check stayed green the whole time because heartbeat.ts was still writing `RUN_HEARTBEAT` lines to stdout every 30s, refreshing the very file the monitor uses as its liveness signal. The user had to kill the process by hand. The runId-scoping fix in #66 closes the proximate cause (cross-project faults no longer reach the drain), but the monitor would still be blind to any future hang inside the orchestrator's main process.
+
+### What changed for the user
+
+If the orchestrator stops making progress for 15 minutes, the monitor now escalates with `USER_ACTION_REQUIRED: orchestrator process alive but state has not advanced for N minutes` and exits cleanly. No more 47-minute waits while the heartbeat ticker pretends everything is fine. The threshold is tunable via `gstack-config set build_stall_threshold_ms 1800000` if your machine genuinely needs longer per-entry drain windows.
+
+Two independent signals are tracked: `state.lastUpdatedAt` (advances on every saveState call) AND `drainProcessedCount` (advances per processed auto-drain entry). The stall arm only escalates when BOTH have been frozen for the configured threshold. Translation: a healthy drain processing entries one by one counts as progress; a drain spinning on the same broken entry counts as stalled.
+
+End-of-build auto-drain has a hard 30-minute wall-clock budget. When the budget fires, any in-flight investigator subprocess receives SIGTERM with a 5-second grace period before SIGKILL, so no orphaned codex processes keep eating CPU after the orchestrator exits. Remaining queue entries stay in `pending-investigations/` for the next run to pick up. The orchestrator logs `auto-drain budget exceeded after Xm; N entries left for next run` and exits with whatever exit code the build produced.
+
+**Behavior change to note.** The previous worst case for auto-drain was 200 minutes (max:20 entries × 10-minute investigator timeout). The 30-minute budget caps real-world drain at roughly three timeout-class entries before abort. Drains that genuinely take longer will defer remaining entries to the next run instead of holding the orchestrator open indefinitely. For typical (non-stuck) fault queues this is invisible. The drain finishes in seconds.
+
+### Itemized changes
+
+#### Added
+
+- New stall-detection arm in `evaluateMonitorOnce`. When the orchestrator's process is alive AND the heartbeat sidecar shows both progress signals frozen beyond `build_stall_threshold_ms` (default 15 min), the monitor escalates `USER_ACTION_REQUIRED` instead of staying at `RUN_RUNNING`. The existing "true-stuck" escalation (pid alive but stdoutLog stale too) is preserved.
+- Per-run heartbeat sidecar at `<stateDir>/<stateSlug>.heartbeat.json`. Carries the orchestrator's runId, pid, current phase, `state.lastUpdatedAt`, and `drainProcessedCount`. Atomic tmp+rename writes so the monitor never observes a partial JSON read. Cleaned up in the orchestrator's `finally` block; the monitor's runId+pid trust gate ignores stale sidecars from crashed prior runs even if cleanup is skipped.
+- Per-run monitor tracker at `<stateDir>/<stateSlug>.heartbeat-track.json`. Records when the orchestrator's progress signals last changed, persists across monitor restarts (the monitor itself is stateless between polls).
+- `drainFaultsForBuildRun(state, opts)` production wrapper. Threads a BuildState through end-of-build auto-drain so each processed entry bumps `state.lastUpdatedAt` and the in-memory `drainProcessedCount` counter. The base `drainFaultsFromHaltEventsQueue(opts)` API stays unchanged, so manual `gstack-build drain-faults --queue` continues to work without a BuildState.
+- `gstack-config build_stall_threshold_ms` knob. Defaults to 900000 (15 min). Read once at monitor startup.
+
+#### Changed
+
+- `runAutoDrainIfEnabled` enforces a 30-minute wall-clock budget via `AbortSignal.timeout`. The signal threads through `drainFaultsForBuildRun` into `spawnInvestigatorCapture`. On abort, the in-flight investigator child is killed via SIGTERM + 5s grace + SIGKILL using the same `killProcessAndGroup` pattern as the per-investigator stall watchdog.
+- `DrainHaltEventsOptions` gains optional `signal: AbortSignal` and `onEntryProcessed: () => void`. `DrainHaltEventsResult` gains `aborted: boolean` and `deferred: number` for telemetry.
+- The `halt-events-drain.jsonl` analytics row now includes `aborted` and `deferred` fields.
+- Skipped entries (filtered by severity or runId) no longer bump the progress signal. A flood of irrelevant queue entries cannot keep the stall arm quiet anymore.
+
+#### Fixed
+
+- 47-minute auto-drain hang on cross-project fault queues (pinned by `MONITOR_BLIND_TO_STUCK_ORCHESTRATOR` regression test).
+- Investigator subprocess orphan when the orchestrator-level budget fires (pinned by `ABORT_KILLS_INVESTIGATOR_CHILD` regression test).
+- Stale heartbeat sidecar from crashed prior run with same stateSlug could not be trusted (pinned by `MONITOR_REJECTS_CROSS_RUN_SIDECAR`).
+
+#### For contributors
+
+- New helper `test/helpers/build-state.ts` exporting `makeMockState()`. Used by drain-faults tests now that they need a real BuildState. Centralizes the mock so a future BuildState schema change ripples through one file.
+- New `build/orchestrator/__tests__/monitor-heartbeat-integration.test.ts` exercising the full heartbeat.ts → sidecar file → monitor.ts read path with a real bun child process (no mocks, deterministic, ~1s runtime via a 500ms threshold override).
+- 5 mandatory regression tests added per the iron-rule in `/plan-eng-review`: `MONITOR_BLIND_TO_STUCK_ORCHESTRATOR`, `HEARTBEAT_REFLECTS_STATE_MOVEMENT`, `DRAIN_FOR_BUILD_RUN_BUMPS_PROGRESS`, `MONITOR_REJECTS_CROSS_RUN_SIDECAR`, `ABORT_KILLS_INVESTIGATOR_CHILD`.
+
 ## [Unreleased - fork-local] - 2026-05-20
 
 **Halt-events pipeline drain. Codex no longer investigates transient warnings; every halt event now carries real log context; two real product bugs in the orchestrator fixed.**
