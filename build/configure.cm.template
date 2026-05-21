@@ -85,7 +85,7 @@
     "redSpecMaxIterations": 3,
     "testMaxIterations": 5,
     "originVerificationMaxIterations": 3,
-    "featureReviewMaxIterations": 5
+    "featureReviewMaxIterations": 3
   },
   "timeoutsMs": {
     "gemini": 600000,
