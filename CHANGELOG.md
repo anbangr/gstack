@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.42.1.0] - 2026-05-22
+
+**Build orchestrator now handles worktree gitdirs and quarantines malformed refs before every fetch. If a repo is corrupt, the orchestrator halts with `GIT_REPO_CORRUPT` and prints recovery commands instead of letting the fetch error bubble up as an opaque string.**
+
+This is PR7 of the tidy-haven plan — worktree-aware gitdir resolution, safe ref quarantine, and corrupt-repo halt. All changes are in `build/orchestrator/`.
+
+### What changed for the user
+
+- The build orchestrator works correctly inside git worktrees (`.git` is a file, not a directory). Previously, paths like `.git/index.lock` were hardcoded and failed in worktrees.
+- Before every `git fetch`, malformed refs (e.g. `refs/heads/feat/foo 1` created by macOS Finder dupes) are moved to `.git/quarantine/` with a sidecar JSON containing the exact recovery command. No ref content is deleted.
+- If `git fetch` fails with "did not send all necessary objects" or "bad object refs/heads/", the orchestrator returns a structured `GIT_REPO_CORRUPT` halt with recovery commands (`git fsck --full`, `git remote prune origin`).
+- Kill switch: set `GSTACK_DISABLE_REF_QUARANTINE=1` to skip ref enumeration.
 ## [1.42.0.0] - 2026-05-22
 
 **Plan mutator now re-parses and recovers when stale line numbers drift, and guards against duplicate phase headings. When a plan file is edited externally (or by another process) between the time the orchestrator reads line numbers and the time it writes checkbox state, the mutator no longer fails with "plan was edited externally." Instead it re-parses the fresh file from disk, resolves the checkbox by its stable phase identity (feature number + phase number + phase name), and flips at the new line. If two phases share the exact same heading, the mutator emits `PLAN_MUTATOR_DUPLICATE_HEADING` with both line numbers so the caller can surface the ambiguity instead of silently mutating the wrong checkbox.**
@@ -43,6 +55,27 @@ This is PR3 of the tidy-haven plan — Feature 7 of the 83-fault recurrence prog
 
 #### Added
 
+- `build/orchestrator/resolve-git-dir.ts` — `resolveGitDir(cwd)` helper using `git rev-parse --git-dir`, with macOS `/private/var` → `/var` normalization and a per-process memoization cache. `clearResolveGitDirCache()` for test isolation.
+- `build/orchestrator/__tests__/resolve-git-dir.test.ts` — 199 lines of tests covering regular repos, worktrees, bare repos, submodule gitdirs, cache hits, and `/private` normalization.
+- `quarantineMalformedRefs(cwd)` in `cli.ts` — filesystem walk of `refs/heads` and `refs/remotes`, `git check-ref-format` validation, safe move to `quarantine/<sanitized>.ref` with `.json` sidecar containing `recoveryCommand`. Handles missing SHAs, name collisions, and Windows backslash ref names.
+- `build/orchestrator/__tests__/quarantine-malformed-refs.test.ts` — 377 lines of tests covering happy path, quarantine directory reuse, missing SHA fallback, recovery command correctness, kill switch, and Windows-style backslash refs.
+- `isCorruptRepoError()` and `corruptRepoResult()` in `cli.ts` — pattern-match fetch stderr for corrupt-repo signals and return structured halt result with `haltKind: "GIT_REPO_CORRUPT"`.
+- `build/orchestrator/__tests__/git-repo-corrupt-halt.test.ts` — 192 lines of tests for corrupt-repo detection, recovery message format, and non-corrupt error passthrough.
+
+#### Changed
+
+- `recoverMutableAgentCommit()` made `async` so it can `await resolveGitDir()` for the `.git/index.lock` path instead of hardcoding `path.join(opts.cwd, ".git", "index.lock")`.
+- `applyMutableAgentHygiene()` made `async` to await the now-async `recoverMutableAgentCommit()`.
+- All call sites of `recoverMutableAgentCommit()` and `applyMutableAgentHygiene()` in `cli.ts` updated to `await`.
+- `ensureFeatureBranch()`, `syncLandedBase()`, and `syncFeatureBranchWithBase()` now call `quarantineMalformedRefs()` before `git fetch` and surface corrupt-repo errors as structured halts.
+
+#### Removed
+
+- The `git gc` retry loop that previously attempted recovery from corrupt-repo errors — replaced by the explicit `GIT_REPO_CORRUPT` halt.
+
+### For contributors
+
+- 1977 build/orchestrator tests pass (0 failures). Browse tests show pre-existing daemon-not-running failures unrelated to this branch.
 - `build/orchestrator/__tests__/plan-mutator-reparse.test.ts` — 339 lines, 11 tests covering T1-T5: re-parse on stale line numbers, genuinely deleted markers, atomic-write rollback failure paths, all three call sites (`setCheckboxState`, `setCheckboxStatusNote`, `unflipPhaseCheckboxes`), non-sequential phase numbering, sublettered phase IDs, review suffixes, kind brackets, and fresh-from-disk reads.
 - `build/orchestrator/__tests__/plan-mutator-duplicate-heading.test.ts` — 215 lines, 7 tests covering T3 and T6: duplicate heading detection with both line numbers reported, phase name normalization (trailing whitespace stripped), non-duplicate detection when phase numbers differ or names differ, `setCheckboxState` and `unflipPhaseCheckboxes` duplicate detection, and atomic-write race safety.
 - `resolveStaleLine()` in `plan-mutator.ts` — re-parses the plan from disk when a stale line number no longer contains the expected marker. Uses `buildPhaseLocations()` and `findPhaseHeadingAbove()` to resolve the checkbox by stable phase identity.
