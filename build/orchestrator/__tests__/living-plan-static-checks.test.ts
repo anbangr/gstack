@@ -114,6 +114,29 @@ function wrap(r: FailureRender): string { return r.kind; }
     expect(r.status).toBe(0);
   });
 
+  it("T1-edge: default-plus-named imports still report unused named identifiers", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Mixed import
+
+Origin trace: test
+Acceptance: passes validation
+
+### Phase 1: Implementation
+- [ ] **Implementation**: write code
+- [ ] **Review**: review
+
+\`\`\`typescript
+import foo, { bar } from "./mod";
+foo();
+\`\`\`
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/unused import:\s*bar/i);
+  });
+
   // ─────────────────────────────────────────────────────────────────────────
   // T2 — missing field reference
   // ─────────────────────────────────────────────────────────────────────────
@@ -173,6 +196,35 @@ Add \`build/orchestrator/__tests__/future-helper.test.ts\`.
     );
     const r = runValidator(plan);
     expect(r.status).toBe(0);
+  });
+
+  it("T3-edge: a planned new file in a different feature does not exempt this feature", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Missing file
+
+Origin trace: test
+Acceptance: \`build/orchestrator/__tests__/future-other-feature.test.ts\` must exist
+
+### Phase 1: Implementation
+- [ ] **Implementation**: write code
+- [ ] **Review**: review
+
+## Feature 2: Later planned file
+
+Origin trace: test
+Acceptance: future file is created here
+
+### Phase 1: Implementation
+- [ ] **Implementation**: write code
+- [ ] **Review**: review
+
+Add \`build/orchestrator/__tests__/future-other-feature.test.ts\`.
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/referenced file does not exist/i);
   });
 
   // ─────────────────────────────────────────────────────────────────────────

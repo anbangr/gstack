@@ -111,7 +111,25 @@ const BUILTIN_MODULES = new Set([
 
 /** Regex matching ES-module import statements (single-line, inside code blocks). */
 const IMPORT_RE =
-  /import\s+(?:type\s+)?(?:(\w+)|\*\s+as\s+(\w+)|\{([^}]+)\})\s+from\s+["']([^"']+)["'];?/g;
+  /import\s+(?:type\s+)?(?:(\w+)\s*,\s*)?(?:(\w+)|\*\s+as\s+(\w+)|\{([^}]+)\})\s+from\s+["']([^"']+)["'];?/g;
+
+function extractNamedImportIdentifiers(specifierList: string): string[] {
+  const idents: string[] = [];
+  for (const part of specifierList.split(",")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const typeMatch = trimmed.match(/^type\s+(\w+)(?:\s+as\s+(\w+))?$/);
+    const asMatch = trimmed.match(/^(\w+)\s+as\s+(\w+)$/);
+    if (typeMatch) {
+      idents.push(typeMatch[2] ?? typeMatch[1]);
+    } else if (asMatch) {
+      idents.push(asMatch[2]);
+    } else if (/^\w+$/.test(trimmed)) {
+      idents.push(trimmed);
+    }
+  }
+  return idents;
+}
 
 /** T1 — detect unused imports inside a single phase. */
 function findUnusedImports(phaseBody: string): string[] {
@@ -122,27 +140,14 @@ function findUnusedImports(phaseBody: string): string[] {
   for (const snippet of snippets) {
     let m: RegExpExecArray | null;
     while ((m = IMPORT_RE.exec(snippet)) !== null) {
-      const source = m[4];
+      const source = m[5];
       const statement = m[0];
       const idents: string[] = [];
 
-      if (m[1]) idents.push(m[1]); // default import
-      if (m[2]) idents.push(m[2]); // namespace import
-      if (m[3]) {
-        for (const part of m[3].split(",")) {
-          const trimmed = part.trim();
-          if (!trimmed) continue;
-          const typeMatch = trimmed.match(/^type\s+(\w+)$/);
-          const asMatch = trimmed.match(/^(\w+)\s+as\s+(\w+)$/);
-          if (typeMatch) {
-            idents.push(typeMatch[1]);
-          } else if (asMatch) {
-            idents.push(asMatch[2]);
-          } else if (/^\w+$/.test(trimmed)) {
-            idents.push(trimmed);
-          }
-        }
-      }
+      if (m[1]) idents.push(m[1]); // default import in "default, { named }"
+      if (m[2]) idents.push(m[2]); // default import
+      if (m[3]) idents.push(m[3]); // namespace import
+      if (m[4]) idents.push(...extractNamedImportIdentifiers(m[4]));
 
       for (const ident of idents) {
         imports.push({ ident, source, statement });
@@ -240,12 +245,12 @@ function isExemptPath(s: string): boolean {
   );
 }
 
-/** Scan the whole plan for "Add `path`" patterns to build the planned-file allow-list. */
-function extractPlannedFiles(content: string): Set<string> {
+/** Scan a feature block for "Add `path`" patterns to build its planned-file allow-list. */
+function extractPlannedFiles(text: string): Set<string> {
   const planned = new Set<string>();
   const re = /Add\s+`([^`]+)`/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(content)) !== null) {
+  while ((m = re.exec(text)) !== null) {
     const candidate = m[1];
     if (isFileLikePath(candidate)) {
       planned.add(candidate);
@@ -257,11 +262,11 @@ function extractPlannedFiles(content: string): Set<string> {
 /** T3 — detect non-existent file references in acceptance / prose. */
 function checkFileRefs(content: string): StaticViolation[] {
   const violations: StaticViolation[] = [];
-  const plannedFiles = extractPlannedFiles(content);
   const blocks = extractFeatureBlocks(content);
 
   for (const block of blocks) {
     const text = block.header + "\n" + block.body;
+    const plannedFiles = extractPlannedFiles(text);
     const re = /`([^`]+)`/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) {
@@ -423,7 +428,7 @@ function validate(planPath: string): ValidationReport {
 
   return {
     planPath,
-    ok: structuralViolations.length === 0,
+    ok: structuralViolations.length === 0 && staticViolations.length === 0,
     featureCount: blocks.length,
     violations: structuralViolations,
     staticViolations,
