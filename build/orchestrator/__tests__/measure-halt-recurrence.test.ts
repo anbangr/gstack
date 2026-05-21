@@ -1,7 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { measureHaltRecurrence } from "../../scripts/measure-halt-recurrence";
+import { measureHaltRecurrence } from "../../../scripts/measure-halt-recurrence";
 import { useIsolatedGstackHome } from "../../../test/helpers/test-home";
 
 function makePattern(
