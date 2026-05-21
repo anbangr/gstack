@@ -11342,25 +11342,32 @@ async function main() {
   // non-fatal — preserves whatever exitCode the build produced. Opt out
   // via --no-auto-drain or GSTACK_HALT_EVENTS_OFF=1.
   //
-  // Outer 60s deadline: the inner drainFaultsFromHaltEventsQueue uses a
-  // 10-minute investigatorTimeoutMs (correct for the standalone
-  // `gstack-build halt drain` command, where investigators legitimately
-  // take that long). At end-of-build it is the wrong UX budget — a
-  // successful run with halt events queued could otherwise sit silent
-  // for up to 10 minutes between "Archived living plan" and process exit,
-  // looking exactly like a hang. process.exit below forcibly tears down
-  // the event loop, ending any orphaned drain investigators via OS
-  // process tree.
+  // Outer deadline (AUTO_DRAIN_DEADLINE_MS): the inner
+  // drainFaultsFromHaltEventsQueue uses a 10-minute investigatorTimeoutMs
+  // (correct for the standalone `gstack-build halt drain` command, where
+  // investigators legitimately take that long). At end-of-build it is the
+  // wrong UX budget — a successful run with halt events queued could
+  // otherwise sit silent for up to 10 minutes between "Archived living
+  // plan" and process exit, looking exactly like a hang. process.exit
+  // below forcibly tears down the event loop, ending any orphaned drain
+  // investigators via OS process tree.
   await runWithDeadline(
     () => runAutoDrainIfEnabled(args, state),
-    60_000,
-    "auto-drain: 60s end-of-build deadline exceeded, skipping " +
+    AUTO_DRAIN_DEADLINE_MS,
+    `auto-drain: ${AUTO_DRAIN_DEADLINE_MS / 1000}s end-of-build deadline exceeded, skipping ` +
       "(any unprocessed halt events remain queued for next build or " +
       "`gstack-build halt drain`)",
   );
 
   process.exit(exitCode);
 }
+
+/**
+ * End-of-build auto-drain deadline. The inner halt-events drain uses a
+ * 10-minute investigatorTimeoutMs which is wrong as a shutdown UX budget.
+ * Imported by tests as the canonical reference (rather than hardcoding).
+ */
+export const AUTO_DRAIN_DEADLINE_MS = 60_000;
 
 /**
  * Race a promise against a hard millisecond deadline. If the deadline fires

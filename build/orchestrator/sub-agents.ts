@@ -291,6 +291,19 @@ function pickProviderForBin(bin: string): Provider {
  * names (GSTACK_BUILD_*_TIMEOUT), new semantics: the value is now a stall
  * window, not a wall-clock budget. A sub-agent that keeps emitting tool-use
  * or status lines runs as long as it needs.
+ *
+ * Trust contract for `logPath`: caller is responsible for ensuring the path
+ * is bounded to a known state directory. spawnCaptured does NOT normalize
+ * or boundary-check the path. Today's callers all pass derived paths under
+ * ~/.gstack/build-state/<slug>/; do not pass user-influenced strings here
+ * without prior resolveSafe(). The exported surface is for orchestrator
+ * subagents only — not a general-purpose spawn helper.
+ *
+ * Log content is sensitive: child stdio routinely includes secrets in
+ * flight. The log file is created with mode 0600 to constrain ACL. The
+ * file format itself (header at top, [OUT]/[ERR] channel-tagged live body,
+ * footer at end) is documented in build/orchestrator/README.md (per
+ * TODOS.md T-FMT) and is not part of the orchestrator's public contract.
  */
 export function spawnCaptured(args: {
   bin: string;
@@ -317,8 +330,19 @@ export function spawnCaptured(args: {
     let ws: fs.WriteStream | null = null;
     let loggedStreamError = false;
     try {
-      ws = fs.createWriteStream(args.logPath);
+      // mode 0600: child stdio routinely surfaces secrets in flight (env
+      // dumps, API keys in HTTP traces, full prompts). The buffered model
+      // had the same exposure but only at close; the streaming model
+      // extends the read window to "anytime during the run." Constrain
+      // the file ACL to the running user so backup daemons, IDE indexers,
+      // and gbrain ingest can't race-read partial dumps.
+      ws = fs.createWriteStream(args.logPath, { mode: 0o600 });
+      // Use ws.on (not once) so reentrant errors don't crash the process,
+      // but gate the user-visible warn behind loggedStreamError so we
+      // log it at most once per spawn — a damaged stream can emit
+      // multiple 'error' events from subsequent write attempts.
       ws.on("error", (err) => {
+        if (loggedStreamError) return;
         loggedStreamError = true;
         console.warn(
           `[spawn] log writer error for ${args.logPath}: ${err.message}; ` +
@@ -381,10 +405,17 @@ export function spawnCaptured(args: {
         .join("");
       const ok = ws.write(prefixed);
       if (!ok) {
-        // Honor backpressure so a 5MB+ e2e dump can't blow memory.
-        const src = channel === "OUT" ? child.stdout : child.stderr;
-        src?.pause();
-        ws.once("drain", () => src?.resume());
+        // Honor backpressure so a high-volume dump can't blow memory.
+        // Pause BOTH channels (not just the one that observed the falsy
+        // write) — the other channel writes through the same single fd
+        // and would otherwise pile up in the writer's internal buffer
+        // even after the active channel paused, defeating the bound.
+        child.stdout?.pause();
+        child.stderr?.pause();
+        ws.once("drain", () => {
+          child.stdout?.resume();
+          child.stderr?.resume();
+        });
       }
     }
 

@@ -74,6 +74,53 @@ be pulled out into a referenced doc.
 **Priority:** P3
 **Depends on:** streaming-log fix landed
 
+### Fix mid-line channel-prefix artifact in spawnCaptured (T-FMT-PARTIAL)
+
+**What:** When a child's stdout chunk arrives without a trailing newline
+and the next chunk completes that line, the continuation chunk gets a
+fresh `[OUT]` / `[ERR]` prefix prepended mid-line. The result is a single
+logical log line that contains e.g. `[OUT] partial[OUT] continuation\n` —
+ugly for humans and breaks grep-by-channel for tools that assume one
+prefix per logical line.
+
+**Why:** Cosmetic today (the streaming benefit dominates), but downstream
+parsers that grep `^\[OUT\]` to filter by channel will miss the
+continuation slice. The fix is small but touches the writeChannel hot
+path so it pairs naturally with T-FMT (documenting the new format).
+
+**Context:** Surfaced by Maintainability specialist on
+`fix/spawn-captured-streaming-and-cleanup`. The right fix is per-channel
+residual buffers (stdoutPartial, stderrPartial): concat incoming text,
+split on `\n`, prefix and write completed lines, retain the trailing
+partial. On finish(), flush any residuals with a final prefix.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** streaming-log fix landed
+
+### Move markVisiblePlanArchived into archiveLivingPlan (T-ARCH)
+
+**What:** The gate-visibility ENOENT race is currently fixed by manually
+calling `markVisiblePlanArchived()` at two callsites in main()
+(success-branch + finally). A future shutdown branch that adds another
+archive callsite would silently regress the bug unless the contributor
+remembers to add a third `markVisiblePlanArchived()` call.
+
+**Why:** Make the invariant structural. Either (a) move the
+`markVisiblePlanArchived()` call inside `archiveLivingPlan` itself so
+any caller benefits automatically, or (b) wrap both in a tiny helper
+(`archiveAndStopReconciling`) that the orchestrator uses. Either way,
+the call sequence becomes uncallable in the wrong order.
+
+**Context:** Surfaced by Maintainability specialist on
+`fix/spawn-captured-streaming-and-cleanup` (M7). The B-T1 PART 3
+regression test catches the today's two callsites, but a third callsite
+added in a different branch wouldn't trip the test.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** none
+
 ## Pre-existing test failures observed on feat/release-daemon-path-fix-and-doctor
 
 ### P0: 4 unrelated tests fail before any of this branch's changes
