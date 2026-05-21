@@ -706,7 +706,7 @@ prior commit.
    1. **Unused imports in code snippets** — every imported identifier in a phase's ` ```typescript ` block must be used in that same phase's body (value position or type annotation). The validator allow-lists built-in modules (`bun`, `node:*`, etc.).
    2. **Missing field references in acceptance** — do not claim `phaseState.<role>.<field>` unless the field name appears in code snippets within the plan.
    3. **Non-existent files in acceptance** — backtick-quoted file paths in acceptance lines must exist in the repo or be explicitly planned (e.g. "Add `path/to/file.ts`" in the same phase). Paths under `inbox/` or `~/.gstack/` are exempt.
-   4. **Multi-arm split across features** — registry additions (e.g. "Add `X` to `child-registry.ts`") must land in the **same feature** as their orchestrator wiring (e.g. "Call `X` in `phase-runner.ts`"). Splitting them across features triggers a structural violation.
+   4. **Multi-arm split across phases** — registry additions (e.g. "Add `X` to `child-registry.ts`") must land in the **same phase** as their orchestrator wiring (e.g. "Call `X` in `phase-runner.ts`"). Splitting them across phases triggers a structural violation.
    5. **Stale file:line quotes** — if acceptance quotes a specific line (`` `path/to/file.ts:405` contains "snippet" ``), verify the on-disk file actually contains that snippet at that line. The validator reads the real file.
 
    After writing all living plan files, write manifest v2 to $BUILD_TMP_DIR/build-run-manifest.json:

@@ -291,30 +291,34 @@ function checkFileRefs(content: string): StaticViolation[] {
   return violations;
 }
 
-/** T4 — detect multi-arm split (registry addition and orchestrator usage in different features). */
+/** T4 — detect multi-arm split (registry addition and orchestrator usage in different phases). */
 function checkMultiArmSplit(content: string): StaticViolation[] {
   const violations: StaticViolation[] = [];
   const blocks = extractFeatureBlocks(content);
-  const registryAdds = new Map<string, number>();
-  const orchestratorUses = new Map<string, number>();
+  const registryAdds = new Map<string, string>();
+  const orchestratorUses = new Map<string, string>();
 
   for (const block of blocks) {
-    const addRe = /Add\s+`(\w+)`\s+to\s+`child-registry\.ts`/gi;
-    let am: RegExpExecArray | null;
-    while ((am = addRe.exec(block.body)) !== null) {
-      registryAdds.set(am[1], block.number);
-    }
+    const phases = extractPhases(block.body);
+    phases.forEach((phase, phaseIndex) => {
+      const phaseKey = `${block.number}:${phaseIndex + 1}`;
+      const addRe = /Add\s+`(\w+)`\s+to\s+`child-registry\.ts`/gi;
+      let am: RegExpExecArray | null;
+      while ((am = addRe.exec(phase)) !== null) {
+        registryAdds.set(am[1], phaseKey);
+      }
 
-    const useRe = /Call\s+`(\w+)`\s+in\s+`phase-runner\.ts`/gi;
-    let um: RegExpExecArray | null;
-    while ((um = useRe.exec(block.body)) !== null) {
-      orchestratorUses.set(um[1], block.number);
-    }
+      const useRe = /Call\s+`(\w+)`\s+in\s+`phase-runner\.ts`/gi;
+      let um: RegExpExecArray | null;
+      while ((um = useRe.exec(phase)) !== null) {
+        orchestratorUses.set(um[1], phaseKey);
+      }
+    });
   }
 
-  for (const [ident, addFeature] of registryAdds) {
-    const useFeature = orchestratorUses.get(ident);
-    if (useFeature && useFeature !== addFeature) {
+  for (const [ident, addPhase] of registryAdds) {
+    const usePhase = orchestratorUses.get(ident);
+    if (usePhase && usePhase !== addPhase) {
       violations.push({
         rule: "multi-arm-split",
         message: `registry entry must land with orchestrator: ${ident}`,
