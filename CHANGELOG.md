@@ -1,5 +1,39 @@
 # Changelog
 
+## [1.40.7.2] - 2026-05-21
+
+**Codex review failures now distinguish "provider blew up" from "the agent couldn't converge." When a codex review iteration hits a capacity banner, a quota wall, a transport error, an auth prompt, or a silent stall, the orchestrator emits the right halt kind (`PROVIDER_OVERLOADED` / `PROVIDER_QUOTA_EXHAUSTED` / `PROVIDER_TRANSPORT_ERROR` / `PROVIDER_AUTH_REQUIRED` / `PROVIDER_TIMEOUT`) instead of misclassifying it as `RETRY_CAP_HIT`. Drain-faults and the investigator route by kind, so a 529 from the model no longer triggers a "convergence failed" code review.**
+
+This is the minimum-viable PR1b from the tidy-haven plan — Feature 4 of the 83-fault recurrence program. The full PR1b spec also adds split retry semantics (exponential backoff for capacity, immediate halt for quota) plus a state-migration for `iterations.successful`; both deferred to a follow-up so we can ship the classification primitive fast and start measuring whether real provider 529s stop being labeled as codex retry caps.
+
+The wiring lives at `cli.ts:6463` — the FAIL handler that used to unconditionally call `recordRetryCapHit("codex", N)`. Now it first reads the latest codex review log and runs `classifyProviderFailure()` against it. If the verdict is non-null, the right `PROVIDER_*` halt fires instead of the cap-hit halt; otherwise behavior is unchanged. Kill switch: `GSTACK_DISABLE_PROVIDER_CLASSIFIER=1` reverts to pre-PR1b behavior.
+
+### What changed for the user
+
+- Provider 529s (capacity exhausted, overloaded) during codex review surface as `PROVIDER_OVERLOADED` halts, not retry caps. The post-mortem investigator now knows to wait and resume instead of looking for code bugs.
+- Provider quota walls (`You've hit your limit`) surface as `PROVIDER_QUOTA_EXHAUSTED`, optionally with the provider's stated reset time parsed from the banner.
+- Provider transport errors (ECONNRESET, socket hang up) surface as `PROVIDER_TRANSPORT_ERROR` so the retry harness sees them as transient.
+- Provider auth prompts (401 Unauthorized, "please re-authenticate") surface as `PROVIDER_AUTH_REQUIRED` with a clear recovery hint.
+- Silent stalls (watchdog SIGTERM, wall-clock timeout) surface as `PROVIDER_TIMEOUT` instead of being absorbed into the cap-hit count.
+
+### Itemized changes
+
+#### Added
+
+- `classifyProviderFailure({ text, stallKilled?, timedOut? })` in `build/orchestrator/halt-event-helpers.ts` — pure classifier returning `{ kind, evidence, resetAt? }` or `null`. Regex precedence: auth → quota → capacity → overloaded → transport → stall.
+- `recordProviderFailureVerdict(state, phaseIdx, role, verdict, ctx)` in the same module — dispatch helper that calls the matching `recordProviderX` emitter based on verdict kind.
+- `__tests__/classify-provider-failure.test.ts` — 17 unit tests covering every regex branch, the precedence rules (auth wins over stall, quota wins over capacity), and the 5 emit paths through `recordProviderFailureVerdict`.
+
+#### Changed
+
+- `build/orchestrator/cli.ts` FAIL handler at line 6463: before falling through to `recordRetryCapHit("codex")`, reads the most-recent `phaseState.codexReview.outputLogPaths` entry and runs `classifyProviderFailure()` against it. On a non-null verdict, emits the matching `PROVIDER_*` halt and skips the cap-hit. Gated behind `GSTACK_DISABLE_PROVIDER_CLASSIFIER=1` for opt-out.
+
+### For contributors
+
+- Out of scope for this PR (deferred to F4 phases 2+3 of the tidy-haven plan): exponential-backoff retry for capacity/overloaded inside the sub-agent spawn function, immediate halt for quota, the `iterations.successful` counter, the state-load migration that backfills `iterations.successful` from `iterations.total`, and the hard 6-attempt session cap. These all build on top of the classifier landed here.
+- Out of scope: extending classification to the `phase-runner.ts:328-335` codex-cap fall-through. The FAIL handler at `cli.ts:6463` is the high-traffic site; the phase-runner site fires only when iterations exceed the configured max, which is rarer.
+- The classifier reads `phaseState.codexReview.outputLogPaths`. Other roles (gemini, dual-impl, test-fix) have their own log paths; widening the classifier to those sites is straightforward once we want to.
+
 ## [1.40.7.1] - 2026-05-21
 
 **Stall kills, signal kills, and auth prompts now surface honestly. The "exit null" / "exit 0" mystery messages that buried the real reason a sub-agent died are replaced with concrete diagnostics like `test-spec writer stalled (no output for 480000ms, killed by watchdog)`.**
