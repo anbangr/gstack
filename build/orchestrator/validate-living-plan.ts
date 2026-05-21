@@ -252,15 +252,25 @@ function isExemptPath(s: string): boolean {
   );
 }
 
-/** Scan a feature block for "Add|Create|Write|New `path`" patterns to build its planned-file allow-list. */
+/** Scan a feature block for "Add|Create|Write|New `path`" patterns to build its planned-file allow-list.
+ *  Also captures the common idiom "Add `A` and `B`" / "Add `A`, `B`, and `C`" where a single verb
+ *  governs multiple paths joined by commas and/or "and". */
 function extractPlannedFiles(text: string): Set<string> {
   const planned = new Set<string>();
-  const re = /(?:Add|Create|Write|New)\s+`([^`]+)`/g;
+  // Primary capture: verb + first backticked path, plus any additional paths
+  // joined by ", ", " and ", or ", and ".
+  const re =
+    /(?:Add|Create|Write|New)\s+`([^`]+)`((?:\s*(?:,\s*(?:and\s+)?|and\s+)`[^`]+`)*)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
-    const candidate = m[1];
-    if (isFileLikePath(candidate)) {
-      planned.add(candidate);
+    if (isFileLikePath(m[1])) planned.add(m[1]);
+    const tail = m[2] || "";
+    if (tail) {
+      const tailRe = /`([^`]+)`/g;
+      let tm: RegExpExecArray | null;
+      while ((tm = tailRe.exec(tail)) !== null) {
+        if (isFileLikePath(tm[1])) planned.add(tm[1]);
+      }
     }
   }
   return planned;
@@ -467,8 +477,7 @@ function main(): number {
     return 1;
   }
 
-  const hasViolations =
-    !report.ok || report.staticViolations.length > 0;
+  const hasViolations = !report.ok || report.staticViolations.length > 0;
   if (!hasViolations) {
     return 0;
   }
