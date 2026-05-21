@@ -2083,6 +2083,14 @@ export function validatePostAgentHygiene(opts: {
    * source but DO touch their own scratch.
    */
   reviewGate?: boolean;
+  /**
+   * Path to the review/QA prompt file that was given to the agent.
+   * When provided, the hygiene diagnostic about the DIFF SCOPE constraint
+   * is only emitted if the prompt body actually contains "DIFF SCOPE:".
+   * This preserves prior-version hygiene logs for review gates that did
+   * not use the new prompt body.
+   */
+  reviewGatePromptPath?: string;
 }): HygieneVerdict {
   const after = captureGitSnapshot(opts.cwd);
   const errors: string[] = [];
@@ -2122,9 +2130,31 @@ export function validatePostAgentHygiene(opts: {
   };
   const dirty = contentHashDelta(opts.before, filteredAfter, opts.cwd);
   if (dirty.length > 0) {
-    errors.push(
-      `${opts.label} left the working tree dirty:\n${dirty.map((line) => `  ${line}`).join("\n")}`,
-    );
+    let msg = `${opts.label} left the working tree dirty:\n${dirty.map((line) => `  ${line}`).join("\n")}`;
+    if (opts.reviewGate) {
+      const nonTestPaths = dirty
+        .map((line) => porcelainStatusToPath(line))
+        .filter(
+          (p) =>
+            !isTestOnlyPath(p, DEFAULT_QA_TEST_PATH_GLOBS) &&
+            !isTestOnlyPath(p, DEFAULT_DATA_OUTPUT_GLOBS),
+        );
+      if (nonTestPaths.length > 0) {
+        let promptHadConstraint = false;
+        if (opts.reviewGatePromptPath) {
+          try {
+            const promptBody = fs.readFileSync(opts.reviewGatePromptPath, "utf8");
+            promptHadConstraint = promptBody.includes("DIFF SCOPE:");
+          } catch {
+            // Prompt unreadable — conservatively treat as constraint absent.
+          }
+        }
+        if (promptHadConstraint) {
+          msg += `\n  the constraint was in the prompt; reviewer edited production paths anyway`;
+        }
+      }
+    }
+    errors.push(msg);
   }
 
   return { ok: errors.length === 0, errors };
@@ -4119,7 +4149,7 @@ export function buildCodexReviewBody(
   hardeningNotes?: string,
   originIssueLogPath?: string,
 ): string {
-  return [
+  const body = [
     `# Review Gate — Phase ${phase.number}: ${phase.name} (iter ${iteration})`,
     "",
     `Branch: ${branch}`,
@@ -4159,12 +4189,18 @@ export function buildCodexReviewBody(
     `1. Run the slash command specified by the runner prompt on the current branch's working tree against its base.`,
     `2. If iteration > 1, this is a re-run after an earlier gate tried to fix findings — be especially thorough.`,
     `3. Use --yolo / workspace-write file tools to inspect the actual code; don't ask the orchestrator to inline anything.`,
-    `4. Fix bugs as you find them (workspace-write sandbox is enabled). This includes running any data-generation or corpus-driver scripts described in the phase if their output files are missing — writing code that could produce them is not the same as producing them. Execute the script, verify the output files exist, and commit them.`,
-    `5. Write your full review report to the output file path (provided in the shell prompt).`,
-    `6. The output file MUST end with a single line: \`GATE PASS\` if no remaining issues, or \`GATE FAIL\` with a list of remaining issues.`,
+    `4. If you find a bug in production code, write a failing test that pins it; do NOT edit production source files (the post-agent hygiene gate will reject the phase if you do). Surface the bug in your report as a recommended follow-up [code] phase.`,
+    `5. You may execute data-generation or corpus-driver scripts described in the phase and commit their output files (data is not production code).`,
+    `6. Write your full review report to the output file path (provided in the shell prompt).`,
+    `7. The output file MUST end with a single line: \`GATE PASS\` if no remaining issues, or \`GATE FAIL\` with a list of remaining issues.`,
   ]
     .filter(Boolean)
     .join("\n");
+
+  return (
+    body +
+    "\n\nDIFF SCOPE: file edits in this phase are limited to: test/**, **/__tests__/**, **/*.test.*, **/*.spec.*, **/conftest.py, **/spec/**, plus committed data outputs from item 5. Edits to anything else fail the post-agent hygiene gate.\n"
+  );
 }
 
 export function buildOriginVerificationBody(args: {
@@ -4781,6 +4817,7 @@ async function runReviewGates(opts: {
       label: `${name} gate`,
       parentWorkspace: parentBeforeGate,
       phaseRef: { phaseNumber: opts.phaseNumber },
+      inputFilePath: opts.inputFilePath,
     });
     outputs.push(result);
     combined.push(
@@ -4806,6 +4843,7 @@ async function runReviewGates(opts: {
         label: `${name} sandbox retry gate`,
         parentWorkspace: parentBeforeGate,
         phaseRef: { phaseNumber: opts.phaseNumber },
+        inputFilePath: opts.inputFilePath,
       });
       outputs.push(checkedRetryResult);
       combined.push(
@@ -4865,6 +4903,14 @@ const DEFAULT_QA_TEST_PATH_GLOBS = [
   "**/*_spec.*",
   "spec/**",
 ];
+
+/**
+ * Glob patterns identifying data-output paths that review/qa gates are
+ * explicitly permitted to commit per item 5 of the review prompt.
+ * These are NOT production source paths, so the hygiene diagnostic
+ * about "editing production paths anyway" must not fire for them.
+ */
+const DEFAULT_DATA_OUTPUT_GLOBS = ["**/data/**/*", "**/corpus/**/*"];
 
 /** Convert a git-porcelain status line ("M path", " D path", "?? path") to
  *  just the path portion. Handles rename arrows (" -> ") and quoted paths. */
@@ -5174,6 +5220,10 @@ function applyGateHygiene(opts: {
    *  prints the exact `--mark-phase-committed` recovery command. Omit when
    *  the gate fires outside a phase context (e.g. merge review). */
   phaseRef?: { featureNumber?: string; phaseNumber: string };
+  /** Path to the review/QA prompt file that was given to the agent.
+   *  When provided, enables the DIFF SCOPE hygiene diagnostic only when
+   *  the prompt body actually contains the constraint. */
+  inputFilePath?: string;
 }): SubAgentResult {
   if (opts.result.timedOut || opts.result.exitCode !== 0) return opts.result;
   // Review/QA gates run Codex under workspace-write and the subagent writes
@@ -5189,6 +5239,7 @@ function applyGateHygiene(opts: {
       before: opts.before,
       label: opts.label,
       reviewGate: isGateRole,
+      reviewGatePromptPath: opts.inputFilePath,
     }),
     validateParentWorkspaceUnchanged({
       before: opts.parentWorkspace?.snapshot ?? null,
@@ -5224,6 +5275,7 @@ function applyGateHygiene(opts: {
             cwd: opts.cwd,
             before: opts.before,
             label: opts.label,
+            reviewGatePromptPath: opts.inputFilePath,
           }),
           validateParentWorkspaceUnchanged({
             before: opts.parentWorkspace?.snapshot ?? null,
@@ -12755,6 +12807,7 @@ async function runMergeReview(args: {
     before,
     cwd: args.cwd,
     label: "merge review",
+    inputFilePath,
   });
   const verdict = parseVerdict(result.stdout + "\n" + result.stderr);
   return {
