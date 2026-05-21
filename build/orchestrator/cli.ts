@@ -11234,17 +11234,41 @@ async function main() {
         }
       }
       if (exitCode === 0 && state.completed && !args.dryRun && !args.skipShip) {
-        // Stop reconciling visible gates BEFORE archiving the plan file.
-        // saveState() invokes reconcileVisiblePlanState which reads
-        // visiblePlanProjection.planFile (set once at parsePlan time with
-        // the inbox/living-plan path). archiveLivingPlan moves that file
-        // to archived/, so the very next saveState would ENOENT. Marking
-        // the projection as archived makes that reconcile path a no-op
-        // for the rest of shutdown. The finally block also clears it as
-        // a belt-and-suspenders guard against test/import leakage.
-        markVisiblePlanArchived();
-        const archivedPath = archiveLivingPlan(state.planFile);
+        // Order matters here. Two failure shapes to avoid:
+        //
+        //   (A) ENOENT race: if we archive THEN saveState (which calls
+        //       reconcileVisiblePlanState), the reconcile reads the
+        //       inbox path stored in visiblePlanProjection and ENOENTs
+        //       because archiveLivingPlan just moved the file.
+        //
+        //   (B) Lost-gate-visibility: if we mark archived BEFORE
+        //       archiveLivingPlan and archiveLivingPlan then throws (FS
+        //       race, EPERM on encrypted vol, network FS hiccup), the
+        //       projection is now null but the inbox plan file is still
+        //       there. Subsequent saveStates lose gate-checkbox sync
+        //       for the rest of the run.
+        //
+        // The safe sequence: try archiveLivingPlan first, mark archived
+        // only AFTER it succeeded (file is now under archived/, no further
+        // inbox-path reconcile makes sense). If archiveLivingPlan throws,
+        // the projection stays valid and gate visibility keeps working
+        // against the unmoved inbox file.
+        let archivedPath: string | null = null;
+        try {
+          archivedPath = archiveLivingPlan(state.planFile);
+        } catch (err) {
+          // archiveLivingPlan failed. Leave the projection intact so
+          // gate visibility keeps reconciling against the unmoved
+          // inbox plan file for the remainder of shutdown.
+          console.warn(
+            `[plan] archiveLivingPlan failed (gate visibility preserved): ${(err as Error).message}`,
+          );
+        }
         if (archivedPath) {
+          // Archive succeeded — stop reconciling against the now-moved
+          // file. The finally block clears the projection again as
+          // belt-and-suspenders / test isolation hygiene.
+          markVisiblePlanArchived();
           state.planFile = archivedPath;
           saveState(state, { noGbrain: args.noGbrain, log: console.warn });
           console.log(`Archived living plan: ${archivedPath}`);

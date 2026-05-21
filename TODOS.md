@@ -98,6 +98,47 @@ partial. On finish(), flush any residuals with a final prefix.
 **Priority:** P3
 **Depends on:** streaming-log fix landed
 
+### Adversarial review follow-ups (T-ADV)
+
+**What:** Adversarial review of `fix/spawn-captured-streaming-and-cleanup`
+surfaced several low-severity items that didn't block the ship but are
+worth picking up in a follow-up branch.
+
+- F2: `logFlushed.then(...)` lacks a `.catch` — currently the inner
+  Promise can only resolve (no reject path), but a future change adding
+  a reject path would silently swallow the spawnCaptured promise.
+  Defensive `.catch(() => resolve(...))` would prevent the latent hang.
+- F12: crash recovery (SIGKILL between archiveLivingPlan and the next
+  build start) still ENOENTs if a recovery hook reconstructs the
+  visiblePlanProjection from disk state without consulting
+  `state.planFile` (which holds the archived path after the fix). Right
+  now no such hook exists, but it's a fragile contract for future
+  resume-from-crash code.
+- F18: log file mode 0600 constrains ACL but doesn't stop root-level
+  backup daemons (Time Machine, restic-as-root) or macOS Spotlight
+  indexing under the user's privileges. Add `~/.gstack/build-state/`
+  to `mdimport` exclusions or move logs under `~/.gstack/cache/` which
+  Spotlight excludes by default.
+- F24: `AUTO_DRAIN_DEADLINE_MS = 60_000` is hardcoded. Operators with a
+  large halt-event backlog have only `--no-auto-drain` (all-or-nothing)
+  as the escape hatch. An env var like `GSTACK_AUTO_DRAIN_DEADLINE_MS`
+  would let an operator allow 3-5 minutes when warranted.
+- F29: `quote()` doesn't escape control characters (`\n`, `\r`, ANSI
+  escapes) in argv. A child whose argv contains a `\n` produces a
+  multi-line `# command:` header — downstream parsers that split on
+  the first newline would truncate the argv. Pretty low impact (callers
+  don't put untrusted content in argv) but is worth fixing for forensic
+  cleanliness.
+- F30: when `loggedStreamError` is true, the fallback `fs.writeFileSync`
+  path overwrites the file from scratch with `[OUT]`/`[ERR]`-less
+  content. Any partial body that did stream before the error gets
+  nuked. A more honest fallback would append a marker + the post-mortem
+  buffers rather than truncating.
+
+**Effort:** S each, ~M cumulative
+**Priority:** P3
+**Depends on:** none
+
 ### Move markVisiblePlanArchived into archiveLivingPlan (T-ARCH)
 
 **What:** The gate-visibility ENOENT race is currently fixed by manually
