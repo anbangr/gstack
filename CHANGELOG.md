@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.41.1.0] - 2026-05-22
+
+**The build orchestrator now catches five classes of synthesizer blind spots before they ever reach the build loop. Living plans are validated for unused imports, missing field references, non-existent file paths, multi-arm split across phases, and stale file:line quotes — with a bounded-retry gate that sends the synthesizer back to fix its own mistakes.**
+
+This is PR5 of the tidy-haven plan — Feature 8 of the 83-fault recurrence program. The orchestrator autonomously built and shipped this PR via Kimi primary + Gemini fallback, converging after multiple review iterations. The diff is 5 files, ~989 lines added, spanning the validator engine, 432 lines of unit tests, and the SKILL.md.tmpl synthesis wrapper.
+
+### What changed for the user
+
+- The plan synthesizer now runs through a bounded structural-gate retry loop (up to 3 attempts). If the generated living plan violates any static check, the synthesizer receives the violation report and must rewrite the offending feature blocks before the build loop starts.
+- Five static checks catch the most common synthesizer hallucinations:
+  1. **Unused imports** — every imported identifier in a phase code snippet must be used in that same phase.
+  2. **Missing field references** — `phaseState.<role>.<field>` claims in acceptance must appear in the plan's code snippets.
+  3. **Non-existent files** — backtick-quoted file paths in acceptance must exist on disk, be explicitly planned, or be exempt (inbox, audit, tmp paths).
+  4. **Multi-arm split** — registry additions and their orchestrator wiring must land in the same phase; splitting them across phases is a structural violation.
+  5. **Stale quotes** — `file:line` quotes with expected snippets are verified against on-disk content.
+- The synthesizer prompt now includes a "Common defects to avoid" self-check section so the model can catch these issues before the validator does.
 ## [1.41.0.0] - 2026-05-21
 
 **The verify-red gate now validates that tests were actually collected, and the orchestrator can introspect test-runner output to know how many tests ran.** New `test-runner-introspect.ts` parses JSON and stdout output from vitest, pytest, jest, bun, mocha, and go test to extract collected/passed/failed counts. When a verify-red phase exits 0 but collected 0 tests, the orchestrator emits a `RED_GATE_ZERO_TESTS_COLLECTED` halt event instead of silently passing — surfacing the common "forgot the testCmd annotation" failure mode immediately. The red-spec iteration cap drops from 3 to 1 (set `GSTACK_BUILD_RED_LEGACY_CAP=3` to restore the old behavior during the deprecation window). The `/build` skill template now includes a polyglot-repo hint reminding users to add `<!-- testCmd: -->` when the per-phase runner differs from the repo default.
@@ -16,6 +32,24 @@ This is PR3 of the tidy-haven plan — Feature 7 of the 83-fault recurrence prog
 
 #### Added
 
+- `build/orchestrator/validate-living-plan.ts` — extended structural validator with T1-T5 static checks, `extractPlannedFiles` with multi-path idiom support ("Add `A` and `B`"), inbox/audit path exemptions, and stale-quote verification against real files.
+- `build/orchestrator/__tests__/living-plan-static-checks.test.ts` — 432-line test suite covering all five rules plus edge cases (Bun built-ins, type-only usage, default+named imports, planned-file allow-list, cross-feature isolation, inbox exemptions, bounded-retry exit-code contract, and wrapper template assertions).
+
+#### Changed
+
+- `build/SKILL.md.tmpl` — hoisted synthesizer dispatch into `_spawn_synthesizer` shell function, wrapped it in a `while true` bounded-retry loop with revision-prompt generation, added "Common defects to avoid" self-check list to the synthesizer instructions, and wired `staticViolations` into the retry report.
+- `build/SKILL.md` — regenerated from template (matching changes above).
+- `build/orchestrator/__tests__/monitor.test.ts` — added `buildStallThresholdMs` parameter support for stall-arm tests.
+
+#### Fixed
+
+- T3 false positives on real living plans — tightened `isFileLikePath` to reject shell commands, globs, variables, and URIs while preserving legitimate repo paths.
+- Multi-path "Add A and B" idiom — `extractPlannedFiles` now captures backtick-quoted paths joined by commas and "and" after a single verb.
+
+### For contributors
+
+- The validator exits 2 on static violations (same contract as the existing Origin-trace / Acceptance gate) so the shell wrapper enters the bounded-retry branch instead of treating it as fatal.
+- The `test:build-skill` test suite passes with 2359 pass / 0 fail across 112 files.
 - `build/orchestrator/test-runner-introspect.ts` — 307-line module with `extractTestCount()` supporting vitest, pytest, jest, bun, mocha, and go test. Parses both JSON output and stdout fallback patterns.
 - `build/orchestrator/__tests__/red-gate-runner-introspect.test.ts` — 296-line unit-test suite (T1-T16) covering JSON parsing, stdout fallback, edge cases, and runner detection.
 - `build/orchestrator/__tests__/red-gate-zero-tests-collected.test.ts` — unit tests for the zero-collection halt path (T8-T16), including suppression for non-coding phases and `audit-only` annotation.
