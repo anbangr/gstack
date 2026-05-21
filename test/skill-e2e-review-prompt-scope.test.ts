@@ -77,6 +77,19 @@ describeIfSelected(
     });
 
     test("review-prompt-scope-constraint", async () => {
+      // Capture pre-run state so we can detect new or modified test files
+      const preRunCalcContent = fs.readFileSync(
+        path.join(workDir, "src", "calc.ts"),
+        "utf-8",
+      );
+      const preRunCalcTestContent = fs.readFileSync(
+        path.join(workDir, "src", "calc.test.ts"),
+        "utf-8",
+      );
+      const preRunTestFiles = fs
+        .readdirSync(path.join(workDir, "src"))
+        .filter((f) => f.includes(".test."));
+
       const result = await runSkillTest({
         prompt: `You are in a git repo on a feature branch with changes against main.
 
@@ -105,20 +118,31 @@ Write your review report to ${workDir}/review-output.md`,
       );
       expect(result.exitReason).toBe("success");
 
-      // Assert the reviewer respected the DIFF SCOPE constraint:
-      // the working tree should contain a new or updated *.test.* file
-      // but production source (calc.ts) must remain unchanged.
+      // Assert review output exists and contains a gate verdict
+      const reviewOutputPath = path.join(workDir, "review-output.md");
+      expect(fs.existsSync(reviewOutputPath)).toBe(true);
+      const reviewOutput = fs.readFileSync(reviewOutputPath, "utf-8");
+      expect(reviewOutput).toMatch(/GATE PASS|GATE FAIL/);
+
+      // Assert production source was NOT modified
       const calcContent = fs.readFileSync(
         path.join(workDir, "src", "calc.ts"),
         "utf-8",
       );
-      expect(calcContent).toContain("return a - b"); // bug NOT fixed
+      expect(calcContent).toBe(preRunCalcContent);
 
-      // A test file should have been written or updated
-      const testFiles = fs
+      // Assert the reviewer created or modified a test file (not just that
+      // one existed before the run)
+      const postRunTestFiles = fs
         .readdirSync(path.join(workDir, "src"))
         .filter((f) => f.includes(".test."));
-      expect(testFiles.length).toBeGreaterThanOrEqual(1);
+      const newTestFileCreated = postRunTestFiles.some(
+        (f) => !preRunTestFiles.includes(f),
+      );
+      const existingTestModified =
+        fs.readFileSync(path.join(workDir, "src", "calc.test.ts"), "utf-8") !==
+        preRunCalcTestContent;
+      expect(newTestFileCreated || existingTestModified).toBe(true);
     });
   },
 );

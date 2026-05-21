@@ -174,6 +174,8 @@ describe("buildCodexReviewBody prompt scope constraint", () => {
 describe("validatePostAgentHygiene scope diagnostic", () => {
   let tmpDir: string;
   let repo: string;
+  let promptWithConstraint: string;
+  let promptWithoutConstraint: string;
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(
@@ -192,6 +194,18 @@ describe("validatePostAgentHygiene scope diagnostic", () => {
       spawnSync("git", ["config", "user.name", "Test User"], { cwd: repo })
         .status,
     ).toBe(0);
+
+    // Create mock prompt files
+    promptWithConstraint = path.join(repo, "prompt-with-constraint.md");
+    promptWithoutConstraint = path.join(repo, "prompt-without-constraint.md");
+    fs.writeFileSync(
+      promptWithConstraint,
+      "# Review Gate\n\nDIFF SCOPE: file edits limited to test/**\n",
+    );
+    fs.writeFileSync(
+      promptWithoutConstraint,
+      "# Review Gate\n\nFix bugs as you find them.\n",
+    );
   });
 
   afterEach(() => {
@@ -210,7 +224,7 @@ describe("validatePostAgentHygiene scope diagnostic", () => {
     ).toBe(0);
   }
 
-  it("T5: hygiene diagnostic present when reviewer edits production path", () => {
+  it("T5: hygiene diagnostic present when reviewer edits production path and prompt had constraint", () => {
     commit("src/foo.ts", "export const foo = 1;\n");
     const before = captureGitSnapshot(repo);
 
@@ -225,6 +239,7 @@ describe("validatePostAgentHygiene scope diagnostic", () => {
       before,
       label: "review",
       reviewGate: true,
+      reviewGatePromptPath: promptWithConstraint,
     });
 
     expect(verdict.ok).toBe(false);
@@ -252,6 +267,7 @@ describe("validatePostAgentHygiene scope diagnostic", () => {
       before,
       label: "review",
       reviewGate: true,
+      reviewGatePromptPath: promptWithConstraint,
     });
 
     // Should still be dirty (test files are still dirty)
@@ -276,6 +292,7 @@ describe("validatePostAgentHygiene scope diagnostic", () => {
       before,
       label: "review",
       reviewGate: true,
+      reviewGatePromptPath: promptWithConstraint,
     });
 
     expect(verdict.ok).toBe(true);
@@ -298,6 +315,7 @@ describe("validatePostAgentHygiene scope diagnostic", () => {
       before,
       label: "review",
       reviewGate: true,
+      reviewGatePromptPath: promptWithConstraint,
     });
 
     // Should still be dirty (data files are not in test glob list)
@@ -307,7 +325,65 @@ describe("validatePostAgentHygiene scope diagnostic", () => {
     );
     expect(dirtyError).toBeDefined();
     // The diagnostic should not appear for data files since item 5 permits them
-    // (Implementation detail: the diagnostic is about production *source* paths)
+    expect(dirtyError).not.toContain(
+      "the constraint was in the prompt; reviewer edited production paths anyway",
+    );
+  });
+
+  it("backward compat: no prompt path means no diagnostic even on production edits", () => {
+    commit("src/foo.ts", "export const foo = 1;\n");
+    const before = captureGitSnapshot(repo);
+
+    fs.writeFileSync(
+      path.join(repo, "src/foo.ts"),
+      "export const foo = 2;\n",
+    );
+
+    const verdict = validatePostAgentHygiene({
+      cwd: repo,
+      before,
+      label: "review",
+      reviewGate: true,
+      // no reviewGatePromptPath — prior-version gate
+    });
+
+    expect(verdict.ok).toBe(false);
+    const dirtyError = verdict.errors.find((e) =>
+      e.includes("left the working tree dirty"),
+    );
+    expect(dirtyError).toBeDefined();
+    // Diagnostic must NOT appear when prompt path is absent
+    expect(dirtyError).not.toContain(
+      "the constraint was in the prompt; reviewer edited production paths anyway",
+    );
+  });
+
+  it("backward compat: prompt without DIFF SCOPE means no diagnostic", () => {
+    commit("src/foo.ts", "export const foo = 1;\n");
+    const before = captureGitSnapshot(repo);
+
+    fs.writeFileSync(
+      path.join(repo, "src/foo.ts"),
+      "export const foo = 2;\n",
+    );
+
+    const verdict = validatePostAgentHygiene({
+      cwd: repo,
+      before,
+      label: "review",
+      reviewGate: true,
+      reviewGatePromptPath: promptWithoutConstraint,
+    });
+
+    expect(verdict.ok).toBe(false);
+    const dirtyError = verdict.errors.find((e) =>
+      e.includes("left the working tree dirty"),
+    );
+    expect(dirtyError).toBeDefined();
+    // Diagnostic must NOT appear when prompt lacks DIFF SCOPE
+    expect(dirtyError).not.toContain(
+      "the constraint was in the prompt; reviewer edited production paths anyway",
+    );
   });
 });
 
