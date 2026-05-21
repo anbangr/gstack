@@ -11271,23 +11271,12 @@ async function main() {
         // a future change makes it non-trivial.
       }
     }
-    // Stop the stdout heartbeat first so we don't write any more lines
-    // while the active-run registry / lock cleanup runs.
-    if (heartbeat) {
-      try {
-        heartbeat.stop();
-      } catch {
-        // stop() is idempotent and swallows its own errors; this catch
-        // is belt-and-braces so an unexpected throw can't shadow the
-        // exit-code reporting below.
-      }
-    }
-    // Best-effort sidecar cleanup. A leftover heartbeat.json from a SIGKILL
-    // path is handled by the monitor's runId+pid trust gate (it would only
-    // be trusted if a NEW orchestrator happened to spawn with the same
-    // runId AND the same pid — vanishingly unlikely). Still, the normal
-    // shutdown path leaves no stragglers.
-    removeHeartbeatSidecar(heartbeatPath);
+    // NOTE: heartbeat.stop() + removeHeartbeatSidecar are deliberately NOT
+    // here. They must run AFTER end-of-build auto-drain (see below), because
+    // the sidecar carries drainProcessedCount and the monitor reads it
+    // throughout the drain. Stopping the heartbeat here would blind the
+    // monitor to drain progress — the exact failure mode this PR fixes.
+    // Cleanup happens after the auto-drain call, in the post-finally block.
     let activeRunRegistryUpdateFailed = false;
     try {
       if (state?.launch?.runId && state.launch.activeRunRegistry) {
@@ -11341,7 +11330,25 @@ async function main() {
   // PR 6: end-of-build auto-drain of the halt-events queue. Failure is
   // non-fatal — preserves whatever exitCode the build produced. Opt out
   // via --no-auto-drain or GSTACK_HALT_EVENTS_OFF=1.
+  //
+  // The heartbeat is intentionally still ticking here. drainFaultsForBuildRun
+  // bumps drainProcessedCount per entry, and the sidecar carries that count
+  // for the monitor's stall arm. If the heartbeat were stopped before
+  // auto-drain (as it was in the initial commit), the monitor would be blind
+  // to drain progress — the exact false-alive failure this PR fixes.
   await runAutoDrainIfEnabled(args, state, drainProgress);
+
+  // NOW stop the heartbeat and clean up the sidecar — auto-drain is done
+  // and there's no more progress to publish. Order matters: stop() first so
+  // no further ticks race with the unlink.
+  if (heartbeat) {
+    try {
+      heartbeat.stop();
+    } catch {
+      // stop() is idempotent and swallows its own errors; defensive catch.
+    }
+  }
+  removeHeartbeatSidecar(heartbeatPath);
 
   process.exit(exitCode);
 }

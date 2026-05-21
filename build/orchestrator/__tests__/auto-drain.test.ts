@@ -254,6 +254,16 @@ describe("auto-drain hook contract", () => {
     expect(result.deferred).toBeGreaterThan(0);
     // calls counts mockInvestigator invocations: should be 2, not all 5.
     expect(calls).toBe(2);
+    // NOTE: the codex/claude adversarial review surfaced a related edge case
+    // that this synchronous-mock test cannot exercise: when AbortSignal fires
+    // DURING the actual `spawnInvestigatorCapture` call (real child process),
+    // the function returns null which used to be counted as `result.failed`,
+    // missing the abort entirely. The post-spawn `if (opts.signal?.aborted)`
+    // check in drain-faults.ts now disambiguates: aborted → break + deferred,
+    // not failed. The mockInvestigator path skips spawnInvestigatorCapture so
+    // it can't trigger that branch; a real-process test would need a binary
+    // that hangs long enough for the abort to land mid-call. Reviewed by
+    // hand; tracked in PR body.
   });
 
   test("signal pre-aborted: drain returns immediately with deferred = full queue", async () => {

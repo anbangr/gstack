@@ -1413,7 +1413,10 @@ export async function drainFaultsFromHaltEventsQueue(
     // they represent queue noise filtered before any real work, and
     // claiming progress on them would let a flood of low-severity entries
     // keep the monitor stall arm quiet forever even if nothing is actually
-    // moving.
+    // moving. (For shortCircuited entries see further down — those DO
+    // bump because they atomically move the queue file to processed/, so
+    // they represent real forward progress on disk even though no
+    // investigator ran.)
     if (SEVERITY_RANK[he.severity] < minRank) {
       result.skipped += 1;
       continue;
@@ -1552,6 +1555,18 @@ export async function drainFaultsFromHaltEventsQueue(
         timeoutMs,
         signal: opts.signal,
       });
+      // Abort-vs-failure disambiguation: spawnInvestigatorCapture returns null
+      // on BOTH (a) genuine investigator failure and (b) AbortSignal-driven
+      // SIGTERM kill. If we just no-op `result.failed += 1; continue;` here,
+      // an abort that fires during the LAST entry's investigator would never
+      // tip the loop into the abortedDuringLoop branch — the budget-exceeded
+      // warning would be silently lost and `aborted: false` would be returned
+      // even though the budget DID fire. Check the signal explicitly after
+      // the await: aborted means this entry deferred, not failed.
+      if (opts.signal?.aborted) {
+        abortedDuringLoop = true;
+        break;
+      }
       if (raw === null) {
         process.stderr.write(
           `[drain-faults] investigator dispatch failed for ${he.faultId}\n`,

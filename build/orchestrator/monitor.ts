@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "./child-registry";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
   activeRunRecordPath,
@@ -484,11 +485,30 @@ function writeHeartbeatTracker(
   }
 }
 
+/**
+ * Resolve the gstack-config binary path. Production callers don't pass one
+ * explicitly — they get the canonical `~/.claude/skills/gstack/bin/gstack-config`
+ * location, the same default `resolveInvestigatorRole` uses. Tests can pass
+ * the empty string "" to force the no-binary code path.
+ */
+function resolveGstackConfigBin(explicit?: string): string {
+  if (explicit !== undefined) return explicit;
+  return path.join(
+    os.homedir(),
+    ".claude",
+    "skills",
+    "gstack",
+    "bin",
+    "gstack-config",
+  );
+}
+
 function readBuildStallThresholdMs(gstackConfigBin?: string): number {
-  // No binary configured: default. Skip the spawn entirely.
-  if (!gstackConfigBin) return DEFAULT_BUILD_STALL_THRESHOLD_MS;
+  const bin = resolveGstackConfigBin(gstackConfigBin);
+  // Empty string = explicit "no binary" (test escape hatch).
+  if (!bin) return DEFAULT_BUILD_STALL_THRESHOLD_MS;
   try {
-    const result = spawnSync(gstackConfigBin, ["get", "build_stall_threshold_ms"], {
+    const result = spawnSync(bin, ["get", "build_stall_threshold_ms"], {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 3000,
