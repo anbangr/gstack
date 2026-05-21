@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.41.0.0] - 2026-05-21
+
+**The verify-red gate now validates that tests were actually collected, and the orchestrator can introspect test-runner output to know how many tests ran.** New `test-runner-introspect.ts` parses JSON and stdout output from vitest, pytest, jest, bun, mocha, and go test to extract collected/passed/failed counts. When a verify-red phase exits 0 but collected 0 tests, the orchestrator emits a `RED_GATE_ZERO_TESTS_COLLECTED` halt event instead of silently passing — surfacing the common "forgot the testCmd annotation" failure mode immediately. The red-spec iteration cap drops from 3 to 1 (set `GSTACK_BUILD_RED_LEGACY_CAP=3` to restore the old behavior during the deprecation window). The `/build` skill template now includes a polyglot-repo hint reminding users to add `<!-- testCmd: -->` when the per-phase runner differs from the repo default.
+
+This is PR3 of the tidy-haven plan — Feature 7 of the 83-fault recurrence program.
+
+### What changed for the user
+
+- **Zero-test detection in verify-red**: If your `code` phase passes its verify-red gate with 0 tests collected, the build now halts with a clear `RED_GATE_ZERO_TESTS_COLLECTED` event pointing to the resolved test command and suggesting you add `<!-- testCmd: -->` to the phase body. No more silent green builds that skipped every test.
+- **Tighter red-spec cap**: `GSTACK_BUILD_RED_MAX_ITER` defaults to `1` (was `3`). This means a test-writer that produces trivially-passing specs gets one retry instead of three before the orchestrator escalates. Restore the old cap with `GSTACK_BUILD_RED_LEGACY_CAP=3`.
+- **Polyglot repo hint in /build skill**: The skill template now reminds users to annotate `code` phases with `<!-- testCmd: -->` when the per-phase test runner differs from the repo root command.
+
+### Itemized changes
+
+#### Added
+
+- `build/orchestrator/test-runner-introspect.ts` — 307-line module with `extractTestCount()` supporting vitest, pytest, jest, bun, mocha, and go test. Parses both JSON output and stdout fallback patterns.
+- `build/orchestrator/__tests__/red-gate-runner-introspect.test.ts` — 296-line unit-test suite (T1-T16) covering JSON parsing, stdout fallback, edge cases, and runner detection.
+- `build/orchestrator/__tests__/red-gate-zero-tests-collected.test.ts` — unit tests for the zero-collection halt path (T8-T16), including suppression for non-coding phases and `audit-only` annotation.
+- `recordRedGateZeroTestsCollected` helper in `halt-event-helpers.ts` — emits `RED_GATE_ZERO_TESTS_COLLECTED` with the resolved test command embedded in the message.
+- `resolveTestCmdForPhase` wiring in `cli.ts` — resolves the effective test command for a phase and passes it through `applyResult` so the zero-collection detector knows what runner to introspect.
+
+#### Changed
+
+- `build/orchestrator/phase-runner.ts` — added `detectRunnerFromTestCmd`, `hasSuppressionAnnotation`, `resolveRedSpecCap`, and wired `extractTestCount` into the verify-red flow. Cap is 3 for zero-collection phases (preserves legacy behavior) and 1 for phases with actual tests (unless `GSTACK_BUILD_RED_LEGACY_CAP` is set).
+- `build/orchestrator/README.md` — documented `GSTACK_BUILD_RED_MAX_ITER=1` and the `GSTACK_BUILD_RED_LEGACY_CAP` deprecation override.
+- `build/SKILL.md.tmpl` — added polyglot-repo test-runner hint under phase-body instructions.
+- `build/SKILL.md` — regenerated from template (frontmatter version 1.29.0).
+
+### For contributors
+
+- `build/orchestrator/__tests__/coverage-matrix.test.ts` updated to own `test-runner-introspect.ts` → `red-gate-runner-introspect.test.ts`.
 ## [1.40.7.6] - 2026-05-21
 
 **Recovery-boundary cleanup for PR8 Phase 2.** Adds an upgrade migration that scrubs old manual-recovery learned-pattern categories, records a single-line migration note, and surfaces `STATE_DRIFT:missing_completedAt` warnings when committed build-state features lack `completedAt`.
