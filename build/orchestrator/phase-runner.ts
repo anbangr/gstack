@@ -21,6 +21,7 @@ import type {
   DualImplState,
   DualImplTestResult,
   Phase,
+  PhaseKind,
   PhaseState,
 } from "./types";
 import type { SubAgentResult, Verdict } from "./sub-agents";
@@ -31,6 +32,7 @@ import {
 } from "./sub-agents";
 import { renderRoleStepFailureMessage } from "./halt-event-helpers";
 import { BUILD_DEFAULTS, envNumberOrDefault } from "./build-config";
+import { extractTestCount } from "./test-runner-introspect";
 
 /** Maximum recursive Codex review iterations before giving up. */
 export const DEFAULT_MAX_CODEX_ITERATIONS = envNumberOrDefault(
@@ -156,6 +158,60 @@ export type Action =
        */
       priorReportPath?: string;
     };
+
+// ------------------------------------------------------------------
+// Zero-collection halt + red-spec cap helpers
+// ------------------------------------------------------------------
+
+const SUPPRESSION_KINDS: PhaseKind[] = [
+  "writing",
+  "experiment",
+  "research",
+  "manual",
+];
+
+const AUDIT_ONLY_RE = /<!--\s*audit-only\s*-->/i;
+
+function hasSuppressionAnnotation(
+  phaseBody: string | undefined,
+  phaseKind: PhaseKind | undefined,
+): boolean {
+  if (phaseBody && AUDIT_ONLY_RE.test(phaseBody)) return true;
+  if (phaseKind && SUPPRESSION_KINDS.includes(phaseKind)) return true;
+  return false;
+}
+
+function detectRunnerFromTestCmd(testCmd: string | undefined): string {
+  if (!testCmd) return "unknown";
+  const cmd = testCmd.toLowerCase();
+  if (cmd.includes("vitest")) return "vitest";
+  if (cmd.includes("pytest")) return "pytest";
+  if (cmd.includes("jest")) return "jest";
+  if (cmd.includes("mocha")) return "mocha";
+  if (cmd.includes("go test")) return "go";
+  // bun test is the catch-all when no other runner is detected
+  if (cmd.includes("bun test") || cmd.includes("bun run test"))
+    return "bun";
+  // Fallback: if it looks like a shell command with no recognized runner,
+  // return "unknown" so extractTestCount falls back to stdout parsing.
+  return "unknown";
+}
+
+function resolveRedSpecCap(collected: number): number {
+  if (collected === 0) {
+    // Maintain legacy behavior for zero-collection phases (suppressed or
+    // otherwise) so they don't hit a tight cap.
+    return 3;
+  }
+  const legacy = process.env.GSTACK_BUILD_RED_LEGACY_CAP;
+  if (legacy) {
+    const parsed = Number(legacy);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return 1;
+}
+
+// ------------------------------------------------------------------
 
 /**
  * Given a phase's runtime state, decide what to do next.
@@ -457,6 +513,8 @@ export interface ApplyResultExtra {
   /** RUN_TESTS: phase body text (for extractCoverageTarget) and test command (for parseCoveragePercent) */
   phaseBody?: string;
   testCmd?: string;
+  /** VERIFY_RED: phase kind for suppression annotation checks */
+  phaseKind?: PhaseKind;
   /** RUN_DUAL_IMPL: worktree paths + branches set up by createWorktrees() */
   dualImplInit?: DualImplState;
   /** RUN_DUAL_TESTS: individual test outcomes for each worktree */
@@ -641,10 +699,25 @@ export function applyResult(
       next.status = "tests_red";
       return next;
     }
+    const runner = detectRunnerFromTestCmd(extra?.testCmd);
+    const testCount = extractTestCount({ stdout: result.stdout }, runner);
+    const suppressed = hasSuppressionAnnotation(
+      extra?.phaseBody,
+      phaseState.kind ?? extra?.phaseKind,
+    );
+    if (testCount.collected === 0 && !suppressed) {
+      next.status = "failed";
+      next.error =
+        `RED_GATE_ZERO_TESTS_COLLECTED: verify-red exited 0 but collected 0 tests (source: ${testCount.source}). ` +
+        `Resolved test command: ${extra?.testCmd ?? "unknown"}. ` +
+        `Did you forget \`<!-- testCmd: -->\`?`;
+      return next;
+    }
     // Tests trivially pass before implementation → need harder tests.
     const attempts = (phaseState.redSpecAttempts ?? 0) + 1;
     next.redSpecAttempts = attempts;
-    if (attempts >= DEFAULT_MAX_RED_SPEC_ITERATIONS) {
+    const cap = resolveRedSpecCap(testCount.collected);
+    if (attempts >= cap) {
       next.status = "failed";
       next.error = `Gemini could not produce failing tests after ${attempts} attempts (GSTACK_BUILD_RED_MAX_ITER). If the test runner is misdetected (e.g. vitest ran for a pytest phase), override per-phase by adding \`<!-- testCmd: <your-test-command> -->\` to the phase body in the plan.`;
       return next;

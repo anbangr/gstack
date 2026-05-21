@@ -133,6 +133,7 @@ describe("red-gate zero-tests-collected halt (T8-T13)", () => {
     const next = applyResult(state, action, verifyRedResult(stdout, 0), {
       phaseBody: p.body,
       testCmd: "npx vitest run",
+      phaseKind: p.kind,
     });
     expect(next.status).toBe("test_spec_running");
     expect(next.error).toBeUndefined();
@@ -147,6 +148,7 @@ describe("red-gate zero-tests-collected halt (T8-T13)", () => {
     const next = applyResult(state, action, verifyRedResult(stdout, 0), {
       phaseBody: p.body,
       testCmd: "npx vitest run",
+      phaseKind: p.kind,
     });
     expect(next.status).toBe("test_spec_running");
     expect(next.error).toBeUndefined();
@@ -161,6 +163,7 @@ describe("red-gate zero-tests-collected halt (T8-T13)", () => {
     const next = applyResult(state, action, verifyRedResult(stdout, 0), {
       phaseBody: p.body,
       testCmd: "npx vitest run",
+      phaseKind: p.kind,
     });
     expect(next.status).toBe("test_spec_running");
     expect(next.error).toBeUndefined();
@@ -175,6 +178,7 @@ describe("red-gate zero-tests-collected halt (T8-T13)", () => {
     const next = applyResult(state, action, verifyRedResult(stdout, 0), {
       phaseBody: p.body,
       testCmd: "npx vitest run",
+      phaseKind: p.kind,
     });
     expect(next.status).toBe("test_spec_running");
     expect(next.error).toBeUndefined();

@@ -1221,6 +1221,10 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
      requires external human action — annotate the heading with the appropriate `[kind]`
      bracket: `[writing]`, `[experiment]`, `[research]`, or `[manual]`. Omitting the
      bracket defaults to `code`. See 'Non-Coding Phase Templates' below for examples.
+   - **Polyglot repo test-runner hint**: Every `code` phase in a polyglot repo
+     MUST include `<!-- testCmd: -->` in the phase body if the per-phase test
+     runner differs from the repo root command. This prevents the verify-red gate
+     from misdetecting the runner and halting with `RED_GATE_ZERO_TESTS_COLLECTED`.
 
    **Non-Coding Phase Templates**
 

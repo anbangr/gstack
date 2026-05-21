@@ -7274,7 +7274,12 @@ async function runPhase(args: {
           });
         }
       }
-      phaseState = applyResult(phaseState, action, result);
+      const effectiveTestCmd = resolveTestCmdForPhase(args, cwd, phase);
+      phaseState = applyResult(phaseState, action, result, {
+        phaseBody: phase.body,
+        testCmd: effectiveTestCmd ?? undefined,
+        phaseKind: phase.kind,
+      });
       state.phases[phase.index] = phaseState;
       saveState(state, { noGbrain, log: console.warn });
       continue;

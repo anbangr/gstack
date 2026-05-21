@@ -209,6 +209,21 @@ export function recordProviderAuthRequired(
   );
 }
 
+export function recordRedGateZeroTestsCollected(
+  state: BuildState,
+  phaseIdx: number,
+  testCmd: string,
+  ctx: HelperContext,
+): string {
+  return emit(
+    "RED_GATE_ZERO_TESTS_COLLECTED",
+    `verify-red exited 0 but collected 0 tests. Resolved test command: ${testCmd}. Did you forget \`<!-- testCmd: -->\`?`,
+    ctx,
+    state,
+    phaseIdx,
+  );
+}
+
 // ------------------------------------------------------------------
 // FailureRender — structured view of why a role step failed
 // ------------------------------------------------------------------
