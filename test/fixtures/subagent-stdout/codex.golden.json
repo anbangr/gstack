@@ -1,0 +1,12 @@
+{
+  "comment": "Each row is { lineIndex, expected }. lineIndex is 0-based against codex.txt after splitting on \\n. expected=null means parser must return null for that line.",
+  "rows": [
+    { "lineIndex": 0, "expected": null },
+    { "lineIndex": 1, "expected": null },
+    { "lineIndex": 2, "expected": null },
+    { "lineIndex": 7, "expected": null },
+    { "lineIndex": 8, "expected": { "event": "TOOL_START", "tool": "Bash", "bucket": "fast" } },
+    { "lineIndex": 9, "expected": null },
+    { "lineIndex": 10, "expected": { "event": "TOOL_END", "tool": "Bash", "bucket": "fast" } }
+  ]
+}

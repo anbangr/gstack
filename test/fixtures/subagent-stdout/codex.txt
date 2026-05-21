@@ -1,0 +1,18 @@
+OpenAI Codex v0.128.0 (research preview)
+--------
+workdir: /tmp/example
+model: gpt-5.5
+provider: openai
+--------
+user
+Read review context at /tmp/example/input.md and review the diff.
+exec
+/bin/zsh -lc "git diff main..HEAD" in /tmp/example
+ succeeded in 12ms:
++++ diff content here
+exec
+/bin/zsh -lc "cat /tmp/example/input.md" in /tmp/example
+ succeeded in 4ms:
+review content
+codex
+Reviewed the diff. The change is safe to land.
