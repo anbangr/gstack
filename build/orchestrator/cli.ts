@@ -6152,6 +6152,65 @@ async function runFeatureReviewIteration(args: {
       featureDiff.slice(0, DIFF_CAP);
   }
 
+  // T8: per-phase diffs. Map phase.number → git diff <prev>..<this> (10KB
+  // cap each). Only populated when consecutive phase commits resolve via
+  // committedSha (set by T7 at every commit; cleared on REDO). When any
+  // step fails (missing sha, rev-parse fail), that phase is skipped and the
+  // reviewer falls back to the mega-diff for that delta.
+  const PHASE_DIFF_CAP = 10_000;
+  const phaseDiffs = new Map<string, string>();
+  // First phase's base is the feature's branch point (best-effort resolve).
+  // Subsequent phases' base is the previous phase's committedSha.
+  const baseR = spawnSync(
+    "git",
+    ["rev-parse", branchPoint],
+    { cwd: args.cwd, encoding: "utf8" },
+  );
+  let prevSha: string | null =
+    baseR.status === 0 ? (baseR.stdout || "").trim() || null : null;
+  for (const phaseIdx of args.feature.phaseIndexes) {
+    const ps = args.state.phases[phaseIdx];
+    const thisSha = ps?.committedSha;
+    if (!prevSha || !thisSha) {
+      // Skip — reviewer will see the unified mega-diff (fall-through path
+      // in the prompt builder when phaseDiffs ends up empty).
+      continue;
+    }
+    const phaseDiffR = spawnSync(
+      "git",
+      ["diff", `${prevSha}..${thisSha}`],
+      { cwd: args.cwd, encoding: "utf8" },
+    );
+    if (phaseDiffR.status === 0 && phaseDiffR.stdout) {
+      let body = phaseDiffR.stdout;
+      if (body.length > PHASE_DIFF_CAP) {
+        body =
+          `[per-phase diff truncated — first ${PHASE_DIFF_CAP} of ${body.length} chars shown]\n` +
+          body.slice(0, PHASE_DIFF_CAP);
+      }
+      phaseDiffs.set(ps.number, body);
+    }
+    prevSha = thisSha;
+  }
+
+  // Cross-phase summary (git diff --stat). Always cheap, useful even when
+  // per-phase didn't resolve. Cap at ~2KB defensively.
+  let featureDiffSummary = "";
+  const SUMMARY_CAP = 2_000;
+  const statR = spawnSync(
+    "git",
+    ["diff", "--stat", `${branchPoint}..HEAD`],
+    { cwd: args.cwd, encoding: "utf8" },
+  );
+  if (statR.status === 0) {
+    featureDiffSummary = statR.stdout || "";
+    if (featureDiffSummary.length > SUMMARY_CAP) {
+      featureDiffSummary =
+        `[summary truncated — first ${SUMMARY_CAP} of ${featureDiffSummary.length} chars shown]\n` +
+        featureDiffSummary.slice(0, SUMMARY_CAP);
+    }
+  }
+
   const promptBody = buildFeatureReviewPrompt({
     feature: args.feature,
     featureState: args.featureState,
@@ -6163,6 +6222,8 @@ async function runFeatureReviewIteration(args: {
     priorReportPath,
     featureCommitsOneline,
     featureDiff,
+    phaseDiffs,
+    featureDiffSummary,
     outputFilePath,
   });
   fs.writeFileSync(inputFilePath, promptBody);

@@ -367,6 +367,21 @@ export interface FeatureReviewPromptArgs {
    */
   featureDiff: string;
   /**
+   * Per-phase diff body (key = Phase.number, e.g. "1", "2.review-1").
+   * Optional. When present, each phase's `### Phase N` block in the prompt
+   * gets a fenced `diff` block immediately under it. When absent or missing
+   * a key, that phase falls back to no per-phase diff (the mega-diff
+   * summary at the top is sufficient context).
+   */
+  phaseDiffs?: Map<string, string>;
+  /**
+   * Short summary (filenames + line counts via `git diff --stat`) of the
+   * net feature diff. Rendered at the top of the prompt as a cross-phase
+   * overview, complementing the per-phase blocks below. Capped to ~2KB
+   * by the caller. Optional — when omitted, no summary block renders.
+   */
+  featureDiffSummary?: string;
+  /**
    * Absolute path the reviewer must write its structured verdict to.
    * Codex/Claude/Gemini all support file-path output; the orchestrator
    * reads from this path after the spawn completes.
@@ -492,6 +507,37 @@ export function buildFeatureReviewPrompt(
       sections.push(`- Error noted: ${state.error}`);
     }
     sections.push("", "Phase body:", "", phase.body.trim(), "");
+    // T8: per-phase diff block (when caller supplied a phaseDiffs map and
+    // this phase has a resolvable entry). Scopes reviewer attention to the
+    // delta this phase introduced. When absent, the cross-phase summary
+    // and (optionally) mega-diff below carry the context.
+    const perPhaseDiff = args.phaseDiffs?.get(phase.number);
+    if (perPhaseDiff) {
+      sections.push(
+        "**Per-phase diff:**",
+        "",
+        "```diff",
+        perPhaseDiff.trim() || "(empty diff)",
+        "```",
+        "",
+      );
+    }
+  }
+
+  // T8: when caller supplied a featureDiffSummary, render a cross-phase
+  // overview block. Always rendered (when present) — gives the reviewer a
+  // file-level overview even when per-phase blocks below contain detail.
+  if (args.featureDiffSummary) {
+    sections.push(
+      "## Cross-phase diff summary",
+      "",
+      "Filenames and line counts across all phases of this feature:",
+      "",
+      "```",
+      args.featureDiffSummary.trim() || "(no files changed)",
+      "```",
+      "",
+    );
   }
 
   sections.push(
@@ -501,13 +547,24 @@ export function buildFeatureReviewPrompt(
     args.featureCommitsOneline.trim() || "(no commits captured)",
     "```",
     "",
-    "## Net diff (feature start → HEAD)",
-    "",
-    "```diff",
-    args.featureDiff.trim() || "(empty diff)",
-    "```",
-    "",
   );
+
+  // T8: when per-phase diffs are present, suppress the mega-diff body — the
+  // per-phase blocks above plus the cross-phase summary cover the same ground
+  // with less context bloat. When phaseDiffs is absent or empty (e.g. pre-T7
+  // state without committedSha, or all rev-parse calls failed), fall back to
+  // the existing mega-diff for backward compat.
+  const hasPhaseDiffs = !!args.phaseDiffs && args.phaseDiffs.size > 0;
+  if (!hasPhaseDiffs) {
+    sections.push(
+      "## Net diff (feature start → HEAD)",
+      "",
+      "```diff",
+      args.featureDiff.trim() || "(empty diff)",
+      "```",
+      "",
+    );
+  }
 
   if (args.priorReportPath) {
     let prior = "(prior review report not readable)";

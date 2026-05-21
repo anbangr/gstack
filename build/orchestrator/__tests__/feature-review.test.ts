@@ -884,6 +884,89 @@ describe("buildFeatureReviewPrompt — structure", () => {
       "K MUST NOT collide with phase numbers already in use under this feature: (none)",
     );
   });
+
+  // T8: per-phase diff blocks
+  it("with phaseDiffs map, embeds per-phase diff under each phase heading", () => {
+    const phaseDiffs = new Map<string, string>([
+      ["1", "diff --git a/schema.ts b/schema.ts\n+ schema phase added line"],
+      [
+        "2",
+        "diff --git a/endpoint.ts b/endpoint.ts\n+ endpoint phase added line",
+      ],
+    ]);
+    const md = buildFeatureReviewPrompt(defaultArgs({ phaseDiffs }));
+    // Each per-phase diff body appears in the prompt.
+    expect(md).toContain("+ schema phase added line");
+    expect(md).toContain("+ endpoint phase added line");
+    // The first phase's diff body comes AFTER its "### Phase 1: Schema"
+    // heading and BEFORE the "### Phase 2: Endpoint" heading.
+    const p1At = md.indexOf("### Phase 1: Schema");
+    const schemaDiffAt = md.indexOf("+ schema phase added line");
+    const p2At = md.indexOf("### Phase 2: Endpoint");
+    const endpointDiffAt = md.indexOf("+ endpoint phase added line");
+    expect(p1At).toBeGreaterThanOrEqual(0);
+    expect(schemaDiffAt).toBeGreaterThan(p1At);
+    expect(schemaDiffAt).toBeLessThan(p2At);
+    // Endpoint diff comes after its heading.
+    expect(endpointDiffAt).toBeGreaterThan(p2At);
+    // The "Per-phase diff" label appears for each phase.
+    expect(md.match(/\*\*Per-phase diff:\*\*/g)?.length).toBe(2);
+  });
+
+  it("with phaseDiffs present, suppresses the mega-diff body", () => {
+    const phaseDiffs = new Map<string, string>([
+      ["1", "diff --git a/x b/x\n+ scoped per-phase delta"],
+    ]);
+    const md = buildFeatureReviewPrompt(
+      defaultArgs({
+        phaseDiffs,
+        // featureDiff has a unique string we can search for.
+        featureDiff: "diff --git a/MEGA b/MEGA\n+ MEGA_DIFF_SENTINEL",
+      }),
+    );
+    // Mega-diff section heading and sentinel content both absent.
+    expect(md).not.toContain("## Net diff (feature start → HEAD)");
+    expect(md).not.toContain("MEGA_DIFF_SENTINEL");
+    // Per-phase content present.
+    expect(md).toContain("scoped per-phase delta");
+  });
+
+  it("without phaseDiffs, mega-diff body still renders (backward compat)", () => {
+    const md = buildFeatureReviewPrompt(
+      defaultArgs({
+        featureDiff: "diff --git a/MEGA b/MEGA\n+ MEGA_DIFF_SENTINEL",
+      }),
+    );
+    expect(md).toContain("## Net diff (feature start → HEAD)");
+    expect(md).toContain("MEGA_DIFF_SENTINEL");
+  });
+
+  it('with featureDiffSummary, renders a "## Cross-phase diff summary" section', () => {
+    const md = buildFeatureReviewPrompt(
+      defaultArgs({
+        featureDiffSummary:
+          " schema.ts  | 12 ++++++++----\n endpoint.ts | 30 ++++++++++++++++++--",
+      }),
+    );
+    expect(md).toContain("## Cross-phase diff summary");
+    expect(md).toContain("schema.ts  | 12 ++++++++----");
+    expect(md).toContain("endpoint.ts | 30 ++++++++++++++++++--");
+  });
+
+  it("phaseDiffs key that doesn't match any phase number is silently ignored", () => {
+    const phaseDiffs = new Map<string, string>([
+      ["999", "+ orphan diff body that should not appear"],
+    ]);
+    const md = buildFeatureReviewPrompt(defaultArgs({ phaseDiffs }));
+    // Orphan body does not render anywhere.
+    expect(md).not.toContain("orphan diff body that should not appear");
+    // No per-phase block was emitted (no phase matched).
+    expect(md).not.toContain("**Per-phase diff:**");
+    // Since phaseDiffs.size > 0, the mega-diff is still suppressed. This is
+    // the documented behavior: caller controls intent via map presence, not
+    // per-phase resolution. Reviewer falls back to the (optional) summary.
+    expect(md).not.toContain("## Net diff (feature start → HEAD)");
+  });
 });
 
 describe("shouldSkipFeatureReview — skip heuristic", () => {
