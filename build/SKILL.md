@@ -2707,6 +2707,32 @@ Release daemon lifecycle:
 
    Read `$BUILD_TMP_DIR/build-verify-feature-<N>-output.md`. If `VERIFICATION: GAPS`, record the issues in the living plan and restart that feature's implementation loop.
 
+2.5. **Post-Merge Tree-Hash Audit (T13)**: After the merge has landed (queued mode: release-daemon has merged the PR; auto-land mode: `/land-and-deploy` returned), compare the feature branch HEAD tree against the squash-merge commit tree. When they differ, the squash resolved a conflict in a way that mutated behavior — exactly the case the pre-merge verifier could not catch.
+
+   ```bash
+   # Resolve the merge commit SHA via gh
+   _MERGE_COMMIT=$(gh pr view "$_PR_NUMBER" --json mergeCommit -q '.mergeCommit.oid' 2>/dev/null || echo "")
+   if [ -z "$_MERGE_COMMIT" ]; then
+     echo "POST_MERGE_AUDIT: SKIPPED — could not resolve merge commit for PR #$_PR_NUMBER" >&2
+   else
+     _PRE_TREE=$(git -C "$repoPath" rev-parse "$_FEATURE_BRANCH^{tree}" 2>/dev/null || echo "")
+     _POST_TREE=$(git -C "$repoPath" rev-parse "${_MERGE_COMMIT}^{tree}" 2>/dev/null || echo "")
+     if [ -z "$_PRE_TREE" ] || [ -z "$_POST_TREE" ]; then
+       echo "POST_MERGE_AUDIT: SKIPPED — pre=$_PRE_TREE post=$_POST_TREE" >&2
+     elif [ "$_PRE_TREE" = "$_POST_TREE" ]; then
+       echo "POST_MERGE_AUDIT: NO_DELTA — landed tree matches feature branch"
+     else
+       echo "POST_MERGE_AUDIT: DELTA_DETECTED — squash mutated tree" >&2
+       echo "  pre:  $_PRE_TREE" >&2
+       echo "  post: $_POST_TREE" >&2
+       echo "  Inspecting diff:" >&2
+       git -C "$repoPath" diff "$_PRE_TREE" "$_POST_TREE" 2>&1 | head -200 >&2
+     fi
+   fi
+   ```
+
+   Non-blocking: this is an audit signal, not a gate. The merge has already happened. If DELTA_DETECTED, surface to the user — they may want to inspect the squash resolution.
+
 3. **Feature Guardrail Verification**: After ship + land-and-deploy, run the guardrail script. The feature branch name is the branch the CLI created for this feature — extract it from the CLI state file or monitoring logs before this step, and store as `_FEATURE_BRANCH`:
    ```bash
    # _FEATURE_BRANCH must be set to the shipped feature branch (e.g. feat/my-feature-1)

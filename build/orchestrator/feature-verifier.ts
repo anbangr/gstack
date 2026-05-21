@@ -352,3 +352,55 @@ export async function runFeatureVerifier(
         : undefined,
   };
 }
+
+/**
+ * Post-merge tree-hash audit (T13).
+ *
+ * After /ship + merge, compare the feature branch HEAD tree against the
+ * squash-merge commit tree. When they match, the landed code is byte-
+ * equivalent to what pre-merge verify approved. When they differ, the
+ * squash resolved a conflict in a way that mutated behavior — exactly
+ * the case pre-merge verify could not catch.
+ *
+ * Pure comparison; the caller resolves the trees via `git rev-parse`.
+ * Non-blocking: this is an audit signal, not a gate. The merge has
+ * already happened.
+ */
+export type PostMergeAuditVerdict = "NO_DELTA" | "DELTA_DETECTED" | "SKIPPED";
+
+export interface PostMergeAuditResult {
+  verdict: PostMergeAuditVerdict;
+  preTree: string | null;
+  postTree: string | null;
+  reason?: string;
+}
+
+/**
+ * Compare two tree hashes from `git rev-parse <ref>^{tree}`. When either
+ * is null/empty (e.g., merge-commit not yet available, branch deleted),
+ * returns SKIPPED with a reason. When both are present and equal,
+ * NO_DELTA. When both are present and differ, DELTA_DETECTED.
+ */
+export function comparePostMergeTrees(
+  preTree: string | null | undefined,
+  postTree: string | null | undefined,
+): PostMergeAuditResult {
+  const pre = (preTree ?? "").trim() || null;
+  const post = (postTree ?? "").trim() || null;
+  if (!pre || !post) {
+    return {
+      verdict: "SKIPPED",
+      preTree: pre,
+      postTree: post,
+      reason: !pre && !post
+        ? "both pre-merge and post-merge tree hashes unavailable"
+        : !pre
+          ? "pre-merge tree hash unavailable"
+          : "post-merge tree hash unavailable (merge not yet landed?)",
+    };
+  }
+  if (pre === post) {
+    return { verdict: "NO_DELTA", preTree: pre, postTree: post };
+  }
+  return { verdict: "DELTA_DETECTED", preTree: pre, postTree: post };
+}

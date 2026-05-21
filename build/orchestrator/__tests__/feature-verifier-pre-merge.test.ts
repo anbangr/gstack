@@ -15,6 +15,7 @@ import {
   parseFeatureVerifierOutput,
   detectBaseBranch,
   runFeatureVerifier,
+  comparePostMergeTrees,
   type RoleTaskDispatcher,
 } from "../feature-verifier";
 import type { RoleConfig } from "../role-config";
@@ -423,5 +424,44 @@ describe("runFeatureVerifier", () => {
     } finally {
       tmp.cleanup();
     }
+  });
+});
+
+describe("comparePostMergeTrees (T13 post-merge audit)", () => {
+  it("returns NO_DELTA when feature branch tree matches merge commit tree", () => {
+    const r = comparePostMergeTrees("abc123tree", "abc123tree");
+    expect(r.verdict).toBe("NO_DELTA");
+    expect(r.preTree).toBe("abc123tree");
+    expect(r.postTree).toBe("abc123tree");
+  });
+
+  it("returns DELTA_DETECTED when trees differ (squash mutated behavior)", () => {
+    const r = comparePostMergeTrees("abc123", "def456");
+    expect(r.verdict).toBe("DELTA_DETECTED");
+    expect(r.preTree).toBe("abc123");
+    expect(r.postTree).toBe("def456");
+  });
+
+  it("returns SKIPPED with reason when pre-tree is empty (e.g., branch deleted)", () => {
+    const r = comparePostMergeTrees("", "def456");
+    expect(r.verdict).toBe("SKIPPED");
+    expect(r.reason).toContain("pre-merge tree hash unavailable");
+  });
+
+  it("returns SKIPPED with reason when post-tree is empty (e.g., merge not yet landed)", () => {
+    const r = comparePostMergeTrees("abc123", null);
+    expect(r.verdict).toBe("SKIPPED");
+    expect(r.reason).toContain("post-merge tree hash unavailable");
+  });
+
+  it("returns SKIPPED when both inputs are unavailable", () => {
+    const r = comparePostMergeTrees(null, undefined);
+    expect(r.verdict).toBe("SKIPPED");
+    expect(r.reason).toContain("both");
+  });
+
+  it("trims whitespace before comparing (git rev-parse output has trailing newline)", () => {
+    const r = comparePostMergeTrees("abc123\n", "abc123");
+    expect(r.verdict).toBe("NO_DELTA");
   });
 });
