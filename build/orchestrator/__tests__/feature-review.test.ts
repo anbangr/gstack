@@ -14,6 +14,7 @@ import {
   buildFeatureReviewPrompt,
   parseFeatureReviewVerdict,
   classifyFeatureReviewTimeout,
+  classifyFeatureReviewResult,
   shouldSkipFeatureReview,
   isPathInLogDir,
   FEATURE_VERDICT_PASS,
@@ -259,6 +260,141 @@ ${marker}
       expect(classification.kind).toBe("unclear-timeout");
       expect(classification.verdict.verdict).toBe("UNCLEAR");
     }
+  });
+});
+
+describe("classifyFeatureReviewResult — failure-state discriminator", () => {
+  // Pre-fix the orchestrator collapsed all non-PASS reviewer outcomes onto
+  // either FEATURE_PASS / FEATURE_NEEDS_PHASES / FEATURE_REDO or a single
+  // TIMEOUT bucket. That hid two structurally different failures behind one
+  // label:
+  //   - codex finished cleanly but wrote implementor-shaped prose (no
+  //     `## VERDICT` sentinel) — that's a prompt routing bug, not a timeout.
+  //   - codex finished cleanly but mutated the worktree, tripping the
+  //     post-agent hygiene gate — that's a sandbox bug, not a timeout.
+  // classifyFeatureReviewResult is the pure replacement that returns the
+  // right discriminator (MISSING_VERDICT, HYGIENE_FAULT, EXEC_ERROR, TIMEOUT).
+  it("returns null for FEATURE_PASS (caller stores parsed verdict)", () => {
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: 0,
+      hygieneFailure: false,
+      parsedVerdict: "FEATURE_PASS",
+    });
+    expect(state).toBeNull();
+  });
+
+  it("returns null for FEATURE_REDO (caller stores parsed verdict)", () => {
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: 0,
+      hygieneFailure: false,
+      parsedVerdict: "FEATURE_REDO",
+    });
+    expect(state).toBeNull();
+  });
+
+  it("returns null for FEATURE_NEEDS_PHASES (caller stores parsed verdict)", () => {
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: 0,
+      hygieneFailure: false,
+      parsedVerdict: "FEATURE_NEEDS_PHASES",
+    });
+    expect(state).toBeNull();
+  });
+
+  it("returns MISSING_VERDICT when exit 0 but no sentinel found", () => {
+    // The actual failure shape from the tidy-haven loop. Codex finished with
+    // exit 0, wrote a "Files changed / tests run" implementor-shaped
+    // summary, and the parser saw UNCLEAR. Old code labeled this TIMEOUT
+    // and the loop kept retrying. The right signal is MISSING_VERDICT —
+    // codex didn't follow the contract, change the prompt.
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: 0,
+      hygieneFailure: false,
+      parsedVerdict: "UNCLEAR",
+    });
+    expect(state).toBe("MISSING_VERDICT");
+  });
+
+  it("returns TIMEOUT when the stall watchdog fired (regardless of exit code)", () => {
+    const state = classifyFeatureReviewResult({
+      timedOut: true,
+      exitCode: null, // killed by signal
+      hygieneFailure: false,
+      parsedVerdict: "UNCLEAR",
+    });
+    expect(state).toBe("TIMEOUT");
+  });
+
+  it("returns TIMEOUT even when hygieneFailure also happens to be true (watchdog wins)", () => {
+    // Defensive: in theory the watchdog could fire AND a stale hygiene log
+    // could appear. The watchdog kill is the authoritative root cause —
+    // hygiene applied to a half-killed subprocess is meaningless.
+    const state = classifyFeatureReviewResult({
+      timedOut: true,
+      exitCode: 1,
+      hygieneFailure: true,
+      parsedVerdict: "UNCLEAR",
+    });
+    expect(state).toBe("TIMEOUT");
+  });
+
+  it("returns HYGIENE_FAULT when non-zero exit + hygiene gate caught a mutation", () => {
+    // The tidy-haven iteration 3 shape: codex completed (exit 0 from its
+    // own perspective) but applyMutableAgentHygiene wrapped the result with
+    // hygieneFailureResult on dirty-tree detection, producing exit 1 +
+    // hygieneFailure: true.
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: 1,
+      hygieneFailure: true,
+      parsedVerdict: "UNCLEAR",
+    });
+    expect(state).toBe("HYGIENE_FAULT");
+  });
+
+  it("returns EXEC_ERROR for non-zero exit with no hygiene log (transport/crash)", () => {
+    // Provider transport failures (Codex 403/429, stream disconnects) and
+    // CLI crashes show up here. Distinct from HYGIENE_FAULT because the fix
+    // path is "retry or surface a provider issue", not "tighten the
+    // reviewer sandbox".
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: 1,
+      hygieneFailure: false,
+      parsedVerdict: "UNCLEAR",
+    });
+    expect(state).toBe("EXEC_ERROR");
+  });
+
+  it("EXEC_ERROR also fires when exit code is null (killed by signal but not via watchdog)", () => {
+    // Rare but possible: subprocess SIGKILL from outside (oom, manual kill).
+    // Not a watchdog kill (timedOut: false) — surface as EXEC_ERROR so the
+    // dashboard doesn't claim the stall watchdog did it.
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: null,
+      hygieneFailure: false,
+      parsedVerdict: "UNCLEAR",
+    });
+    expect(state).toBe("EXEC_ERROR");
+  });
+
+  it("HYGIENE_FAULT precedence: exit 1 + hygiene + UNCLEAR returns HYGIENE_FAULT, not MISSING_VERDICT", () => {
+    // When both signals are present (a hygiene-rejected reviewer that also
+    // failed to write the sentinel), HYGIENE_FAULT is the more actionable
+    // diagnosis. The reviewer mutating the worktree IS the upstream cause
+    // of the missing verdict.
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: 1,
+      hygieneFailure: true,
+      parsedVerdict: "UNCLEAR",
+    });
+    expect(state).toBe("HYGIENE_FAULT");
   });
 });
 

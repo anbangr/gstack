@@ -92,6 +92,7 @@ import {
   runTests,
   runCodexImpl,
   runCodexReview,
+  runCodexFeatureReview,
   parseVerdict,
   parseFailureCount,
   parseJudgeVerdict,
@@ -2657,12 +2658,15 @@ export function hygieneFailureResult(
     fs.mkdirSync(parsed.dir, { recursive: true });
   }
   fs.writeFileSync(hygieneLogPath, body);
-  return mockResult({
-    exitCode: 1,
-    stdout: body,
-    stderr: "",
-    logPath: hygieneLogPath,
-  });
+  return {
+    ...mockResult({
+      exitCode: 1,
+      stdout: body,
+      stderr: "",
+      logPath: hygieneLogPath,
+    }),
+    hygieneFailure: true,
+  };
 }
 
 export function archiveLivingPlan(planFile: string): string | null {
@@ -6046,16 +6050,38 @@ async function runFeatureReviewIteration(args: {
     parentBeforeRole = refreshParentWorkspaceSnapshot(
       args.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
     );
-    result = await runRoleTask({
-      role: args.roles.featureReview,
-      inputFilePath,
-      outputFilePath,
-      cwd: args.cwd,
-      slug,
-      phaseNumber: `feature-${args.feature.number}`,
-      iteration: args.iteration,
-      logPrefix: "feature-review",
-    });
+    // Codex provider routes through runCodexFeatureReview — implementor's
+    // workspace-write sandbox and "files changed / tests run" prompt template
+    // were producing TIMEOUT-rebranded UNCLEAR verdicts and tripping the
+    // post-agent hygiene gate when the reviewer mutated audit files. The
+    // dedicated reviewer path uses a read-only sandbox and a verdict-sentinel
+    // prompt. Other providers still go through runRoleTask for now —
+    // follow-up commits will give gemini/kimi/claude the same treatment.
+    if (args.roles.featureReview.provider === "codex") {
+      const resolved = resolveRoleTimeouts(args.roles.featureReview);
+      result = await runCodexFeatureReview({
+        inputFilePath,
+        outputFilePath,
+        cwd: args.cwd,
+        slug,
+        phaseNumber: `feature-${args.feature.number}`,
+        iteration: args.iteration,
+        reasoning: args.roles.featureReview.reasoning,
+        model: args.roles.featureReview.model,
+        timeoutMs: resolved.primaryMs,
+      });
+    } else {
+      result = await runRoleTask({
+        role: args.roles.featureReview,
+        inputFilePath,
+        outputFilePath,
+        cwd: args.cwd,
+        slug,
+        phaseNumber: `feature-${args.feature.number}`,
+        iteration: args.iteration,
+        logPrefix: "feature-review",
+      });
+    }
   }
   result = applyMutableAgentHygiene({
     result,
@@ -6089,9 +6115,15 @@ async function runFeatureReviewIteration(args: {
     artifactRaw = result.stdout || "";
   }
   let verdict = parseFeatureReviewVerdict(artifactRaw);
+  // Set initial finalVerdict. UNCLEAR means the parser couldn't find a
+  // `## VERDICT` sentinel — that's MISSING_VERDICT, not TIMEOUT. The old
+  // code collapsed UNCLEAR onto TIMEOUT for dashboard convenience, which
+  // hid a real failure mode (reviewer didn't follow the prompt contract)
+  // behind the generic timeout label. Now the dashboard sees the actual
+  // shape.
   fr.finalVerdict =
     verdict.verdict === "UNCLEAR"
-      ? "TIMEOUT" // surface unclear as the closest existing enum so dashboards don't choke
+      ? "MISSING_VERDICT"
       : (verdict.verdict as any);
 
   let timedOutWithStructuredVerdict = false;
@@ -6111,7 +6143,14 @@ async function runFeatureReviewIteration(args: {
   }
 
   if (!timedOutWithStructuredVerdict && result.exitCode !== 0) {
-    fr.finalVerdict = "TIMEOUT";
+    // Non-zero exit, watchdog didn't fire. Two shapes:
+    //   - hygieneFailure: applyMutableAgentHygiene caught a worktree mutation
+    //     (reviewer edited files). Distinct fix path: tighten the reviewer
+    //     sandbox / change the prompt. Repeats with same dirty paths are a
+    //     signal to halt rather than retry.
+    //   - everything else: provider transport failure, quota exhaustion,
+    //     CLI crash. Generic retry-or-bail.
+    fr.finalVerdict = result.hygieneFailure ? "HYGIENE_FAULT" : "EXEC_ERROR";
     return { verdict, action: "unclear", outputFilePath };
   }
 

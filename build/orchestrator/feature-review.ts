@@ -102,6 +102,65 @@ export function parseFeatureReviewVerdict(raw: string): ParsedFeatureVerdict {
   return { verdict, phasesToRedo, additionalPhasesMd, findings };
 }
 
+/**
+ * The set of states `FeatureReviewState.finalVerdict` can take when the
+ * reviewer subprocess produced a non-PASS / non-NEEDS_PHASES / non-REDO
+ * outcome. These are dashboard discriminators — each one points at a
+ * distinct fix path, so the orchestrator must not collapse them onto a
+ * single label.
+ *
+ * Why this matters: the previous code rebranded UNCLEAR onto TIMEOUT and
+ * rebranded exit-code-non-zero onto TIMEOUT, which hid the fact that the
+ * reviewer was either writing the wrong artifact shape (MISSING_VERDICT)
+ * or being rejected by the post-agent hygiene gate (HYGIENE_FAULT). Same
+ * label, different fixes. See plans/this-issue-is-the-streamed-stream.md.
+ */
+export type FeatureReviewFailureState =
+  | "TIMEOUT" // stall watchdog SIGTERM'd the subprocess
+  | "HYGIENE_FAULT" // exited non-zero, post-agent hygiene caught a mutation
+  | "EXEC_ERROR" // exited non-zero, no hygiene log (transport, crash, quota)
+  | "MISSING_VERDICT"; // exited 0, artifact had no `## VERDICT` sentinel
+
+export interface ClassifyFeatureReviewResultArgs {
+  /** True iff the stall watchdog SIGTERM'd the subprocess. */
+  timedOut: boolean;
+  /** Exit code from the subprocess (null when killed by signal). */
+  exitCode: number | null;
+  /** True iff the result was wrapped by cli.ts:hygieneFailureResult. */
+  hygieneFailure: boolean;
+  /** Parsed verdict from the artifact. UNCLEAR means no sentinel found. */
+  parsedVerdict: FeatureVerdict;
+}
+
+/**
+ * Map a feature-review subprocess result onto the dashboard's failure-state
+ * discriminator. Returns null when the result is a successful verdict
+ * (FEATURE_PASS / FEATURE_NEEDS_PHASES / FEATURE_REDO) — caller stores
+ * the parsed verdict directly. Pure function; no side effects. Tested
+ * in __tests__/feature-review.test.ts.
+ *
+ * Precedence:
+ *   1. timedOut → TIMEOUT (watchdog kill takes priority over exit code)
+ *   2. exitCode !== 0 + hygieneFailure → HYGIENE_FAULT
+ *   3. exitCode !== 0 → EXEC_ERROR
+ *   4. parsedVerdict === UNCLEAR → MISSING_VERDICT (exit 0, no sentinel)
+ *   5. otherwise → null (caller uses parsedVerdict)
+ */
+export function classifyFeatureReviewResult(
+  args: ClassifyFeatureReviewResultArgs,
+): FeatureReviewFailureState | null {
+  if (args.timedOut) {
+    return "TIMEOUT";
+  }
+  if (args.exitCode !== 0) {
+    return args.hygieneFailure ? "HYGIENE_FAULT" : "EXEC_ERROR";
+  }
+  if (args.parsedVerdict === "UNCLEAR") {
+    return "MISSING_VERDICT";
+  }
+  return null;
+}
+
 export function classifyFeatureReviewTimeout(
   raw: string,
 ): FeatureReviewTimeoutClassification {

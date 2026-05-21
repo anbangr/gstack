@@ -345,13 +345,41 @@ export interface FeatureReviewState {
    * iteration or building the BLOCKED-feature-N.md report.
    */
   outputFilePaths: string[];
-  /** Verdict from the most recent invocation. */
+  /** Verdict from the most recent invocation.
+   *
+   * Successful reviewer outcomes:
+   *   FEATURE_PASS / FEATURE_NEEDS_PHASES / FEATURE_REDO — parsed from
+   *   the reviewer's `## VERDICT` sentinel.
+   *
+   * Operator-set outcomes:
+   *   FEATURE_BLOCKED — feature failed to converge within the cap and the
+   *   user (or CI) was offered no extension. The orchestrator wrote
+   *   BLOCKED-feature-<N>.md and halted.
+   *
+   * Reviewer subprocess failures (kept distinct so dashboards can
+   * tell the failure modes apart — they have different fix paths):
+   *   TIMEOUT          — the stall watchdog SIGTERM'd the subprocess
+   *                      (no CPU + no stdout for the stall window).
+   *                      Genuine deadlock or runaway silent agent.
+   *   HYGIENE_FAULT    — the subprocess exited but the post-agent hygiene
+   *                      gate caught a worktree mutation. The reviewer
+   *                      edited files it shouldn't have. Same-shape
+   *                      repeats should halt the loop, not retry.
+   *   EXEC_ERROR       — non-zero exit with no hygiene log. Provider
+   *                      transport failure, quota exhaustion, CLI crash.
+   *   MISSING_VERDICT  — exit 0 but the artifact contained no `## VERDICT`
+   *                      sentinel. The reviewer produced output but didn't
+   *                      follow the contract — usually a routing/prompting
+   *                      bug (e.g. wrong prompt template). */
   finalVerdict?:
     | "FEATURE_PASS"
     | "FEATURE_NEEDS_PHASES"
     | "FEATURE_REDO"
     | "FEATURE_BLOCKED"
-    | "TIMEOUT";
+    | "TIMEOUT"
+    | "HYGIENE_FAULT"
+    | "EXEC_ERROR"
+    | "MISSING_VERDICT";
   /** Set when a timed-out review artifact had pass-like test/no-findings evidence but no parseable sentinel. */
   timeoutEvidence?: "pass";
   /** Phase indexes the reviewer asked us to reset (FEATURE_REDO). */

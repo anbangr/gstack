@@ -263,6 +263,14 @@ export interface SubAgentResult {
   durationMs: number;
   /** Number of retries used (0 if first attempt succeeded). */
   retries: number;
+  /**
+   * True when this result was produced by cli.ts:hygieneFailureResult
+   * because the post-agent hygiene gate caught a worktree mutation.
+   * Optional for back-compat with existing call sites; set by
+   * hygieneFailureResult itself. Distinguishes hygiene rejections from
+   * other exitCode=1 outcomes (provider crash, transport failure, etc).
+   */
+  hygieneFailure?: boolean;
 }
 
 /**
@@ -2581,6 +2589,142 @@ export async function runCodexImpl(opts: {
   });
 
   const logName = opts.logPrefix ?? "codex-impl";
+  const logPath = path.join(
+    logDir(opts.slug),
+    `phase-${opts.phaseNumber}-${logName}-${opts.iteration}.log`,
+  );
+
+  const timeoutMs = opts.timeoutMs ?? CODEX_TIMEOUT_MS;
+
+  const result = await spawnCaptured({
+    bin: CODEX_BIN,
+    argv,
+    cwd: opts.cwd,
+    timeoutMs,
+    logPath,
+    closeStdin: true,
+  });
+
+  cleanup();
+  return mergeOutputFile(result, opts.outputFilePath);
+}
+
+/**
+ * Build the argv for the feature-level review (not a phase review and not an
+ * implementation pass). Two things this gets right that buildCodexImplArgv
+ * gets wrong when it's misused for feature-review:
+ *
+ *  1. The prompt tells codex it is a REVIEWER. It must read the prepared
+ *     review prompt from inputFilePath verbatim, then write a verdict-shaped
+ *     report with `## VERDICT\n<FEATURE_PASS|FEATURE_NEEDS_PHASES|FEATURE_REDO>`
+ *     to outputFilePath. The reviewer must NOT edit any other file.
+ *
+ *  2. Sandbox defaults to `read-only`. The reviewer's job is to read commits
+ *     and report — it has no business mutating the worktree. Under
+ *     `workspace-write` the agent would happily polish files it found
+ *     imperfect, tripping the post-agent hygiene gate and looping. Override
+ *     via `GSTACK_BUILD_CODEX_FEATURE_REVIEW_SANDBOX` if you need the rare
+ *     hybrid mode.
+ *
+ * Note that codex still needs to write the OUTPUT file. Callers stage that
+ * file inside `.llm-tmp/` via stageCodexIO before invoking; even with
+ * sandbox=read-only, codex can write the explicit output path because we
+ * pass it as the agreed target in the prompt (codex treats the named output
+ * file as a permitted write target). If a future codex CLI version makes
+ * read-only block all writes including the explicit output path, flip the
+ * default to `workspace-write` and rely on the strict reviewer hygiene
+ * check to catch mutations.
+ */
+export function buildCodexFeatureReviewArgv(opts: {
+  inputFilePath: string;
+  outputFilePath: string;
+  cwd: string;
+  sandbox?: CodexSandbox;
+  reasoning?: RoleReasoning;
+  model?: string;
+}): string[] {
+  const codexPrompt = [
+    `You are the feature-level reviewer for gstack-build.`,
+    `Read the review brief at ${opts.inputFilePath} verbatim — it contains the feature body, phase summaries, commit log, and the EXACT verdict template you must emit.`,
+    `Do NOT edit any file in the worktree. Do NOT run git commit. Your only write target is ${opts.outputFilePath}.`,
+    `When done, write your report to ${opts.outputFilePath} starting with a section literally headed "## VERDICT" followed by one of FEATURE_PASS, FEATURE_NEEDS_PHASES, or FEATURE_REDO on the next non-blank line, then a "## Findings" section.`,
+    `Return ONLY the output file path. No narrative.`,
+  ].join(" ");
+
+  const sandbox =
+    opts.sandbox ||
+    (process.env.GSTACK_BUILD_CODEX_FEATURE_REVIEW_SANDBOX as
+      | CodexSandbox
+      | undefined) ||
+    "read-only";
+
+  const reasoning = opts.reasoning || "high";
+
+  return [
+    "exec",
+    codexPrompt,
+    ...(opts.model ? ["-m", opts.model] : []),
+    "-s",
+    sandbox,
+    "-c",
+    `model_reasoning_effort="${reasoning}"`,
+    "-C",
+    opts.cwd,
+  ];
+}
+
+/**
+ * Run a single feature-review iteration via Codex. Companion to runCodexImpl
+ * but for the reviewer role: reviewer prompt + read-only sandbox + the
+ * `## VERDICT` sentinel contract that parseFeatureReviewVerdict requires.
+ *
+ * Why this exists: feature-review previously routed through runCodexImpl
+ * (designed for the implementor half of a dual-impl tournament). The
+ * implementor prompt tells codex to "implement changes autonomously" and
+ * write a "files changed / tests run / what's verified" summary — which
+ * never contains the VERDICT sentinel, so the parser sees UNCLEAR every
+ * time, and the outer loop maps UNCLEAR onto TIMEOUT for the dashboard.
+ * Combined with workspace-write letting the reviewer mutate the tree
+ * (tripping post-agent hygiene), this produces an infinite loop of TIMEOUT
+ * verdicts that never converge. See plans/this-issue-is-the-streamed-stream.md
+ * for the full root-cause writeup.
+ */
+export async function runCodexFeatureReview(opts: {
+  inputFilePath: string;
+  outputFilePath: string;
+  cwd: string;
+  slug: string;
+  /** Feature identifier, e.g. "feature-1". Used for log filenames. */
+  phaseNumber: string;
+  iteration: number;
+  reasoning?: RoleReasoning;
+  model?: string;
+  logPrefix?: string;
+  timeoutMs?: number;
+  sandbox?: CodexSandbox;
+}): Promise<SubAgentResult> {
+  ensureLogDir(opts.slug);
+
+  const { stagedInput, stagedOutput, cleanup } = stageCodexIO({
+    slug: opts.slug,
+    phaseNumber: opts.phaseNumber,
+    iteration: opts.iteration,
+    suffix: opts.logPrefix ?? "feature-review",
+    cwd: opts.cwd,
+    inputFilePath: opts.inputFilePath,
+    outputFilePath: opts.outputFilePath,
+  });
+
+  const argv = buildCodexFeatureReviewArgv({
+    inputFilePath: stagedInput,
+    outputFilePath: stagedOutput,
+    cwd: opts.cwd,
+    sandbox: opts.sandbox,
+    reasoning: opts.reasoning,
+    model: opts.model,
+  });
+
+  const logName = opts.logPrefix ?? "feature-review";
   const logPath = path.join(
     logDir(opts.slug),
     `phase-${opts.phaseNumber}-${logName}-${opts.iteration}.log`,
