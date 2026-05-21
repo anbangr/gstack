@@ -232,6 +232,12 @@ const KNOWN_FILE_EXTS = new Set([
 
 function isFileLikePath(s: string): boolean {
   if (!s.includes("/")) return false;
+  // Reject shell commands, globs, vars, and URIs.
+  if (/\s/.test(s)) return false;
+  if (s.startsWith("$")) return false;
+  if (s.includes("*")) return false;
+  // Reject ':' except when it is the file:line suffix at the very end.
+  if (/:(?!\d+$)/.test(s)) return false;
   const ext = path.extname(s).toLowerCase();
   return KNOWN_FILE_EXTS.has(ext);
 }
@@ -241,14 +247,15 @@ function isExemptPath(s: string): boolean {
     s.startsWith("~/.gstack/") ||
     s.startsWith("inbox/") ||
     s.startsWith("/tmp/") ||
-    s.includes("/inbox/")
+    s.includes("/inbox/") ||
+    /(^|[\s|>~])(\.\/|\/)?(~\/\.gstack|inbox|tmp)\//.test(s)
   );
 }
 
-/** Scan a feature block for "Add `path`" patterns to build its planned-file allow-list. */
+/** Scan a feature block for "Add|Create|Write|New `path`" patterns to build its planned-file allow-list. */
 function extractPlannedFiles(text: string): Set<string> {
   const planned = new Set<string>();
-  const re = /Add\s+`([^`]+)`/g;
+  const re = /(?:Add|Create|Write|New)\s+`([^`]+)`/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     const candidate = m[1];
@@ -259,17 +266,26 @@ function extractPlannedFiles(text: string): Set<string> {
   return planned;
 }
 
-/** T3 — detect non-existent file references in acceptance / prose. */
+/** Extract only the acceptance line(s) from a feature block header. */
+function extractAcceptanceLines(header: string): string {
+  return header
+    .split("\n")
+    .filter((line) => /^Acceptance:/.test(line))
+    .join("\n");
+}
+
+/** T3 — detect non-existent file references in acceptance lines only. */
 function checkFileRefs(content: string): StaticViolation[] {
   const violations: StaticViolation[] = [];
   const blocks = extractFeatureBlocks(content);
 
   for (const block of blocks) {
-    const text = block.header + "\n" + block.body;
-    const plannedFiles = extractPlannedFiles(text);
+    // Only scan acceptance lines, not the entire block (spec compliance).
+    const acceptanceText = extractAcceptanceLines(block.header);
+    const plannedFiles = extractPlannedFiles(block.header + "\n" + block.body);
     const re = /`([^`]+)`/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) {
+    while ((m = re.exec(acceptanceText)) !== null) {
       const candidate = m[1];
 
       // Skip file:line references (T5 handles those).
