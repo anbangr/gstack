@@ -29,6 +29,7 @@ import {
   parseCoveragePercent,
   extractCoverageTarget,
 } from "./sub-agents";
+import { renderRoleStepFailureMessage } from "./halt-event-helpers";
 import { BUILD_DEFAULTS, envNumberOrDefault } from "./build-config";
 
 /** Maximum recursive Codex review iterations before giving up. */
@@ -621,7 +622,7 @@ export function applyResult(
     };
     if (result.timedOut || result.exitCode !== 0) {
       next.status = "failed";
-      next.error = `Gemini test-spec step failed: exit ${result.exitCode}`;
+      next.error = renderRoleStepFailureMessage("test-spec writer", result);
       return next;
     }
     next.status = "test_spec_done";
@@ -697,7 +698,7 @@ export function applyResult(
     };
     if (result.timedOut || result.exitCode !== 0) {
       next.status = "failed";
-      next.error = `Gemini fix step failed: exit ${result.exitCode}`;
+      next.error = renderRoleStepFailureMessage("test-fixer", result);
       return next;
     }
     // After a successful fix, re-run tests (route back through impl_done → RUN_TESTS).
@@ -708,7 +709,7 @@ export function applyResult(
   if (action.type === "RUN_DUAL_IMPL") {
     if (result.timedOut || result.exitCode !== 0) {
       next.status = "failed";
-      next.error = `Dual implementation failed: exit ${result.exitCode}`;
+      next.error = renderRoleStepFailureMessage("dual implementation", result);
       return next;
     }
     if (!extra?.dualImplInit) {
@@ -821,7 +822,7 @@ export function applyResult(
   if (action.type === "RUN_JUDGE") {
     if (result.timedOut || result.exitCode !== 0) {
       next.status = "failed";
-      next.error = `Judge failed: exit ${result.exitCode}`;
+      next.error = renderRoleStepFailureMessage("dual-impl judge", result);
       return next;
     }
     const verdict = extra?.judgeVerdict;

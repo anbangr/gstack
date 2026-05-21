@@ -1040,13 +1040,18 @@ describe("Dual-implementor state machine transitions", () => {
         stderr: "timeout",
         exitCode: null,
         timedOut: true,
+        stallKilled: false,
         logPath: "x.log",
         durationMs: 0,
         retries: 0,
       },
     );
     expect(next.status).toBe("failed");
-    expect(next.error).toMatch(/failed/i);
+    // PR4: error message uses renderRoleStepFailureMessage which surfaces
+    // the actual failure shape (timed out, stalled, signal killed) instead
+    // of the legacy "Dual implementation failed: exit ${result.exitCode}"
+    // pattern. The R4 cluster from the tidy-haven plan.
+    expect(next.error).toMatch(/timed out/i);
   });
 
   // RUN_DUAL_IMPL failure: exitCode !== 0 → status failed

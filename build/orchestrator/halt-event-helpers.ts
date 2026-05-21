@@ -144,13 +144,7 @@ export function recordProviderTimeout(
   evidence: string,
   ctx: HelperContext,
 ): string {
-  return emit(
-    "PROVIDER_TIMEOUT",
-    `${role}: ${evidence}`,
-    ctx,
-    state,
-    phaseIdx,
-  );
+  return emit("PROVIDER_TIMEOUT", `${role}: ${evidence}`, ctx, state, phaseIdx);
 }
 
 export function recordProviderQuotaExhausted(
@@ -161,14 +155,10 @@ export function recordProviderQuotaExhausted(
   ctx: HelperContext,
   resetAt?: string,
 ): string {
-  const msg = resetAt ? `${role}: ${evidence} · resets at ${resetAt}` : `${role}: ${evidence}`;
-  return emit(
-    "PROVIDER_QUOTA_EXHAUSTED",
-    msg,
-    ctx,
-    state,
-    phaseIdx,
-  );
+  const msg = resetAt
+    ? `${role}: ${evidence} · resets at ${resetAt}`
+    : `${role}: ${evidence}`;
+  return emit("PROVIDER_QUOTA_EXHAUSTED", msg, ctx, state, phaseIdx);
 }
 
 export function recordProviderOverloaded(
@@ -284,6 +274,32 @@ export function renderRoleStepFailure(
     kind: "exited",
     exitCode: result.exitCode ?? 0,
   };
+}
+
+/**
+ * Convenience: format a FailureRender as a single-line human-readable
+ * message suitable for state.error / phase.error / failureReason. Wraps
+ * `renderRoleStepFailure` so call sites in phase-runner.ts can replace
+ * the legacy `\`<role> step failed: exit ${result.exitCode}\`` pattern
+ * with one helper call. Critical for fixing the R4 cluster of stale
+ * "exit null" / "exit 0" messages that hide stall kills, signal kills,
+ * and interactive auth prompts.
+ */
+export function renderRoleStepFailureMessage(
+  role: string,
+  result: Parameters<typeof renderRoleStepFailure>[1],
+): string {
+  const fr = renderRoleStepFailure(role, result);
+  switch (fr.kind) {
+    case "stalled":
+    case "timed_out":
+    case "auth_required":
+      return fr.summary;
+    case "signal_killed":
+      return `${role} killed by signal ${fr.signal}`;
+    case "exited":
+      return `${role} exited ${fr.exitCode}`;
+  }
 }
 
 export function emitManualRecoveryInvoked(opts: {

@@ -1,5 +1,47 @@
 # Changelog
 
+## [1.40.7.1] - 2026-05-21
+
+**Stall kills, signal kills, and auth prompts now surface honestly. The "exit null" / "exit 0" mystery messages that buried the real reason a sub-agent died are replaced with concrete diagnostics like `test-spec writer stalled (no output for 480000ms, killed by watchdog)`.**
+
+This is the minimum-viable PR4 from the tidy-haven plan — Feature 5's R4 cluster, scoped down to unblock F4 (PR1b) which was stalling on test-spec writes with no diagnostic. The full PR4 spec also adds `closeStdin: true` for Gemini and a watchdog auth-prompt detector; both deferred to a follow-up so we can ship the renderer wiring fast.
+
+### What changed for the user
+
+When a test-spec writer, fixer, dual-implementor, or judge subprocess dies, the orchestrator's `phase.error` and halt-event message now carry the actual reason. The 4 call sites at `phase-runner.ts:626` (test-spec), `:704` (fix), `:716` (dual-impl), and `:827` (judge) all stopped surfacing `Gemini test-spec step failed: exit ${result.exitCode}` (which formats as `exit null` when killed by signal). They now call `renderRoleStepFailureMessage(role, result)` which inspects `stallKilled`, `timedOut`, `exitSignal`, and `killReason` to produce one of:
+
+- `test-spec writer stalled (no output for 480000ms, killed by watchdog)`
+- `test-fixer timed out after 900000ms wall clock`
+- `dual implementation killed by signal SIGTERM`
+- `dual-impl judge exited 1`
+- `test-spec writer halted: authentication required (try \`gemini auth login\` or \`codex auth login\`)`
+
+`SubAgentResult` gained two optional fields — `stallSilenceMs` and `exitSignal` — populated by the existing `spawnCaptured` watchdog/signal-handler so the renderer has the raw numbers. Both are optional so hygiene-failure and phase-oversized fallback paths don't need to populate them.
+
+The existing-correct site at `phase-runner.ts:506-510` (RUN_GEMINI primary-impl) is intentionally left alone. It already distinguishes `timedOut` from non-zero exit; refactoring would change the user-facing string format (e.g. `Gemini timed out (after 2 retries)` becomes `... timed out after Nms wall clock`). The change is downstream of the CRITICAL R1 regression test from the source plan — preserve the working site.
+
+### Itemized changes
+
+#### Added
+
+- `renderRoleStepFailureMessage(role, result): string` in `halt-event-helpers.ts`. Thin wrapper around `renderRoleStepFailure` that produces a single-line human-readable string for all 5 `FailureRender` kinds. Used by the 4 wired phase-runner sites.
+- `stallSilenceMs?: number` field on `SubAgentResult`. Populated from the stall-watchdog's `stallSilenceMs` local at `spawnCaptured` resolve() time. Zero when stallKilled is false.
+- `exitSignal?: string | null` field on `SubAgentResult`. Populated from the child's `exit` event signal arg. Null when exited normally.
+- 8-case test file `__tests__/render-role-step-failure-message.test.ts` covering all 5 kinds plus precedence (stalled wins over signal_killed even when SIGTERM is present), role-name interpolation, and missing-optional-fields safety.
+
+#### Changed
+
+- `phase-runner.ts:626` (test-spec): `\`Gemini test-spec step failed: exit ${result.exitCode}\``→`renderRoleStepFailureMessage("test-spec writer", result)`.
+- `phase-runner.ts:704` (fix): `\`Gemini fix step failed: exit ${result.exitCode}\``→`renderRoleStepFailureMessage("test-fixer", result)`.
+- `phase-runner.ts:716` (RUN_DUAL_IMPL): `\`Dual implementation failed: exit ${result.exitCode}\``→`renderRoleStepFailureMessage("dual implementation", result)`.
+- `phase-runner.ts:828` (RUN_JUDGE): `\`Judge failed: exit ${result.exitCode}\``→`renderRoleStepFailureMessage("dual-impl judge", result)`.
+- `phase-runner.test.ts:1049` assertion updated from `/failed/i` to `/timed out/i` to match the new diagnostic-bearing message shape.
+
+#### For contributors
+
+- Deferred from the full PR4 spec: `closeStdin: true` for Gemini spawn at `sub-agents.ts:1041-1048` and watchdog auth-prompt detector in `stall-watchdog.ts`. Both are worthwhile but the renderer wiring is the critical-path piece for unblocking F4's test-spec stall investigation. Follow-up PR.
+- Build skill version unchanged at 1.27.1. No SKILL.md.tmpl edit; the changes are internal orchestrator behavior, not user-facing skill behavior.
+
 ## [1.40.7.0] - 2026-05-21
 
 **Halt taxonomy foundation: the orchestrator now distinguishes five real provider failure shapes (timeout, quota, overload, transport, auth-required) from generic phase failures. Plus a `FailureRender` shape and per-pattern hit tracking so the static fault detector can grow without coupling the renderer.**
