@@ -898,6 +898,25 @@ export interface DrainHaltEventsOptions {
   configureFile?: string;
   /** If true, parse + report intent without spawning an investigator. */
   dryRun?: boolean;
+  /**
+   * Optional cancellation signal. When aborted:
+   *  - The per-entry loop breaks BEFORE processing the next event.
+   *  - Any in-flight `spawnInvestigatorCapture` child receives SIGTERM with
+   *    a 5s grace before SIGKILL (same pattern as the per-investigator
+   *    timeout path). Already-completed work in this drain stays committed.
+   * Production: `runAutoDrainIfEnabled` builds an `AbortSignal.timeout()`
+   * for the 30-min wall-clock budget. Manual `gstack-build drain-faults --queue`
+   * does not pass a signal and runs unbounded as before.
+   */
+  signal?: AbortSignal;
+  /**
+   * Called after each processed/shortCircuited/skipped entry so the
+   * orchestrator can bump `state.lastUpdatedAt` (visible to the monitor's
+   * stall arm via the heartbeat sidecar) and increment its
+   * `drainProcessedCount` counter. Wired from `drainFaultsForBuildRun`;
+   * `--queue` callers omit it.
+   */
+  onEntryProcessed?: () => void;
 }
 
 export interface DrainHaltEventsResult {
@@ -913,6 +932,14 @@ export interface DrainHaltEventsResult {
   proposalsAppended: number;
   /** Events that failed to dispatch or parse. */
   failed: number;
+  /**
+   * True if the drain stopped because `opts.signal` aborted before the
+   * pending queue was drained. Callers can log the remaining count and
+   * leave entries in pending-investigations/ for the next run.
+   */
+  aborted?: boolean;
+  /** Pending entries left in the queue when aborted. 0 when not aborted. */
+  deferred?: number;
 }
 
 /**
@@ -991,7 +1018,17 @@ async function spawnInvestigatorCapture(args: {
   prompt: string;
   config: InvestigatorConfig;
   timeoutMs: number;
+  /**
+   * Optional cancellation signal. When aborted while the child is running,
+   * the child receives SIGTERM and after a 5s grace SIGKILL — same
+   * escalation as the wall-clock timeout. The returned promise resolves
+   * to `null`.
+   */
+  signal?: AbortSignal;
 }): Promise<string | null> {
+  // Short-circuit if the signal is already aborted — don't spawn at all.
+  if (args.signal?.aborted) return null;
+
   const builder = PROVIDER_DISPATCH[args.config.provider as InvestigatorProvider];
   if (!builder) return null;
   const { cmd, args: cmdArgs } = builder({
@@ -1017,12 +1054,10 @@ async function spawnInvestigatorCapture(args: {
     child.stderr.resume();
   }
 
-  // Wall-clock timeout (no mtime watchdog here since we're streaming stdout
-  // directly; this is a different liveness regime than the file-watching
-  // log path).
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
+  // Helper: send SIGTERM with 5s grace before SIGKILL. Reused by both the
+  // wall-clock timeout and the AbortSignal handler so the kill semantics
+  // are identical.
+  const escalateKill = () => {
     const pid = child.pid;
     if (typeof pid === "number" && pid > 0) {
       killProcessAndGroup(pid, "SIGTERM");
@@ -1030,10 +1065,36 @@ async function spawnInvestigatorCapture(args: {
         killProcessAndGroup(pid, "SIGKILL");
       }, 5000).unref();
     }
+  };
+
+  // Wall-clock timeout (no mtime watchdog here since we're streaming stdout
+  // directly; this is a different liveness regime than the file-watching
+  // log path).
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    escalateKill();
   }, args.timeoutMs);
   // Don't keep the event loop alive solely for this timer.
   if (typeof (timer as NodeJS.Timeout).unref === "function") {
     (timer as NodeJS.Timeout).unref();
+  }
+
+  // AbortSignal: when the orchestrator-level budget fires (or the caller
+  // cancels for any reason), kill the in-flight child with the same
+  // escalation. The listener is removed on exit so a one-off signal doesn't
+  // accumulate listeners across many investigator calls.
+  let aborted = false;
+  const onAbort = () => {
+    aborted = true;
+    escalateKill();
+  };
+  if (args.signal) {
+    if (args.signal.aborted) {
+      onAbort();
+    } else {
+      args.signal.addEventListener("abort", onAbort, { once: true });
+    }
   }
 
   return await new Promise<string | null>((resolve) => {
@@ -1042,11 +1103,14 @@ async function spawnInvestigatorCapture(args: {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (args.signal) {
+        args.signal.removeEventListener("abort", onAbort);
+      }
       resolve(v);
     };
     child.on("error", () => settle(null));
     child.on("exit", (code) => {
-      if (timedOut) {
+      if (timedOut || aborted) {
         settle(null);
         return;
       }
@@ -1335,13 +1399,27 @@ export async function drainFaultsFromHaltEventsQueue(
   }
 
   let processedCount = 0;
+  let abortedDuringLoop = false;
   for (const he of events) {
-    // Severity gate
+    // Cooperative cancellation: check BEFORE every entry so the abort
+    // doesn't have to wait for a slow investigator to finish. If we just
+    // dispatched and the signal fires during the await, spawnInvestigatorCapture
+    // will see the abort and kill the child.
+    if (opts.signal?.aborted) {
+      abortedDuringLoop = true;
+      break;
+    }
+    // Severity gate. Skipped entries do NOT bump the progress signal:
+    // they represent queue noise filtered before any real work, and
+    // claiming progress on them would let a flood of low-severity entries
+    // keep the monitor stall arm quiet forever even if nothing is actually
+    // moving.
     if (SEVERITY_RANK[he.severity] < minRank) {
       result.skipped += 1;
       continue;
     }
-    // runId filter
+    // runId filter. Same reasoning as the severity gate: a fault for
+    // another run isn't progress for THIS run.
     if (opts.runIdFilter && he.runId !== opts.runIdFilter) {
       result.skipped += 1;
       continue;
@@ -1420,6 +1498,7 @@ export async function drainFaultsFromHaltEventsQueue(
           );
         }
         result.shortCircuited += 1;
+        opts.onEntryProcessed?.();
       }
       continue;
     }
@@ -1436,11 +1515,13 @@ export async function drainFaultsFromHaltEventsQueue(
         // ignore — file may have been moved by a concurrent drain
       }
       result.shortCircuited += 1;
+      opts.onEntryProcessed?.();
       continue;
     }
 
     if (opts.dryRun) {
       result.processed += 1;
+      opts.onEntryProcessed?.();
       continue;
     }
 
@@ -1469,6 +1550,7 @@ export async function drainFaultsFromHaltEventsQueue(
         prompt,
         config,
         timeoutMs,
+        signal: opts.signal,
       });
       if (raw === null) {
         process.stderr.write(
@@ -1575,9 +1657,100 @@ export async function drainFaultsFromHaltEventsQueue(
     }
 
     result.processed += 1;
+    opts.onEntryProcessed?.();
+  }
+
+  // Aborted accounting: every event that did not contribute to one of the
+  // counted categories is "deferred" — still sitting in pending-investigations/
+  // for the next run to pick up.
+  if (abortedDuringLoop) {
+    result.aborted = true;
+    const accounted =
+      result.processed +
+      result.skipped +
+      result.shortCircuited +
+      result.failed;
+    result.deferred = Math.max(0, events.length - accounted);
+  } else {
+    result.aborted = false;
+    result.deferred = 0;
   }
 
   // Reference imports so unused-import linting doesn't strip the type re-export.
   void pendingInvestigationsDir;
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// drainFaultsForBuildRun — production wrapper for end-of-build auto-drain
+// ---------------------------------------------------------------------------
+
+/**
+ * Production wrapper around `drainFaultsFromHaltEventsQueue` that ties the
+ * drain to a live `BuildState`:
+ *
+ *   1. Calls `saveState(state, ...)` after each processed entry so the
+ *      monitor's stall arm sees `state.lastUpdatedAt` advancing — proves
+ *      the orchestrator is making per-entry progress, distinct from the
+ *      heartbeat ticker which only proves the event loop is running.
+ *   2. Increments an in-memory `drainProcessedCount` exposed via a getter.
+ *      The heartbeat reads this counter into the sidecar payload so the
+ *      monitor can distinguish "looping on the same broken entry" from
+ *      "no progress at all" (codex finding #6, plan v1.40.7.0 §Change 2).
+ *
+ * The base `drainFaultsFromHaltEventsQueue` keeps its existing optional
+ * shape so the `gstack-build drain-faults --queue` CLI subcommand — which
+ * runs without a `BuildState` — continues to work unchanged.
+ */
+export function createDrainProgressCounter(): {
+  count: () => number;
+  bump: () => void;
+} {
+  let counter = 0;
+  return {
+    count: () => counter,
+    bump: () => {
+      counter += 1;
+    },
+  };
+}
+
+export async function drainFaultsForBuildRun(
+  state: BuildStateLike,
+  saveState: (state: BuildStateLike) => void,
+  opts: DrainHaltEventsOptions,
+  progress?: { bump: () => void },
+): Promise<DrainHaltEventsResult> {
+  return drainFaultsFromHaltEventsQueue({
+    ...opts,
+    onEntryProcessed: () => {
+      // Bump state.lastUpdatedAt so the heartbeat sidecar's stateLastUpdatedAt
+      // field moves on the next tick. Persist via the caller-provided
+      // saveState (we don't import the cli.ts saveState wrapper directly to
+      // avoid a circular dep — cli.ts wires the projection here).
+      state.lastUpdatedAt = new Date().toISOString();
+      try {
+        saveState(state);
+      } catch (err) {
+        process.stderr.write(
+          `[drain-faults] saveState during drain progress failed: ${(err as Error).message}\n`,
+        );
+      }
+      progress?.bump();
+      // Compose with a caller-provided onEntryProcessed if any (none today
+      // but keeps the wrapper composable for tests).
+      opts.onEntryProcessed?.();
+    },
+  });
+}
+
+/**
+ * Minimal shape of BuildState that drainFaultsForBuildRun needs. Kept narrow
+ * so this module stays decoupled from the full BuildState type (defined in
+ * types.ts) and so tests can pass a 2-field mock without constructing a full
+ * BuildState. The production caller passes the real BuildState — TypeScript
+ * structural typing accepts it.
+ */
+export interface BuildStateLike {
+  lastUpdatedAt: string;
 }
