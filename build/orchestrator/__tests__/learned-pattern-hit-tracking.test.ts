@@ -236,6 +236,7 @@ describe("drain-faults dedup for halt events (T10 behaviour)", () => {
 
     const result = await drainFaultsFromHaltEventsQueue({
       queueDir: home,
+      inboxDir: path.join(home, "inbox"),
       mockInvestigator: () => ({
         outcome: "root-cause-identified",
         rootCause: "quota",
