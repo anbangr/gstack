@@ -18,6 +18,7 @@ import {
   fingerprintFeatureReviewFailure,
   SAME_SHAPE_REPEAT_HALT_THRESHOLD,
   shouldSkipFeatureReview,
+  compileGlob,
   isPathInLogDir,
   FEATURE_VERDICT_PASS,
   FEATURE_VERDICT_REDO,
@@ -983,6 +984,7 @@ describe("buildFeatureReviewPrompt — structure", () => {
 });
 
 describe("shouldSkipFeatureReview — skip heuristic", () => {
+  // 1-phase regression coverage (pre-T11 behavior must still hold).
   it("skips when feature has 1 phase AND that phase passed Codex on iter 1", () => {
     const feature = fakeFeature({ phaseIndexes: [0] });
     const states = [
@@ -995,7 +997,9 @@ describe("shouldSkipFeatureReview — skip heuristic", () => {
         },
       }),
     ];
-    expect(shouldSkipFeatureReview(feature, states)).toBe(true);
+    expect(
+      shouldSkipFeatureReview({ feature, phaseStates: states }),
+    ).toBe(true);
   });
 
   it("does NOT skip when the single phase needed multiple Codex iterations", () => {
@@ -1010,7 +1014,9 @@ describe("shouldSkipFeatureReview — skip heuristic", () => {
         },
       }),
     ];
-    expect(shouldSkipFeatureReview(feature, states)).toBe(false);
+    expect(
+      shouldSkipFeatureReview({ feature, phaseStates: states }),
+    ).toBe(false);
   });
 
   it("does NOT skip when the single phase needed a Gemini re-run from review feedback", () => {
@@ -1026,7 +1032,9 @@ describe("shouldSkipFeatureReview — skip heuristic", () => {
         },
       }),
     ];
-    expect(shouldSkipFeatureReview(feature, states)).toBe(false);
+    expect(
+      shouldSkipFeatureReview({ feature, phaseStates: states }),
+    ).toBe(false);
   });
 
   it("does NOT skip when the single phase needed any test-fix iterations", () => {
@@ -1038,10 +1046,13 @@ describe("shouldSkipFeatureReview — skip heuristic", () => {
         testFix: { iterations: 2, outputLogPaths: [] } as any,
       }),
     ];
-    expect(shouldSkipFeatureReview(feature, states)).toBe(false);
+    expect(
+      shouldSkipFeatureReview({ feature, phaseStates: states }),
+    ).toBe(false);
   });
 
-  it("does NOT skip when the feature has more than one phase, regardless of cleanliness", () => {
+  // T11: broadened skip path — ≤ 2 phases is OK if every phase is clean.
+  it("skips a 2-phase feature when every phase converged cleanly (no diff/files info)", () => {
     const feature = fakeFeature({ phaseIndexes: [0, 1] });
     const states = [
       fakePhaseState({
@@ -1061,7 +1072,170 @@ describe("shouldSkipFeatureReview — skip heuristic", () => {
         },
       }),
     ];
-    expect(shouldSkipFeatureReview(feature, states)).toBe(false);
+    expect(
+      shouldSkipFeatureReview({ feature, phaseStates: states }),
+    ).toBe(true);
+  });
+
+  it("does NOT skip a 2-phase feature when the second phase needed multiple Codex iterations", () => {
+    const feature = fakeFeature({ phaseIndexes: [0, 1] });
+    const states = [
+      fakePhaseState({
+        index: 0,
+        codexReview: {
+          iterations: 1,
+          outputLogPaths: [],
+          finalVerdict: "GATE PASS",
+        },
+      }),
+      fakePhaseState({
+        index: 1,
+        codexReview: {
+          iterations: 2,
+          outputLogPaths: [],
+          finalVerdict: "GATE PASS",
+        },
+      }),
+    ];
+    expect(
+      shouldSkipFeatureReview({ feature, phaseStates: states }),
+    ).toBe(false);
+  });
+
+  it("does NOT skip when the feature has more than two phases", () => {
+    const feature = fakeFeature({ phaseIndexes: [0, 1, 2] });
+    const states = [
+      fakePhaseState({
+        index: 0,
+        codexReview: { iterations: 1, outputLogPaths: [] },
+      }),
+      fakePhaseState({
+        index: 1,
+        codexReview: { iterations: 1, outputLogPaths: [] },
+      }),
+      fakePhaseState({
+        index: 2,
+        codexReview: { iterations: 1, outputLogPaths: [] },
+      }),
+    ];
+    expect(
+      shouldSkipFeatureReview({ feature, phaseStates: states }),
+    ).toBe(false);
+  });
+
+  // T11: diff-size gate.
+  it("does NOT skip a 2-phase clean feature when net diff >= 5KB", () => {
+    const feature = fakeFeature({ phaseIndexes: [0, 1] });
+    const states = [
+      fakePhaseState({
+        index: 0,
+        codexReview: { iterations: 1, outputLogPaths: [] },
+      }),
+      fakePhaseState({
+        index: 1,
+        codexReview: { iterations: 1, outputLogPaths: [] },
+      }),
+    ];
+    expect(
+      shouldSkipFeatureReview({
+        feature,
+        phaseStates: states,
+        diffBytes: 5_000,
+      }),
+    ).toBe(false);
+    // 4999 bytes still under threshold → skip.
+    expect(
+      shouldSkipFeatureReview({
+        feature,
+        phaseStates: states,
+        diffBytes: 4_999,
+      }),
+    ).toBe(true);
+  });
+
+  // T11: alwaysReviewPaths safety gate.
+  it("does NOT skip a 2-phase clean feature when any changed file matches alwaysReviewPaths", () => {
+    const feature = fakeFeature({ phaseIndexes: [0, 1] });
+    const states = [
+      fakePhaseState({
+        index: 0,
+        codexReview: { iterations: 1, outputLogPaths: [] },
+      }),
+      fakePhaseState({
+        index: 1,
+        codexReview: { iterations: 1, outputLogPaths: [] },
+      }),
+    ];
+    expect(
+      shouldSkipFeatureReview({
+        feature,
+        phaseStates: states,
+        diffBytes: 1_000,
+        changedFiles: ["src/notes.ts", "src/auth/login.ts"],
+        alwaysReviewPaths: ["**/auth/**"],
+      }),
+    ).toBe(false);
+  });
+
+  it("still skips when alwaysReviewPaths is undefined (safety gate disabled)", () => {
+    const feature = fakeFeature({ phaseIndexes: [0, 1] });
+    const states = [
+      fakePhaseState({
+        index: 0,
+        codexReview: { iterations: 1, outputLogPaths: [] },
+      }),
+      fakePhaseState({
+        index: 1,
+        codexReview: { iterations: 1, outputLogPaths: [] },
+      }),
+    ];
+    expect(
+      shouldSkipFeatureReview({
+        feature,
+        phaseStates: states,
+        diffBytes: 1_000,
+        // changedFiles supplied but no alwaysReviewPaths → gate skipped
+        changedFiles: ["src/auth/login.ts"],
+      }),
+    ).toBe(true);
+    // alwaysReviewPaths = [] is also disabled.
+    expect(
+      shouldSkipFeatureReview({
+        feature,
+        phaseStates: states,
+        diffBytes: 1_000,
+        changedFiles: ["src/auth/login.ts"],
+        alwaysReviewPaths: [],
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("compileGlob — minimal glob compiler", () => {
+  it("**/auth/** matches files inside any auth segment", () => {
+    const m = compileGlob("**/auth/**");
+    expect(m("src/auth/login.ts")).toBe(true);
+    expect(m("auth/index.ts")).toBe(true);
+    expect(m("a/b/auth/c.ts")).toBe(true);
+  });
+
+  it("**/auth/** does not match unrelated paths", () => {
+    const m = compileGlob("**/auth/**");
+    expect(m("notify/something.ts")).toBe(false);
+    expect(m("src/utility.ts")).toBe(false);
+  });
+
+  it("**/*[Aa]uth* matches files containing 'auth' or 'Auth'", () => {
+    const m = compileGlob("**/*[Aa]uth*");
+    expect(m("src/SettingsAuthPanel.ts")).toBe(true);
+    expect(m("src/auth.ts")).toBe(true);
+    expect(m("AuthService.ts")).toBe(true);
+  });
+
+  it("**/*[Aa]uth* does not match files without 'auth' or 'Auth'", () => {
+    const m = compileGlob("**/*[Aa]uth*");
+    expect(m("src/something.ts")).toBe(false);
+    expect(m("readme.md")).toBe(false);
   });
 });
 

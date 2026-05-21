@@ -622,19 +622,140 @@ export function isPathInLogDir(
 }
 
 /**
- * Skip heuristic: per the design, feature-review is overkill when the
- * feature is a single phase that converged on iter 1 (no rerun, no test-
- * fix loops). Returns true when the heuristic says skip.
+ * Skip heuristic (T11): feature-review is overkill when ALL of the
+ * following hold:
+ *   1. the feature has ≤ 2 phases,
+ *   2. every phase converged on iter ≤ 1 (no Codex re-iteration),
+ *   3. no phase needed a Gemini rerun off review feedback,
+ *   4. no phase needed any test-fix iterations,
+ *   5. the net diff is < 5KB (when the caller measured it), AND
+ *   6. no changed file matches an `alwaysReviewPaths` glob (when the
+ *      caller supplied both the file list and the configured patterns).
+ *
+ * Returns true when the heuristic says skip. When optional inputs are
+ * omitted the corresponding gate is treated as not-applicable (skip is
+ * still allowed). This keeps the helper callable from tests and from
+ * call sites that haven't computed git context yet.
  */
+export interface ShouldSkipFeatureReviewArgs {
+  feature: Feature;
+  phaseStates: PhaseState[];
+  /**
+   * Net diff size in bytes (caller computes via
+   * `Buffer.byteLength(featureDiff, "utf8")` or similar). Used for the
+   * <5KB threshold. When undefined, the size gate is not applied.
+   */
+  diffBytes?: number;
+  /**
+   * Changed file paths (relative to repo root) from `git diff --name-only`.
+   * Used together with `alwaysReviewPaths` for the file-path safety gate.
+   * When undefined, the safety gate is not applied.
+   */
+  changedFiles?: string[];
+  /**
+   * Configured glob patterns that ALWAYS warrant a review regardless of
+   * size/iter heuristics. Matched against `changedFiles`. When undefined
+   * or empty, no file-path safety gate is applied.
+   */
+  alwaysReviewPaths?: string[];
+}
+
 export function shouldSkipFeatureReview(
-  feature: Feature,
-  phaseStates: PhaseState[],
+  args: ShouldSkipFeatureReviewArgs,
 ): boolean {
-  if (feature.phaseIndexes.length !== 1) return false;
-  const only = phaseStates[feature.phaseIndexes[0]];
-  if (!only) return false;
-  const codexIters = only.codexReview?.iterations ?? 0;
-  const reruns = only.codexReview?.geminiReRunCount ?? 0;
-  const testFixIters = only.testFix?.iterations ?? 0;
-  return codexIters <= 1 && reruns === 0 && testFixIters === 0;
+  const { feature, phaseStates, diffBytes, changedFiles, alwaysReviewPaths } =
+    args;
+
+  // 1. ≤2 phases (broadened from "exactly 1"). Zero is defensive — a
+  // feature with no phases shouldn't reach this code path, but if it
+  // does, do not silently skip the review.
+  if (feature.phaseIndexes.length === 0) return false;
+  if (feature.phaseIndexes.length > 2) return false;
+
+  // 2-4. Every phase must have converged cleanly.
+  for (const idx of feature.phaseIndexes) {
+    const ps = phaseStates[idx];
+    if (!ps) return false;
+    const codexIters = ps.codexReview?.iterations ?? 0;
+    const reruns = ps.codexReview?.geminiReRunCount ?? 0;
+    const testFixIters = ps.testFix?.iterations ?? 0;
+    if (codexIters > 1 || reruns > 0 || testFixIters > 0) return false;
+  }
+
+  // 5. Diff size threshold (only when caller measured it).
+  if (diffBytes !== undefined && diffBytes >= 5_000) return false;
+
+  // 6. Always-review file-path safety gate.
+  if (
+    changedFiles &&
+    alwaysReviewPaths &&
+    alwaysReviewPaths.length > 0 &&
+    changedFiles.length > 0
+  ) {
+    const matchers = alwaysReviewPaths.map(compileGlob);
+    for (const file of changedFiles) {
+      if (matchers.some((m) => m(file))) return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Tiny built-in glob compiler. Avoids adding a `minimatch` / `picomatch`
+ * dependency. Supports:
+ *   - `**`        — any sequence of path segments (including empty)
+ *   - `*`         — any sequence of non-`/` chars
+ *   - `?`         — any single non-`/` char
+ *   - `[...]`     — character class, passed through to regex
+ *   - literal text
+ *
+ * Sufficient for the default `alwaysReviewPaths` patterns and pinned by
+ * tests in feature-review.test.ts. Exported for testability.
+ */
+export function compileGlob(pattern: string): (filePath: string) => boolean {
+  const re = globToRegExp(pattern);
+  return (p) => re.test(p);
+}
+
+function globToRegExp(pattern: string): RegExp {
+  let i = 0;
+  let out = "^";
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === "*" && pattern[i + 1] === "*") {
+      // ** = any sequence including /
+      out += ".*";
+      i += 2;
+      // skip following slash so `**/foo` matches both `foo` and `a/b/foo`.
+      if (pattern[i] === "/") i += 1;
+    } else if (ch === "*") {
+      out += "[^/]*";
+      i += 1;
+    } else if (ch === "?") {
+      out += "[^/]";
+      i += 1;
+    } else if (ch === "[") {
+      // character class — pass through to regex as-is
+      let j = i + 1;
+      while (j < pattern.length && pattern[j] !== "]") j += 1;
+      if (j < pattern.length) {
+        out += pattern.slice(i, j + 1);
+        i = j + 1;
+      } else {
+        // unterminated bracket — treat as literal `[`
+        out += "\\[";
+        i += 1;
+      }
+    } else if (/[.+^$()|{}\\]/.test(ch)) {
+      // regex metachars (excluding ones we handle above) — escape
+      out += "\\" + ch;
+      i += 1;
+    } else {
+      out += ch;
+      i += 1;
+    }
+  }
+  out += "$";
+  return new RegExp(out);
 }

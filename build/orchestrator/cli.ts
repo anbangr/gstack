@@ -10772,11 +10772,50 @@ async function main() {
           //                          running, continue outer loop
           //   UNCLEAR / cap-hit    → F3 ships hard-fail; F4 adds the user
           //                          stdin prompt for a 4th cycle
+          // T11: compute git-context inputs for the broadened skip heuristic
+          // (≤2 phases + diff-size gate + alwaysReviewPaths safety). Best-
+          // effort — if any git call fails, the corresponding gate falls
+          // back to not-applicable inside shouldSkipFeatureReview.
+          let _skipDiffBytes: number | undefined = undefined;
+          let _skipChangedFiles: string[] | undefined = undefined;
+          try {
+            // Mirror runFeatureReviewIteration's branchPoint resolution.
+            const _bp = featureState.branch
+              ? `${featureState.branch}^{tree}`
+              : "HEAD~10";
+            const _filesR = spawnSync(
+              "git",
+              ["diff", "--name-only", `${_bp}..HEAD`],
+              { cwd, encoding: "utf8" },
+            );
+            if (_filesR.status === 0) {
+              _skipChangedFiles = (_filesR.stdout || "")
+                .split("\n")
+                .map((l) => l.trim())
+                .filter((l) => l.length > 0);
+            }
+            const _diffR = spawnSync(
+              "git",
+              ["diff", `${_bp}..HEAD`],
+              { cwd, encoding: "utf8" },
+            );
+            if (_diffR.status === 0) {
+              _skipDiffBytes = Buffer.byteLength(_diffR.stdout || "", "utf8");
+            }
+          } catch {
+            // Best-effort; leave inputs undefined.
+          }
           const skipReview =
             args.skipFeatureReview ||
             resumeAfterLanding ||
             featureReviewAlreadySatisfied(featureState) ||
-            shouldSkipFeatureReview(featureDef, state.phases);
+            shouldSkipFeatureReview({
+              feature: featureDef,
+              phaseStates: state.phases,
+              diffBytes: _skipDiffBytes,
+              changedFiles: _skipChangedFiles,
+              alwaysReviewPaths: BUILD_DEFAULTS.alwaysReviewPaths,
+            });
           if (
             !args.skipFeatureReview &&
             !resumeAfterLanding &&
