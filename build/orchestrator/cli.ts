@@ -2618,6 +2618,22 @@ function parentWorkspaceSnapshot(projectRoot: string): {
   return { workspaceRoot: parent, snapshot: captureGitSnapshot(parent) };
 }
 
+function refreshParentWorkspaceSnapshot(parentWorkspace: {
+  workspaceRoot: string | null;
+  snapshot: GitSnapshot | null;
+}): {
+  workspaceRoot: string | null;
+  snapshot: GitSnapshot | null;
+} {
+  if (!parentWorkspace.workspaceRoot) {
+    return { workspaceRoot: null, snapshot: null };
+  }
+  return {
+    workspaceRoot: parentWorkspace.workspaceRoot,
+    snapshot: captureGitSnapshot(parentWorkspace.workspaceRoot),
+  };
+}
+
 export function hygieneFailureResult(
   message: string,
   logPath: string,
@@ -4643,13 +4659,16 @@ async function runReviewGates(opts: {
     // discard ("before.workTreeContents not captured") and the orphan
     // edits stay on the worktree. Class 2 fix.
     const before = captureGitSnapshot(opts.cwd, { captureContents: true });
+    const parentBeforeGate = refreshParentWorkspaceSnapshot(
+      opts.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
+    );
     let result = await runGate(name, role);
     result = applyGateHygiene({
       result,
       before,
       cwd: opts.cwd,
       label: `${name} gate`,
-      parentWorkspace: opts.parentWorkspace,
+      parentWorkspace: parentBeforeGate,
       phaseRef: { phaseNumber: opts.phaseNumber },
     });
     outputs.push(result);
@@ -4674,7 +4693,7 @@ async function runReviewGates(opts: {
         before,
         cwd: opts.cwd,
         label: `${name} sandbox retry gate`,
-        parentWorkspace: opts.parentWorkspace,
+        parentWorkspace: parentBeforeGate,
         phaseRef: { phaseNumber: opts.phaseNumber },
       });
       outputs.push(checkedRetryResult);
@@ -6003,6 +6022,10 @@ async function runFeatureReviewIteration(args: {
   fs.writeFileSync(outputFilePath, "");
 
   const before = args.dryRun ? null : captureGitSnapshot(args.cwd);
+  let parentBeforeRole: {
+    workspaceRoot: string | null;
+    snapshot: GitSnapshot | null;
+  };
   let result: SubAgentResult;
   if (args.dryRun) {
     // Default dry-run verdict: PASS so the orchestrator walks the happy
@@ -6011,12 +6034,18 @@ async function runFeatureReviewIteration(args: {
       outputFilePath,
       "## VERDICT\nFEATURE_PASS\n\n## Findings\n- [dry-run] no real review performed\n",
     );
+    parentBeforeRole = refreshParentWorkspaceSnapshot(
+      args.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
+    );
     result = mockResult({
       exitCode: 0,
       stdout: "## VERDICT\nFEATURE_PASS\n",
       logPath: inputFilePath,
     });
   } else {
+    parentBeforeRole = refreshParentWorkspaceSnapshot(
+      args.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
+    );
     result = await runRoleTask({
       role: args.roles.featureReview,
       inputFilePath,
@@ -6033,7 +6062,7 @@ async function runFeatureReviewIteration(args: {
     before,
     cwd: args.cwd,
     label: "feature review",
-    parentWorkspace: args.parentWorkspace,
+    parentWorkspace: parentBeforeRole,
   });
 
   // Persist iteration onto featureState.featureReview.
@@ -6326,8 +6355,13 @@ async function runPhase(args: {
         `phase-${phase.number}-gemini-${action.iteration}-output.md`,
       );
       const before = dryRun ? null : captureGitSnapshot(cwd);
+      let parentBeforeRole: {
+        workspaceRoot: string | null;
+        snapshot: GitSnapshot | null;
+      };
       let result: SubAgentResult;
       if (dryRun) {
+        parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);
         result = mockResult({
           exitCode: 0,
           stdout: `[dry-run] ${roleLabel(args.roles.primaryImpl)} would have implemented`,
@@ -6348,6 +6382,7 @@ async function runPhase(args: {
         );
         // Pre-create empty output file so a missing-file error is unambiguous.
         fs.writeFileSync(outputFilePath, "");
+        parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);
         result = await runRoleTask({
           role: args.roles.primaryImpl,
           inputFilePath,
@@ -6396,7 +6431,7 @@ async function runPhase(args: {
         // `true`: for those agents, "no commit" means they failed at their job.
         requireNewCommit: !phase.auditOnly,
         allowSubmoduleRecovery: args.allowSubmoduleRecovery,
-        parentWorkspace,
+        parentWorkspace: parentBeforeRole,
       });
       phaseState = applyResult(phaseState, action, result, { outputFilePath });
       state.phases[phase.index] = phaseState;
@@ -6413,8 +6448,13 @@ async function runPhase(args: {
         `phase-${phase.number}-gemini-rerun-${action.iteration}-output.md`,
       );
       const before = dryRun ? null : captureGitSnapshot(cwd);
+      let parentBeforeRole: {
+        workspaceRoot: string | null;
+        snapshot: GitSnapshot | null;
+      };
       let result: SubAgentResult;
       if (dryRun) {
+        parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);
         result = mockResult({
           exitCode: 0,
           stdout: `[dry-run] ${roleLabel(args.roles.primaryImpl)} would have re-implemented with review feedback`,
@@ -6461,6 +6501,7 @@ async function runPhase(args: {
           ),
         );
         fs.writeFileSync(outputFilePath, "");
+        parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);
         result = await runRoleTask({
           role: args.roles.primaryImpl,
           inputFilePath,
@@ -6514,7 +6555,7 @@ async function runPhase(args: {
         // means the agent never started.
         allowNoChangesSentinel: true,
         allowSubmoduleRecovery: args.allowSubmoduleRecovery,
-        parentWorkspace,
+        parentWorkspace: parentBeforeRole,
       });
       phaseState = applyResult(phaseState, action, result, { outputFilePath });
       state.phases[phase.index] = phaseState;
@@ -6754,8 +6795,13 @@ async function runPhase(args: {
         `phase-${phase.number}-gemini-fix-${action.iteration}-output.md`,
       );
       const before = dryRun ? null : captureGitSnapshot(cwd);
+      let parentBeforeRole: {
+        workspaceRoot: string | null;
+        snapshot: GitSnapshot | null;
+      };
       let result: SubAgentResult;
       if (dryRun) {
+        parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);
         result = mockResult({
           exitCode: 0,
           stdout: `[dry-run] ${roleLabel(args.roles.testFixer)} would fix tests`,
@@ -6770,6 +6816,7 @@ async function runPhase(args: {
           buildGeminiFixPrompt(phase, state.planFile),
         );
         fs.writeFileSync(outputFilePath, "");
+        parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);
         result = await runRoleTask({
           role: args.roles.testFixer,
           inputFilePath,
@@ -6790,7 +6837,7 @@ async function runPhase(args: {
         requireNonEmptyOutput: true,
         requireNewCommit: true,
         allowSubmoduleRecovery: args.allowSubmoduleRecovery,
-        parentWorkspace,
+        parentWorkspace: parentBeforeRole,
       });
       phaseState = applyResult(phaseState, action, result);
       state.phases[phase.index] = phaseState;

@@ -16,8 +16,11 @@ import {
   detectSkillFaults,
   type LearnedPattern,
 } from "../skill-fault-detector";
+import { useIsolatedGstackHome } from "../../../test/helpers/test-home";
 
 describe("state_jsonpath learned pattern", () => {
+  useIsolatedGstackHome("skill-fault-detector-");
+
   test("fires on hand-merged feature shape", () => {
     const state = {
       phases: [],
@@ -116,6 +119,8 @@ describe("state_jsonpath learned pattern", () => {
 });
 
 describe("HAND_MERGED_FEATURE detector", () => {
+  useIsolatedGstackHome("skill-fault-detector-");
+
   test("fires on polis state shape", () => {
     const state = JSON.parse(
       fs.readFileSync(

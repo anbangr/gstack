@@ -2259,6 +2259,71 @@ describe("post-agent hygiene helpers", () => {
     );
   });
 
+  it("allows parent workspace changes that happened before the role snapshot", () => {
+    const workspace = path.join(tmpDir!, "parent-window");
+    fs.mkdirSync(workspace, { recursive: true });
+    git(["init", "--initial-branch=main"], workspace);
+    git(["config", "user.email", "test@test.com"], workspace);
+    git(["config", "user.name", "Test User"], workspace);
+    fs.writeFileSync(path.join(workspace, "README.md"), "root\n");
+    git(["add", "README.md"], workspace);
+    git(["commit", "-m", "root init"], workspace);
+
+    fs.writeFileSync(path.join(workspace, "README.md"), "root changed\n");
+    git(["add", "README.md"], workspace);
+    git(["commit", "-m", "orchestrator-owned parent move"], workspace);
+
+    const beforeRole = captureGitSnapshot(workspace);
+    const verdict = validateParentWorkspaceUnchanged({
+      before: beforeRole,
+      workspaceRoot: workspace,
+      label: "primary implementor",
+    });
+
+    expect(verdict).toEqual({ ok: true, errors: [] });
+  });
+
+  it("keeps the first gate parent snapshot across sandbox retry hygiene", () => {
+    const workspace = path.join(tmpDir!, "parent-retry-window");
+    fs.mkdirSync(workspace, { recursive: true });
+    git(["init", "--initial-branch=main"], workspace);
+    git(["config", "user.email", "test@test.com"], workspace);
+    git(["config", "user.name", "Test User"], workspace);
+    fs.writeFileSync(path.join(workspace, "README.md"), "root\n");
+    git(["add", "README.md"], workspace);
+    git(["commit", "-m", "root init"], workspace);
+
+    const parentBeforeGate = captureGitSnapshot(workspace);
+
+    // Mirrors the runReviewGates retry path: the first gate attempt can fail
+    // before applyGateHygiene checks parentWorkspace, but any parent mutation
+    // it caused must still be caught when a later sandbox retry is checked.
+    fs.writeFileSync(path.join(workspace, "README.md"), "mutated by gate\n");
+    git(["add", "README.md"], workspace);
+    git(["commit", "-m", "gate mutated parent"], workspace);
+
+    const retryVerdict = validateParentWorkspaceUnchanged({
+      before: parentBeforeGate,
+      workspaceRoot: workspace,
+      label: "codex sandbox retry gate",
+    });
+
+    expect(retryVerdict.ok).toBe(false);
+    expect(retryVerdict.errors.join("\n")).toContain(
+      "codex sandbox retry gate changed workspace root HEAD",
+    );
+
+    // If the retry re-baselined here instead of reusing parentBeforeGate, the
+    // mutation above would be hidden and the retry could incorrectly pass.
+    const incorrectlyRefreshedBeforeRetry = captureGitSnapshot(workspace);
+    const hiddenVerdict = validateParentWorkspaceUnchanged({
+      before: incorrectlyRefreshedBeforeRetry,
+      workspaceRoot: workspace,
+      label: "codex sandbox retry gate",
+    });
+    expect(hiddenVerdict).toEqual({ ok: true, errors: [] });
+  });
+
   // ------------------------------------------------------------------
   // Audit-only phase hygiene (no commit required)
   // ------------------------------------------------------------------

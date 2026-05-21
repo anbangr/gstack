@@ -18,6 +18,18 @@ describe("PLAN_REVIEW_PROMPT (reviewer)", () => {
     expect(PLAN_REVIEW_PROMPT).toContain("do NOT re-raise");
   });
 
+  it("exempts non-code phases from code/TDD test spec requirements", () => {
+    expect(PLAN_REVIEW_PROMPT).toContain(
+      "For code/TDD phases, does every phase have a `#### Test Spec` section?",
+    );
+    expect(PLAN_REVIEW_PROMPT).toContain(
+      "Non-code phases are exempt from `#### Test Spec` requirements",
+    );
+    expect(PLAN_REVIEW_PROMPT).toContain("kind-specific two-gate shape");
+    expect(PLAN_REVIEW_PROMPT).toContain("[writing]");
+    expect(PLAN_REVIEW_PROMPT).toContain("[manual]");
+  });
+
   it("snapshot — fails if prompt drifts", () => {
     expect(PLAN_REVIEW_PROMPT).toMatchSnapshot();
   });
@@ -32,6 +44,24 @@ describe("SYNTH_REVISION_PROMPT (synthesizer)", () => {
 
   it("supports the disputed escape hatch", () => {
     expect(SYNTH_REVISION_PROMPT).toContain("RESOLUTION: disputed");
+  });
+
+  it("preserves the one-phase two-gate contract for non-code phases", () => {
+    expect(SYNTH_REVISION_PROMPT).toContain("Do NOT split a non-code phase");
+    expect(SYNTH_REVISION_PROMPT).toContain(
+      "Each executable phase must contain both required checkboxes",
+    );
+    expect(SYNTH_REVISION_PROMPT).toContain("[writing]");
+    expect(SYNTH_REVISION_PROMPT).toContain("**Draft**");
+    expect(SYNTH_REVISION_PROMPT).toContain("**Review**");
+    expect(SYNTH_REVISION_PROMPT).toContain("[experiment]");
+    expect(SYNTH_REVISION_PROMPT).toContain("**Execute**");
+    expect(SYNTH_REVISION_PROMPT).toContain("[research]");
+    expect(SYNTH_REVISION_PROMPT).toContain("**Explore**");
+    expect(SYNTH_REVISION_PROMPT).toContain("[manual]");
+    expect(SYNTH_REVISION_PROMPT).toContain("**Action Required**");
+    expect(SYNTH_REVISION_PROMPT).toContain("**Verify Completion**");
+    expect(SYNTH_REVISION_PROMPT).toContain("one phase");
   });
 
   it("snapshot — fails if prompt drifts", () => {

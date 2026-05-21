@@ -430,15 +430,20 @@ Review for:
 3. TEST COVERAGE GAPS — What edge cases or failure modes are missing?
 4. RISK — Which phases are high-risk and need extra guard phases?
 5. DEPENDENCIES — Implicit prerequisites not captured as phases?
-6. TEST SPEC QUALITY — Does every phase have a \`#### Test Spec\` section?
-   - Flag CRITICAL if SOME phases have \`#### Test Spec\` and OTHERS don't (structural
-     inconsistency — the plan is malformed; the build will apply spec instructions
-     to some phases but not others).
-   - Flag IMPORTANT if NO phases have \`#### Test Spec\` (likely a legacy plan; user
-     can pass --no-plan-review to proceed without fixing).
-   - Flag IMPORTANT if a phase has a spec but fewer than 3 test cases, vague scenarios
-     (no concrete inputs/outputs named), or no edge cases listed.
-   - Flag SUGGESTION if the coverage target line is missing (add \`**Coverage target: ≥80%**\`).
+6. TEST SPEC QUALITY — For code/TDD phases, does every phase have a \`#### Test Spec\` section?
+   - Non-code phases are exempt from \`#### Test Spec\` requirements when they use
+     the valid kind-specific two-gate shape, such as [writing] phases with
+     \`**Draft**\` + \`**Review**\` or [manual] phases with \`**Action Required**\` +
+     \`**Verify Completion**\`.
+   - Flag CRITICAL if SOME code/TDD phases have \`#### Test Spec\` and OTHERS don't
+     (structural inconsistency — the plan is malformed; the build will apply spec
+     instructions to some code phases but not others).
+   - Flag IMPORTANT if NO code/TDD phases have \`#### Test Spec\` (likely a legacy
+     plan; user can pass --no-plan-review to proceed without fixing).
+   - Flag IMPORTANT if a code/TDD phase has a spec but fewer than 3 test cases,
+     vague scenarios (no concrete inputs/outputs named), or no edge cases listed.
+   - Flag SUGGESTION if a code/TDD phase's coverage target line is missing (add
+     \`**Coverage target: ≥80%**\`).
 
 The plan file may contain annotation blocks (HTML comments) above each
 \`### Phase N\` heading that record prior review rounds. They look like:
@@ -510,6 +515,14 @@ For each annotation with \`USER: defer\`:
 
 Annotation history from prior rounds is informational — read for context
 on what was already resolved. Do not re-resolve already-resolved items.
+
+Phase shape contract:
+- Do NOT split a non-code phase into separate draft/action and review phases.
+- Each executable phase must contain both required checkboxes for its kind.
+- For [writing], one phase contains both \`- [ ] **Draft**: ...\` and \`- [ ] **Review**: ...\`.
+- For [experiment], one phase contains both \`- [ ] **Execute**: ...\` and \`- [ ] **Review**: ...\`.
+- For [research], one phase contains both \`- [ ] **Explore**: ...\` and \`- [ ] **Review**: ...\`.
+- For [manual], one phase contains both \`- [ ] **Action Required**: ...\` and \`- [ ] **Verify Completion**: ...\`.
 
 If the plan file's \`<!-- gstack-plan-review-history -->\` header indicates
 this is round 3 or later, you may collapse stale RESOLUTION lines from

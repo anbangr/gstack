@@ -110,7 +110,33 @@ Verify Red -> Implementation -> Green tests -> Review/QA.
 - [ ] **Review & QA (review roles)**: Run /review, optional secondary review if configured, and /qa...
 ```
 
-Feature and phase numbers can be `N` or `N.M`. The orchestrator processes features in document order, and phases in document order within each feature. Phases missing the `**Implementation` or `**Review` checkbox are skipped with a warning. TDD format phases without a `**Test Specification` checkbox are treated as legacy and skip the Red/Green steps; keep that compatibility for old plans, but do not generate new living plans in the legacy shape.
+**Non-code phase kinds** use the same one-phase/two-gate rule. Do not split
+draft/action work and review into separate phases. One executable phase must
+contain both required checkboxes for its kind:
+
+```markdown
+### Phase 2.1 [writing]: Draft and review the paper
+
+- [ ] **Draft**: Write the paper section.
+- [ ] **Review**: Review the section for accuracy and clarity.
+
+### Phase 2.2 [experiment]: Run and review the ablation
+
+- [ ] **Execute**: Run the ablation command and capture results.
+- [ ] **Review**: Check result integrity and summarize findings.
+
+### Phase 2.3 [research]: Explore and review prior work
+
+- [ ] **Explore**: Collect relevant sources and notes.
+- [ ] **Review**: Verify claims against the collected sources.
+
+### Phase 2.4 [manual]: Complete and verify external setup
+
+- [ ] **Action Required**: Complete the external setup step.
+- [ ] **Verify Completion**: Confirm the setup is complete.
+```
+
+Feature and phase numbers can be `N` or `N.M`. The orchestrator processes features in document order, and phases in document order within each feature. Phases missing their kind-specific implementation/action gate or kind-specific review/verification gate are skipped with a warning. Code phases missing a `**Test Specification` checkbox are treated as legacy and skip the Red/Green steps; keep that compatibility for old plans, but do not generate new living plans in the legacy shape.
 
 ## Feature Workflow
 

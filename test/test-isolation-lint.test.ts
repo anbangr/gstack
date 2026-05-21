@@ -48,8 +48,9 @@ const HOME_WRITERS = [
 /**
  * Two recognized isolation patterns:
  *
- *   1. File-level: imports `useIsolatedGstackHome` from `./helpers/test-home`
- *      AND calls it (the canonical pattern).
+ *   1. Helper-level: imports `useIsolatedGstackHome` from `./helpers/test-home`
+ *      (or a nested `test/helpers/test-home` path) AND either calls it at
+ *      top-level or inside every home-writer describe block before tests.
  *
  *   2. beforeEach-level: a `beforeEach(...)` block that assigns
  *      `process.env.GSTACK_HOME = <something>`. The assignment must be
@@ -62,12 +63,12 @@ const HOME_WRITERS = [
  */
 function fileIsolatesGstackHome(src: string): boolean {
   // Pattern 1: file-level helper. The import line proves a real binding
-  // (not a comment match); the call line proves it actually fires.
+  // (not a comment match); the call scan proves it fires before test bodies.
   const importsHelper =
-    /import\s*\{[^}]*\buseIsolatedGstackHome\b[^}]*\}\s*from\s*["']\.\/helpers\/test-home["']/.test(
+    /import\s*\{[^}]*\buseIsolatedGstackHome\b[^}]*\}\s*from\s*["'](?:\.\/helpers\/test-home|(?:\.\.\/)+test\/helpers\/test-home)["']/.test(
       src,
     );
-  const callsHelper = /^\s*useIsolatedGstackHome\s*\(/m.test(src);
+  const callsHelper = callsGstackHomeHelperOutsideTestBody(src);
   if (importsHelper && callsHelper) return true;
 
   // Pattern 2: a beforeEach block that sets GSTACK_HOME. Find every
@@ -93,6 +94,122 @@ function fileIsolatesGstackHome(src: string): boolean {
   return false;
 }
 
+function callsGstackHomeHelperOutsideTestBody(src: string): boolean {
+  if (hasTopLevelHelperCall(src)) return true;
+  return everyHomeWriterDescribeHasHelper(src);
+}
+
+function everyHomeWriterDescribeHasHelper(src: string): boolean {
+  const describeRe = /\bdescribe\s*\([^=]*?=>\s*\{/g;
+  let m: RegExpExecArray | null;
+  const topLevelDescribeRanges: { start: number; end: number }[] = [];
+
+  while ((m = describeRe.exec(src)) !== null) {
+    if (braceDepthBefore(src, m.index) !== 0) continue;
+    const blockStart = m.index + m[0].length;
+    const blockEnd = findMatchingBrace(src, blockStart);
+    if (blockEnd == null) continue;
+    topLevelDescribeRanges.push({ start: m.index, end: blockEnd + 1 });
+
+    const body = src.slice(blockStart, blockEnd);
+    if (containsHomeWriter(body) && !describeBodyCallsHelperBeforeTests(body)) {
+      return false;
+    }
+  }
+
+  if (topLevelDescribeRanges.length === 0) return false;
+
+  const outsideDescribes = removeRanges(src, topLevelDescribeRanges);
+  return !containsHomeWriter(outsideDescribes);
+}
+
+function hasTopLevelHelperCall(src: string): boolean {
+  let depth = 0;
+  for (const line of src.split("\n")) {
+    if (
+      depth === 0 &&
+      helperCallRe().test(stripLineComment(line).trim())
+    ) {
+      return true;
+    }
+    depth += braceDelta(line);
+  }
+  return false;
+}
+
+function describeBodyCallsHelperBeforeTests(body: string): boolean {
+  let depth = 0;
+  for (const line of body.split("\n")) {
+    const code = stripLineComment(line).trim();
+    if (depth === 0) {
+      if (/^(?:test|it)\s*\(/.test(code)) return false;
+      if (helperCallRe().test(code)) return true;
+    }
+    depth += braceDelta(line);
+  }
+  return false;
+}
+
+function containsHomeWriter(src: string): boolean {
+  const withoutImports = src.replace(
+    /\bimport\s+[\s\S]*?\s+from\s*["'][^"']+["'];?/g,
+    "",
+  );
+  return HOME_WRITERS.some((sym) =>
+    new RegExp(`\\b${sym}\\b`).test(withoutImports),
+  );
+}
+
+function helperCallRe(): RegExp {
+  return /^(?:(?:const|let|var)\s+\w+\s*=\s*)?useIsolatedGstackHome\s*\(/;
+}
+
+function braceDepthBefore(src: string, end: number): number {
+  let depth = 0;
+  for (const line of src.slice(0, end).split("\n")) {
+    depth += braceDelta(line);
+  }
+  return depth;
+}
+
+function removeRanges(
+  src: string,
+  ranges: { start: number; end: number }[],
+): string {
+  let out = "";
+  let cursor = 0;
+  for (const range of ranges) {
+    out += src.slice(cursor, range.start);
+    cursor = range.end;
+  }
+  return out + src.slice(cursor);
+}
+
+function findMatchingBrace(src: string, blockStart: number): number | null {
+  let depth = 1;
+  for (let i = blockStart; i < src.length; i++) {
+    const c = src[i];
+    if (c === "{") depth++;
+    else if (c === "}") depth--;
+    if (depth === 0) return i;
+  }
+  return null;
+}
+
+function stripLineComment(line: string): string {
+  return line.replace(/\/\/.*$/, "");
+}
+
+function braceDelta(line: string): number {
+  const code = stripLineComment(line);
+  let delta = 0;
+  for (const c of code) {
+    if (c === "{") delta++;
+    else if (c === "}") delta--;
+  }
+  return delta;
+}
+
 // This file itself names every home-writer symbol in `HOME_WRITERS` so the lint
 // would flag itself if we didn't skip it.
 const SELF = "test-isolation-lint.test.ts";
@@ -106,6 +223,67 @@ function collectFiles(dir: string): { dir: string; name: string }[] {
 }
 
 describe("test isolation lint", () => {
+  test("recognizes useIsolatedGstackHome imported from nested test directories", () => {
+    const src = [
+      'import { describe } from "bun:test";',
+      'import { useIsolatedGstackHome } from "../../../test/helpers/test-home";',
+      'import { detectSkillFaults } from "../skill-fault-detector";',
+      'describe("nested", () => {',
+      '  useIsolatedGstackHome("nested-");',
+      '  test("case", () => detectSkillFaults({} as any));',
+      "});",
+    ].join("\n");
+
+    expect(fileIsolatesGstackHome(src)).toBe(true);
+  });
+
+  test("recognizes top-level assigned useIsolatedGstackHome calls", () => {
+    const src = [
+      'import { describe, test } from "bun:test";',
+      'import { useIsolatedGstackHome } from "../../../test/helpers/test-home";',
+      'import { detectSkillFaults } from "../skill-fault-detector";',
+      'const home = useIsolatedGstackHome("x-");',
+      'describe("nested", () => {',
+      '  test("case", () => detectSkillFaults({} as any));',
+      "});",
+    ].join("\n");
+
+    expect(fileIsolatesGstackHome(src)).toBe(true);
+  });
+
+  test("rejects useIsolatedGstackHome called inside an individual test", () => {
+    const src = [
+      'import { describe, test } from "bun:test";',
+      'import { useIsolatedGstackHome } from "../../../test/helpers/test-home";',
+      'import { detectSkillFaults } from "../skill-fault-detector";',
+      'describe("nested", () => {',
+      '  test("case", () => {',
+      '    useIsolatedGstackHome("bad-");',
+      "    detectSkillFaults({} as any);",
+      "  });",
+      "});",
+    ].join("\n");
+
+    expect(fileIsolatesGstackHome(src)).toBe(false);
+  });
+
+  test("rejects sibling home-writer describes without local helper setup", () => {
+    const src = [
+      'import { describe, test } from "bun:test";',
+      'import { useIsolatedGstackHome } from "../../../test/helpers/test-home";',
+      'import { detectSkillFaults } from "../skill-fault-detector";',
+      'describe("isolated", () => {',
+      '  useIsolatedGstackHome("good-");',
+      '  test("case", () => expect(true).toBe(true));',
+      "});",
+      'describe("not isolated", () => {',
+      '  test("case", () => detectSkillFaults({} as any));',
+      "});",
+    ].join("\n");
+
+    expect(fileIsolatesGstackHome(src)).toBe(false);
+  });
+
   test("every test that writes to ~/.gstack/ also isolates GSTACK_HOME", () => {
     const entries = [
       ...collectFiles(TEST_DIR),

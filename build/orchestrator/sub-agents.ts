@@ -19,7 +19,10 @@
  *   - --yolo on Gemini for autonomous file edits
  */
 
-import { spawn as registeredSpawn } from "./child-registry";
+import {
+  spawn as registeredSpawn,
+  spawnSync as registeredSpawnSync,
+} from "./child-registry";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { logDir, ensureLogDir, deriveGeminiTmpKey } from "./state";
@@ -59,6 +62,32 @@ const SHIP_TIMEOUT_MS = envNumberOrDefault(
 
 function geminiBin(): string {
   return process.env.GEMINI_BIN || "gemini";
+}
+
+/**
+ * Cached probe for `ps` availability with the flags cpu-mode needs.
+ * Runs the actual command we'll use later (`ps -o pid=,cputime= -g <pid>`)
+ * against the current process pid; if it exits 0, the platform supports
+ * cpu mode. Memoized — we call this once per spawn at most.
+ */
+let _psProbeResult: boolean | null = null;
+function psAvailableForWatchdog(): boolean {
+  if (_psProbeResult !== null) return _psProbeResult;
+  if (process.platform === "win32") {
+    _psProbeResult = false;
+    return false;
+  }
+  try {
+    const result = registeredSpawnSync(
+      "ps",
+      ["-o", "pid=,cputime=", "-g", String(process.pid)],
+      { stdio: ["ignore", "pipe", "ignore"], timeout: 1000 },
+    );
+    _psProbeResult = result.status === 0;
+  } catch {
+    _psProbeResult = false;
+  }
+  return _psProbeResult;
 }
 
 function kimiBin(): string {
@@ -315,8 +344,34 @@ function spawnCaptured(args: {
       stderrBuf = truncate(stderrBuf + text);
     });
 
+    // Watchdog mode: env-var opt-in for CPU-time liveness probing. Stream
+    // mode is the default; cpu mode adds a `ps -o pid=,cputime= -g <pgid>`
+    // probe on every poll tick (kernel-truthful activity signal for
+    // sub-agents that run silently by design, e.g. kimi --print
+    // --final-message-only, codex exec without --json). Stdout activity
+    // still resets the timer in cpu mode — CPU is the canonical signal,
+    // stdout is the safety net.
+    //
+    // Rollout sunset: this env-var is the canary path. The plan is to
+    // observe cpu-mode behavior across kimi + codex runs without false-
+    // positive kills, then flip the default to cpu mode and treat
+    // `GSTACK_BUILD_WATCHDOG_CPU=0` as the explicit opt-out. When that
+    // flip lands, this branch goes away entirely.
+    //
+    // Platform guard: cpu mode shells out to `ps`. macOS + Linux ship it
+    // by default; Windows + minimal containers (alpine without procps)
+    // do not. We probe at attach time and silently degrade to stream
+    // mode with a one-line stderr notice — otherwise the user's opt-in
+    // would silently kill every silent sub-agent at stallMs.
+    const cpuModeRequested = process.env.GSTACK_BUILD_WATCHDOG_CPU === "1";
+    const useCpuWatchdog = cpuModeRequested && psAvailableForWatchdog();
+    if (cpuModeRequested && !useCpuWatchdog) {
+      process.stderr.write(
+        "gstack-build: GSTACK_BUILD_WATCHDOG_CPU=1 ignored — `ps` not available on this platform; using stream-mode watchdog instead.\n",
+      );
+    }
     const watchdog = attachStallWatchdog(
-      { mode: "stream", child },
+      useCpuWatchdog ? { mode: "cpu", child } : { mode: "stream", child },
       {
         stallMs: args.timeoutMs,
         provider: pickProviderForBin(args.bin),
