@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   flipCheckbox,
+  flipPhaseCheckboxes,
   setCheckboxState,
   setCheckboxStatusNote,
   unflipPhaseCheckboxes,
@@ -44,6 +45,48 @@ describe("plan-mutator re-parse on stale line numbers", () => {
     expect(r.error).toBeUndefined();
     const after = fs.readFileSync(p, "utf8").split(/\r?\n/);
     expect(after[3]).toBe("- [x] **Implementation**: do the work");
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("T1: uses phase identity when inserted lines move the stale line above the target phase", () => {
+    const md = `## Feature 1: Auth
+### Phase 1.1: First
+- [ ] **Implementation**: first work
+- [ ] **Review**: first review
+
+### Phase 1.2: Target
+- [ ] **Implementation**: target work
+- [ ] **Review**: target review
+`;
+    const p = _testWritePlan(md);
+    const edited = insertBefore(
+      fs.readFileSync(p, "utf8"),
+      6,
+      "<!-- inserted above target phase -->\n<!-- still above target phase -->",
+    );
+    fs.writeFileSync(p, edited);
+
+    const r = flipPhaseCheckboxes({
+      planFile: p,
+      implementationLine: 7,
+      reviewLine: 8,
+      kind: "code",
+      phase: {
+        featureNumber: "1",
+        number: "1.2",
+        name: "Target",
+      },
+    });
+
+    expect(r.implementation.error).toBeUndefined();
+    expect(r.review.error).toBeUndefined();
+    expect(r.implementation.flipped).toBe(true);
+    expect(r.review.flipped).toBe(true);
+    const after = fs.readFileSync(p, "utf8").split(/\r?\n/);
+    expect(after).toContain("- [ ] **Implementation**: first work");
+    expect(after).toContain("- [ ] **Review**: first review");
+    expect(after).toContain("- [x] **Implementation**: target work");
+    expect(after).toContain("- [x] **Review**: target review");
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 
@@ -202,6 +245,42 @@ describe("plan-mutator re-parse on stale line numbers", () => {
     });
 
     expect(r.flipped).toBe(true);
+    fs.rmSync(path.dirname(p), { recursive: true });
+  });
+
+  it("matches parser-supported phase ids with subletters, review suffixes, and kind brackets", () => {
+    const md = `## Feature 1.2: Auth
+### Phase 2.1a [code]: Sublettered
+- [ ] **Implementation**: first
+- [ ] **Review**: first review
+
+### Phase 2.review-1 [code]: Reviewer Follow-up
+- [ ] **Implementation**: follow-up
+- [ ] **Review**: follow-up review
+`;
+    const p = _testWritePlan(md);
+    const edited = insertBefore(fs.readFileSync(p, "utf8"), 6, "<!-- shift -->");
+    fs.writeFileSync(p, edited);
+
+    const r = flipPhaseCheckboxes({
+      planFile: p,
+      implementationLine: 7,
+      reviewLine: 8,
+      kind: "code",
+      phase: {
+        featureNumber: "1.2",
+        number: "2.review-1",
+        name: "Reviewer Follow-up",
+      },
+    });
+
+    expect(r.implementation.error).toBeUndefined();
+    expect(r.review.error).toBeUndefined();
+    expect(r.implementation.flipped).toBe(true);
+    expect(r.review.flipped).toBe(true);
+    const after = fs.readFileSync(p, "utf8").split(/\r?\n/);
+    expect(after).toContain("- [ ] **Implementation**: first");
+    expect(after).toContain("- [x] **Implementation**: follow-up");
     fs.rmSync(path.dirname(p), { recursive: true });
   });
 
