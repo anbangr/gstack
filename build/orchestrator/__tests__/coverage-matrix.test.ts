@@ -56,6 +56,7 @@ const MODULE_TEST_OWNERS: Record<string, string[]> = {
   "plan-review-loop.ts": ["plan-review-history-jsonl.test.ts", "convergence-jsonl.test.ts", "adaptive-cap-set-aware.test.ts", "plan-reviewer-triage-tty.test.ts", "plan-reviewer-triage-non-tty.test.ts", "plan-reviewer-loop.test.ts", "integration/loop-converge-bundle-1.test.ts", "integration/loop-bail-no-progress.test.ts", "integration/loop-synth-disputes.test.ts"],
   "plan-reviewer.ts": ["cli.test.ts", "plan-review-prompts.test.ts", "plan-annotation-round-trip.test.ts"],
   "registry.ts": ["release-queue.test.ts", "active-runs.test.ts"],
+  "resolve-git-dir.ts": ["resolve-git-dir.test.ts"],
   "release-daemon.ts": ["cli.test.ts", "release-daemon.test.ts"],
   "release-identity.ts": [
     "release-identity.test.ts",

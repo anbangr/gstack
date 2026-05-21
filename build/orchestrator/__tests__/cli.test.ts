@@ -1877,7 +1877,7 @@ describe("post-agent hygiene helpers", () => {
     expect(verdict.errors.join("\n")).toMatch(/\?\? rewrite\.py/);
   });
 
-  it("recovers a sandboxed implementor by host-committing summary-listed files and cleaning cache noise", () => {
+  it("recovers a sandboxed implementor by host-committing summary-listed files and cleaning cache noise", async () => {
     fs.mkdirSync(path.join(tmpDir!, "pkg", "__pycache__"), { recursive: true });
     fs.writeFileSync(
       path.join(tmpDir!, "pkg", "__pycache__", "mod.pyc"),
@@ -1913,7 +1913,7 @@ describe("post-agent hygiene helpers", () => {
       ].join("\n"),
     );
 
-    const recovery = recoverMutableAgentCommit({
+    const recovery = await recoverMutableAgentCommit({
       cwd: tmpDir!,
       before,
       outputFilePath: summary,
@@ -1946,7 +1946,7 @@ describe("post-agent hygiene helpers", () => {
     expect(verdict).toEqual({ ok: true, errors: [] });
   });
 
-  it("cleans a stale .git/index.lock (>10s old) before host-committing summary-listed files", () => {
+  it("cleans a stale .git/index.lock (>10s old) before host-committing summary-listed files", async () => {
     // Reproduces F0+F1 from AGNT2 run: a concurrent gstack-build process or a
     // crashed git op leaves .git/index.lock around; the host-commit recovery
     // step's `git add` fails with "Unable to create '.../.git/index.lock':
@@ -1975,7 +1975,7 @@ describe("post-agent hygiene helpers", () => {
     const staleMtime = new Date(Date.now() - 60_000);
     fs.utimesSync(lockPath, staleMtime, staleMtime);
 
-    const recovery = recoverMutableAgentCommit({
+    const recovery = await recoverMutableAgentCommit({
       cwd: tmpDir!,
       before,
       outputFilePath: summary,
@@ -1990,7 +1990,7 @@ describe("post-agent hygiene helpers", () => {
     );
   });
 
-  it("leaves a fresh .git/index.lock (<10s old) in place and surfaces a clear error", () => {
+  it("leaves a fresh .git/index.lock (<10s old) in place and surfaces a clear error", async () => {
     // Negative case: a lock that's < 10s old belongs to a concurrent active
     // git op. Removing it would corrupt that op's transaction. The recovery
     // must NOT clean fresh locks; instead, surface the git error so the
@@ -2018,7 +2018,7 @@ describe("post-agent hygiene helpers", () => {
     const freshMtime = new Date(Date.now() - 1_000);
     fs.utimesSync(lockPath, freshMtime, freshMtime);
 
-    const recovery = recoverMutableAgentCommit({
+    const recovery = await recoverMutableAgentCommit({
       cwd: tmpDir!,
       before,
       outputFilePath: summary,
@@ -2031,7 +2031,7 @@ describe("post-agent hygiene helpers", () => {
     expect(fs.existsSync(lockPath)).toBe(true);
   });
 
-  it("recovers uncommitted files listed as markdown links in agent summaries", () => {
+  it("recovers uncommitted files listed as markdown links in agent summaries", async () => {
     const before = captureGitSnapshot(tmpDir!);
     const summary = path.join(tmpDir!, ".llm-tmp", "summary.md");
     fs.mkdirSync(path.dirname(summary), { recursive: true });
@@ -2063,7 +2063,7 @@ describe("post-agent hygiene helpers", () => {
       ].join("\n"),
     );
 
-    const recovery = recoverMutableAgentCommit({
+    const recovery = await recoverMutableAgentCommit({
       cwd: tmpDir!,
       before: beforeImpl,
       outputFilePath: summary,
@@ -2083,7 +2083,7 @@ describe("post-agent hygiene helpers", () => {
     expect(committedFiles).not.toContain("sequencer/rpc/rpc_test.go");
   });
 
-  it("fails closed when recovery sees submodule-internal summary paths without explicit allowlist", () => {
+  it("fails closed when recovery sees submodule-internal summary paths without explicit allowlist", async () => {
     const subRepo = fs.mkdtempSync(
       path.join(os.tmpdir(), "gstack-submodule-src-"),
     );
@@ -2128,7 +2128,7 @@ describe("post-agent hygiene helpers", () => {
       ].join("\n"),
     );
 
-    const recovery = recoverMutableAgentCommit({
+    const recovery = await recoverMutableAgentCommit({
       cwd: tmpDir!,
       before,
       outputFilePath: summary,
@@ -2142,7 +2142,7 @@ describe("post-agent hygiene helpers", () => {
     expect(git(["rev-parse", "HEAD"], tmpDir!)).toBe(before.head);
   });
 
-  it("stages only an explicitly allowed clean submodule gitlink during recovery", () => {
+  it("stages only an explicitly allowed clean submodule gitlink during recovery", async () => {
     const subRepo = fs.mkdtempSync(
       path.join(os.tmpdir(), "gstack-submodule-src-"),
     );
@@ -2187,7 +2187,7 @@ describe("post-agent hygiene helpers", () => {
       ].join("\n"),
     );
 
-    const recovery = recoverMutableAgentCommit({
+    const recovery = await recoverMutableAgentCommit({
       cwd: tmpDir!,
       before,
       outputFilePath: summary,

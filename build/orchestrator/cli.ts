@@ -35,6 +35,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ExitError } from "./errors";
 import { parsePlan, isPhaseComplete } from "./parser";
+import { resolveGitDir } from "./resolve-git-dir";
 import {
   freshState,
   loadState,
@@ -2528,18 +2529,18 @@ function cleanupGeneratedCacheChanges(cwd: string): string[] {
   return cleaned;
 }
 
-export function recoverMutableAgentCommit(opts: {
+export async function recoverMutableAgentCommit(opts: {
   cwd: string;
   before: GitSnapshot;
   outputFilePath?: string;
   label: string;
   allowSubmoduleRecovery?: string[];
-}): {
+}): Promise<{
   recovered: boolean;
   commit?: string;
   errors: string[];
   cleaned: string[];
-} {
+}> {
   const after = captureGitSnapshot(opts.cwd);
   if (after.head !== opts.before.head) {
     return { recovered: false, errors: [], cleaned: [] };
@@ -2635,7 +2636,7 @@ export function recoverMutableAgentCommit(opts: {
   // create '.../.git/index.lock': File exists." Fresh locks (< 10s old)
   // belong to an active git op — clobbering them corrupts that transaction.
   // Stale locks (>= 10s old) are abandoned; remove them so recovery proceeds.
-  const lockPath = path.join(opts.cwd, ".git", "index.lock");
+  const lockPath = path.join(await resolveGitDir(opts.cwd), "index.lock");
   try {
     const lockStat = fs.statSync(lockPath);
     const ageMs = Date.now() - lockStat.mtimeMs;
@@ -5338,7 +5339,7 @@ export function formatGateHygieneRecoveryHint(opts: {
   ].join("\n");
 }
 
-export function applyMutableAgentHygiene(opts: {
+export async function applyMutableAgentHygiene(opts: {
   result: SubAgentResult;
   before: GitSnapshot | null;
   cwd: string;
@@ -5360,7 +5361,7 @@ export function applyMutableAgentHygiene(opts: {
    *  Opt-in per call site; the first RUN_GEMINI pass and the test-fixer keep the
    *  strict default. */
   allowNoChangesSentinel?: boolean;
-}): SubAgentResult {
+}): Promise<SubAgentResult> {
   if (!opts.before) {
     return opts.result;
   }
@@ -5408,7 +5409,7 @@ export function applyMutableAgentHygiene(opts: {
   // expected. Recovery exists for sandboxed agents that wrote files but
   // couldn't commit; an audit phase that found nothing to fix is not that.
   const recovery = opts.requireNewCommit
-    ? recoverMutableAgentCommit({
+    ? await recoverMutableAgentCommit({
         cwd: opts.cwd,
         before: opts.before,
         outputFilePath: opts.outputFilePath,
@@ -5737,7 +5738,7 @@ async function runDualImplFixLoop(opts: {
       );
       break;
     }
-    const recovery = recoverMutableAgentCommit({
+    const recovery = await recoverMutableAgentCommit({
       cwd: worktreePath,
       before: beforeFix,
       outputFilePath: fixOutput,
@@ -6495,7 +6496,7 @@ async function runFeatureReviewIteration(args: {
       });
     }
   }
-  result = applyMutableAgentHygiene({
+  result = await applyMutableAgentHygiene({
     result,
     before,
     cwd: args.cwd,
@@ -6994,7 +6995,7 @@ async function runPhase(args: {
           });
         }
       }
-      result = applyMutableAgentHygiene({
+      result = await applyMutableAgentHygiene({
         result,
         before,
         cwd,
@@ -7113,7 +7114,7 @@ async function runPhase(args: {
           });
         }
       }
-      result = applyMutableAgentHygiene({
+      result = await applyMutableAgentHygiene({
         result,
         before,
         cwd,
@@ -7410,7 +7411,7 @@ async function runPhase(args: {
           logPrefix: "gemini-fix",
         });
       }
-      result = applyMutableAgentHygiene({
+      result = await applyMutableAgentHygiene({
         result,
         before,
         cwd,
@@ -7585,7 +7586,7 @@ async function runPhase(args: {
             logPrefix: `dual-${candidate}`,
           });
           if (!implResult.timedOut && implResult.exitCode === 0) {
-            const recovery = recoverMutableAgentCommit({
+            const recovery = await recoverMutableAgentCommit({
               cwd: candidateState.worktreePath,
               before,
               outputFilePath: outputPath,
@@ -12848,7 +12849,7 @@ async function runMergeFixer(args: {
     iteration: args.iteration,
     logPrefix: "merge-fix",
   });
-  result = applyMutableAgentHygiene({
+  result = await applyMutableAgentHygiene({
     result,
     before,
     cwd: args.cwd,
