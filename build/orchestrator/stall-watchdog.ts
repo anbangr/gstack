@@ -96,6 +96,13 @@ export interface StallWatchdogController {
   silenceMs: () => number;
   /** Cancel the watchdog without killing the child. Idempotent. */
   stop: () => void;
+  /**
+   * Reset the silence timer NOW. Use when an external mechanism (e.g.
+   * sub-agents.ts's backpressure pause) is about to suppress the normal
+   * 'data' event signal for a known reason. Without this, a paused child
+   * that's actually busy producing output would be misread as silent.
+   */
+  notifyActivity: () => void;
 }
 
 /**
@@ -485,5 +492,8 @@ export function attachStallWatchdog(
     stallKilled: () => killed,
     silenceMs: () => clock.now() - lastActivityAt,
     stop,
+    notifyActivity: () => {
+      if (!stopped && !killed) recordActivity();
+    },
   };
 }

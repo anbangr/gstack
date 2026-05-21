@@ -280,6 +280,59 @@ let visiblePlanProjection: {
   singleBranch?: boolean;
 } | null = null;
 
+/**
+ * Mark the visible plan projection as archived: any subsequent saveState
+ * call short-circuits the gate-visibility reconcile path. Called in two
+ * places in the success branch of main() — once before archiveLivingPlan
+ * moves the file out from under the reconciler, and once defensively in
+ * the finally block. Exported so the regression test (B-T1) can drive
+ * the same shutdown sequence the production code follows.
+ */
+export function markVisiblePlanArchived(): void {
+  visiblePlanProjection = null;
+}
+
+/**
+ * Read-side accessor for the projection — exported solely for tests that
+ * need to verify (a) it was non-null before the archive step and (b) it
+ * is null after. Production code never reads it through this accessor.
+ */
+export function _getVisiblePlanProjectionForTests(): unknown {
+  return visiblePlanProjection;
+}
+
+/**
+ * Set-side accessor for the projection — exported solely for tests that
+ * need to set up a realistic shutdown scenario (visiblePlanProjection
+ * pointing at a real plan file, then archive, then saveState). Production
+ * code sets visiblePlanProjection directly inside main().
+ */
+export function _setVisiblePlanProjectionForTests(
+  projection: {
+    planFile: string;
+    features: Feature[];
+    phases: Phase[];
+    skipShip?: boolean;
+    dryRun?: boolean;
+    singleBranch?: boolean;
+  } | null,
+): void {
+  visiblePlanProjection = projection;
+}
+
+/**
+ * Test-only invocation of saveState. Exported solely so B-T1 can prove
+ * that after markVisiblePlanArchived(), calling saveState (which is what
+ * the production shutdown sequence does) is a no-op for the gate-visibility
+ * reconcile path. Production callers use saveState directly inside main().
+ */
+export function _saveStateForTests(
+  state: BuildState,
+  log?: (msg: string) => void,
+): void {
+  saveState(state, { noGbrain: true, log });
+}
+
 function saveState(
   state: BuildState,
   opts: { noGbrain?: boolean; log?: (msg: string) => void } = {},
@@ -11181,8 +11234,41 @@ async function main() {
         }
       }
       if (exitCode === 0 && state.completed && !args.dryRun && !args.skipShip) {
-        const archivedPath = archiveLivingPlan(state.planFile);
+        // Order matters here. Two failure shapes to avoid:
+        //
+        //   (A) ENOENT race: if we archive THEN saveState (which calls
+        //       reconcileVisiblePlanState), the reconcile reads the
+        //       inbox path stored in visiblePlanProjection and ENOENTs
+        //       because archiveLivingPlan just moved the file.
+        //
+        //   (B) Lost-gate-visibility: if we mark archived BEFORE
+        //       archiveLivingPlan and archiveLivingPlan then throws (FS
+        //       race, EPERM on encrypted vol, network FS hiccup), the
+        //       projection is now null but the inbox plan file is still
+        //       there. Subsequent saveStates lose gate-checkbox sync
+        //       for the rest of the run.
+        //
+        // The safe sequence: try archiveLivingPlan first, mark archived
+        // only AFTER it succeeded (file is now under archived/, no further
+        // inbox-path reconcile makes sense). If archiveLivingPlan throws,
+        // the projection stays valid and gate visibility keeps working
+        // against the unmoved inbox file.
+        let archivedPath: string | null = null;
+        try {
+          archivedPath = archiveLivingPlan(state.planFile);
+        } catch (err) {
+          // archiveLivingPlan failed. Leave the projection intact so
+          // gate visibility keeps reconciling against the unmoved
+          // inbox plan file for the remainder of shutdown.
+          console.warn(
+            `[plan] archiveLivingPlan failed (gate visibility preserved): ${(err as Error).message}`,
+          );
+        }
         if (archivedPath) {
+          // Archive succeeded — stop reconciling against the now-moved
+          // file. The finally block clears the projection again as
+          // belt-and-suspenders / test isolation hygiene.
+          markVisiblePlanArchived();
           state.planFile = archivedPath;
           saveState(state, { noGbrain: args.noGbrain, log: console.warn });
           console.log(`Archived living plan: ${archivedPath}`);
@@ -11196,6 +11282,13 @@ async function main() {
       }
     }
   } finally {
+    // Belt-and-suspenders for the gate-visibility reconcile race: even if
+    // shutdown hit the failure branch (so the success-path mark didn't
+    // run), make sure no further saveState calls trigger a stale-path
+    // reconcile. Module-level visiblePlanProjection persists across
+    // imports — clearing it here also prevents leakage into the next
+    // test that imports this module.
+    markVisiblePlanArchived();
     // Uninstall the wrapConsole shim FIRST so registry / lock cleanup
     // warnings below go through the real console.warn (not the wrapped
     // version, which would queue them as halt events on a run that's
@@ -11272,9 +11365,61 @@ async function main() {
   // PR 6: end-of-build auto-drain of the halt-events queue. Failure is
   // non-fatal — preserves whatever exitCode the build produced. Opt out
   // via --no-auto-drain or GSTACK_HALT_EVENTS_OFF=1.
-  await runAutoDrainIfEnabled(args, state);
+  //
+  // Outer deadline (AUTO_DRAIN_DEADLINE_MS): the inner
+  // drainFaultsFromHaltEventsQueue uses a 10-minute investigatorTimeoutMs
+  // (correct for the standalone `gstack-build halt drain` command, where
+  // investigators legitimately take that long). At end-of-build it is the
+  // wrong UX budget — a successful run with halt events queued could
+  // otherwise sit silent for up to 10 minutes between "Archived living
+  // plan" and process exit, looking exactly like a hang. process.exit
+  // below forcibly tears down the event loop, ending any orphaned drain
+  // investigators via OS process tree.
+  await runWithDeadline(
+    () => runAutoDrainIfEnabled(args, state),
+    AUTO_DRAIN_DEADLINE_MS,
+    `auto-drain: ${AUTO_DRAIN_DEADLINE_MS / 1000}s end-of-build deadline exceeded, skipping ` +
+      "(any unprocessed halt events remain queued for next build or " +
+      "`gstack-build halt drain`)",
+  );
 
   process.exit(exitCode);
+}
+
+/**
+ * End-of-build auto-drain deadline. The inner halt-events drain uses a
+ * 10-minute investigatorTimeoutMs which is wrong as a shutdown UX budget.
+ * Imported by tests as the canonical reference (rather than hardcoding).
+ */
+export const AUTO_DRAIN_DEADLINE_MS = 60_000;
+
+/**
+ * Race a promise against a hard millisecond deadline. If the deadline fires
+ * first, log `deadlineWarning` to console.warn and resolve `void`. The
+ * underlying work is NOT cancelled (callers should rely on process.exit or
+ * AbortSignal threading for true cancellation), but the parent stops
+ * awaiting it — useful for non-fatal end-of-build hooks where we'd rather
+ * exit late-on-its-own-terms than block shutdown.
+ *
+ * Exported only for unit testing — see auto-drain.test.ts.
+ */
+export async function runWithDeadline<T>(
+  work: () => Promise<T>,
+  deadlineMs: number,
+  deadlineWarning: string,
+): Promise<T | void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      console.warn(deadlineWarning);
+      resolve();
+    }, deadlineMs);
+  });
+  try {
+    return await Promise.race([work(), deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 export function checkWorkingTreeClean(cwd: string): {
