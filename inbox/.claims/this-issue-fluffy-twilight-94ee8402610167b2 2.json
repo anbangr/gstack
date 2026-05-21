@@ -1,0 +1,23 @@
+{
+  "runGroupId": "20260511-195327-0d054ad5",
+  "sourcePlanPath": "/Users/anbang/.claude/plans/this-issue-fluffy-twilight.md",
+  "hostname": "MacBook-Pro-4.local",
+  "pid": 48586,
+  "status": "running",
+  "createdAt": "2026-05-11T11:54:09Z",
+  "runIds": [
+    "gstack-this-issue-fluffy-twilight-20260511-195458-663567a2"
+  ],
+  "repoPaths": [
+    "/Users/anbang/Documents/Antigravity/claude-workspace/gstack"
+  ],
+  "updatedAt": "2026-05-11T22:44:22Z",
+  "manifestedAt": "2026-05-11T11:59:02Z",
+  "pidFiles": [
+    "/Users/anbang/Documents/Antigravity/claude-workspace/gstack/.llm-tmp/build-runs/20260511-195327-0d054ad5/gstack-this-issue-fluffy-twilight-20260511-195458-663567a2/gstack-build.pid"
+  ],
+  "stdoutLogs": [
+    "/Users/anbang/Documents/Antigravity/claude-workspace/gstack/.llm-tmp/build-runs/20260511-195327-0d054ad5/gstack-this-issue-fluffy-twilight-20260511-195458-663567a2/agent-stdout.log"
+  ],
+  "runningAt": "2026-05-11T22:44:22Z"
+}

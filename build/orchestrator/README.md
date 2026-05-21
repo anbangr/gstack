@@ -426,7 +426,7 @@ the repo copy. `GSTACK_BUILD_DEFAULTS_FILE` remains as a legacy alias.
 | `GSTACK_BUILD_CODEX_MAX_ITER`         | `5`                  | Hard cap on recursive review gate iterations.                                                                                                                                  |
 | `GSTACK_BUILD_TEST_TIMEOUT`           | `300000`             | Per-test-run timeout in ms (5 min).                                                                                                                                            |
 | `GSTACK_BUILD_TEST_MAX_ITER`          | `5`                  | Hard cap on test-fixer iterations when tests fail post-impl.                                                                                                                   |
-| `GSTACK_BUILD_RED_MAX_ITER`           | `3`                  | Hard cap on test-writer re-spec iterations when tests pass trivially (VERIFY_RED).                                                                                             |
+| `GSTACK_BUILD_RED_MAX_ITER`           | `1`                  | Hard cap on test-writer re-spec iterations when tests pass trivially (VERIFY_RED). Set `GSTACK_BUILD_RED_LEGACY_CAP=3` during the deprecation window to restore the old cap.   |
 | `GSTACK_BUILD_JUDGE_TIMEOUT`          | `600000`             | Per-judge-call timeout in ms (10 min). Dual-impl only.                                                                                                                         |
 | `GSTACK_BUILD_JUDGE_MODEL`            | role default         | Model passed to `claude --model` for the judge. Dual-impl only.                                                                                                                |
 | `GSTACK_BUILD_CODEX_IMPL_SANDBOX`     | `workspace-write`    | Sandbox mode for `runCodexImpl`. Set to `danger-full-access` to opt in to looser sandboxing (worktrees share .git/remotes — be aware).                                         |
@@ -627,7 +627,7 @@ child-registry.ts drop-in spawn wrappers + signal handlers (reap detached childr
 plan-reviewer.ts single-round review: parsing, reconciliation, annotation read/write, prompts
 plan-review-loop.ts multi-round orchestration, triage gates, adaptive cap, history JSONL
 drain-faults.ts skill-fault drain consumer; short-circuits audit events (investigate:false)
-halt-event-helpers.ts emitManualRecoveryInvoked() — pins investigate:false on audit events
+halt-event-helpers.ts emitRecoveryBoundary() — pins investigate:false on audit events
 halt-events.ts  HaltEvent schema, markInvestigated; investigate?: boolean property
 feature-review.ts per-feature meta-review pass; same-shape fingerprint detection; UNCLEAR fail-fast
 feature-review-metrics.ts JSONL instrumentation for cycles, tokens, latency, verdict (T1)

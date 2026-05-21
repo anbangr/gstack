@@ -93,7 +93,7 @@ import { _testWritePlan } from "../plan-mutator";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { DEFAULT_ROLE_CONFIGS } from "../role-config";
 
 let tmpDir: string | null = null;
@@ -1877,7 +1877,7 @@ describe("post-agent hygiene helpers", () => {
     expect(verdict.errors.join("\n")).toMatch(/\?\? rewrite\.py/);
   });
 
-  it("recovers a sandboxed implementor by host-committing summary-listed files and cleaning cache noise", () => {
+  it("recovers a sandboxed implementor by host-committing summary-listed files and cleaning cache noise", async () => {
     fs.mkdirSync(path.join(tmpDir!, "pkg", "__pycache__"), { recursive: true });
     fs.writeFileSync(
       path.join(tmpDir!, "pkg", "__pycache__", "mod.pyc"),
@@ -1913,7 +1913,7 @@ describe("post-agent hygiene helpers", () => {
       ].join("\n"),
     );
 
-    const recovery = recoverMutableAgentCommit({
+    const recovery = await recoverMutableAgentCommit({
       cwd: tmpDir!,
       before,
       outputFilePath: summary,
@@ -1946,7 +1946,7 @@ describe("post-agent hygiene helpers", () => {
     expect(verdict).toEqual({ ok: true, errors: [] });
   });
 
-  it("cleans a stale .git/index.lock (>10s old) before host-committing summary-listed files", () => {
+  it("cleans a stale .git/index.lock (>10s old) before host-committing summary-listed files", async () => {
     // Reproduces F0+F1 from AGNT2 run: a concurrent gstack-build process or a
     // crashed git op leaves .git/index.lock around; the host-commit recovery
     // step's `git add` fails with "Unable to create '.../.git/index.lock':
@@ -1975,7 +1975,7 @@ describe("post-agent hygiene helpers", () => {
     const staleMtime = new Date(Date.now() - 60_000);
     fs.utimesSync(lockPath, staleMtime, staleMtime);
 
-    const recovery = recoverMutableAgentCommit({
+    const recovery = await recoverMutableAgentCommit({
       cwd: tmpDir!,
       before,
       outputFilePath: summary,
@@ -1990,7 +1990,65 @@ describe("post-agent hygiene helpers", () => {
     );
   });
 
-  it("leaves a fresh .git/index.lock (<10s old) in place and surfaces a clear error", () => {
+  it("cleans a stale index.lock from the real gitdir when recovery runs in a worktree", async () => {
+    const worktreePath = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-hygiene-worktree-"),
+    );
+    const branchName = `worktree-lock-${path.basename(worktreePath)}`;
+    try {
+      git(["worktree", "add", "-b", branchName, worktreePath, "HEAD"], tmpDir!);
+      expect(fs.statSync(path.join(worktreePath, ".git")).isFile()).toBe(true);
+
+      const before = captureGitSnapshot(worktreePath);
+      const summary = path.join(worktreePath, ".llm-tmp", "summary.md");
+      fs.mkdirSync(path.dirname(summary), { recursive: true });
+      fs.writeFileSync(path.join(worktreePath, "README.md"), "changed\n");
+      fs.writeFileSync(
+        summary,
+        [
+          "# Primary implementor summary",
+          "",
+          "## Files changed",
+          "- `README.md` - update docs.",
+          "",
+          "## Commit",
+          "- Conventional commit message: `feat: worktree stale-lock survivor`",
+        ].join("\n"),
+      );
+
+      const realGitDir = git(["rev-parse", "--absolute-git-dir"], worktreePath);
+      const lockPath = path.join(realGitDir, "index.lock");
+      fs.writeFileSync(lockPath, "");
+      const staleMtime = new Date(Date.now() - 60_000);
+      fs.utimesSync(lockPath, staleMtime, staleMtime);
+
+      const recovery = await recoverMutableAgentCommit({
+        cwd: worktreePath,
+        before,
+        outputFilePath: summary,
+        label: "primary implementor",
+      });
+
+      expect(recovery.recovered).toBe(true);
+      expect(recovery.errors).toEqual([]);
+      expect(fs.existsSync(lockPath)).toBe(false);
+      expect(git(["log", "-1", "--pretty=%s"], worktreePath)).toBe(
+        "feat: worktree stale-lock survivor",
+      );
+    } finally {
+      spawnSync("git", ["worktree", "remove", "--force", worktreePath], {
+        cwd: tmpDir!,
+        stdio: "ignore",
+      });
+      spawnSync("git", ["branch", "-D", branchName], {
+        cwd: tmpDir!,
+        stdio: "ignore",
+      });
+      fs.rmSync(worktreePath, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves a fresh .git/index.lock (<10s old) in place and surfaces a clear error", async () => {
     // Negative case: a lock that's < 10s old belongs to a concurrent active
     // git op. Removing it would corrupt that op's transaction. The recovery
     // must NOT clean fresh locks; instead, surface the git error so the
@@ -2018,7 +2076,7 @@ describe("post-agent hygiene helpers", () => {
     const freshMtime = new Date(Date.now() - 1_000);
     fs.utimesSync(lockPath, freshMtime, freshMtime);
 
-    const recovery = recoverMutableAgentCommit({
+    const recovery = await recoverMutableAgentCommit({
       cwd: tmpDir!,
       before,
       outputFilePath: summary,
@@ -2031,7 +2089,7 @@ describe("post-agent hygiene helpers", () => {
     expect(fs.existsSync(lockPath)).toBe(true);
   });
 
-  it("recovers uncommitted files listed as markdown links in agent summaries", () => {
+  it("recovers uncommitted files listed as markdown links in agent summaries", async () => {
     const before = captureGitSnapshot(tmpDir!);
     const summary = path.join(tmpDir!, ".llm-tmp", "summary.md");
     fs.mkdirSync(path.dirname(summary), { recursive: true });
@@ -2063,7 +2121,7 @@ describe("post-agent hygiene helpers", () => {
       ].join("\n"),
     );
 
-    const recovery = recoverMutableAgentCommit({
+    const recovery = await recoverMutableAgentCommit({
       cwd: tmpDir!,
       before: beforeImpl,
       outputFilePath: summary,
@@ -2083,7 +2141,7 @@ describe("post-agent hygiene helpers", () => {
     expect(committedFiles).not.toContain("sequencer/rpc/rpc_test.go");
   });
 
-  it("fails closed when recovery sees submodule-internal summary paths without explicit allowlist", () => {
+  it("fails closed when recovery sees submodule-internal summary paths without explicit allowlist", async () => {
     const subRepo = fs.mkdtempSync(
       path.join(os.tmpdir(), "gstack-submodule-src-"),
     );
@@ -2128,7 +2186,7 @@ describe("post-agent hygiene helpers", () => {
       ].join("\n"),
     );
 
-    const recovery = recoverMutableAgentCommit({
+    const recovery = await recoverMutableAgentCommit({
       cwd: tmpDir!,
       before,
       outputFilePath: summary,
@@ -2142,7 +2200,7 @@ describe("post-agent hygiene helpers", () => {
     expect(git(["rev-parse", "HEAD"], tmpDir!)).toBe(before.head);
   });
 
-  it("stages only an explicitly allowed clean submodule gitlink during recovery", () => {
+  it("stages only an explicitly allowed clean submodule gitlink during recovery", async () => {
     const subRepo = fs.mkdtempSync(
       path.join(os.tmpdir(), "gstack-submodule-src-"),
     );
@@ -2187,7 +2245,7 @@ describe("post-agent hygiene helpers", () => {
       ].join("\n"),
     );
 
-    const recovery = recoverMutableAgentCommit({
+    const recovery = await recoverMutableAgentCommit({
       cwd: tmpDir!,
       before,
       outputFilePath: summary,
@@ -3961,6 +4019,77 @@ describe("ensureFeatureBranch", () => {
     });
     // HEAD should be at same commit as origin/main since we branched from it.
     expect(trackingRef.stdout.trim()).toBe(originMain.stdout.trim());
+    fs.rmSync(statePath(slug), { force: true });
+  });
+
+  it("quarantines malformed refs before fetching to create a feature branch", () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-feature-quarantine-"));
+    const bare = path.join(tmpDir, "origin.git");
+    const repo = path.join(tmpDir, "repo");
+    expect(spawnSync("git", ["init", "--bare", bare]).status).toBe(0);
+    expect(spawnSync("git", ["clone", bare, repo]).status).toBe(0);
+    expect(
+      spawnSync("git", ["config", "user.email", "test@example.com"], {
+        cwd: repo,
+      }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["config", "user.name", "Test User"], { cwd: repo })
+        .status,
+    ).toBe(0);
+    fs.writeFileSync(path.join(repo, "README.md"), "# test\n");
+    expect(spawnSync("git", ["add", "README.md"], { cwd: repo }).status).toBe(
+      0,
+    );
+    expect(
+      spawnSync("git", ["commit", "-m", "init"], { cwd: repo }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["push", "-u", "origin", "main"], { cwd: repo }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["checkout", "-b", "feat/other"], { cwd: repo }).status,
+    ).toBe(0);
+
+    const sha = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repo,
+      encoding: "utf8",
+    }).stdout.trim();
+    const malformedRefPath = path.join(
+      repo,
+      ".git",
+      "refs",
+      "heads",
+      "feat",
+      "foo 1",
+    );
+    fs.mkdirSync(path.dirname(malformedRefPath), { recursive: true });
+    fs.writeFileSync(malformedRefPath, sha + "\n");
+
+    const slug = `test-feature-quarantine-${Date.now()}`;
+    const feature: FeatureState = {
+      index: 0,
+      number: "1",
+      name: "Auth",
+      phaseIndexes: [],
+      status: "running",
+    };
+    const state = stateForBranchTest(slug, feature, "feat/other");
+
+    const result = ensureFeatureBranch({
+      cwd: repo,
+      state,
+      feature,
+      dryRun: false,
+      noGbrain: true,
+    });
+
+    expect(result).toBe(true);
+    expect(fs.existsSync(malformedRefPath)).toBe(false);
+    expect(
+      fs.existsSync(path.join(repo, ".git", "quarantine", "feat-foo-1.ref")),
+    ).toBe(true);
+    expect(feature.branch).toBe("feat/plan-1-auth");
     fs.rmSync(statePath(slug), { force: true });
   });
 
@@ -6357,20 +6486,18 @@ describe("runStopRun (Bug 6)", () => {
   it("refuses to signal a PID whose command line is not gstack-build (PID-reuse guard)", async () => {
     // Spawn a long-running sleep — its command line is "sleep 600",
     // NOT gstack-build. runStopRun must refuse to signal it (exit 2).
-    const child = spawnSync("sh", ["-c", "sleep 600 & echo $!"], {
-      encoding: "utf8",
-    });
-    const pidStr = (child.stdout || "").trim();
-    const pid = Number(pidStr);
+    const child = spawn("sleep", ["600"], { stdio: "ignore" });
+    child.unref();
+    const pid = child.pid;
     expect(Number.isInteger(pid)).toBe(true);
-    spawnedPids.push(pid);
+    spawnedPids.push(pid!);
 
     const record = {
       runId: "guard-run",
       stateSlug: "guard-run",
       repoPath: "/tmp/repo",
       planFile: "/tmp/plan.md",
-      pid,
+      pid: pid!,
       status: "running" as const,
       startedAt: "2026-01-01T00:00:00.000Z",
       lastUpdatedAt: "2026-01-01T00:00:00.000Z",
@@ -6378,14 +6505,14 @@ describe("runStopRun (Bug 6)", () => {
     };
     writeActiveRunRecord(registryDir, record);
 
-    const exitCode = await runStopRun("guard-run", registryDir);
-    expect(exitCode).toBe(2);
-
-    // Confirm the sleep was NOT killed.
-    const stillAlive = spawnSync("ps", ["-p", String(pid)], {
+    const psProbe = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
       encoding: "utf8",
     });
-    expect(stillAlive.status).toBe(0);
+    const exitCode = await runStopRun("guard-run", registryDir);
+    expect(exitCode).toBe(psProbe.status === 0 ? 2 : 4);
+
+    // Confirm the sleep was NOT killed.
+    expect(() => process.kill(pid!, 0)).not.toThrow();
   });
 });
 

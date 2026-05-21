@@ -35,6 +35,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ExitError } from "./errors";
 import { parsePlan, isPhaseComplete } from "./parser";
+import { resolveGitDir } from "./resolve-git-dir";
 import {
   freshState,
   loadState,
@@ -210,10 +211,11 @@ import {
 import { renderPlanStatusTable, resolvePlanSelection } from "./plan-selection";
 import {
   classifyProviderFailure,
-  emitManualRecoveryInvoked,
+  emitRecoveryBoundary,
   markFeatureFailed,
   markPhaseFailed,
   recordProviderFailureVerdict,
+  recordRedGateZeroTestsCollected,
   recordRetryCapHit,
   rewindPhase,
 } from "./halt-event-helpers";
@@ -538,6 +540,7 @@ function reconcilePhaseVisibleGates(
         lineNumber: gs.line,
         checked: shouldBeDone,
         expectedMarker: PHASE_GATE_MARKERS[gateKey],
+        expectedPhase: phase,
       });
       if (result.flipped) {
         gs.done = shouldBeDone;
@@ -2083,6 +2086,14 @@ export function validatePostAgentHygiene(opts: {
    * source but DO touch their own scratch.
    */
   reviewGate?: boolean;
+  /**
+   * Path to the review/QA prompt file that was given to the agent.
+   * When provided, the hygiene diagnostic about the DIFF SCOPE constraint
+   * is only emitted if the prompt body actually contains "DIFF SCOPE:".
+   * This preserves prior-version hygiene logs for review gates that did
+   * not use the new prompt body.
+   */
+  reviewGatePromptPath?: string;
 }): HygieneVerdict {
   const after = captureGitSnapshot(opts.cwd);
   const errors: string[] = [];
@@ -2122,9 +2133,31 @@ export function validatePostAgentHygiene(opts: {
   };
   const dirty = contentHashDelta(opts.before, filteredAfter, opts.cwd);
   if (dirty.length > 0) {
-    errors.push(
-      `${opts.label} left the working tree dirty:\n${dirty.map((line) => `  ${line}`).join("\n")}`,
-    );
+    let msg = `${opts.label} left the working tree dirty:\n${dirty.map((line) => `  ${line}`).join("\n")}`;
+    if (opts.reviewGate) {
+      const nonTestPaths = dirty
+        .map((line) => porcelainStatusToPath(line))
+        .filter(
+          (p) =>
+            !isTestOnlyPath(p, DEFAULT_QA_TEST_PATH_GLOBS) &&
+            !isTestOnlyPath(p, DEFAULT_DATA_OUTPUT_GLOBS),
+        );
+      if (nonTestPaths.length > 0) {
+        let promptHadConstraint = false;
+        if (opts.reviewGatePromptPath) {
+          try {
+            const promptBody = fs.readFileSync(opts.reviewGatePromptPath, "utf8");
+            promptHadConstraint = promptBody.includes("DIFF SCOPE:");
+          } catch {
+            // Prompt unreadable — conservatively treat as constraint absent.
+          }
+        }
+        if (promptHadConstraint) {
+          msg += `\n  the constraint was in the prompt; reviewer edited production paths anyway`;
+        }
+      }
+    }
+    errors.push(msg);
   }
 
   return { ok: errors.length === 0, errors };
@@ -2496,18 +2529,18 @@ function cleanupGeneratedCacheChanges(cwd: string): string[] {
   return cleaned;
 }
 
-export function recoverMutableAgentCommit(opts: {
+export async function recoverMutableAgentCommit(opts: {
   cwd: string;
   before: GitSnapshot;
   outputFilePath?: string;
   label: string;
   allowSubmoduleRecovery?: string[];
-}): {
+}): Promise<{
   recovered: boolean;
   commit?: string;
   errors: string[];
   cleaned: string[];
-} {
+}> {
   const after = captureGitSnapshot(opts.cwd);
   if (after.head !== opts.before.head) {
     return { recovered: false, errors: [], cleaned: [] };
@@ -2603,7 +2636,7 @@ export function recoverMutableAgentCommit(opts: {
   // create '.../.git/index.lock': File exists." Fresh locks (< 10s old)
   // belong to an active git op — clobbering them corrupts that transaction.
   // Stale locks (>= 10s old) are abandoned; remove them so recovery proceeds.
-  const lockPath = path.join(opts.cwd, ".git", "index.lock");
+  const lockPath = path.join(await resolveGitDir(opts.cwd), "index.lock");
   try {
     const lockStat = fs.statSync(lockPath);
     const ageMs = Date.now() - lockStat.mtimeMs;
@@ -3465,15 +3498,24 @@ export function ensureFeatureBranch(args: {
   // implementor-hygiene-hardening build after a broken
   // `refs/remotes/origin/main 2` macOS Finder dupe made `git fetch origin
   // main` fail).
+  const q = quarantineMalformedRefs(args.cwd);
+  if (q.quarantined > 0) {
+    console.log(`[sync] quarantined ${q.quarantined} malformed ref(s)`);
+  }
+
   const fetchBase = spawnSync("git", ["fetch", "origin", base], {
     cwd: args.cwd,
     encoding: "utf8",
   });
   if (fetchBase.status !== 0) {
+    const fetchErr = fetchBase.stderr || fetchBase.stdout || "";
+    const renderedErr = isCorruptRepoError(fetchErr)
+      ? corruptRepoResult(fetchErr).error
+      : fetchErr;
     markFeatureFailed(
       args.state,
       args.feature.index,
-      `failed to fetch origin/${base} before feature branch: ${fetchBase.stderr || fetchBase.stdout}`,
+      `failed to fetch origin/${base} before feature branch: ${renderedErr}`,
       helperCtxFor(args.state),
     );
     saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
@@ -3510,11 +3552,196 @@ export function ensureFeatureBranch(args: {
   return true;
 }
 
+function isCorruptRepoError(stderr: string): boolean {
+  const text = stderr || "";
+  return (
+    text.includes("did not send all necessary objects") ||
+    text.includes("bad object refs/heads/")
+  );
+}
+
+function corruptRepoResult(error: string): {
+  ok: false;
+  haltKind: "GIT_REPO_CORRUPT";
+  error: string;
+} {
+  return {
+    ok: false,
+    haltKind: "GIT_REPO_CORRUPT",
+    error:
+      `${error}\n` +
+      `Repository appears corrupt (GIT_REPO_CORRUPT). Recovery commands:\n` +
+      `  git fsck --full\n` +
+      `  git remote prune origin`,
+  };
+}
+
+/**
+ * Before `git fetch`, enumerate refs and move any malformed ones to
+ * `.git/quarantine/<sanitized>.ref` with a sidecar JSON.  No ref content is
+ * deleted — everything is restorable via the recorded recovery command.
+ *
+ * Kill switch: set `GSTACK_DISABLE_REF_QUARANTINE=1` to skip enumeration.
+ */
+export function quarantineMalformedRefs(cwd: string): {
+  quarantined: number;
+  skipped?: boolean;
+} {
+  if (process.env.GSTACK_DISABLE_REF_QUARANTINE === "1") {
+    return { quarantined: 0, skipped: true };
+  }
+
+  const gitDirResult = spawnSync(
+    "git",
+    ["-C", cwd, "rev-parse", "--git-dir"],
+    { cwd, encoding: "utf8" },
+  );
+  if (gitDirResult.status !== 0) {
+    return { quarantined: 0 };
+  }
+  const gitDir = path.resolve(cwd, gitDirResult.stdout.trim());
+  const commonDirResult = spawnSync(
+    "git",
+    ["-C", cwd, "rev-parse", "--git-common-dir"],
+    { cwd, encoding: "utf8" },
+  );
+  const commonDir =
+    commonDirResult.status === 0 && commonDirResult.stdout.trim()
+      ? path.resolve(cwd, commonDirResult.stdout.trim())
+      : gitDir;
+
+  // Enumerate loose refs by walking the filesystem.  git for-each-ref
+  // silently skips refs with broken names (it prints a warning to stderr),
+  // so a filesystem walk is required to discover malformed refs.
+  const refs: string[] = [];
+  for (const prefix of ["refs/heads", "refs/remotes"]) {
+    const dir = path.join(commonDir, prefix);
+    if (!fs.existsSync(dir)) continue;
+    const walk = (relDir: string): void => {
+      const absDir = path.join(dir, relDir);
+      for (const entry of fs.readdirSync(absDir)) {
+        const absPath = path.join(absDir, entry);
+        const relPath = relDir ? `${relDir}/${entry}` : entry;
+        const st = fs.statSync(absPath);
+        if (st.isDirectory()) {
+          walk(relPath);
+        } else {
+          refs.push(`${prefix}/${relPath}`);
+        }
+      }
+    };
+    walk("");
+  }
+
+  // Determine which refs are malformed.
+  const malformed: string[] = [];
+  for (const ref of refs) {
+    const checkResult = spawnSync("git", ["check-ref-format", ref], {
+      cwd,
+      encoding: "utf8",
+    });
+    if (checkResult.status !== 0) {
+      malformed.push(ref);
+    }
+  }
+
+  let quarantined = 0;
+  const quarantineDir = path.join(commonDir, "quarantine");
+  const usedNames = new Set<string>();
+  if (fs.existsSync(quarantineDir)) {
+    for (const entry of fs.readdirSync(quarantineDir)) {
+      if (entry.endsWith(".ref") || entry.endsWith(".json")) {
+        usedNames.add(entry.replace(/\.(ref|json)$/, ""));
+      }
+    }
+  }
+
+  for (const ref of malformed) {
+    // Resolve SHA (may be missing in an already-corrupt repo).
+    // git rev-parse often fails for broken ref names, so fall back to reading
+    // the loose-ref file directly.
+    const refRelPath = ref.replace(/^refs\//, "").replace(/\//g, path.sep);
+    const looseRefPath = path.join(commonDir, "refs", refRelPath);
+    let originalSha: string | null = null;
+    const shaResult = spawnSync("git", ["-C", cwd, "rev-parse", ref], {
+      cwd,
+      encoding: "utf8",
+    });
+    if (
+      shaResult.status === 0 &&
+      /^[0-9a-f]{40}$/i.test(shaResult.stdout.trim())
+    ) {
+      originalSha = shaResult.stdout.trim();
+    } else if (fs.existsSync(looseRefPath)) {
+      const content = fs.readFileSync(looseRefPath, "utf8").trim();
+      if (/^[0-9a-f]{40}$/i.test(content)) {
+        originalSha = content;
+      }
+    }
+
+    const shortRef = ref.replace(/^refs\/(heads\/|remotes\/)/, "");
+    let sanitized = shortRef.replace(/[^A-Za-z0-9._-]/g, "-");
+    let quarantineName = sanitized;
+    let counter = 1;
+    while (usedNames.has(quarantineName)) {
+      quarantineName = `${sanitized}-${counter}`;
+      counter++;
+    }
+    usedNames.add(quarantineName);
+
+    fs.mkdirSync(quarantineDir, { recursive: true });
+
+    const refFile = path.join(quarantineDir, `${quarantineName}.ref`);
+    const sidecarFile = path.join(quarantineDir, `${quarantineName}.json`);
+
+    const sourceRefPath = path.join(commonDir, "refs", refRelPath);
+
+    const effectiveSha = originalSha ?? "0000000000000000000000000000000000000000";
+    const isNullSha = /^0{40}$/i.test(effectiveSha);
+    const quotedRef = ref.replace(/'/g, "'\\''");
+    // git update-ref refuses bad ref names, so add a filesystem fallback that
+    // directly recreates the loose-ref file when update-ref fails.
+    const recoveryCommand =
+      `git update-ref '${quotedRef}' ${isNullSha ? "0000000000000000000000000000000000000000" : effectiveSha} || ` +
+      `(mkdir -p '${path.dirname(looseRefPath).replace(/'/g, "'\\''")}' && echo '${effectiveSha}' > '${looseRefPath.replace(/'/g, "'\\''")}')`;
+    const sidecar = {
+      originalRef: ref,
+      originalSha: isNullSha ? null : originalSha,
+      timestamp: new Date().toISOString(),
+      reason: "invalid ref format",
+      recoveryCommand,
+    };
+    fs.writeFileSync(sidecarFile, JSON.stringify(sidecar, null, 2) + "\n");
+
+    if (fs.existsSync(sourceRefPath)) {
+      try {
+        fs.renameSync(sourceRefPath, refFile);
+      } catch (err) {
+        fs.rmSync(sidecarFile, { force: true });
+        throw err;
+      }
+    }
+
+    console.log(`[quarantine] moved invalid ref ${ref} to ${refFile}`);
+    console.log(`[quarantine] recovery: ${sidecar.recoveryCommand}`);
+
+    quarantined++;
+  }
+
+  return { quarantined };
+}
+
 export function syncLandedBase(cwd: string): {
   ok: boolean;
   branch?: string;
   error?: string;
+  haltKind?: string;
 } {
+  const q = quarantineMalformedRefs(cwd);
+  if (q.quarantined > 0) {
+    console.log(`[sync] quarantined ${q.quarantined} malformed ref(s)`);
+  }
+
   // Worktree-safe: only fetch, never checkout. A linked worktree cannot check
   // out a branch that is already checked out in the primary clone. Fetching
   // updates origin/<base> so callers can branch from that tracking ref directly.
@@ -3523,7 +3750,11 @@ export function syncLandedBase(cwd: string): {
     encoding: "utf8",
   });
   if (fetch.status !== 0) {
-    return { ok: false, error: fetch.stderr || fetch.stdout };
+    const err = fetch.stderr || fetch.stdout || "";
+    if (isCorruptRepoError(err)) {
+      return corruptRepoResult(err);
+    }
+    return { ok: false, error: err };
   }
   const baseRef = detectRemoteBaseRef(cwd);
   const base = baseRef.replace(/^origin\//, "");
@@ -3533,13 +3764,22 @@ export function syncLandedBase(cwd: string): {
 export function syncFeatureBranchWithBase(
   cwd: string,
   branch: string,
-): { ok: boolean; baseRef?: string; conflicts?: string[]; error?: string } {
+): { ok: boolean; baseRef?: string; conflicts?: string[]; error?: string; haltKind?: string } {
+  const q = quarantineMalformedRefs(cwd);
+  if (q.quarantined > 0) {
+    console.log(`[sync] quarantined ${q.quarantined} malformed ref(s)`);
+  }
+
   const fetch = spawnSync("git", ["fetch", "origin"], {
     cwd,
     encoding: "utf8",
   });
   if (fetch.status !== 0) {
-    return { ok: false, error: fetch.stderr || fetch.stdout };
+    const err = fetch.stderr || fetch.stdout || "";
+    if (isCorruptRepoError(err)) {
+      return corruptRepoResult(err);
+    }
+    return { ok: false, error: err };
   }
   const baseRef = detectRemoteBaseRef(cwd);
   const checkout = spawnSync("git", ["checkout", branch], {
@@ -4119,7 +4359,7 @@ export function buildCodexReviewBody(
   hardeningNotes?: string,
   originIssueLogPath?: string,
 ): string {
-  return [
+  const body = [
     `# Review Gate — Phase ${phase.number}: ${phase.name} (iter ${iteration})`,
     "",
     `Branch: ${branch}`,
@@ -4159,12 +4399,18 @@ export function buildCodexReviewBody(
     `1. Run the slash command specified by the runner prompt on the current branch's working tree against its base.`,
     `2. If iteration > 1, this is a re-run after an earlier gate tried to fix findings — be especially thorough.`,
     `3. Use --yolo / workspace-write file tools to inspect the actual code; don't ask the orchestrator to inline anything.`,
-    `4. Fix bugs as you find them (workspace-write sandbox is enabled). This includes running any data-generation or corpus-driver scripts described in the phase if their output files are missing — writing code that could produce them is not the same as producing them. Execute the script, verify the output files exist, and commit them.`,
-    `5. Write your full review report to the output file path (provided in the shell prompt).`,
-    `6. The output file MUST end with a single line: \`GATE PASS\` if no remaining issues, or \`GATE FAIL\` with a list of remaining issues.`,
+    `4. If you find a bug in production code, write a failing test that pins it; do NOT edit production source files (the post-agent hygiene gate will reject the phase if you do). Surface the bug in your report as a recommended follow-up [code] phase.`,
+    `5. You may execute data-generation or corpus-driver scripts described in the phase and commit their output files (data is not production code).`,
+    `6. Write your full review report to the output file path (provided in the shell prompt).`,
+    `7. The output file MUST end with a single line: \`GATE PASS\` if no remaining issues, or \`GATE FAIL\` with a list of remaining issues.`,
   ]
     .filter(Boolean)
     .join("\n");
+
+  return (
+    body +
+    "\n\nDIFF SCOPE: file edits in this phase are limited to: test/**, **/__tests__/**, **/*.test.*, **/*.spec.*, **/conftest.py, **/spec/**, plus committed data outputs from item 5. Edits to anything else fail the post-agent hygiene gate.\n"
+  );
 }
 
 export function buildOriginVerificationBody(args: {
@@ -4781,6 +5027,7 @@ async function runReviewGates(opts: {
       label: `${name} gate`,
       parentWorkspace: parentBeforeGate,
       phaseRef: { phaseNumber: opts.phaseNumber },
+      inputFilePath: opts.inputFilePath,
     });
     outputs.push(result);
     combined.push(
@@ -4806,6 +5053,7 @@ async function runReviewGates(opts: {
         label: `${name} sandbox retry gate`,
         parentWorkspace: parentBeforeGate,
         phaseRef: { phaseNumber: opts.phaseNumber },
+        inputFilePath: opts.inputFilePath,
       });
       outputs.push(checkedRetryResult);
       combined.push(
@@ -4865,6 +5113,14 @@ const DEFAULT_QA_TEST_PATH_GLOBS = [
   "**/*_spec.*",
   "spec/**",
 ];
+
+/**
+ * Glob patterns identifying data-output paths that review/qa gates are
+ * explicitly permitted to commit per item 5 of the review prompt.
+ * These are NOT production source paths, so the hygiene diagnostic
+ * about "editing production paths anyway" must not fire for them.
+ */
+const DEFAULT_DATA_OUTPUT_GLOBS = ["**/data/**/*", "**/corpus/**/*"];
 
 /** Convert a git-porcelain status line ("M path", " D path", "?? path") to
  *  just the path portion. Handles rename arrows (" -> ") and quoted paths. */
@@ -5174,6 +5430,10 @@ function applyGateHygiene(opts: {
    *  prints the exact `--mark-phase-committed` recovery command. Omit when
    *  the gate fires outside a phase context (e.g. merge review). */
   phaseRef?: { featureNumber?: string; phaseNumber: string };
+  /** Path to the review/QA prompt file that was given to the agent.
+   *  When provided, enables the DIFF SCOPE hygiene diagnostic only when
+   *  the prompt body actually contains the constraint. */
+  inputFilePath?: string;
 }): SubAgentResult {
   if (opts.result.timedOut || opts.result.exitCode !== 0) return opts.result;
   // Review/QA gates run Codex under workspace-write and the subagent writes
@@ -5189,6 +5449,7 @@ function applyGateHygiene(opts: {
       before: opts.before,
       label: opts.label,
       reviewGate: isGateRole,
+      reviewGatePromptPath: opts.inputFilePath,
     }),
     validateParentWorkspaceUnchanged({
       before: opts.parentWorkspace?.snapshot ?? null,
@@ -5224,6 +5485,7 @@ function applyGateHygiene(opts: {
             cwd: opts.cwd,
             before: opts.before,
             label: opts.label,
+            reviewGatePromptPath: opts.inputFilePath,
           }),
           validateParentWorkspaceUnchanged({
             before: opts.parentWorkspace?.snapshot ?? null,
@@ -5284,7 +5546,7 @@ export function formatGateHygieneRecoveryHint(opts: {
   ].join("\n");
 }
 
-export function applyMutableAgentHygiene(opts: {
+export async function applyMutableAgentHygiene(opts: {
   result: SubAgentResult;
   before: GitSnapshot | null;
   cwd: string;
@@ -5306,7 +5568,7 @@ export function applyMutableAgentHygiene(opts: {
    *  Opt-in per call site; the first RUN_GEMINI pass and the test-fixer keep the
    *  strict default. */
   allowNoChangesSentinel?: boolean;
-}): SubAgentResult {
+}): Promise<SubAgentResult> {
   if (!opts.before) {
     return opts.result;
   }
@@ -5354,7 +5616,7 @@ export function applyMutableAgentHygiene(opts: {
   // expected. Recovery exists for sandboxed agents that wrote files but
   // couldn't commit; an audit phase that found nothing to fix is not that.
   const recovery = opts.requireNewCommit
-    ? recoverMutableAgentCommit({
+    ? await recoverMutableAgentCommit({
         cwd: opts.cwd,
         before: opts.before,
         outputFilePath: opts.outputFilePath,
@@ -5683,7 +5945,7 @@ async function runDualImplFixLoop(opts: {
       );
       break;
     }
-    const recovery = recoverMutableAgentCommit({
+    const recovery = await recoverMutableAgentCommit({
       cwd: worktreePath,
       before: beforeFix,
       outputFilePath: fixOutput,
@@ -6008,6 +6270,7 @@ export function markPhaseCommittedAfterManualRecovery(args: {
       implementationLine: phase.implementationCheckboxLine,
       reviewLine: phase.reviewCheckboxLine,
       kind: phase.kind,
+      phase,
     });
     if (flips.implementation.error || flips.review.error) {
       return {
@@ -6440,7 +6703,7 @@ async function runFeatureReviewIteration(args: {
       });
     }
   }
-  result = applyMutableAgentHygiene({
+  result = await applyMutableAgentHygiene({
     result,
     before,
     cwd: args.cwd,
@@ -6795,6 +7058,17 @@ async function runPhase(args: {
           }
         }
       }
+      if (action.reason.startsWith("RED_GATE_ZERO_TESTS_COLLECTED")) {
+        const testCmd =
+          resolveTestCmdForPhase(args, cwd, phase) ?? "unknown";
+        recordRedGateZeroTestsCollected(
+          state,
+          phaseState.index,
+          testCmd,
+          helperCtxFor(state),
+        );
+        classified = true;
+      }
       if (!classified) {
         recordRetryCapHit(
           state,
@@ -6826,6 +7100,7 @@ async function runPhase(args: {
           implementationLine: phase.implementationCheckboxLine,
           reviewLine: phase.reviewCheckboxLine,
           kind: phase.kind,
+          phase,
         });
         if (flips.implementation.error || flips.review.error) {
           state.failedAtPhase = phase.index;
@@ -6927,7 +7202,7 @@ async function runPhase(args: {
           });
         }
       }
-      result = applyMutableAgentHygiene({
+      result = await applyMutableAgentHygiene({
         result,
         before,
         cwd,
@@ -7046,7 +7321,7 @@ async function runPhase(args: {
           });
         }
       }
-      result = applyMutableAgentHygiene({
+      result = await applyMutableAgentHygiene({
         result,
         before,
         cwd,
@@ -7222,7 +7497,12 @@ async function runPhase(args: {
           });
         }
       }
-      phaseState = applyResult(phaseState, action, result);
+      const effectiveTestCmd = resolveTestCmdForPhase(args, cwd, phase);
+      phaseState = applyResult(phaseState, action, result, {
+        phaseBody: phase.body,
+        testCmd: effectiveTestCmd ?? undefined,
+        phaseKind: phase.kind,
+      });
       state.phases[phase.index] = phaseState;
       saveState(state, { noGbrain, log: console.warn });
       continue;
@@ -7338,7 +7618,7 @@ async function runPhase(args: {
           logPrefix: "gemini-fix",
         });
       }
-      result = applyMutableAgentHygiene({
+      result = await applyMutableAgentHygiene({
         result,
         before,
         cwd,
@@ -7513,7 +7793,7 @@ async function runPhase(args: {
             logPrefix: `dual-${candidate}`,
           });
           if (!implResult.timedOut && implResult.exitCode === 0) {
-            const recovery = recoverMutableAgentCommit({
+            const recovery = await recoverMutableAgentCommit({
               cwd: candidateState.worktreePath,
               before,
               outputFilePath: outputPath,
@@ -10045,7 +10325,7 @@ async function main() {
   }
 
   if (args.mode === "drain-faults") {
-    emitManualRecoveryInvoked({
+    emitRecoveryBoundary({
       runId: args.runId ?? "drain-faults",
       stateSlug: args.planFile
         ? deriveStateSlug(args.planFile)
@@ -10071,7 +10351,7 @@ async function main() {
   }
 
   if (args.mode === "mark-shipped") {
-    emitManualRecoveryInvoked({
+    emitRecoveryBoundary({
       runId: args.runId ?? "mark-shipped",
       stateSlug: deriveStateSlug(args.planFile),
       message:
@@ -10392,7 +10672,7 @@ async function main() {
     if (!setupFailed && state && args.markPhaseCommitted) {
       {
         const ctx = helperCtxFor(state);
-        emitManualRecoveryInvoked({
+        emitRecoveryBoundary({
           runId: ctx.runId,
           stateSlug: ctx.stateSlug,
           message: `--mark-phase-committed invoked for phase ${args.markPhaseCommitted}`,
@@ -10728,34 +11008,9 @@ async function main() {
             featureState.status === "committed" &&
             !featureState.completedAt
           ) {
-            // Emit SILENT_STATE_MUTATION BEFORE the destructive rewrite so the
-            // halt-events queue captures the original shape (the polis
-            // hand-merged-feature class). Mutation behavior unchanged in this
-            // PR; a follow-up will decide whether to keep re-processing or
-            // treat the merge as authoritative.
-            {
-              const ctx = helperCtxFor(state);
-              emitHaltEvent({
-                kind: "SILENT_STATE_MUTATION",
-                runId: ctx.runId,
-                stateSlug: ctx.stateSlug,
-                severity: severityFor("SILENT_STATE_MUTATION"),
-                message:
-                  `Feature ${featureState.number} status="committed" without completedAt — ` +
-                  `orchestrator re-processing (mergeSha=${featureState.mergeSha ?? "absent"}, prNumber=${featureState.prNumber ?? "absent"})`,
-                pointers: ctx.pointers,
-                snapshot: buildHaltSnapshot({
-                  state,
-                  stdoutLogPath: ctx.pointers.stdoutLog,
-                  worktreePath: ctx.pointers.worktreePath,
-                  featureIndex,
-                }),
-              });
-            }
             console.warn(
-              `⚠ Feature ${featureState.number} status is "committed" but completedAt is missing — ` +
-                `this indicates a manual JSON state patch that bypassed ship+land+verify. ` +
-                `Re-processing the feature so the pipeline runs.`,
+              `STATE_DRIFT:missing_completedAt feature "${featureState.name}" (feature ${featureState.number}) is committed but has no completedAt. ` +
+                `Recover with: gstack-build mark-shipped --plan ${state.planFile} --feature ${featureState.number}`,
             );
             // Reset to phases_done so resumeAtShip routes us into the ship
             // path on the next checks (status==="phases_done" → resumeAtShip
@@ -12762,6 +13017,7 @@ async function runMergeReview(args: {
     before,
     cwd: args.cwd,
     label: "merge review",
+    inputFilePath,
   });
   const verdict = parseVerdict(result.stdout + "\n" + result.stderr);
   return {
@@ -12807,7 +13063,7 @@ async function runMergeFixer(args: {
     iteration: args.iteration,
     logPrefix: "merge-fix",
   });
-  result = applyMutableAgentHygiene({
+  result = await applyMutableAgentHygiene({
     result,
     before,
     cwd: args.cwd,

@@ -93,7 +93,7 @@ function mockResult(): SubAgentResult {
 }
 
 describe("applyMutableAgentHygiene — NO_CHANGES_NEEDED sentinel", () => {
-  it("returns success unmodified when sentinel is present and the only error is the no-commit one", () => {
+  it("returns success unmodified when sentinel is present and the only error is the no-commit one", async () => {
     const before = captureGitSnapshot(repo);
     // Agent reports NO_CHANGES_NEEDED, makes no commit, leaves tree clean.
     fs.writeFileSync(
@@ -101,7 +101,7 @@ describe("applyMutableAgentHygiene — NO_CHANGES_NEEDED sentinel", () => {
       "NO_CHANGES_NEEDED\n\nThe reviewer's finding about the empty-input branch is already covered in commit abc123 from the prior pass.\n",
     );
     const inputResult = mockResult();
-    const out = applyMutableAgentHygiene({
+    const out = await applyMutableAgentHygiene({
       result: inputResult,
       before,
       cwd: repo,
@@ -117,10 +117,10 @@ describe("applyMutableAgentHygiene — NO_CHANGES_NEEDED sentinel", () => {
     expect(out).toBe(inputResult);
   });
 
-  it("still fails when the opt is NOT set, even if the sentinel is present", () => {
+  it("still fails when the opt is NOT set, even if the sentinel is present", async () => {
     const before = captureGitSnapshot(repo);
     fs.writeFileSync(outputFilePath, "NO_CHANGES_NEEDED\n\nAlready in HEAD.\n");
-    const out = applyMutableAgentHygiene({
+    const out = await applyMutableAgentHygiene({
       result: mockResult(),
       before,
       cwd: repo,
@@ -134,7 +134,7 @@ describe("applyMutableAgentHygiene — NO_CHANGES_NEEDED sentinel", () => {
     expect(out.stdout).toContain("did not create a new commit");
   });
 
-  it("still fails the dirty-tree check when the working tree has uncommitted changes, even with the sentinel set", () => {
+  it("still fails the dirty-tree check when the working tree has uncommitted changes, even with the sentinel set", async () => {
     const before = captureGitSnapshot(repo);
     // Agent claims NO_CHANGES_NEEDED but actually mutated a tracked file.
     fs.writeFileSync(path.join(repo, "seed.txt"), "tampered\n");
@@ -142,7 +142,7 @@ describe("applyMutableAgentHygiene — NO_CHANGES_NEEDED sentinel", () => {
       outputFilePath,
       "NO_CHANGES_NEEDED\n\nLying about a clean tree.\n",
     );
-    const out = applyMutableAgentHygiene({
+    const out = await applyMutableAgentHygiene({
       result: mockResult(),
       before,
       cwd: repo,
@@ -157,13 +157,13 @@ describe("applyMutableAgentHygiene — NO_CHANGES_NEEDED sentinel", () => {
     expect(out.stdout).toContain("left the working tree dirty");
   });
 
-  it("still fails when the opt is set but the output file does not contain the sentinel", () => {
+  it("still fails when the opt is set but the output file does not contain the sentinel", async () => {
     const before = captureGitSnapshot(repo);
     fs.writeFileSync(
       outputFilePath,
       "I looked at the reviewer's findings but did not make any changes because I forgot.\n",
     );
-    const out = applyMutableAgentHygiene({
+    const out = await applyMutableAgentHygiene({
       result: mockResult(),
       before,
       cwd: repo,
@@ -177,7 +177,7 @@ describe("applyMutableAgentHygiene — NO_CHANGES_NEEDED sentinel", () => {
     expect(out.stdout).toContain("did not create a new commit");
   });
 
-  it("requires the sentinel on its own line — substring match inside prose does not unlock the gate", () => {
+  it("requires the sentinel on its own line — substring match inside prose does not unlock the gate", async () => {
     const before = captureGitSnapshot(repo);
     // The agent mentioned the sentinel in prose but didn't put it on its own
     // line. Our regex `/^NO_CHANGES_NEEDED\b/m` requires line-start anchor,
@@ -186,7 +186,7 @@ describe("applyMutableAgentHygiene — NO_CHANGES_NEEDED sentinel", () => {
       outputFilePath,
       "I considered emitting NO_CHANGES_NEEDED but then decided to bail.\n",
     );
-    const out = applyMutableAgentHygiene({
+    const out = await applyMutableAgentHygiene({
       result: mockResult(),
       before,
       cwd: repo,

@@ -830,7 +830,9 @@ describe("evaluateMonitorOnce", () => {
       manifestPath: writeManifest(data),
       now: new Date("2026-05-08T00:14:00.000Z"),
       pollMs: 60_000,
+      gstackConfigBin: "",
       spawnResume: false,
+      gstackConfigBin: "",
       // No buildStallThresholdMs override → default 15min applies.
     });
     expect(under.terminalEvent.event).toBe("MONITOR_REENTER");
@@ -849,7 +851,9 @@ describe("evaluateMonitorOnce", () => {
       manifestPath: writeManifest(data),
       now: new Date("2026-05-08T00:16:00.000Z"),
       pollMs: 60_000,
+      gstackConfigBin: "",
       spawnResume: false,
+      gstackConfigBin: "",
     });
     expect(over.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
   });

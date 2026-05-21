@@ -1,5 +1,164 @@
 # Changelog
 
+## [1.42.1.0] - 2026-05-22
+
+**Build orchestrator now handles worktree gitdirs and quarantines malformed refs before every fetch. If a repo is corrupt, the orchestrator halts with `GIT_REPO_CORRUPT` and prints recovery commands instead of letting the fetch error bubble up as an opaque string.**
+
+This is PR7 of the tidy-haven plan — worktree-aware gitdir resolution, safe ref quarantine, and corrupt-repo halt. All changes are in `build/orchestrator/`.
+
+### What changed for the user
+
+- The build orchestrator works correctly inside git worktrees (`.git` is a file, not a directory). Previously, paths like `.git/index.lock` were hardcoded and failed in worktrees.
+- Before every `git fetch`, malformed refs (e.g. `refs/heads/feat/foo 1` created by macOS Finder dupes) are moved to `.git/quarantine/` with a sidecar JSON containing the exact recovery command. No ref content is deleted.
+- If `git fetch` fails with "did not send all necessary objects" or "bad object refs/heads/", the orchestrator returns a structured `GIT_REPO_CORRUPT` halt with recovery commands (`git fsck --full`, `git remote prune origin`).
+- Kill switch: set `GSTACK_DISABLE_REF_QUARANTINE=1` to skip ref enumeration.
+## [1.42.0.0] - 2026-05-22
+
+**Plan mutator now re-parses and recovers when stale line numbers drift, and guards against duplicate phase headings. When a plan file is edited externally (or by another process) between the time the orchestrator reads line numbers and the time it writes checkbox state, the mutator no longer fails with "plan was edited externally." Instead it re-parses the fresh file from disk, resolves the checkbox by its stable phase identity (feature number + phase number + phase name), and flips at the new line. If two phases share the exact same heading, the mutator emits `PLAN_MUTATOR_DUPLICATE_HEADING` with both line numbers so the caller can surface the ambiguity instead of silently mutating the wrong checkbox.**
+
+This is PR6 of the tidy-haven plan — Feature 9 of the 83-fault recurrence program. Ships two new test files (554 lines of unit tests, 18 tests total) covering re-parse recovery, duplicate-heading detection, atomic-write rollback, phase identity normalization, and all three call sites (`setCheckboxState`, `setCheckboxStatusNote`, `unflipPhaseCheckboxes`).
+
+### What changed for the user
+
+- Orchestrator no longer stalls with "plan was edited externally" when a plan file has been modified between phase reads and writes. The mutator re-parses from disk, locates the checkbox by its phase identity, and continues.
+- Duplicate phase headings are detected before mutation and surfaced as `PLAN_MUTATOR_DUPLICATE_HEADING` errors with both conflicting line numbers, preventing silent mutation of the wrong checkbox.
+- Phase identity includes feature number, phase number, and normalized phase name — stable even when line numbers shift.
+## [1.41.1.0] - 2026-05-22
+
+**The build orchestrator now catches five classes of synthesizer blind spots before they ever reach the build loop. Living plans are validated for unused imports, missing field references, non-existent file paths, multi-arm split across phases, and stale file:line quotes — with a bounded-retry gate that sends the synthesizer back to fix its own mistakes.**
+
+This is PR5 of the tidy-haven plan — Feature 8 of the 83-fault recurrence program. The orchestrator autonomously built and shipped this PR via Kimi primary + Gemini fallback, converging after multiple review iterations. The diff is 5 files, ~989 lines added, spanning the validator engine, 432 lines of unit tests, and the SKILL.md.tmpl synthesis wrapper.
+
+### What changed for the user
+
+- The plan synthesizer now runs through a bounded structural-gate retry loop (up to 3 attempts). If the generated living plan violates any static check, the synthesizer receives the violation report and must rewrite the offending feature blocks before the build loop starts.
+- Five static checks catch the most common synthesizer hallucinations:
+  1. **Unused imports** — every imported identifier in a phase code snippet must be used in that same phase.
+  2. **Missing field references** — `phaseState.<role>.<field>` claims in acceptance must appear in the plan's code snippets.
+  3. **Non-existent files** — backtick-quoted file paths in acceptance must exist on disk, be explicitly planned, or be exempt (inbox, audit, tmp paths).
+  4. **Multi-arm split** — registry additions and their orchestrator wiring must land in the same phase; splitting them across phases is a structural violation.
+  5. **Stale quotes** — `file:line` quotes with expected snippets are verified against on-disk content.
+- The synthesizer prompt now includes a "Common defects to avoid" self-check section so the model can catch these issues before the validator does.
+## [1.41.0.0] - 2026-05-21
+
+**The verify-red gate now validates that tests were actually collected, and the orchestrator can introspect test-runner output to know how many tests ran.** New `test-runner-introspect.ts` parses JSON and stdout output from vitest, pytest, jest, bun, mocha, and go test to extract collected/passed/failed counts. When a verify-red phase exits 0 but collected 0 tests, the orchestrator emits a `RED_GATE_ZERO_TESTS_COLLECTED` halt event instead of silently passing — surfacing the common "forgot the testCmd annotation" failure mode immediately. The red-spec iteration cap drops from 3 to 1 (set `GSTACK_BUILD_RED_LEGACY_CAP=3` to restore the old behavior during the deprecation window). The `/build` skill template now includes a polyglot-repo hint reminding users to add `<!-- testCmd: -->` when the per-phase runner differs from the repo default.
+
+This is PR3 of the tidy-haven plan — Feature 7 of the 83-fault recurrence program.
+
+### What changed for the user
+
+- **Zero-test detection in verify-red**: If your `code` phase passes its verify-red gate with 0 tests collected, the build now halts with a clear `RED_GATE_ZERO_TESTS_COLLECTED` event pointing to the resolved test command and suggesting you add `<!-- testCmd: -->` to the phase body. No more silent green builds that skipped every test.
+- **Tighter red-spec cap**: `GSTACK_BUILD_RED_MAX_ITER` defaults to `1` (was `3`). This means a test-writer that produces trivially-passing specs gets one retry instead of three before the orchestrator escalates. Restore the old cap with `GSTACK_BUILD_RED_LEGACY_CAP=3`.
+- **Polyglot repo hint in /build skill**: The skill template now reminds users to annotate `code` phases with `<!-- testCmd: -->` when the per-phase test runner differs from the repo root command.
+
+### Itemized changes
+
+#### Added
+
+- `build/orchestrator/resolve-git-dir.ts` — `resolveGitDir(cwd)` helper using `git rev-parse --git-dir`, with macOS `/private/var` → `/var` normalization and a per-process memoization cache. `clearResolveGitDirCache()` for test isolation.
+- `build/orchestrator/__tests__/resolve-git-dir.test.ts` — 199 lines of tests covering regular repos, worktrees, bare repos, submodule gitdirs, cache hits, and `/private` normalization.
+- `quarantineMalformedRefs(cwd)` in `cli.ts` — filesystem walk of `refs/heads` and `refs/remotes`, `git check-ref-format` validation, safe move to `quarantine/<sanitized>.ref` with `.json` sidecar containing `recoveryCommand`. Handles missing SHAs, name collisions, and Windows backslash ref names.
+- `build/orchestrator/__tests__/quarantine-malformed-refs.test.ts` — 377 lines of tests covering happy path, quarantine directory reuse, missing SHA fallback, recovery command correctness, kill switch, and Windows-style backslash refs.
+- `isCorruptRepoError()` and `corruptRepoResult()` in `cli.ts` — pattern-match fetch stderr for corrupt-repo signals and return structured halt result with `haltKind: "GIT_REPO_CORRUPT"`.
+- `build/orchestrator/__tests__/git-repo-corrupt-halt.test.ts` — 192 lines of tests for corrupt-repo detection, recovery message format, and non-corrupt error passthrough.
+
+#### Changed
+
+- `recoverMutableAgentCommit()` made `async` so it can `await resolveGitDir()` for the `.git/index.lock` path instead of hardcoding `path.join(opts.cwd, ".git", "index.lock")`.
+- `applyMutableAgentHygiene()` made `async` to await the now-async `recoverMutableAgentCommit()`.
+- All call sites of `recoverMutableAgentCommit()` and `applyMutableAgentHygiene()` in `cli.ts` updated to `await`.
+- `ensureFeatureBranch()`, `syncLandedBase()`, and `syncFeatureBranchWithBase()` now call `quarantineMalformedRefs()` before `git fetch` and surface corrupt-repo errors as structured halts.
+
+#### Removed
+
+- The `git gc` retry loop that previously attempted recovery from corrupt-repo errors — replaced by the explicit `GIT_REPO_CORRUPT` halt.
+
+### For contributors
+
+- 1977 build/orchestrator tests pass (0 failures). Browse tests show pre-existing daemon-not-running failures unrelated to this branch.
+- `build/orchestrator/__tests__/plan-mutator-reparse.test.ts` — 339 lines, 11 tests covering T1-T5: re-parse on stale line numbers, genuinely deleted markers, atomic-write rollback failure paths, all three call sites (`setCheckboxState`, `setCheckboxStatusNote`, `unflipPhaseCheckboxes`), non-sequential phase numbering, sublettered phase IDs, review suffixes, kind brackets, and fresh-from-disk reads.
+- `build/orchestrator/__tests__/plan-mutator-duplicate-heading.test.ts` — 215 lines, 7 tests covering T3 and T6: duplicate heading detection with both line numbers reported, phase name normalization (trailing whitespace stripped), non-duplicate detection when phase numbers differ or names differ, `setCheckboxState` and `unflipPhaseCheckboxes` duplicate detection, and atomic-write race safety.
+- `resolveStaleLine()` in `plan-mutator.ts` — re-parses the plan from disk when a stale line number no longer contains the expected marker. Uses `buildPhaseLocations()` and `findPhaseHeadingAbove()` to resolve the checkbox by stable phase identity.
+- `buildPhaseLocations()`, `findPhaseHeadingAbove()`, `phaseIdFromParts()`, `normalizePhaseName()` — helper utilities for stable phase identification across line-number drift.
+
+#### Changed
+
+- `setCheckboxState()`, `setCheckboxStatusNote()`, `flipCheckbox()`, `flipPhaseCheckboxes()`, `unflipPhaseCheckboxes()`, `reconcilePhaseCheckboxes()`, `flipTestSpecCheckbox()` in `plan-mutator.ts` — all accept an optional `expectedPhase` parameter and delegate to `resolveStaleLine()` when the marker is missing at the expected line.
+- `cli.ts` — three call sites (`reconcilePhaseVisibleGates`, `markPhaseCommittedAfterManualRecovery`, `runPhase`) now pass the full `phase` object as `expectedPhase` to `setCheckboxState`, `flipPhaseCheckboxes`, and `unflipPhaseCheckboxes`.
+- `build/orchestrator/validate-living-plan.ts` — extended structural validator with T1-T5 static checks, `extractPlannedFiles` with multi-path idiom support ("Add `A` and `B`"), inbox/audit path exemptions, and stale-quote verification against real files.
+- `build/orchestrator/__tests__/living-plan-static-checks.test.ts` — 432-line test suite covering all five rules plus edge cases (Bun built-ins, type-only usage, default+named imports, planned-file allow-list, cross-feature isolation, inbox exemptions, bounded-retry exit-code contract, and wrapper template assertions).
+
+#### Changed
+
+- `build/SKILL.md.tmpl` — hoisted synthesizer dispatch into `_spawn_synthesizer` shell function, wrapped it in a `while true` bounded-retry loop with revision-prompt generation, added "Common defects to avoid" self-check list to the synthesizer instructions, and wired `staticViolations` into the retry report.
+- `build/SKILL.md` — regenerated from template (matching changes above).
+- `build/orchestrator/__tests__/monitor.test.ts` — added `buildStallThresholdMs` parameter support for stall-arm tests.
+
+#### Fixed
+
+- T3 false positives on real living plans — tightened `isFileLikePath` to reject shell commands, globs, variables, and URIs while preserving legitimate repo paths.
+- Multi-path "Add A and B" idiom — `extractPlannedFiles` now captures backtick-quoted paths joined by commas and "and" after a single verb.
+
+### For contributors
+
+- The validator exits 2 on static violations (same contract as the existing Origin-trace / Acceptance gate) so the shell wrapper enters the bounded-retry branch instead of treating it as fatal.
+- The `test:build-skill` test suite passes with 2359 pass / 0 fail across 112 files.
+- `build/orchestrator/test-runner-introspect.ts` — 307-line module with `extractTestCount()` supporting vitest, pytest, jest, bun, mocha, and go test. Parses both JSON output and stdout fallback patterns.
+- `build/orchestrator/__tests__/red-gate-runner-introspect.test.ts` — 296-line unit-test suite (T1-T16) covering JSON parsing, stdout fallback, edge cases, and runner detection.
+- `build/orchestrator/__tests__/red-gate-zero-tests-collected.test.ts` — unit tests for the zero-collection halt path (T8-T16), including suppression for non-coding phases and `audit-only` annotation.
+- `recordRedGateZeroTestsCollected` helper in `halt-event-helpers.ts` — emits `RED_GATE_ZERO_TESTS_COLLECTED` with the resolved test command embedded in the message.
+- `resolveTestCmdForPhase` wiring in `cli.ts` — resolves the effective test command for a phase and passes it through `applyResult` so the zero-collection detector knows what runner to introspect.
+
+#### Changed
+
+- `build/orchestrator/phase-runner.ts` — added `detectRunnerFromTestCmd`, `hasSuppressionAnnotation`, `resolveRedSpecCap`, and wired `extractTestCount` into the verify-red flow. Cap is 3 for zero-collection phases (preserves legacy behavior) and 1 for phases with actual tests (unless `GSTACK_BUILD_RED_LEGACY_CAP` is set).
+- `build/orchestrator/README.md` — documented `GSTACK_BUILD_RED_MAX_ITER=1` and the `GSTACK_BUILD_RED_LEGACY_CAP` deprecation override.
+- `build/SKILL.md.tmpl` — added polyglot-repo test-runner hint under phase-body instructions.
+- `build/SKILL.md` — regenerated from template (frontmatter version 1.29.0).
+
+### For contributors
+
+- `build/orchestrator/__tests__/coverage-matrix.test.ts` updated to own `test-runner-introspect.ts` → `red-gate-runner-introspect.test.ts`.
+## [1.40.7.6] - 2026-05-21
+
+**Recovery-boundary cleanup for PR8 Phase 2.** Adds an upgrade migration that scrubs old manual-recovery learned-pattern categories, records a single-line migration note, and surfaces `STATE_DRIFT:missing_completedAt` warnings when committed build-state features lack `completedAt`.
+
+### Changed
+
+- Added `gstack-upgrade/migrations/v1.40.7.6.sh` plus the TypeScript migration it runs.
+- Added load-time `STATE_DRIFT` warnings for malformed feature state without halting the build.
+- Added targeted tests for migration idempotency, fresh-install no-op behavior, and warning-only state drift.
+
+## [1.40.7.5] - 2026-05-21
+
+**Codex review prompt now tells the reviewer NOT to edit production code. Instead of "fix bugs as you find them," the prompt now says "if you find a bug, write a failing test that pins it; do NOT edit production source files." A DIFF SCOPE block at the end explicitly limits edits to test/spec paths. The hygiene gate also surfaces a clear "the constraint was in the prompt; reviewer edited production paths anyway" diagnostic when the reviewer ignores the rule, so investigators can tell confused-reviewer from real-bug.**
+
+This is PR2 of the tidy-haven plan — Feature 6 of the 83-fault recurrence program. Hand-shipped via the orchestrator (Kimi/Gemini auth preflight + watchdog auth detector from PR4-rest kept it from stalling); converged after 3 review iterations with the codex reviewer correctly catching its own first-attempt issues. The auto-built diff is 4 files, ~666 lines added, all in test paths plus the prompt + hygiene-diagnostic edits to `cli.ts`.
+
+### What changed for the user
+
+- Codex review iterations on `code` phases no longer treat "found a bug" as an invitation to edit production source. The reviewer now writes a failing test and surfaces the bug in its report as a recommended follow-up phase, exactly as the plan called for.
+- The hygiene gate's "left the working tree dirty" message now includes the diagnostic line "the constraint was in the prompt; reviewer edited production paths anyway" when the dirty files are outside the test-only DIFF SCOPE. Lets investigators tell a confused reviewer from a real production-code bug fast.
+- DIFF SCOPE block at the end of every review prompt: `test/**`, `**/__tests__/**`, `**/*.test.*`, `**/*.spec.*`, `**/conftest.py`, `**/spec/**`, plus committed data outputs. Edits to anything else fail the hygiene gate.
+
+### Itemized changes
+
+#### Added
+
+- `__tests__/review-prompt-scope.test.ts` — 13 unit tests covering the prompt content (DIFF SCOPE present, "do NOT edit production" wording present, every code/writing/experiment/research/manual kind has appropriate guidance), plus the hygiene-diagnostic gate.
+- `test/skill-e2e-review-prompt-scope.test.ts` — 148-line paid eval (ANTHROPIC_API_KEY required, ~$0.20/run) that hands a fixture branch (production bug + failing test) to the new review prompt and asserts the reviewer writes a `*.test.*` file rather than editing the production source. Wired into `test/helpers/touchfiles.ts` for diff-based selection.
+- Diagnostic line in `validatePostAgentHygiene` (cli.ts:2122) — when the dirty file set contains non-test paths AND the call site is the review gate, append "the constraint was in the prompt; reviewer edited production paths anyway" to the error message.
+
+#### Changed
+
+- `buildCodexReviewBody` in `cli.ts:4126` — replaced "Fix bugs as you find them (workspace-write sandbox is enabled)" with two new prompt items: (4) write a failing test for any bug; do NOT edit production source; (5) execute data-generation/corpus-driver scripts and commit their output. Existing items renumbered.
+- Appended DIFF SCOPE block to the end of the review prompt (after the numbered list) so it cannot be missed.
+
+### For contributors
+
+- The orchestrator built and shipped this PR autonomously (3 commits via Kimi + Gemini, converged after 3 codex review iterations). The `gemini-auth-preflight` + `auth-prompt-watchdog` shipped in v1.40.7.4 worked in the orchestrator's favor — no stalls from auth issues this build.
+- The paid E2E eval (`test/skill-e2e-review-prompt-scope.test.ts`) is the canonical regression check for this PR. Run it manually on any change to the review prompt before merging.
+
 ## [1.40.7.4] - 2026-05-21
 
 **Gemini and Codex now skip-or-stop before doing anything destructive. Auth preflight runs once per process — if `gemini auth status` (or `--version` fallback) returns non-zero, the orchestrator halts with a clear "run `gemini auth login`" message instead of letting the stalled subprocess silently burn 25 minutes of watchdog timeout. The stall-watchdog also matches an auth-prompt regex on stdout chunks and kills the child immediately on a match, so mid-build re-auth prompts never silently hang anymore. Gemini stdin defaults to closed, removing one more pre-stdin-prompt hang surface.**

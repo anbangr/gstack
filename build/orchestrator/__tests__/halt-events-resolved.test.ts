@@ -25,7 +25,7 @@ describe("emitHaltEventResolved", () => {
   test("T_HER1: writes minimal-shape JSON to pending-investigations/", () => {
     const skillFaults = path.join(tmp, "skill-faults");
     const ok = emitHaltEventResolved(
-      "MANUAL_RECOVERY_INVOKED:all:276ba8b1",
+      "RECOVERY_BOUNDARY:all:276ba8b1",
       "drain-faults",
       { queueDir: skillFaults },
     );
@@ -40,7 +40,7 @@ describe("emitHaltEventResolved", () => {
     );
     expect(content.event).toBe("SKILL_FAULT_RESOLVED");
     expect(content.runId).toBe("drain-faults");
-    expect(content.faultId).toBe("MANUAL_RECOVERY_INVOKED:all:276ba8b1");
+    expect(content.faultId).toBe("RECOVERY_BOUNDARY:all:276ba8b1");
     expect(typeof content.timestamp).toBe("string");
     // Should not contain extra HaltEvent fields like kind/severity/snapshot
     expect(content.kind).toBeUndefined();
@@ -78,7 +78,7 @@ describe("emitHaltEventResolved", () => {
 
     try {
       const ok = emitHaltEventResolved(
-        "MANUAL_RECOVERY_INVOKED:all:276ba8b1",
+        "RECOVERY_BOUNDARY:all:276ba8b1",
         "drain-faults",
         { queueDir: skillFaults },
       );

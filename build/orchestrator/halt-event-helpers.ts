@@ -138,7 +138,7 @@ export function recordRetryCapHit(
 }
 
 /**
- * Emit a MANUAL_RECOVERY_INVOKED audit event with investigate:false.
+ * Emit a RECOVERY_BOUNDARY audit event with investigate:false.
  *
  * Every manual-recovery cli entry point (drain-faults, mark-shipped,
  * --mark-phase-committed) calls this helper instead of emitting a raw
@@ -227,6 +227,21 @@ export function recordProviderAuthRequired(
   return emit(
     "PROVIDER_AUTH_REQUIRED",
     `${role}: ${evidence}`,
+    ctx,
+    state,
+    phaseIdx,
+  );
+}
+
+export function recordRedGateZeroTestsCollected(
+  state: BuildState,
+  phaseIdx: number,
+  testCmd: string,
+  ctx: HelperContext,
+): string {
+  return emit(
+    "RED_GATE_ZERO_TESTS_COLLECTED",
+    `verify-red exited 0 but collected 0 tests. Resolved test command: ${testCmd}. Did you forget \`<!-- testCmd: -->\`?`,
     ctx,
     state,
     phaseIdx,
@@ -593,7 +608,7 @@ export function planProviderRetry(input: {
   }
 }
 
-export function emitManualRecoveryInvoked(opts: {
+export function emitRecoveryBoundary(opts: {
   runId: string;
   stateSlug: string;
   message: string;
@@ -604,10 +619,10 @@ export function emitManualRecoveryInvoked(opts: {
 }): string {
   return emitHaltEvent(
     {
-      kind: "MANUAL_RECOVERY_INVOKED",
+      kind: "RECOVERY_BOUNDARY",
       runId: opts.runId,
       stateSlug: opts.stateSlug,
-      severity: severityFor("MANUAL_RECOVERY_INVOKED"),
+      severity: severityFor("RECOVERY_BOUNDARY"),
       message: opts.message,
       investigate: false,
       pointers: opts.pointers,

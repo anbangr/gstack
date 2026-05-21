@@ -82,7 +82,7 @@
   },
   "limits": {
     "codexMaxIterations": 10,
-    "redSpecMaxIterations": 3,
+    "redSpecMaxIterations": 1,
     "testMaxIterations": 5,
     "originVerificationMaxIterations": 3,
     "featureReviewMaxIterations": 3
