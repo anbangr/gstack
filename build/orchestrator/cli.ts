@@ -280,6 +280,59 @@ let visiblePlanProjection: {
   singleBranch?: boolean;
 } | null = null;
 
+/**
+ * Mark the visible plan projection as archived: any subsequent saveState
+ * call short-circuits the gate-visibility reconcile path. Called in two
+ * places in the success branch of main() — once before archiveLivingPlan
+ * moves the file out from under the reconciler, and once defensively in
+ * the finally block. Exported so the regression test (B-T1) can drive
+ * the same shutdown sequence the production code follows.
+ */
+export function markVisiblePlanArchived(): void {
+  visiblePlanProjection = null;
+}
+
+/**
+ * Read-side accessor for the projection — exported solely for tests that
+ * need to verify (a) it was non-null before the archive step and (b) it
+ * is null after. Production code never reads it through this accessor.
+ */
+export function _getVisiblePlanProjectionForTests(): unknown {
+  return visiblePlanProjection;
+}
+
+/**
+ * Set-side accessor for the projection — exported solely for tests that
+ * need to set up a realistic shutdown scenario (visiblePlanProjection
+ * pointing at a real plan file, then archive, then saveState). Production
+ * code sets visiblePlanProjection directly inside main().
+ */
+export function _setVisiblePlanProjectionForTests(
+  projection: {
+    planFile: string;
+    features: Feature[];
+    phases: Phase[];
+    skipShip?: boolean;
+    dryRun?: boolean;
+    singleBranch?: boolean;
+  } | null,
+): void {
+  visiblePlanProjection = projection;
+}
+
+/**
+ * Test-only invocation of saveState. Exported solely so B-T1 can prove
+ * that after markVisiblePlanArchived(), calling saveState (which is what
+ * the production shutdown sequence does) is a no-op for the gate-visibility
+ * reconcile path. Production callers use saveState directly inside main().
+ */
+export function _saveStateForTests(
+  state: BuildState,
+  log?: (msg: string) => void,
+): void {
+  saveState(state, { noGbrain: true, log });
+}
+
 function saveState(
   state: BuildState,
   opts: { noGbrain?: boolean; log?: (msg: string) => void } = {},
@@ -11185,11 +11238,11 @@ async function main() {
         // saveState() invokes reconcileVisiblePlanState which reads
         // visiblePlanProjection.planFile (set once at parsePlan time with
         // the inbox/living-plan path). archiveLivingPlan moves that file
-        // to archived/, so the very next saveState would ENOENT. Nulling
-        // the projection makes that reconcile path a no-op for the rest
-        // of shutdown. The finally block also clears it as a belt-and-
-        // suspenders guard against test/import leakage.
-        visiblePlanProjection = null;
+        // to archived/, so the very next saveState would ENOENT. Marking
+        // the projection as archived makes that reconcile path a no-op
+        // for the rest of shutdown. The finally block also clears it as
+        // a belt-and-suspenders guard against test/import leakage.
+        markVisiblePlanArchived();
         const archivedPath = archiveLivingPlan(state.planFile);
         if (archivedPath) {
           state.planFile = archivedPath;
@@ -11206,12 +11259,12 @@ async function main() {
     }
   } finally {
     // Belt-and-suspenders for the gate-visibility reconcile race: even if
-    // shutdown hit the failure branch (so the success-path null at line
-    // ~11183 didn't run), make sure no further saveState calls trigger a
-    // stale-path reconcile. Module-level visiblePlanProjection persists
-    // across imports — clearing it here also prevents leakage into the
-    // next test that imports this module.
-    visiblePlanProjection = null;
+    // shutdown hit the failure branch (so the success-path mark didn't
+    // run), make sure no further saveState calls trigger a stale-path
+    // reconcile. Module-level visiblePlanProjection persists across
+    // imports — clearing it here also prevents leakage into the next
+    // test that imports this module.
+    markVisiblePlanArchived();
     // Uninstall the wrapConsole shim FIRST so registry / lock cleanup
     // warnings below go through the real console.warn (not the wrapped
     // version, which would queue them as halt events on a run that's

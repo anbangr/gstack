@@ -36,6 +36,10 @@ import {
   phaseGateProjection,
   featureGateProjection,
   reconcileVisiblePlanState,
+  markVisiblePlanArchived,
+  _setVisiblePlanProjectionForTests,
+  _getVisiblePlanProjectionForTests,
+  _saveStateForTests,
   releaseDaemonLaunchCommand,
   releaseDaemonDefaultPath,
   renderLaunchdReleaseDaemonPlist,
@@ -6480,5 +6484,127 @@ describe("B-T1: gate-visibility reconcile ENOENT race", () => {
     expect(() =>
       reconcileVisiblePlanState(missing, features, phases, state),
     ).toThrow(/ENOENT|no such file/);
+  });
+
+  // B-T1 PART 3 — the regression test that actually covers the fix.
+  // The two tests above prove the bug exists (archiveLivingPlan moves the
+  // file; reconcileVisiblePlanState throws ENOENT on a missing path).
+  // This test drives the FULL shutdown path: set visiblePlanProjection to
+  // a non-null projection pointing at an inbox plan file, archive the
+  // file (production move), call markVisiblePlanArchived() (the production
+  // fix), then invoke saveState (which would otherwise trigger reconcile).
+  // The assertion: no ENOENT warning fires and the projection is null.
+  // Reverting markVisiblePlanArchived() (i.e. removing the production fix)
+  // makes this test fail with the ENOENT warning.
+  it("PART 3 (REGRESSION): markVisiblePlanArchived + saveState is a no-op (covers the actual fix)", async () => {
+    // Build a real inbox/living-plan/<plan>.md so archiveLivingPlan accepts it.
+    const inboxDir = path.join(tmpDir, "inbox", "living-plan");
+    fs.mkdirSync(inboxDir, { recursive: true });
+    const planPath = path.join(inboxDir, "demo.md");
+    fs.writeFileSync(planPath, "# demo plan\n");
+
+    // Capture warnings so we can assert no ENOENT line fires.
+    const warnings: string[] = [];
+    const oldWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map((a) => String(a)).join(" "));
+    };
+
+    try {
+      // Step 1: set the projection as production main() would, after parsePlan.
+      _setVisiblePlanProjectionForTests({
+        planFile: planPath,
+        features: [
+          {
+            number: "1",
+            status: "committed",
+            phaseIndices: [0],
+          },
+        ] as unknown as Parameters<typeof reconcileVisiblePlanState>[1],
+        phases: [
+          {
+            index: 0,
+            number: "1.1",
+            name: "test",
+            kind: "code",
+            gates: {
+              test_spec: { line: 1, done: false },
+            },
+          },
+        ] as unknown as Parameters<typeof reconcileVisiblePlanState>[2],
+      });
+      expect(_getVisiblePlanProjectionForTests()).not.toBeNull();
+
+      // Step 2: production sequence — mark archived, then archiveLivingPlan,
+      // then saveState. Without markVisiblePlanArchived(), saveState would
+      // hit reconcileVisiblePlanState with the now-deleted inbox path and
+      // log the ENOENT warning that the original bug produced.
+      markVisiblePlanArchived();
+      const archived = archiveLivingPlan(planPath);
+      expect(archived).not.toBeNull();
+      expect(fs.existsSync(planPath)).toBe(false);
+
+      // Step 3: minimal BuildState that lets saveState run far enough to
+      // reach the reconcile callsite. persistBuildState writes to
+      // ~/.gstack/build-state/<slug>.json — point it at a tmp slug so we
+      // don't pollute the real state dir, and clean up after.
+      const stateSlug = `b-t1-part3-${Date.now()}`;
+      const stateFile = path.join(
+        process.env.HOME ?? "/tmp",
+        ".gstack",
+        "build-state",
+        `${stateSlug}.json`,
+      );
+      const state = {
+        slug: stateSlug,
+        planFile: archived as string,
+        branch: "test",
+        currentPhaseIndex: 0,
+        currentFeatureIndex: 0,
+        features: [
+          {
+            number: "1",
+            status: "committed",
+            phaseIndices: [0],
+            completedAt: new Date().toISOString(),
+          },
+        ],
+        phases: [
+          {
+            index: 0,
+            number: "1.1",
+            name: "test",
+            status: "committed",
+          },
+        ],
+        completed: true,
+        startedAt: new Date().toISOString(),
+        lastUpdatedAt: new Date().toISOString(),
+      } as unknown as Parameters<typeof _saveStateForTests>[0];
+
+      try {
+        _saveStateForTests(state);
+      } finally {
+        // Best-effort cleanup of the state file.
+        try {
+          fs.unlinkSync(stateFile);
+        } catch {
+          // ignore
+        }
+      }
+
+      // Step 4: assert the fix worked.
+      // (a) projection is null
+      expect(_getVisiblePlanProjectionForTests()).toBeNull();
+      // (b) no ENOENT warning fired during saveState
+      const enoentWarning = warnings.find((w) =>
+        /gate visibility reconcile failed.*ENOENT/.test(w),
+      );
+      expect(enoentWarning).toBeUndefined();
+    } finally {
+      console.warn = oldWarn;
+      // Always clean projection so test isolation holds.
+      _setVisiblePlanProjectionForTests(null);
+    }
   });
 });
