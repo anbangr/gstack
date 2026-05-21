@@ -58,3 +58,9 @@ describe("parseCodexLine", () => {
     assertRow("codex", parseCodexLine);
   });
 });
+
+describe("parseGeminiLine", () => {
+  it("matches the golden fixture", () => {
+    assertRow("gemini", parseGeminiLine);
+  });
+});

@@ -1,0 +1,10 @@
+{
+  "comment": "Gemini emits 'Tool: <name>' lines. v1 parser emits TOOL_START only; TOOL_END is inferred at the watchdog level.",
+  "rows": [
+    { "lineIndex": 0, "expected": null },
+    { "lineIndex": 3, "expected": { "event": "TOOL_START", "tool": "Read", "bucket": "fast" } },
+    { "lineIndex": 5, "expected": null },
+    { "lineIndex": 6, "expected": { "event": "TOOL_START", "tool": "Write", "bucket": "fast" } },
+    { "lineIndex": 8, "expected": null }
+  ]
+}

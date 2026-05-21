@@ -40,11 +40,39 @@ function bucketFor(tool: string): ToolBucket | null {
   return TOOL_BUCKET[tool] ?? null;
 }
 
+/**
+ * Gemini prose-mode markers. Today's `gemini --yolo` emits:
+ *   Tool: <snake_name>
+ *     path: ...
+ *   Tool finished.
+ * The TOOL_END line ("Tool finished.") carries NO tool name, so a pure
+ * single-line parser can't emit a meaningful TOOL_END from it. v1
+ * compromise: emit TOOL_START only; the watchdog infers end-of-tool
+ * when the next TOOL_START arrives or the stall window closes. This
+ * keeps the parser pure.
+ */
+const GEMINI_TOOL_MAP: Record<string, string> = {
+  read_file: "Read",
+  write_file: "Write",
+  edit_file: "Edit",
+  grep: "Grep",
+  glob: "Glob",
+  run_shell_command: "Bash",
+  web_fetch: "WebFetch",
+  web_search: "WebSearch",
+};
+
 export function parseGeminiLine(
-  _line: string,
-  _now: number,
+  line: string,
+  now: number,
 ): ProgressEvent | null {
-  return null;
+  const m = /^Tool: (\w+)/.exec(line);
+  if (!m) return null;
+  const canonical = GEMINI_TOOL_MAP[m[1]];
+  if (!canonical) return null;
+  const bucket = bucketFor(canonical);
+  if (bucket === null) return null;
+  return { event: "TOOL_START", tool: canonical, bucket, ts: now };
 }
 
 /**

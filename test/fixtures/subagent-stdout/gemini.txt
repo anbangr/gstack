@@ -1,0 +1,10 @@
+Gemini CLI 0.4.2
+working dir: /tmp/example
+> Read instructions at /tmp/example/input.md
+Tool: read_file
+  path: /tmp/example/input.md
+Tool finished.
+Tool: write_file
+  path: /tmp/example/output.md
+Tool finished.
+> done
