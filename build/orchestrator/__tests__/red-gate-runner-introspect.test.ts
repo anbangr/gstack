@@ -100,7 +100,7 @@ describe("extractTestCount — T1-T7 core cases", () => {
     const stdout = "PASS\nok      github.com/example/pkg  0.123s\n";
     const result = extractTestCount({ stdout }, "go");
     expect(result.source).toBe("stdout-fallback");
-    expect(typeof result.collected).toBe("number");
+    expect(result.collected).toBeGreaterThanOrEqual(1);
   });
 
   // T7: unrecognized runner
@@ -181,6 +181,71 @@ describe("extractTestCount — edge cases", () => {
       source: "json",
     });
     expect(fs.existsSync(jsonPath)).toBe(false);
+  });
+
+  test("edge: pytest-json-report top-level summary JSON is parsed", () => {
+    const jsonPath = path.join(tmp, "pytest-report.json");
+    fs.writeFileSync(
+      jsonPath,
+      JSON.stringify({
+        created: 1518371686.7981803,
+        duration: 0.12,
+        exitcode: 1,
+        summary: {
+          collected: 10,
+          passed: 2,
+          failed: 3,
+          error: 2,
+          skipped: 1,
+          total: 10,
+        },
+      }),
+    );
+
+    const result = extractTestCount(
+      { stdout: "", jsonReportPath: jsonPath },
+      "pytest",
+    );
+
+    expect(result).toEqual({
+      collected: 10,
+      passed: 2,
+      failed: 5,
+      source: "json",
+    });
+  });
+
+  test("edge: mocha fallback counts failing tests in the collection total", () => {
+    const stdout = "\n  2 passing (42ms)\n  1 failing\n\n";
+    const result = extractTestCount({ stdout }, "mocha");
+    expect(result).toEqual({
+      collected: 3,
+      passed: 2,
+      failed: 1,
+      source: "stdout-fallback",
+    });
+  });
+
+  test("edge: go test package failure without -v is counted as a failed run", () => {
+    const stdout = "FAIL    github.com/example/pkg  0.123s\n";
+    const result = extractTestCount({ stdout }, "go");
+    expect(result).toEqual({
+      collected: 1,
+      passed: 0,
+      failed: 1,
+      source: "stdout-fallback",
+    });
+  });
+
+  test("edge: go test package with no test files keeps collected at zero", () => {
+    const stdout = "?       github.com/example/pkg  [no test files]\n";
+    const result = extractTestCount({ stdout }, "go");
+    expect(result).toEqual({
+      collected: 0,
+      passed: 0,
+      failed: 0,
+      source: "stdout-fallback",
+    });
   });
 
   test("edge: vitest skips invalid brace-like stdout before JSON", () => {

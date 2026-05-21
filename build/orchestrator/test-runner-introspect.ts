@@ -36,6 +36,29 @@ function numberField(record: Record<string, unknown>, key: string): number {
   return typeof value === "number" ? value : 0;
 }
 
+function objectField(
+  record: Record<string, unknown>,
+  key: string,
+): Record<string, unknown> | undefined {
+  const value = record[key];
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function countSummary(summary: Record<string, unknown>): TestCountResult {
+  const passed = numberField(summary, "passed");
+  const failed =
+    numberField(summary, "failed") + numberField(summary, "error");
+  return {
+    collected:
+      numberField(summary, "collected") || numberField(summary, "total"),
+    passed,
+    failed,
+    source: "json",
+  };
+}
+
 /** Find the first parseable line that looks like a JSON object ({...}). */
 function findJsonObjectLine(stdout: string): Record<string, unknown> | undefined {
   const lines = stdout.split(/\r?\n/);
@@ -68,22 +91,12 @@ function parsePytestJson(jsonPath: string): TestCountResult | null {
   try {
     const raw = fs.readFileSync(jsonPath, "utf-8");
     const data = safeParseJson(raw);
-    if (
-      data &&
-      typeof data === "object" &&
-      data.report &&
-      typeof data.report === "object" &&
-      (data.report as Record<string, unknown>).summary &&
-      typeof (data.report as Record<string, unknown>).summary === "object"
-    ) {
-      const summary = (data.report as Record<string, unknown>)
-        .summary as Record<string, unknown>;
-      return {
-        collected: numberField(summary, "collected"),
-        passed: numberField(summary, "passed"),
-        failed: numberField(summary, "failed"),
-        source: "json",
-      };
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      const report = data as Record<string, unknown>;
+      const summary =
+        objectField(report, "summary") ||
+        objectField(objectField(report, "report") || {}, "summary");
+      if (summary) return countSummary(summary);
     }
   } catch {
     // fall through
@@ -135,30 +148,44 @@ function parseBunCoverageJson(coveragePath: string): TestCountResult | null {
 // --- stdout fallback regex parsers ---
 
 function parseMochaStdout(stdout: string): TestCountResult {
-  const m = stdout.match(/(\d+)\s+passing/);
-  const collected = m ? parseInt(m[1], 10) : 0;
+  const passing = stdout.match(/(\d+)\s+passing/);
+  const failing = stdout.match(/(\d+)\s+failing/);
+  const passed = passing ? parseInt(passing[1], 10) : 0;
+  const failed = failing ? parseInt(failing[1], 10) : 0;
   return {
-    collected,
-    passed: collected,
-    failed: 0,
+    collected: passed + failed,
+    passed,
+    failed,
     source: "stdout-fallback",
   };
 }
 
 function parseGoStdout(stdout: string): TestCountResult {
-  // Best-effort: count "PASS" lines or lines with test names.
-  // If we see "PASS" or "ok", signal that tests ran.
   const lines = stdout.split(/\r?\n/);
   let collected = 0;
+  let failed = 0;
+  let sawPackageResult = false;
+  let sawFailedPackageResult = false;
   for (const line of lines) {
     // e.g. "--- PASS: TestFoo (0.01s)"
     const m = line.match(/^---\s+(PASS|FAIL):\s+\S+/);
-    if (m) collected++;
+    if (m) {
+      collected++;
+      if (m[1] === "FAIL") failed++;
+    }
+    if (/^(ok|FAIL)\s+\S+/.test(line) && !/\[no test files\]/.test(line)) {
+      sawPackageResult = true;
+      if (line.startsWith("FAIL")) sawFailedPackageResult = true;
+    }
+  }
+  if (collected === 0 && sawPackageResult) {
+    collected = 1;
+    failed = sawFailedPackageResult ? 1 : 0;
   }
   return {
     collected,
-    passed: collected,
-    failed: 0,
+    passed: Math.max(0, collected - failed),
+    failed,
     source: "stdout-fallback",
   };
 }
@@ -168,10 +195,15 @@ function parsePytestStdout(stdout: string): TestCountResult {
   const collectedMatch = stdout.match(/collected\s+(\d+)\s+item/);
   const passedMatch = stdout.match(/(\d+)\s+passed/);
   const failedMatch = stdout.match(/(\d+)\s+failed/);
+  const errorMatch = stdout.match(/(\d+)\s+error/);
+  const passed = passedMatch ? parseInt(passedMatch[1], 10) : 0;
+  const failed =
+    (failedMatch ? parseInt(failedMatch[1], 10) : 0) +
+    (errorMatch ? parseInt(errorMatch[1], 10) : 0);
   return {
-    collected: collectedMatch ? parseInt(collectedMatch[1], 10) : (passedMatch ? parseInt(passedMatch[1], 10) : 0),
-    passed: passedMatch ? parseInt(passedMatch[1], 10) : 0,
-    failed: failedMatch ? parseInt(failedMatch[1], 10) : 0,
+    collected: collectedMatch ? parseInt(collectedMatch[1], 10) : passed + failed,
+    passed,
+    failed,
     source: "stdout-fallback",
   };
 }
@@ -189,13 +221,18 @@ function parseBunStdout(stdout: string): TestCountResult {
 }
 
 function parseVitestStdout(stdout: string): TestCountResult {
-  // e.g. "Test Files  2 passed (2)"
-  const m = stdout.match(/Tests?\s+(\d+)\s+passed/);
-  const collected = m ? parseInt(m[1], 10) : 0;
+  // e.g. "Tests  1 failed | 2 passed (3)"
+  const summary = stdout.match(/Tests?\s+([^\n]+)/);
+  const passedMatch = summary?.[1]?.match(/(\d+)\s+passed/);
+  const failedMatch = summary?.[1]?.match(/(\d+)\s+failed/);
+  const totalMatch = summary?.[1]?.match(/\((\d+)\)/);
+  const passed = passedMatch ? parseInt(passedMatch[1], 10) : 0;
+  const failed = failedMatch ? parseInt(failedMatch[1], 10) : 0;
+  const collected = totalMatch ? parseInt(totalMatch[1], 10) : passed + failed;
   return {
     collected,
-    passed: collected,
-    failed: 0,
+    passed,
+    failed,
     source: "stdout-fallback",
   };
 }
