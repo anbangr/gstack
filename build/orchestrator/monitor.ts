@@ -106,6 +106,15 @@ interface MonitorRunSnapshot {
   lastUpdatedAtMs: number | null;
   recentProcessActivity: boolean;
   stale: boolean;
+  /**
+   * How long the orchestrator's progress signals (state.lastUpdatedAt +
+   * drainProcessedCount, read from the heartbeat sidecar) have been frozen,
+   * in ms. `null` when no sidecar is available or trust gate failed —
+   * monitor falls back to the existing decision tree in that case. A
+   * positive value above the configured threshold triggers the new
+   * USER_ACTION_REQUIRED stall arm.
+   */
+  heartbeatStalledMs: number | null;
 }
 
 export interface MonitorOnceOptions {
@@ -123,6 +132,19 @@ export interface MonitorOnceOptions {
    * Per-runId file: `<dir>/<safeRunId>.json`. Atomic tmp+rename writes.
    */
   activeFaultRegistryDir?: string;
+  /**
+   * Optional path to the gstack-config binary. When set, monitor reads the
+   * `build_stall_threshold_ms` knob to override the default 15-min stall
+   * threshold. Pattern matches drain-faults.ts's `fault_investigator_model`
+   * read. Tests can pass an empty/undefined value to force the default.
+   */
+  gstackConfigBin?: string;
+  /**
+   * Override the build stall threshold directly, bypassing gstack-config.
+   * Test-only escape hatch — production callers should set gstackConfigBin
+   * (or rely on the default).
+   */
+  buildStallThresholdMs?: number;
 }
 
 export interface MonitorEvaluation {
@@ -359,6 +381,172 @@ function readContextSaveCount(filePath: string): number {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Heartbeat sidecar + per-run stall tracker
+// ---------------------------------------------------------------------------
+//
+// Background: the existing decision tree at the bottom of evaluateMonitorOnce
+// treats `recentProcessActivity` (stdoutLog mtime touched within 3*pollMs) as
+// "the orchestrator is alive, give it more time". heartbeat.ts writes a JSON
+// line to stdout every 30s, which keeps stdoutLog mtime fresh even when the
+// orchestrator is wedged inside a long await. That created the false-alive
+// bug (auto-drain hung for 47 minutes, monitor never escalated).
+//
+// Fix shape (plan v1.40.7.0, codex-revised):
+//   1. heartbeat.ts writes a per-run sidecar `<stateDir>/<slug>.heartbeat.json`
+//      carrying state.lastUpdatedAt + drainProcessedCount + runId + pid.
+//   2. The monitor reads that sidecar, gates trust on runId+pid matching the
+//      run it's evaluating (PID reuse defense), and persists a per-run tracker
+//      file recording when the progress signals last changed.
+//   3. When pidAlive AND recentProcessActivity AND (now - tracker.lastChangedAt)
+//      exceeds the configured threshold, the monitor escalates instead of
+//      logging "waiting for state update" indefinitely.
+//
+// All read/write is best-effort: a missing sidecar, malformed JSON, or
+// disk write failure leaves the monitor falling back to its pre-fix
+// behavior (existing decision tree, no new silent failure mode).
+
+interface HeartbeatSidecar {
+  ts: string;
+  runId: string;
+  pid: number;
+  stateSlug: string;
+  phase?: number;
+  stateLastUpdatedAt?: string;
+  drainProcessedCount?: number;
+}
+
+interface HeartbeatTracker {
+  lastSeenStateLastUpdatedAt?: string;
+  lastSeenDrainProcessedCount?: number;
+  /** Wall-clock ms when either of the tracked signals last changed. */
+  lastChangedAt: number;
+}
+
+const DEFAULT_BUILD_STALL_THRESHOLD_MS = 15 * 60 * 1000;
+
+function heartbeatSidecarPath(stateDir: string, stateSlug: string): string {
+  return path.join(stateDir, `${stateSlug}.heartbeat.json`);
+}
+
+function heartbeatTrackerPath(stateDir: string, stateSlug: string): string {
+  return path.join(stateDir, `${stateSlug}.heartbeat-track.json`);
+}
+
+function readHeartbeatSidecar(
+  filePath: string,
+  expectedRunId: string,
+  expectedPid: number | null,
+): HeartbeatSidecar | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return null;
+  }
+  let parsed: HeartbeatSidecar;
+  try {
+    parsed = JSON.parse(raw) as HeartbeatSidecar;
+  } catch {
+    return null;
+  }
+  // Trust gate: a stale sidecar from a crashed prior run on the same slug
+  // (PID got reused, cleanup failed, etc.) must NOT be treated as fresh.
+  // Mismatched runId or pid → null the sidecar; the monitor falls back to
+  // the existing recentProcessActivity branch.
+  if (parsed.runId !== expectedRunId) return null;
+  if (expectedPid != null && parsed.pid !== expectedPid) return null;
+  return parsed;
+}
+
+function readHeartbeatTracker(filePath: string): HeartbeatTracker | null {
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw) as HeartbeatTracker;
+    if (!Number.isFinite(parsed.lastChangedAt)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeHeartbeatTracker(
+  filePath: string,
+  tracker: HeartbeatTracker,
+): void {
+  try {
+    const tmp = `${filePath}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(tracker), { mode: 0o600 });
+    fs.renameSync(tmp, filePath);
+  } catch {
+    // Best-effort. If the tracker write fails the monitor regresses to
+    // its existing behavior on this tick — i.e. no new silent failure mode.
+  }
+}
+
+function readBuildStallThresholdMs(gstackConfigBin?: string): number {
+  // No binary configured: default. Skip the spawn entirely.
+  if (!gstackConfigBin) return DEFAULT_BUILD_STALL_THRESHOLD_MS;
+  try {
+    const result = spawnSync(gstackConfigBin, ["get", "build_stall_threshold_ms"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 3000,
+    });
+    if (result.status === 0 && typeof result.stdout === "string") {
+      const parsed = Number(result.stdout.trim());
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+  } catch {
+    // Fall through to default.
+  }
+  return DEFAULT_BUILD_STALL_THRESHOLD_MS;
+}
+
+/**
+ * Read the per-run heartbeat sidecar, compare against the prior tick's
+ * tracker, and return how long the orchestrator's progress signals have
+ * been frozen (in ms). Updates the tracker on disk whenever either signal
+ * has moved since the prior poll.
+ *
+ * Returns:
+ *   - `null` when the sidecar is missing, malformed, or fails the
+ *     runId+pid trust gate. Caller treats null as "no signal this tick"
+ *     and falls back to the existing recentProcessActivity branch.
+ *   - `0` when the sidecar shows progress on this poll vs the tracker.
+ *   - A positive ms value when both signals are frozen vs the tracker —
+ *     this is the number the stall threshold is compared against.
+ */
+export function evaluateHeartbeatStall(
+  stateDir: string,
+  run: BuildRunManifestRun,
+  pid: number | null,
+  nowMs: number,
+): { sidecar: HeartbeatSidecar | null; stalledMs: number | null } {
+  const sidecarPath = heartbeatSidecarPath(stateDir, run.stateSlug);
+  const sidecar = readHeartbeatSidecar(sidecarPath, run.runId, pid);
+  if (!sidecar) return { sidecar: null, stalledMs: null };
+
+  const trackerPath = heartbeatTrackerPath(stateDir, run.stateSlug);
+  const tracker = readHeartbeatTracker(trackerPath);
+
+  const moved =
+    !tracker ||
+    sidecar.stateLastUpdatedAt !== tracker.lastSeenStateLastUpdatedAt ||
+    sidecar.drainProcessedCount !== tracker.lastSeenDrainProcessedCount;
+
+  if (moved || !tracker) {
+    writeHeartbeatTracker(trackerPath, {
+      lastSeenStateLastUpdatedAt: sidecar.stateLastUpdatedAt,
+      lastSeenDrainProcessedCount: sidecar.drainProcessedCount,
+      lastChangedAt: nowMs,
+    });
+    return { sidecar, stalledMs: 0 };
+  }
+
+  return { sidecar, stalledMs: Math.max(0, nowMs - tracker.lastChangedAt) };
+}
+
 function readRunSnapshot(
   run: BuildRunManifestRun,
   pollMs: number,
@@ -393,10 +581,20 @@ function readRunSnapshot(
     fileMtimeMs(run.pidFile),
     fileMtimeMs(run.stdoutLog),
   ].some((mtime) => mtime != null && now.getTime() - mtime < staleWindowMs);
+  // Heartbeat sidecar stall detection (plan v1.40.7.0 §Change 2). Tracker
+  // file written here so the per-poll comparison persists across monitor
+  // restarts — evaluateMonitorOnce itself is stateless.
+  const stateDir = path.dirname(stateFile);
+  const heartbeatResult = evaluateHeartbeatStall(
+    stateDir,
+    run,
+    pid,
+    now.getTime(),
+  );
   return {
     run,
     stateFile,
-    stateDir: path.dirname(stateFile),
+    stateDir,
     state,
     stateError,
     pid,
@@ -414,6 +612,7 @@ function readRunSnapshot(
     stale:
       lastUpdatedAtMs != null &&
       now.getTime() - lastUpdatedAtMs >= staleWindowMs,
+    heartbeatStalledMs: heartbeatResult.stalledMs,
   };
 }
 
@@ -617,6 +816,8 @@ export function evaluateMonitorOnce(
   const pollMs = opts.pollMs ?? 60_000;
   const skillFaultEvents: SkillFaultEvent[] = [];
   const registryDir = opts.activeFaultRegistryDir;
+  const buildStallThresholdMs =
+    opts.buildStallThresholdMs ?? readBuildStallThresholdMs(opts.gstackConfigBin);
   try {
     const manifest = loadMonitorManifest(opts.manifestPath);
     const events: MonitorEvent[] = [];
@@ -844,6 +1045,34 @@ export function evaluateMonitorOnce(
       if (snapshot.stale) {
         if (snapshot.pidAlive || snapshot.registryPidAlive) {
           if (snapshot.recentProcessActivity) {
+            // New stall arm (plan v1.40.7.0 §Change 2). The heartbeat ticker
+            // keeps stdoutLog mtime fresh whether or not the orchestrator is
+            // making progress, so recentProcessActivity alone can no longer
+            // be trusted to mean "actually doing work". When the per-run
+            // heartbeat sidecar reports BOTH state.lastUpdatedAt AND
+            // drainProcessedCount frozen for >buildStallThresholdMs, we
+            // escalate. When the sidecar is unavailable (missing, malformed,
+            // runId/pid mismatch) we fall through to the existing
+            // "waiting for state update" branch — i.e. regress to the
+            // pre-fix behavior, no new silent failure mode.
+            if (
+              snapshot.heartbeatStalledMs != null &&
+              snapshot.heartbeatStalledMs > buildStallThresholdMs
+            ) {
+              const minutes = Math.round(snapshot.heartbeatStalledMs / 60_000);
+              const terminalEvent = runEvent(
+                "USER_ACTION_REQUIRED",
+                snapshot,
+                `orchestrator process alive but state has not advanced for ${minutes} minutes`,
+                now,
+              );
+              return {
+                manifest,
+                events: [...events, terminalEvent],
+                skillFaultEvents,
+                terminalEvent,
+              };
+            }
             events.push(
               runEvent(
                 "RUN_RUNNING",
