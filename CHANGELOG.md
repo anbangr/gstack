@@ -222,6 +222,18 @@ These are projections from the bundle-1 case study (real production build, 4 rou
 - Layer 4 E2E in `test/skill-e2e-build-convergence.test.ts` (gate tier, ~$0.50/run with real Codex)
 - Design spec: [docs/superpowers/specs/2026-05-19-build-plan-review-convergence-design.md](docs/superpowers/specs/2026-05-19-build-plan-review-convergence-design.md)
 
+## [1.40.6.0] - 2026-05-21
+
+**New `measure-halt-recurrence` script computes 7-day halt-recurrence baselines per category.**
+
+Reads `~/.gstack/skill-faults/learned-patterns.json`, sums `hitCount` per category within a rolling 7-day window, and writes a dated baseline JSON file to `~/.gstack/halt-recurrence-baseline-YYYY-MM-DD.json`. Run via `bun run measure-halt-recurrence`.
+
+### Added
+
+- `scripts/measure-halt-recurrence.ts` — core aggregation logic with typed interfaces (`LearnedPattern`, `PerCategoryResult`, `BaselineResult`), 7-day rolling window filter, and per-category hit summation with most-recent `lastHit` tracking.
+- `build/orchestrator/__tests__/measure-halt-recurrence.test.ts` — 12 tests covering empty input, single/multi-category aggregation, 7-day window exclusion, missing `hitCount`/`lastHit` edge cases, daylight-saving UTC boundary, output filename format, and idempotency.
+- `package.json` script alias `measure-halt-recurrence` for one-command execution.
+
 ## [1.40.5.0] - 2026-05-20
 
 **`gstack-build drain-faults --queue` no longer self-enqueues. Manual-recovery audit events short-circuit instead of paying codex (~$0.30) to investigate the recovery sink invoking itself.**
