@@ -129,13 +129,23 @@ function ensureStateDir(): void {
 }
 
 function migrateState(state: BuildState): BuildState {
-  state.phases = state.phases.map((ph) =>
-    (ph.status as string) === "gemini_done"
+  state.phases = state.phases.map((ph) => {
+    // PR1b: backfill iterationsSuccessful from iterations for state files
+    // written before the field existed. Done in-place on each phase.
+    if (ph.codexReview && ph.codexReview.iterationsSuccessful === undefined) {
+      ph.codexReview.iterationsSuccessful = ph.codexReview.iterations;
+    }
+    // PR1b: backfill providerRetryAttempts to 0 so the session cap starts
+    // counting from a known baseline.
+    if (ph.providerRetryAttempts === undefined) {
+      ph.providerRetryAttempts = 0;
+    }
+    return (ph.status as string) === "gemini_done"
       ? { ...ph, status: "impl_done" }
       : (ph.status as string) === "done"
         ? { ...ph, status: "committed" }
-        : ph,
-  );
+        : ph;
+  });
   state.roleConfigs = migrateLegacyModels(state);
   if (!state.features) {
     state.features = [
