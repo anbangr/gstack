@@ -1484,91 +1484,91 @@ prior commit.
    Return ONLY the path $BUILD_TMP_DIR/build-synthesis-output.md. No narrative.
    ```
 
-   Spawn (provider/model read from configure.cm `planSynthesizer` role):
+   Spawn with a bounded structural-gate retry loop (provider/model read from
+   configure.cm `planSynthesizer` role):
    ```bash
    _SYNTH_PROVIDER=$(jq -r '.roles.planSynthesizer.provider // empty' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
    _SYNTH_MODEL=$(jq -r '.roles.planSynthesizer.model // empty' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
    ```
    If `_SYNTH_PROVIDER` or `_SYNTH_MODEL` is empty, STOP — configure.cm is missing or malformed.
    ```bash
-   case "$_SYNTH_PROVIDER" in
-     gemini)
-       gemini -p "Read synthesis instructions at $BUILD_TMP_DIR/build-synthesis-input.md. Read the source plan. Write the living plan. Write the summary to $BUILD_TMP_DIR/build-synthesis-output.md. Return ONLY the output path. No narrative." -m "$_SYNTH_MODEL" --yolo
-       ;;
-     kimi)
-       kimi --work-dir "$(pwd -P)" --add-dir "$(pwd -P)/$BUILD_TMP_DIR" -p "Read synthesis instructions at $BUILD_TMP_DIR/build-synthesis-input.md. Read the source plan. Write the living plan. Write the summary to $BUILD_TMP_DIR/build-synthesis-output.md. Return ONLY the output path. No narrative." -m "$_SYNTH_MODEL" --yolo --print --final-message-only
-       ;;
-     claude)
-       claude --model "$_SYNTH_MODEL" -p "Read synthesis instructions at $BUILD_TMP_DIR/build-synthesis-input.md. Read the source plan. Write the living plan. Write the summary to $BUILD_TMP_DIR/build-synthesis-output.md. Return ONLY the output path. No narrative."
-       ;;
-     codex)
-       _SYNTH_REASONING=$(jq -r '.roles.planSynthesizer.reasoning // "high"' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
-       codex exec "Read synthesis instructions at $BUILD_TMP_DIR/build-synthesis-input.md. Read the source plan. Write the living plan. Write the summary to $BUILD_TMP_DIR/build-synthesis-output.md. Return ONLY the output path. No narrative." -m "$_SYNTH_MODEL" -s workspace-write -c "model_reasoning_effort=\"$_SYNTH_REASONING\"" -C "$(pwd -P)"
-       ;;
-     *)
-       echo "unsupported planSynthesizer provider: $_SYNTH_PROVIDER" >&2
-       exit 1
-       ;;
-   esac
-   ```
+   _spawn_synthesizer() {
+     _SYNTH_PROMPT_PATH="$1"
+     case "$_SYNTH_PROVIDER" in
+       gemini)
+         gemini -p "Read synthesis instructions at $_SYNTH_PROMPT_PATH. Read the source plan. Write the living plan. Write the summary to $BUILD_TMP_DIR/build-synthesis-output.md. Return ONLY the output path. No narrative." -m "$_SYNTH_MODEL" --yolo
+         ;;
+       kimi)
+         kimi --work-dir "$(pwd -P)" --add-dir "$(pwd -P)/$BUILD_TMP_DIR" -p "Read synthesis instructions at $_SYNTH_PROMPT_PATH. Read the source plan. Write the living plan. Write the summary to $BUILD_TMP_DIR/build-synthesis-output.md. Return ONLY the output path. No narrative." -m "$_SYNTH_MODEL" --yolo --print --final-message-only
+         ;;
+       claude)
+         claude --model "$_SYNTH_MODEL" -p "Read synthesis instructions at $_SYNTH_PROMPT_PATH. Read the source plan. Write the living plan. Write the summary to $BUILD_TMP_DIR/build-synthesis-output.md. Return ONLY the output path. No narrative."
+         ;;
+       codex)
+         _SYNTH_REASONING=$(jq -r '.roles.planSynthesizer.reasoning // "high"' ~/.claude/skills/gstack/build/configure.cm 2>/dev/null)
+         codex exec "Read synthesis instructions at $_SYNTH_PROMPT_PATH. Read the source plan. Write the living plan. Write the summary to $BUILD_TMP_DIR/build-synthesis-output.md. Return ONLY the output path. No narrative." -m "$_SYNTH_MODEL" -s workspace-write -c "model_reasoning_effort=\"$_SYNTH_REASONING\"" -C "$(pwd -P)"
+         ;;
+       *)
+         echo "unsupported planSynthesizer provider: $_SYNTH_PROVIDER" >&2
+         exit 1
+         ;;
+     esac
+   }
 
-   **Structural gate (bounded retry).** After the synthesizer subagent
-   exits, run `build/orchestrator/validate-living-plan.ts` against every
-   living plan path the subagent claims to have written, parsing the
-   `- <repoSlug>: <absolute path> (...)` lines from
-   `$BUILD_TMP_DIR/build-synthesis-output.md`. The validator exits 0 on
-   structurally valid plans, 2 with a JSON violation report on stderr if
-   any feature block is missing `Origin trace:` or `Acceptance:` as
-   line-anchored fields, and 1 on IO error. Mirrors the bounded-retry
-   pattern from Step 5.5 (planReviewer):
-
-   ```bash
    _SYNTH_ROUND=${_SYNTH_ROUND:-1}
    _SYNTH_VALIDATOR=~/.claude/skills/gstack/build/orchestrator/validate-living-plan.ts
    _SYNTH_VIOLATIONS_PATH="$BUILD_TMP_DIR/build-synthesis-violations.json"
-   : > "$_SYNTH_VIOLATIONS_PATH"
-   _SYNTH_GATE_FAILED=0
-   while IFS= read -r _LP_PATH; do
-     [ -n "$_LP_PATH" ] || continue
-     [ -f "$_LP_PATH" ] || continue
-     if ! bun run "$_SYNTH_VALIDATOR" "$_LP_PATH" 2> "$_SYNTH_VIOLATIONS_PATH.tmp"; then
-       _SYNTH_GATE_FAILED=1
-       cat "$_SYNTH_VIOLATIONS_PATH.tmp" >> "$_SYNTH_VIOLATIONS_PATH"
-     fi
-     rm -f "$_SYNTH_VIOLATIONS_PATH.tmp"
-   done < <(grep -E '^- ' "$BUILD_TMP_DIR/build-synthesis-output.md" 2>/dev/null | sed -E 's/^- [^:]+: ([^ ]+).*/\1/')
+   _SYNTH_PROMPT_PATH="$BUILD_TMP_DIR/build-synthesis-input.md"
 
-   if [ "$_SYNTH_GATE_FAILED" -eq 1 ]; then
+   while true; do
+     export _SYNTH_ROUND
+     _spawn_synthesizer "$_SYNTH_PROMPT_PATH"
+
+     # Structural gate (bounded retry). After the synthesizer subagent exits,
+     # run `build/orchestrator/validate-living-plan.ts` against every living
+     # plan path the subagent claims to have written. The validator exits 0 on
+     # valid plans, 2 with a JSON violation report on stderr for structural or
+     # static-check violations, and 1 on IO error.
+     : > "$_SYNTH_VIOLATIONS_PATH"
+     _SYNTH_GATE_FAILED=0
+     while IFS= read -r _LP_PATH; do
+       [ -n "$_LP_PATH" ] || continue
+       [ -f "$_LP_PATH" ] || continue
+       if ! bun run "$_SYNTH_VALIDATOR" "$_LP_PATH" 2> "$_SYNTH_VIOLATIONS_PATH.tmp"; then
+         _SYNTH_GATE_FAILED=1
+         cat "$_SYNTH_VIOLATIONS_PATH.tmp" >> "$_SYNTH_VIOLATIONS_PATH"
+       fi
+       rm -f "$_SYNTH_VIOLATIONS_PATH.tmp"
+     done < <(grep -E '^- ' "$BUILD_TMP_DIR/build-synthesis-output.md" 2>/dev/null | sed -E 's/^- [^:]+: ([^ ]+).*/\1/')
+
+     [ "$_SYNTH_GATE_FAILED" -eq 0 ] && break
+
      if [ "$_SYNTH_ROUND" -ge 3 ]; then
        echo "PLAN_SYNTHESIS_INVALID: structural gate failed after 2 retries" >&2
        echo "Violations:" >&2
        cat "$_SYNTH_VIOLATIONS_PATH" >&2
        exit 1
      fi
+
      _SYNTH_ROUND=$((_SYNTH_ROUND + 1))
-     # Build a revision prompt that quotes the JSON violations and re-spawn
-     # the synthesizer with the same provider/model. The subagent must
-     # rewrite the offending feature blocks to put `Origin trace:` and
-     # `Acceptance:` on their own lines (line-anchored).
      {
        echo "Your previous living plan(s) failed the structural validator."
-       echo "Each violation lists the feature number and which line-anchored field is missing."
-       echo "Rewrite ONLY the offending feature blocks so Origin trace: and Acceptance:"
-       echo "each appear on their own line at column 0 (not as run-on prose)."
+       echo "Each JSON report may include missing line-anchored fields and staticViolations."
+       echo "Rewrite ONLY the offending feature blocks so they pass every listed rule:"
+       echo "- Origin trace: and Acceptance: each appear on their own line at column 0."
+       echo "- Imported identifiers are used in the same phase."
+       echo "- phaseState fields named in acceptance appear in the current code snippets."
+       echo "- Acceptance file paths exist, are exempt, or are planned in the same feature."
+       echo "- Registry additions and orchestrator calls for the same helper land in the same phase."
+       echo "- Quoted file:line snippets still match on-disk content."
        echo "Then re-run your self-check and re-append the synthesis-complete sentinel."
        echo ""
        echo "Validator output:"
        cat "$_SYNTH_VIOLATIONS_PATH"
      } > "$BUILD_TMP_DIR/build-synthesis-revision-input.md"
-     # Re-spawn the synthesizer using the same case statement above with
-     # the revision prompt; the next iteration of the loop re-validates.
-     # (Implementations should hoist the synthesizer dispatch into a shell
-     # function _spawn_synthesizer "$_PROMPT_PATH" and call it here.)
-     export _SYNTH_ROUND
-     # Loop back to the dispatch case above with revision input — agent
-     # re-enters Step 5 with the revision-prompt file in place of the
-     # original input.
-   fi
+     _SYNTH_PROMPT_PATH="$BUILD_TMP_DIR/build-synthesis-revision-input.md"
+   done
+   ```
 
    # Safety-net sentinel: if the validator passed for a plan but the
    # subagent forgot to append the sentinel, append it from the shell so
