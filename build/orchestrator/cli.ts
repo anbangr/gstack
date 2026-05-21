@@ -9358,12 +9358,14 @@ async function runLearnFaultPatternsMode(args: Args): Promise<number> {
   return 2;
 }
 
-async function runAutoDrainIfEnabled(
+export async function runAutoDrainIfEnabled(
   args: Args,
   state: BuildState | null,
 ): Promise<void> {
   if (args.noAutoDrain) return;
   if (process.env.GSTACK_HALT_EVENTS_OFF === "1") return;
+  const runIdFilter = state?.launch?.runId ?? state?.slug;
+  if (!runIdFilter) return;
 
   try {
     const startMs = Date.now();
@@ -9371,13 +9373,16 @@ async function runAutoDrainIfEnabled(
       max: 20,
       severityMin: "MEDIUM",
       investigatorTimeoutMs: 10 * 60 * 1000,
+      runIdFilter,
     });
     const durationMs = Date.now() - startMs;
 
     if (
       result.processed === 0 &&
-      result.skipped === 0 &&
-      result.shortCircuited === 0
+      result.shortCircuited === 0 &&
+      result.inboxFiled === 0 &&
+      result.proposalsAppended === 0 &&
+      result.failed === 0
     ) {
       return;
     }

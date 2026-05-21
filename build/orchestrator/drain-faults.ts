@@ -1261,7 +1261,12 @@ export async function drainFaultsFromHaltEventsQueue(
   // drained on a prior run.
   const pendingDir = pendingInvestigationsDir({ queueDir });
   const processedTo = processedDir({ queueDir });
-  const allEntries = loadPendingEntries({ queueDir });
+  const allEntries = loadPendingEntries({ queueDir }).filter((entry) => {
+    if (!opts.runIdFilter) return true;
+    return entry.kind === "detected"
+      ? entry.event.runId === opts.runIdFilter
+      : entry.runId === opts.runIdFilter;
+  });
   const detectedByKey = new Map<
     string,
     Extract<typeof allEntries[number], { kind: "detected" }>

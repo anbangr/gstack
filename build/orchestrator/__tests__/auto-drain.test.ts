@@ -2,6 +2,8 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { runAutoDrainIfEnabled } from "../cli";
+import { emitManualRecoveryInvoked } from "../halt-event-helpers";
 import { emitHaltEvent } from "../halt-events";
 import { drainFaultsFromHaltEventsQueue } from "../drain-faults";
 
@@ -81,11 +83,39 @@ describe("auto-drain hook contract", () => {
         throw new Error("should not be called on empty queue");
       },
     });
-    // The hook checks (processed === 0 && skipped === 0 && shortCircuited === 0)
-    // to decide whether to log anything. All three must report 0 for an
-    // empty queue to keep the silent-on-empty contract.
+    // Empty queues must stay cheap and quiet: no investigator work, no
+    // short-circuits, and no skipped rows to report.
     expect(result.processed).toBe(0);
     expect(result.skipped).toBe(0);
     expect(result.shortCircuited).toBe(0);
+  });
+
+  test("auto-drain leaves unrelated run events pending", async () => {
+    const skillFaults = path.join(tmp, "skill-faults");
+    emitManualRecoveryInvoked({
+      runId: "other-project-run",
+      stateSlug: "other-project",
+      message: "--mark-phase-committed invoked for phase 1.1",
+      pointers: {
+        stateFile: "/x",
+        stdoutLog: "/x",
+        livingPlan: "/x",
+        worktreePath: tmp,
+      },
+      queueDir: skillFaults,
+    });
+
+    await runAutoDrainIfEnabled(
+      { noAutoDrain: false } as never,
+      {
+        slug: "current-state",
+        launch: { runId: "current-run" },
+      } as never,
+    );
+
+    const pending = fs.readdirSync(
+      path.join(skillFaults, "pending-investigations"),
+    );
+    expect(pending.length).toBe(1);
   });
 });
