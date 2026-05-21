@@ -428,6 +428,19 @@ describe("fingerprintFeatureReviewFailure — same-shape detection", () => {
     expect(shape).toBe("MISSING_VERDICT");
   });
 
+  it("MISSING_VERDICT fingerprint is stable across repeated calls (drives consecutive-UNCLEAR halt)", () => {
+    // The outer loop halts after SAME_SHAPE_REPEAT_HALT_THRESHOLD (=2)
+    // consecutive iterations produce the same fingerprint. UNCLEAR
+    // verdicts surface as MISSING_VERDICT and must produce a stable
+    // fingerprint so the streak counter advances. Without this, an
+    // UNCLEAR loop would never trip the halt and the orchestrator
+    // would burn the full 5-iteration cap.
+    const a = fingerprintFeatureReviewFailure({ failureState: "MISSING_VERDICT" });
+    const b = fingerprintFeatureReviewFailure({ failureState: "MISSING_VERDICT" });
+    expect(a).toBe(b);
+    expect(a).toBe("MISSING_VERDICT");
+  });
+
   it("HYGIENE_FAULT with no log path falls back to a sentinel", () => {
     const shape = fingerprintFeatureReviewFailure({
       failureState: "HYGIENE_FAULT",
