@@ -144,4 +144,36 @@ describe("attachStallWatchdog tool-aware", () => {
 
     w.stop();
   });
+
+  it("fast bucket kills at 90s with killReason=silence", () => {
+    const { clock, advance } = makeFakeClock();
+    const { child, emitStdout } = makeFakeChild();
+    let killedSilenceMs: number | null = null;
+
+    const w = attachStallWatchdog(
+      { mode: "stream", child },
+      {
+        stallMs: 60_000,
+        provider: "shell",
+        clock,
+        onStallKill: (s) => {
+          killedSilenceMs = s;
+        },
+        parseProgress: (line) =>
+          line === "TOOL_START_FAST" ? fastToolStart(clock.now()) : null,
+        toolStallMs: { fast: 90_000, slow: 600_000 },
+        progressGapMs: 300_000,
+      },
+    );
+
+    emitStdout("TOOL_START_FAST\n");
+    advance(120_000); // 120s — past the 90s fast window
+
+    expect(w.stallKilled()).toBe(true);
+    expect(killedSilenceMs).not.toBeNull();
+    expect(killedSilenceMs! >= 90_000).toBe(true);
+    expect(w.killReason()).toBe("silence");
+
+    w.stop();
+  });
 });

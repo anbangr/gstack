@@ -557,7 +557,15 @@ export function attachStallWatchdog(
     }
     if (silence >= effectiveStallMs) {
       killed = true;
-      killReason = killReason ?? "stall";
+      // "silence" when the tool-aware path is active (parseProgress set,
+      // we have seen at least one classified event). "stall" for
+      // the legacy path so existing consumers / tests see the same string.
+      if (killReason === undefined) {
+        killReason =
+          parseProgress && lastClassifiedActivityAt !== null
+            ? "silence"
+            : "stall";
+      }
       try {
         opts.onStallKill?.(silence);
       } catch {
