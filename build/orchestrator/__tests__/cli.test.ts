@@ -1990,6 +1990,64 @@ describe("post-agent hygiene helpers", () => {
     );
   });
 
+  it("cleans a stale index.lock from the real gitdir when recovery runs in a worktree", async () => {
+    const worktreePath = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-hygiene-worktree-"),
+    );
+    const branchName = `worktree-lock-${path.basename(worktreePath)}`;
+    try {
+      git(["worktree", "add", "-b", branchName, worktreePath, "HEAD"], tmpDir!);
+      expect(fs.statSync(path.join(worktreePath, ".git")).isFile()).toBe(true);
+
+      const before = captureGitSnapshot(worktreePath);
+      const summary = path.join(worktreePath, ".llm-tmp", "summary.md");
+      fs.mkdirSync(path.dirname(summary), { recursive: true });
+      fs.writeFileSync(path.join(worktreePath, "README.md"), "changed\n");
+      fs.writeFileSync(
+        summary,
+        [
+          "# Primary implementor summary",
+          "",
+          "## Files changed",
+          "- `README.md` - update docs.",
+          "",
+          "## Commit",
+          "- Conventional commit message: `feat: worktree stale-lock survivor`",
+        ].join("\n"),
+      );
+
+      const realGitDir = git(["rev-parse", "--absolute-git-dir"], worktreePath);
+      const lockPath = path.join(realGitDir, "index.lock");
+      fs.writeFileSync(lockPath, "");
+      const staleMtime = new Date(Date.now() - 60_000);
+      fs.utimesSync(lockPath, staleMtime, staleMtime);
+
+      const recovery = await recoverMutableAgentCommit({
+        cwd: worktreePath,
+        before,
+        outputFilePath: summary,
+        label: "primary implementor",
+      });
+
+      expect(recovery.recovered).toBe(true);
+      expect(recovery.errors).toEqual([]);
+      expect(fs.existsSync(lockPath)).toBe(false);
+      expect(git(["log", "-1", "--pretty=%s"], worktreePath)).toBe(
+        "feat: worktree stale-lock survivor",
+      );
+    } finally {
+      spawnSync("git", ["worktree", "remove", "--force", worktreePath], {
+        cwd: tmpDir!,
+        stdio: "ignore",
+      });
+      spawnSync("git", ["branch", "-D", branchName], {
+        cwd: tmpDir!,
+        stdio: "ignore",
+      });
+      fs.rmSync(worktreePath, { recursive: true, force: true });
+    }
+  });
+
   it("leaves a fresh .git/index.lock (<10s old) in place and surfaces a clear error", async () => {
     // Negative case: a lock that's < 10s old belongs to a concurrent active
     // git op. Removing it would corrupt that op's transaction. The recovery
