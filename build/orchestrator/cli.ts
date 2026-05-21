@@ -120,6 +120,10 @@ import {
   type ParsedFeatureVerdict,
 } from "./feature-review";
 import { promptYesNo, buildBlockedFeatureMd } from "./feature-review-prompt";
+import {
+  writeFeatureReviewMetrics,
+  watchFirstWrite,
+} from "./feature-review-metrics";
 import { runPlanReview, SYNTH_REVISION_PROMPT } from "./plan-reviewer";
 import { runPlanReviewLoop } from "./plan-review-loop";
 import { shipAndDeploy, shipOnly } from "./ship";
@@ -6076,6 +6080,19 @@ async function runFeatureReviewIteration(args: {
   outputFilePath: string;
 }> {
   const slug = args.state.slug;
+  // T1 metrics state — captured at well-known sites in the body, emitted
+  // once in finally so all 8 return paths share one write site.
+  const _metricsSpawnStart = Date.now();
+  let _metricsFirstWriteWatcher: ReturnType<typeof watchFirstWrite> | null =
+    null;
+  let _metricsPromptBytes = 0;
+  let _metricsFinalVerdict = "UNKNOWN";
+  let _metricsPassEvidenceTimeout = false;
+  let _metricsEndedBy:
+    | "exit0"
+    | "watchdog"
+    | "signal"
+    | "exit-nonzero" = "exit-nonzero";
   const inputFilePath = path.join(
     logDir(slug),
     `feature-${args.feature.number}-review-${args.iteration}-input.md`,
@@ -6084,6 +6101,7 @@ async function runFeatureReviewIteration(args: {
     logDir(slug),
     `feature-${args.feature.number}-review-${args.iteration}-output.md`,
   );
+  try {
 
   // Containment-checked prior report (F2 trust-boundary defense).
   const priorRaw = args.featureState.featureReview?.outputFilePaths?.at(-1);
@@ -6134,6 +6152,13 @@ async function runFeatureReviewIteration(args: {
   });
   fs.writeFileSync(inputFilePath, promptBody);
   fs.writeFileSync(outputFilePath, "");
+  _metricsPromptBytes = Buffer.byteLength(promptBody, "utf8");
+  if (!args.dryRun) {
+    _metricsFirstWriteWatcher = watchFirstWrite(
+      outputFilePath,
+      _metricsSpawnStart,
+    );
+  }
 
   const before = args.dryRun ? null : captureGitSnapshot(args.cwd);
   let parentBeforeRole: {
@@ -6200,6 +6225,15 @@ async function runFeatureReviewIteration(args: {
     label: "feature review",
     parentWorkspace: parentBeforeRole,
   });
+  if (result.timedOut) {
+    _metricsEndedBy = "watchdog";
+  } else if (result.exitCode === 0) {
+    _metricsEndedBy = "exit0";
+  } else if (result.exitCode === null) {
+    _metricsEndedBy = "signal";
+  } else {
+    _metricsEndedBy = "exit-nonzero";
+  }
 
   // Persist iteration onto featureState.featureReview.
   if (!args.featureState.featureReview) {
@@ -6225,6 +6259,7 @@ async function runFeatureReviewIteration(args: {
     artifactRaw = result.stdout || "";
   }
   let verdict = parseFeatureReviewVerdict(artifactRaw);
+  _metricsFinalVerdict = verdict.verdict;
   // Initial finalVerdict. UNCLEAR (no `## VERDICT` sentinel) is MISSING_VERDICT
   // not TIMEOUT — the old code collapsed every non-PASS shape onto TIMEOUT,
   // which hid the prompt-contract violation behind a generic timeout label.
@@ -6238,6 +6273,10 @@ async function runFeatureReviewIteration(args: {
   if (result.timedOut) {
     const timeoutClassification = classifyFeatureReviewTimeout(artifactRaw);
     verdict = timeoutClassification.verdict;
+    _metricsFinalVerdict = verdict.verdict;
+    if (timeoutClassification.kind === "pass-evidence-timeout") {
+      _metricsPassEvidenceTimeout = true;
+    }
     if (timeoutClassification.kind === "structured-verdict") {
       fr.finalVerdict = verdict.verdict as any;
       timedOutWithStructuredVerdict = true;
@@ -6321,6 +6360,35 @@ async function runFeatureReviewIteration(args: {
   }
 
   return { verdict, action: "unclear", outputFilePath };
+  } finally {
+    _metricsFirstWriteWatcher?.stop();
+    if (!args.dryRun) {
+      const spawnEnd = Date.now();
+      const wallMs = spawnEnd - _metricsSpawnStart;
+      const firstWriteMs = _metricsFirstWriteWatcher?.firstWriteAt() ?? null;
+      let outputBytes = 0;
+      try {
+        outputBytes = fs.statSync(outputFilePath).size;
+      } catch {
+        // file may not exist on early failure
+      }
+      writeFeatureReviewMetrics({
+        ts: new Date().toISOString(),
+        feature: String(args.feature.number),
+        cycle: args.iteration,
+        reasoning: args.roles.featureReview.reasoning,
+        verdict: _metricsFinalVerdict,
+        promptBytes: _metricsPromptBytes,
+        outputBytes,
+        wallMs,
+        spawnToFirstWriteMs: firstWriteMs,
+        firstWriteToCompletionMs:
+          firstWriteMs !== null ? wallMs - firstWriteMs : null,
+        endedBy: _metricsEndedBy,
+        passEvidenceTimeout: _metricsPassEvidenceTimeout,
+      });
+    }
+  }
 }
 
 async function runPhase(args: {
