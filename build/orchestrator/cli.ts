@@ -194,9 +194,11 @@ import {
 } from "./escalation-streak";
 import { renderPlanStatusTable, resolvePlanSelection } from "./plan-selection";
 import {
+  classifyProviderFailure,
   emitManualRecoveryInvoked,
   markFeatureFailed,
   markPhaseFailed,
+  recordProviderFailureVerdict,
   recordRetryCapHit,
   rewindPhase,
 } from "./halt-event-helpers";
@@ -6458,13 +6460,49 @@ async function runPhase(args: {
       console.error(
         `✗ Phase ${phase.number} (${phase.name}) failed: ${action.reason}`,
       );
-      recordRetryCapHit(
-        state,
-        phaseState.index,
-        "codex",
-        phaseState.codexReview?.iterations ?? 0,
-        helperCtxFor(state),
-      );
+      // PR1b: before counting a codex convergence failure as a retry-cap
+      // hit, see if the most-recent review iteration was actually a
+      // provider failure (capacity / quota / overloaded / transport / auth
+      // / stall). If so, emit the right halt kind instead — drain-faults
+      // and downstream consumers will route it to the right recovery
+      // playbook rather than to the "convergence failed" investigator.
+      // Kill switch: GSTACK_DISABLE_PROVIDER_CLASSIFIER=1 reverts to the
+      // pre-PR1b behavior (skip classification, always cap-hit).
+      let classified = false;
+      if (process.env.GSTACK_DISABLE_PROVIDER_CLASSIFIER !== "1") {
+        const reviewLogs = phaseState.codexReview?.outputLogPaths ?? [];
+        const lastLog = reviewLogs[reviewLogs.length - 1];
+        if (lastLog) {
+          let text = "";
+          try {
+            text = fs.readFileSync(lastLog, "utf8");
+          } catch {
+            // Log unreadable; fall through to retry-cap-hit.
+          }
+          if (text) {
+            const verdict = classifyProviderFailure({ text });
+            if (verdict) {
+              recordProviderFailureVerdict(
+                state,
+                phaseState.index,
+                "codex-review",
+                verdict,
+                helperCtxFor(state),
+              );
+              classified = true;
+            }
+          }
+        }
+      }
+      if (!classified) {
+        recordRetryCapHit(
+          state,
+          phaseState.index,
+          "codex",
+          phaseState.codexReview?.iterations ?? 0,
+          helperCtxFor(state),
+        );
+      }
       return "failed";
     }
 
@@ -9552,7 +9590,11 @@ export async function runAutoDrainIfEnabled(
     const result = state
       ? await drainFaultsForBuildRun(
           state,
-          (s) => saveState(s as BuildState, { noGbrain: args.noGbrain, log: console.warn }),
+          (s) =>
+            saveState(s as BuildState, {
+              noGbrain: args.noGbrain,
+              log: console.warn,
+            }),
           baseOpts,
           drainProgress,
         )
@@ -10865,14 +10907,11 @@ async function main() {
               // tidy-haven loop incident for the failure mode this
               // prevents (5 iterations, identical hygiene fault, ~25
               // minutes of compute burned).
-              const streak =
-                featureState.featureReview?.sameShapeStreak ?? 0;
+              const streak = featureState.featureReview?.sameShapeStreak ?? 0;
               const shape = featureState.featureReview?.lastFailureShape;
               if (streak >= SAME_SHAPE_REPEAT_HALT_THRESHOLD && shape) {
                 const reason = `feature-review halted: ${streak} consecutive iterations with the same failure shape (${shape.slice(0, 200)}). Retrying a deterministic failure is wasted compute; intervene manually.`;
-                console.error(
-                  `\n✗ Feature ${featureState.number}: ${reason}`,
-                );
+                console.error(`\n✗ Feature ${featureState.number}: ${reason}`);
                 const lastReportPath =
                   featureState.featureReview?.outputFilePaths?.at(-1);
                 const md = buildBlockedFeatureMd({
