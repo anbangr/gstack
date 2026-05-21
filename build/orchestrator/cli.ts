@@ -7648,6 +7648,12 @@ async function runPhase(args: {
 
         if (bothTimedOut || bothExitNonZero || neitherCommitted) {
           state.phases[phase.index] = phaseState;
+          // Forward watchdog kill info from the primary result when present.
+          // Secondary result is ignored here; primary is the canonical signal
+          // for dual-impl stall-kill diagnostics.
+          const dualFailResult = primaryResult.implResult.stallKilled
+            ? primaryResult.implResult
+            : undefined;
           markPhaseFailed(
             state,
             phaseState.index,
@@ -7655,6 +7661,7 @@ async function runPhase(args: {
               `primary exit=${primaryResult.implResult.exitCode} timedOut=${primaryResult.implResult.timedOut} commits=${primaryCommits}; ` +
               `secondary exit=${secondaryResult.implResult.exitCode} timedOut=${secondaryResult.implResult.timedOut} commits=${secondaryCommits}`,
             helperCtxFor(state),
+            dualFailResult,
           );
           saveState(state, { noGbrain, log: console.warn });
           // dualImplOk stays false → finally block will tear down.

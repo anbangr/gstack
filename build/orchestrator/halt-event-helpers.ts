@@ -22,6 +22,11 @@ function emit(
   phaseIndex?: number,
   featureIndex?: number,
   failureReason?: string,
+  result?: {
+    killReason?: string;
+    lastTool?: string | null;
+    lastBucket?: "fast" | "slow" | null;
+  },
 ): string {
   return emitHaltEvent(
     {
@@ -38,6 +43,14 @@ function emit(
         phaseIndex,
         featureIndex,
         failureReason,
+        killReason: result?.killReason as
+          | "silence"
+          | "progress_gap"
+          | "stall"
+          | "auth_required"
+          | undefined,
+        lastTool: result?.lastTool,
+        lastBucket: result?.lastBucket,
       }),
     },
     { queueDir: ctx.queueDir },
@@ -49,12 +62,17 @@ export function markPhaseFailed(
   phaseIdx: number,
   reason: string,
   ctx: HelperContext,
+  result?: {
+    killReason?: string;
+    lastTool?: string | null;
+    lastBucket?: "fast" | "slow" | null;
+  },
 ): string {
   if (state.phases[phaseIdx]) {
     state.phases[phaseIdx].status = "failed";
     state.phases[phaseIdx].error = reason;
   }
-  return emit("PHASE_FAILED", reason, ctx, state, phaseIdx, undefined, reason);
+  return emit("PHASE_FAILED", reason, ctx, state, phaseIdx, undefined, reason, result);
 }
 
 export function markFeatureFailed(
@@ -62,6 +80,11 @@ export function markFeatureFailed(
   featureIdx: number,
   reason: string,
   ctx: HelperContext,
+  result?: {
+    killReason?: string;
+    lastTool?: string | null;
+    lastBucket?: "fast" | "slow" | null;
+  },
 ): string {
   const f = state.features?.[featureIdx];
   if (f) {
@@ -76,6 +99,7 @@ export function markFeatureFailed(
     undefined,
     featureIdx,
     reason,
+    result,
   );
 }
 

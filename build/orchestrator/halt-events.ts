@@ -286,6 +286,14 @@ export interface BuildHaltSnapshotInput {
   phaseIndex?: number;
   featureIndex?: number;
   failureReason?: string;
+  /**
+   * Watchdog kill info. Forwarded from a SubAgentResult through the
+   * halt-event-helpers when the halt was triggered by a stall-kill.
+   * Absent for non-watchdog halts.
+   */
+  killReason?: "silence" | "progress_gap" | "stall" | "auth_required";
+  lastTool?: string | null;
+  lastBucket?: "fast" | "slow" | null;
 }
 
 export function buildHaltSnapshot(
@@ -332,5 +340,8 @@ export function buildHaltSnapshot(
     iterationHistory,
     worktreeHead,
     stdoutTail,
+    killReason: input.killReason,
+    lastTool: input.lastTool,
+    lastBucket: input.lastBucket,
   };
 }
