@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.42.0.0] - 2026-05-22
+
+**Plan mutator now re-parses and recovers when stale line numbers drift, and guards against duplicate phase headings. When a plan file is edited externally (or by another process) between the time the orchestrator reads line numbers and the time it writes checkbox state, the mutator no longer fails with "plan was edited externally." Instead it re-parses the fresh file from disk, resolves the checkbox by its stable phase identity (feature number + phase number + phase name), and flips at the new line. If two phases share the exact same heading, the mutator emits `PLAN_MUTATOR_DUPLICATE_HEADING` with both line numbers so the caller can surface the ambiguity instead of silently mutating the wrong checkbox.**
+
+This is PR6 of the tidy-haven plan — Feature 9 of the 83-fault recurrence program. Ships two new test files (554 lines of unit tests, 18 tests total) covering re-parse recovery, duplicate-heading detection, atomic-write rollback, phase identity normalization, and all three call sites (`setCheckboxState`, `setCheckboxStatusNote`, `unflipPhaseCheckboxes`).
+
+### What changed for the user
+
+- Orchestrator no longer stalls with "plan was edited externally" when a plan file has been modified between phase reads and writes. The mutator re-parses from disk, locates the checkbox by its phase identity, and continues.
+- Duplicate phase headings are detected before mutation and surfaced as `PLAN_MUTATOR_DUPLICATE_HEADING` errors with both conflicting line numbers, preventing silent mutation of the wrong checkbox.
+- Phase identity includes feature number, phase number, and normalized phase name — stable even when line numbers shift.
 ## [1.41.1.0] - 2026-05-22
 
 **The build orchestrator now catches five classes of synthesizer blind spots before they ever reach the build loop. Living plans are validated for unused imports, missing field references, non-existent file paths, multi-arm split across phases, and stale file:line quotes — with a bounded-retry gate that sends the synthesizer back to fix its own mistakes.**
@@ -32,6 +43,15 @@ This is PR3 of the tidy-haven plan — Feature 7 of the 83-fault recurrence prog
 
 #### Added
 
+- `build/orchestrator/__tests__/plan-mutator-reparse.test.ts` — 339 lines, 11 tests covering T1-T5: re-parse on stale line numbers, genuinely deleted markers, atomic-write rollback failure paths, all three call sites (`setCheckboxState`, `setCheckboxStatusNote`, `unflipPhaseCheckboxes`), non-sequential phase numbering, sublettered phase IDs, review suffixes, kind brackets, and fresh-from-disk reads.
+- `build/orchestrator/__tests__/plan-mutator-duplicate-heading.test.ts` — 215 lines, 7 tests covering T3 and T6: duplicate heading detection with both line numbers reported, phase name normalization (trailing whitespace stripped), non-duplicate detection when phase numbers differ or names differ, `setCheckboxState` and `unflipPhaseCheckboxes` duplicate detection, and atomic-write race safety.
+- `resolveStaleLine()` in `plan-mutator.ts` — re-parses the plan from disk when a stale line number no longer contains the expected marker. Uses `buildPhaseLocations()` and `findPhaseHeadingAbove()` to resolve the checkbox by stable phase identity.
+- `buildPhaseLocations()`, `findPhaseHeadingAbove()`, `phaseIdFromParts()`, `normalizePhaseName()` — helper utilities for stable phase identification across line-number drift.
+
+#### Changed
+
+- `setCheckboxState()`, `setCheckboxStatusNote()`, `flipCheckbox()`, `flipPhaseCheckboxes()`, `unflipPhaseCheckboxes()`, `reconcilePhaseCheckboxes()`, `flipTestSpecCheckbox()` in `plan-mutator.ts` — all accept an optional `expectedPhase` parameter and delegate to `resolveStaleLine()` when the marker is missing at the expected line.
+- `cli.ts` — three call sites (`reconcilePhaseVisibleGates`, `markPhaseCommittedAfterManualRecovery`, `runPhase`) now pass the full `phase` object as `expectedPhase` to `setCheckboxState`, `flipPhaseCheckboxes`, and `unflipPhaseCheckboxes`.
 - `build/orchestrator/validate-living-plan.ts` — extended structural validator with T1-T5 static checks, `extractPlannedFiles` with multi-path idiom support ("Add `A` and `B`"), inbox/audit path exemptions, and stale-quote verification against real files.
 - `build/orchestrator/__tests__/living-plan-static-checks.test.ts` — 432-line test suite covering all five rules plus edge cases (Bun built-ins, type-only usage, default+named imports, planned-file allow-list, cross-feature isolation, inbox exemptions, bounded-retry exit-code contract, and wrapper template assertions).
 
