@@ -76,3 +76,14 @@ describe("parseClaudeLine", () => {
     assertRow("claude", parseClaudeLine);
   });
 });
+
+describe("bucket gating", () => {
+  it("returns null for a Gemini tool not in TOOL_BUCKET", () => {
+    // 'image_generation' is a hypothetical tool not in TOOL_BUCKET.
+    // Even if Gemini emits 'Tool: image_generation', parser must return
+    // null so the watchdog falls back to legacy stallMs.
+    const line = "Tool: image_generation";
+    const got = parseGeminiLine(line, 1000);
+    expect(got).toBeNull();
+  });
+});
