@@ -2,7 +2,7 @@
 
 ## [Unreleased - fork-local: build skill 1.27.0] - 2026-05-21
 
-**Orchestrator stall detection: the monitor now catches a wedged build instead of waiting forever, and end-of-build auto-drain has a 30-minute wall-clock budget so a stuck fault queue can no longer hold the orchestrator open for hours.**
+**Orchestrator stall detection: the monitor now catches a wedged build instead of waiting forever. Pairs with the 60-second auto-drain deadline from build skill 1.26.1 (#70) to close two distinct failure modes of the end-of-build hang.**
 
 This entry pins the fix for a real production hang on 2026-05-21. A `gstack-build --mark-phase-committed` invocation got stuck for 47 minutes inside end-of-build auto-drain processing other projects' faults. The monitor's `recentProcessActivity` check stayed green the whole time because heartbeat.ts was still writing `RUN_HEARTBEAT` lines to stdout every 30s, refreshing the very file the monitor uses as its liveness signal. The user had to kill the process by hand. The runId-scoping fix in #66 closes the proximate cause (cross-project faults no longer reach the drain), but the monitor would still be blind to any future hang inside the orchestrator's main process.
 
@@ -12,9 +12,9 @@ If the orchestrator stops making progress for 15 minutes, the monitor now escala
 
 Two independent signals are tracked: `state.lastUpdatedAt` (advances on every saveState call) AND `drainProcessedCount` (advances per processed auto-drain entry). The stall arm only escalates when BOTH have been frozen for the configured threshold. Translation: a healthy drain processing entries one by one counts as progress; a drain spinning on the same broken entry counts as stalled.
 
-End-of-build auto-drain has a hard 30-minute wall-clock budget. When the budget fires, any in-flight investigator subprocess receives SIGTERM with a 5-second grace period before SIGKILL, so no orphaned codex processes keep eating CPU after the orchestrator exits. Remaining queue entries stay in `pending-investigations/` for the next run to pick up. The orchestrator logs `auto-drain budget exceeded after Xm; N entries left for next run` and exits with whatever exit code the build produced.
+End-of-build auto-drain enforces a 60-second outer deadline (`AUTO_DRAIN_DEADLINE_MS`, landed in build skill 1.26.1 via #70) so a stuck queue can no longer hold the orchestrator open between "Archived living plan" and process exit. The drain still gets the full window if it's making progress, and `process.exit` reaps any orphaned investigator children via the OS. Remaining queue entries stay in `pending-investigations/` for the next run.
 
-**Behavior change to note.** The previous worst case for auto-drain was 200 minutes (max:20 entries × 10-minute investigator timeout). The 30-minute budget caps real-world drain at roughly three timeout-class entries before abort. Drains that genuinely take longer will defer remaining entries to the next run instead of holding the orchestrator open indefinitely. For typical (non-stuck) fault queues this is invisible. The drain finishes in seconds.
+For callers that drive drain outside the end-of-build path (a future long-lived host process, the manual `gstack-build halt drain` subcommand), `DrainHaltEventsOptions.signal` accepts an explicit `AbortSignal` that threads down to `spawnInvestigatorCapture`. On abort, the in-flight investigator receives SIGTERM with a 5-second grace before SIGKILL via `killProcessAndGroup` — clean child cleanup without relying on `process.exit`. End-of-build callers don't need this because the 60-second deadline + process exit are sufficient.
 
 ### Itemized changes
 
@@ -28,7 +28,7 @@ End-of-build auto-drain has a hard 30-minute wall-clock budget. When the budget 
 
 #### Changed
 
-- `runAutoDrainIfEnabled` enforces a 30-minute wall-clock budget via `AbortSignal.timeout`. The signal threads through `drainFaultsForBuildRun` into `spawnInvestigatorCapture`. On abort, the in-flight investigator child is killed via SIGTERM + 5s grace + SIGKILL using the same `killProcessAndGroup` pattern as the per-investigator stall watchdog.
+- `DrainHaltEventsOptions.signal` accepts an explicit `AbortSignal` for callers that need clean child-process cleanup (instead of relying on `process.exit` reaping). The signal threads through `drainFaultsForBuildRun` into `spawnInvestigatorCapture`. On abort, the in-flight investigator child is killed via SIGTERM + 5s grace + SIGKILL using the same `killProcessAndGroup` pattern as the per-investigator stall watchdog. End-of-build callers use the 60-second outer `runWithDeadline` from build skill 1.26.1 instead.
 - `DrainHaltEventsOptions` gains optional `signal: AbortSignal` and `onEntryProcessed: () => void`. `DrainHaltEventsResult` gains `aborted: boolean` and `deferred: number` for telemetry.
 - The `halt-events-drain.jsonl` analytics row now includes `aborted` and `deferred` fields.
 - Skipped entries (filtered by severity or runId) no longer bump the progress signal. A flood of irrelevant queue entries cannot keep the stall arm quiet anymore.

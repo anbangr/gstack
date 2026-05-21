@@ -263,6 +263,14 @@ export interface SubAgentResult {
   durationMs: number;
   /** Number of retries used (0 if first attempt succeeded). */
   retries: number;
+  /**
+   * True when this result was produced by cli.ts:hygieneFailureResult
+   * because the post-agent hygiene gate caught a worktree mutation.
+   * Optional for back-compat with existing call sites; set by
+   * hygieneFailureResult itself. Distinguishes hygiene rejections from
+   * other exitCode=1 outcomes (provider crash, transport failure, etc).
+   */
+  hygieneFailure?: boolean;
 }
 
 /**
@@ -291,8 +299,21 @@ function pickProviderForBin(bin: string): Provider {
  * names (GSTACK_BUILD_*_TIMEOUT), new semantics: the value is now a stall
  * window, not a wall-clock budget. A sub-agent that keeps emitting tool-use
  * or status lines runs as long as it needs.
+ *
+ * Trust contract for `logPath`: caller is responsible for ensuring the path
+ * is bounded to a known state directory. spawnCaptured does NOT normalize
+ * or boundary-check the path. Today's callers all pass derived paths under
+ * ~/.gstack/build-state/<slug>/; do not pass user-influenced strings here
+ * without prior resolveSafe(). The exported surface is for orchestrator
+ * subagents only — not a general-purpose spawn helper.
+ *
+ * Log content is sensitive: child stdio routinely includes secrets in
+ * flight. The log file is created with mode 0600 to constrain ACL. The
+ * file format itself (header at top, [OUT]/[ERR] channel-tagged live body,
+ * footer at end) is documented in build/orchestrator/README.md (per
+ * TODOS.md T-FMT) and is not part of the orchestrator's public contract.
  */
-function spawnCaptured(args: {
+export function spawnCaptured(args: {
   bin: string;
   argv: string[];
   cwd?: string;
@@ -309,6 +330,49 @@ function spawnCaptured(args: {
     let stderrBuf = "";
     let stdoutBytes = 0;
     let stderrBytes = 0;
+    // Live log streaming: open the log file when the child spawns so callers
+    // can `tail -f` it instead of waiting for child close to see anything.
+    // Pre-streaming, finish() did a single fs.writeFileSync at the end, which
+    // is why /ship-driven e2e runs appeared frozen for 10+ min while the
+    // Kimi subagent produced 100MB+ of stdout that nobody could see.
+    let ws: fs.WriteStream | null = null;
+    let loggedStreamError = false;
+    try {
+      // mode 0600: child stdio routinely surfaces secrets in flight (env
+      // dumps, API keys in HTTP traces, full prompts). The buffered model
+      // had the same exposure but only at close; the streaming model
+      // extends the read window to "anytime during the run." Constrain
+      // the file ACL to the running user so backup daemons, IDE indexers,
+      // and gbrain ingest can't race-read partial dumps.
+      ws = fs.createWriteStream(args.logPath, { mode: 0o600 });
+      // Use ws.on (not once) so reentrant errors don't crash the process,
+      // but gate the user-visible warn behind loggedStreamError so we
+      // log it at most once per spawn — a damaged stream can emit
+      // multiple 'error' events from subsequent write attempts.
+      ws.on("error", (err) => {
+        if (loggedStreamError) return;
+        loggedStreamError = true;
+        console.warn(
+          `[spawn] log writer error for ${args.logPath}: ${err.message}; ` +
+            `continuing without log streaming`,
+        );
+      });
+      // Header at TOP (preserves existing log-format contract — downstream
+      // tooling that greps `# command:` from the head of the file still works).
+      // Final result metadata (duration, exit, byte counts) lands in finish()
+      // via ws.end(footer) — single fd, no separate appendFileSync race.
+      ws.write(
+        `# command: ${args.bin} ${args.argv.map(quote).join(" ")}\n` +
+          `# cwd: ${args.cwd || process.cwd()}\n` +
+          `# started: ${new Date(startedAt).toISOString()}\n` +
+          `\n# ---- live output ----\n`,
+      );
+    } catch {
+      // createWriteStream sync-throws on extreme cases (e.g. logPath dir
+      // doesn't exist). finish() detects ws === null and skips ws.end().
+      loggedStreamError = true;
+      ws = null;
+    }
 
     // Use spawn (not execFile) for two reasons:
     //   1. We need real-time stream events for the StallWatchdog. execFile
@@ -333,15 +397,139 @@ function spawnCaptured(args: {
       return buf;
     };
 
+    // Channel-prefixed live write with backpressure and per-channel
+    // line-start tracking.
+    //
+    // The naive form (split on /(?<=\n)/, prefix every non-empty slice)
+    // corrupts logs in two ways:
+    //   1. Chunk split mid-line: child emits "foo " then "bar\n", we'd
+    //      write `[OUT] foo [OUT] bar\n` — a spurious mid-line prefix.
+    //   2. Cross-channel interleave: OUT "foo " then ERR "warn\n" then
+    //      OUT "bar\n" would write `[OUT] foo [ERR] warn\n[OUT] bar\n` —
+    //      readers see "foo warn" as a single ERR line, completely wrong.
+    //
+    // Fix: track per-channel `atLineStart` state. Only prepend a prefix
+    // when we're starting a new line. On a channel switch mid-line, inject
+    // a synthetic newline first so the new channel's prefix lands at line
+    // start. Trailing partials at finish() get flushed with a final
+    // newline (see finish() below).
+    //
+    // Channel terminators: we treat both \n and \r as terminators so
+    // \r-driven progress bars (curl, wget, npm, pytest tqdm — common in
+    // the e2e subagents this orchestrator runs) don't spill prefixes
+    // mid-line.
+    let lastChannel: "OUT" | "ERR" | null = null;
+    let stdoutAtLineStart = true;
+    let stderrAtLineStart = true;
+    function writeChannel(channel: "OUT" | "ERR", text: string): void {
+      if (!ws) return;
+      if (text.length === 0) return;
+
+      // Channel switch mid-line: the previous channel emitted text but
+      // did not end with a terminator. Inject a synthetic newline so
+      // we don't smear two channels together on one visible line.
+      const prevChannelAtLineStart =
+        channel === "OUT" ? stdoutAtLineStart : stderrAtLineStart;
+      let prelude = "";
+      if (
+        lastChannel !== null &&
+        lastChannel !== channel &&
+        !(lastChannel === "OUT" ? stdoutAtLineStart : stderrAtLineStart)
+      ) {
+        prelude = `[${lastChannel}] (cont)\n`;
+        if (lastChannel === "OUT") stdoutAtLineStart = true;
+        else stderrAtLineStart = true;
+      }
+
+      // Walk the chunk, splitting on \n and \r terminators. Each segment
+      // is "everything up to and including the next terminator" (or the
+      // tail if no terminator). Prefix when starting a new line.
+      let out = prelude;
+      let i = 0;
+      let atLineStart = prevChannelAtLineStart || prelude.length > 0;
+      const len = text.length;
+      while (i < len) {
+        // Find the next terminator at or after i.
+        let j = i;
+        while (j < len && text[j] !== "\n" && text[j] !== "\r") j++;
+        // Segment text[i..j) is the body up to (but excluding) the
+        // terminator; text[j] is either the terminator or end-of-text.
+        const hasTerminator = j < len;
+        const body = text.slice(i, j);
+        const terminator = hasTerminator ? text[j] : "";
+
+        if (atLineStart && (body.length > 0 || hasTerminator)) {
+          out += `[${channel}] `;
+        }
+        out += body + terminator;
+        atLineStart = hasTerminator;
+
+        i = j + (hasTerminator ? 1 : 0);
+      }
+
+      if (channel === "OUT") stdoutAtLineStart = atLineStart;
+      else stderrAtLineStart = atLineStart;
+      lastChannel = channel;
+
+      const ok = ws.write(out);
+      if (!ok) {
+        // Honor backpressure so a high-volume dump can't blow memory.
+        // Pause BOTH channels (not just the one that observed the falsy
+        // write) — the other channel writes through the same single fd
+        // and would otherwise pile up in the writer's internal buffer
+        // even after the active channel paused, defeating the bound.
+        //
+        // F6 mitigation: also stamp the watchdog's activity timer so the
+        // forced pause isn't misread as agent silence. The watchdog
+        // observes stdio 'data' events; pausing both channels stops
+        // those events entirely. Without proactive stamping, a slow disk
+        // that takes longer than args.timeoutMs to drain would let the
+        // watchdog conclude the child went silent and stall-kill it —
+        // even though we paused it. notifyActivity() is wired by
+        // attachStallWatchdog later in this function; declare a forward
+        // hook on the watchdog handle once it's attached. For now we
+        // record the pause time; finish() reads it for diagnostics.
+        backpressurePauses++;
+        backpressurePausedAt = Date.now();
+        child.stdout?.pause();
+        child.stderr?.pause();
+        ws.once("drain", () => {
+          if (backpressurePausedAt) {
+            backpressurePausedMs += Date.now() - backpressurePausedAt;
+            backpressurePausedAt = 0;
+          }
+          // Stamp activity on resume so the watchdog's "silence since
+          // last data event" counter is reset to NOW, not to whenever
+          // the last pre-pause data event fired. The watchdog handle
+          // exposes notifyActivity() once attached (added below).
+          watchdogActivityHook?.();
+          child.stdout?.resume();
+          child.stderr?.resume();
+        });
+      }
+    }
+
+    // F6 instrumentation: counters and a hook the watchdog can install
+    // to receive proactive activity signals from the backpressure path.
+    // The watchdog itself is attached below; the hook stays null until
+    // then. Tests can introspect backpressurePauses/Ms via the result
+    // object if we ever surface it; for now they're internal.
+    let backpressurePauses = 0;
+    let backpressurePausedAt = 0;
+    let backpressurePausedMs = 0;
+    let watchdogActivityHook: (() => void) | null = null;
+
     child.stdout?.on("data", (chunk: Buffer | string) => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       stdoutBytes += text.length;
       stdoutBuf = truncate(stdoutBuf + text);
+      writeChannel("OUT", text);
     });
     child.stderr?.on("data", (chunk: Buffer | string) => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       stderrBytes += text.length;
       stderrBuf = truncate(stderrBuf + text);
+      writeChannel("ERR", text);
     });
 
     // Watchdog mode: env-var opt-in for CPU-time liveness probing. Stream
@@ -382,6 +570,15 @@ function spawnCaptured(args: {
       },
     );
 
+    // F6 wire-up: when backpressure pauses both stdio streams, the
+    // stream-mode watchdog stops seeing 'data' events even though the
+    // child is actually busy producing output. Stamp the watchdog on
+    // resume so the silence-since-last-activity counter starts from
+    // NOW, not from whenever the last pre-pause data event fired.
+    // cpu-mode watchdog reads kernel CPU time directly so it doesn't
+    // need this hook; the call is a cheap recordActivity() either way.
+    watchdogActivityHook = () => watchdog.notifyActivity();
+
     if (args.closeStdin) child.stdin?.end();
 
     const finish = (exitCode: number | null, signal: NodeJS.Signals | null) => {
@@ -391,34 +588,115 @@ function spawnCaptured(args: {
       // as a non-timeout failure.
       const timedOut = stallKilled;
 
-      try {
-        fs.writeFileSync(
-          args.logPath,
-          `# command: ${args.bin} ${args.argv.map(quote).join(" ")}\n` +
-            `# cwd: ${args.cwd || process.cwd()}\n` +
-            `# started: ${new Date(startedAt).toISOString()}\n` +
-            `# duration_ms: ${Date.now() - startedAt}\n` +
-            `# timed_out: ${timedOut}\n` +
-            `# stall_killed: ${stallKilled}\n` +
-            `# stall_silence_ms: ${stallSilenceMs}\n` +
-            `# exit: ${exitCode ?? signal ?? "unknown"}\n` +
-            `# stdout_bytes: ${stdoutBytes}\n` +
-            `# stderr_bytes: ${stderrBytes}\n` +
-            `\n# ---- stdout ----\n${stdoutBuf}\n# ---- stderr ----\n${stderrBuf}\n`,
-        );
-      } catch {
-        // Log file write failures shouldn't sink the orchestrator.
-      }
+      // Footer goes through the SAME fd as the streamed body. Calling
+      // ws.end(footerBytes) on a stream that already wrote the header and
+      // body is race-free, unlike the pre-streaming model that did a single
+      // fs.writeFileSync on close. If we ever opened a separate fd with
+      // appendFileSync after ws.end(), buffered ws writes could land AFTER
+      // the appended footer and corrupt the log.
+      const footer =
+        (loggedStreamError
+          ? `\n# WARNING: log writer hit error; body may be truncated\n`
+          : "") +
+        `\n# ---- result ----\n` +
+        `# duration_ms: ${Date.now() - startedAt}\n` +
+        `# timed_out: ${timedOut}\n` +
+        `# stall_killed: ${stallKilled}\n` +
+        `# stall_silence_ms: ${stallSilenceMs}\n` +
+        `# exit: ${exitCode ?? signal ?? "unknown"}\n` +
+        `# stdout_bytes: ${stdoutBytes}\n` +
+        `# stderr_bytes: ${stderrBytes}\n`;
 
-      resolve({
-        stdout: stdoutBuf,
-        stderr: stderrBuf,
-        exitCode,
-        timedOut,
-        stallKilled,
-        logPath: args.logPath,
-        durationMs: Date.now() - startedAt,
-        retries: 0,
+      // Flush any trailing partial lines so the final log doesn't leave a
+      // dangling prefix-less segment on either channel. The body terminates
+      // with a clean newline before the footer; readers grepping `^\[OUT\]`
+      // / `^\[ERR\]` see complete lines.
+      let partialFlush = "";
+      if (!stdoutAtLineStart && lastChannel === "OUT") partialFlush += "\n";
+      if (!stderrAtLineStart && lastChannel === "ERR") partialFlush += "\n";
+
+      // Build a promise that resolves when the log file is fully flushed
+      // to disk. This matters because callers (and tests) often read
+      // logPath immediately after awaiting spawnCaptured — if we resolve
+      // before ws.end()'s flush completes, the reader sees a partial file
+      // missing the footer (and possibly the last few stdout/stderr
+      // chunks too). The 'finish' event fires after all buffered writes
+      // are flushed to the OS write buffer (close to but not identical
+      // to fsync; close enough for the post-close read pattern in
+      // practice).
+      //
+      // If the stream already errored before finish(), do NOT await
+      // another event — the stream is destroyed and no further events
+      // will fire. loggedStreamError tracks this so we resolve
+      // immediately rather than hanging on a stream that won't emit.
+      //
+      // No flush ceiling: the previous implementation had a 1s setTimeout
+      // safety net that silently truncated legitimate slow flushes on NFS
+      // / encrypted / CI disks. The 'finish'/'close'/'error' events from
+      // Node's WritableStream are guaranteed to fire (one of them always
+      // does); awaiting them as long as they need is correct. The only
+      // failure shape where none fire is a Node bug, and we'd rather
+      // surface that as a hang the operator notices than a silent
+      // truncated log shipped through detectBlindExecution.
+      const logFlushed: Promise<void> =
+        ws && !loggedStreamError
+          ? new Promise<void>((resolveFlush) => {
+              let settled = false;
+              const settle = () => {
+                if (settled) return;
+                settled = true;
+                resolveFlush();
+              };
+              ws!.once("finish", settle);
+              ws!.once("close", settle);
+              ws!.once("error", settle);
+              try {
+                ws!.end(partialFlush + footer);
+              } catch {
+                // ws already in error state. settle() will fire via the
+                // 'error' listener registered above. If for some reason
+                // it doesn't, force-destroy and settle so we don't hang.
+                try {
+                  ws!.destroy();
+                } catch {
+                  // destroy errors are swallowed; we're already on the
+                  // failure path.
+                }
+                settle();
+              }
+            })
+          : (() => {
+              // No live stream (createWriteStream sync-threw at spawn time).
+              // Fall back to a single best-effort sync write so the log
+              // file at least exists.
+              try {
+                fs.writeFileSync(
+                  args.logPath,
+                  `# command: ${args.bin} ${args.argv.map(quote).join(" ")}\n` +
+                    `# cwd: ${args.cwd || process.cwd()}\n` +
+                    `# started: ${new Date(startedAt).toISOString()}\n` +
+                    `# WARNING: live log stream unavailable\n` +
+                    footer +
+                    `\n# ---- stdout (post-mortem) ----\n${stdoutBuf}\n` +
+                    `# ---- stderr (post-mortem) ----\n${stderrBuf}\n`,
+                );
+              } catch {
+                // Log file write failures shouldn't sink the orchestrator.
+              }
+              return Promise.resolve();
+            })();
+
+      logFlushed.then(() => {
+        resolve({
+          stdout: stdoutBuf,
+          stderr: stderrBuf,
+          exitCode,
+          timedOut,
+          stallKilled,
+          logPath: args.logPath,
+          durationMs: Date.now() - startedAt,
+          retries: 0,
+        });
       });
     };
 
@@ -2581,6 +2859,143 @@ export async function runCodexImpl(opts: {
   });
 
   const logName = opts.logPrefix ?? "codex-impl";
+  const logPath = path.join(
+    logDir(opts.slug),
+    `phase-${opts.phaseNumber}-${logName}-${opts.iteration}.log`,
+  );
+
+  const timeoutMs = opts.timeoutMs ?? CODEX_TIMEOUT_MS;
+
+  const result = await spawnCaptured({
+    bin: CODEX_BIN,
+    argv,
+    cwd: opts.cwd,
+    timeoutMs,
+    logPath,
+    closeStdin: true,
+  });
+
+  cleanup();
+  return mergeOutputFile(result, opts.outputFilePath);
+}
+
+/**
+ * Build the argv for the feature-level review (not a phase review and not an
+ * implementation pass). Two things this gets right that buildCodexImplArgv
+ * gets wrong when it's misused for feature-review:
+ *
+ *  1. The prompt tells codex it is a REVIEWER. It must read the prepared
+ *     review prompt from inputFilePath verbatim, then write a verdict-shaped
+ *     report with `## VERDICT\n<FEATURE_PASS|FEATURE_NEEDS_PHASES|FEATURE_REDO>`
+ *     to outputFilePath. The prompt explicitly forbids editing any other file.
+ *
+ *  2. Sandbox = `workspace-write` (default). NOT `read-only`. Under codex
+ *     CLI v0.128+, `-s read-only` blocks ALL filesystem writes including the
+ *     reviewer's own output file → empty staged output → MISSING_VERDICT
+ *     every iteration → false halt-with-BLOCKED after 2 iterations. This was
+ *     the failure mode independent adversarial reviews flagged before ship.
+ *
+ *     The defense-in-depth model is now:
+ *       a) Prompt instruction: "Do NOT edit any file in the worktree"
+ *          (deterministic for compliant reviewers, advisory for adversarial)
+ *       b) Hygiene gate at cli.ts:applyMutableAgentHygiene catches any
+ *          worktree mutation post-spawn and converts it to HYGIENE_FAULT
+ *       c) Same-shape repeat detector halts the loop after 2 identical
+ *          HYGIENE_FAULTs (cli.ts outer loop)
+ *
+ *     Override via `GSTACK_BUILD_CODEX_FEATURE_REVIEW_SANDBOX` if you need a
+ *     stricter or looser sandbox.
+ */
+export function buildCodexFeatureReviewArgv(opts: {
+  inputFilePath: string;
+  outputFilePath: string;
+  cwd: string;
+  sandbox?: CodexSandbox;
+  reasoning?: RoleReasoning;
+  model?: string;
+}): string[] {
+  const codexPrompt = [
+    `You are the feature-level reviewer for gstack-build.`,
+    `Read the review brief at ${opts.inputFilePath} verbatim — it contains the feature body, phase summaries, commit log, and the EXACT verdict template you must emit.`,
+    `Do NOT edit any file in the worktree. Do NOT run git commit. Your only write target is ${opts.outputFilePath}.`,
+    `When done, write your report to ${opts.outputFilePath} starting with a section literally headed "## VERDICT" followed by one of FEATURE_PASS, FEATURE_NEEDS_PHASES, or FEATURE_REDO on the next non-blank line, then a "## Findings" section.`,
+    `Return ONLY the output file path. No narrative.`,
+  ].join(" ");
+
+  const sandbox =
+    opts.sandbox ||
+    (process.env.GSTACK_BUILD_CODEX_FEATURE_REVIEW_SANDBOX as
+      | CodexSandbox
+      | undefined) ||
+    "workspace-write";
+
+  const reasoning = opts.reasoning || "high";
+
+  return [
+    "exec",
+    codexPrompt,
+    ...(opts.model ? ["-m", opts.model] : []),
+    "-s",
+    sandbox,
+    "-c",
+    `model_reasoning_effort="${reasoning}"`,
+    "-C",
+    opts.cwd,
+  ];
+}
+
+/**
+ * Run a single feature-review iteration via Codex. Companion to runCodexImpl
+ * but for the reviewer role: reviewer prompt + read-only sandbox + the
+ * `## VERDICT` sentinel contract that parseFeatureReviewVerdict requires.
+ *
+ * Why this exists: feature-review previously routed through runCodexImpl
+ * (designed for the implementor half of a dual-impl tournament). The
+ * implementor prompt tells codex to "implement changes autonomously" and
+ * write a "files changed / tests run / what's verified" summary — which
+ * never contains the VERDICT sentinel, so the parser sees UNCLEAR every
+ * time, and the outer loop maps UNCLEAR onto TIMEOUT for the dashboard.
+ * Combined with workspace-write letting the reviewer mutate the tree
+ * (tripping post-agent hygiene), this produces an infinite loop of TIMEOUT
+ * verdicts that never converge. See plans/this-issue-is-the-streamed-stream.md
+ * for the full root-cause writeup.
+ */
+export async function runCodexFeatureReview(opts: {
+  inputFilePath: string;
+  outputFilePath: string;
+  cwd: string;
+  slug: string;
+  /** Feature identifier, e.g. "feature-1". Used for log filenames. */
+  phaseNumber: string;
+  iteration: number;
+  reasoning?: RoleReasoning;
+  model?: string;
+  logPrefix?: string;
+  timeoutMs?: number;
+  sandbox?: CodexSandbox;
+}): Promise<SubAgentResult> {
+  ensureLogDir(opts.slug);
+
+  const { stagedInput, stagedOutput, cleanup } = stageCodexIO({
+    slug: opts.slug,
+    phaseNumber: opts.phaseNumber,
+    iteration: opts.iteration,
+    suffix: opts.logPrefix ?? "feature-review",
+    cwd: opts.cwd,
+    inputFilePath: opts.inputFilePath,
+    outputFilePath: opts.outputFilePath,
+  });
+
+  const argv = buildCodexFeatureReviewArgv({
+    inputFilePath: stagedInput,
+    outputFilePath: stagedOutput,
+    cwd: opts.cwd,
+    sandbox: opts.sandbox,
+    reasoning: opts.reasoning,
+    model: opts.model,
+  });
+
+  const logName = opts.logPrefix ?? "feature-review";
   const logPath = path.join(
     logDir(opts.slug),
     `phase-${opts.phaseNumber}-${logName}-${opts.iteration}.log`,

@@ -92,6 +92,7 @@ import {
   runTests,
   runCodexImpl,
   runCodexReview,
+  runCodexFeatureReview,
   parseVerdict,
   parseFailureCount,
   parseJudgeVerdict,
@@ -112,6 +113,8 @@ import {
 import {
   buildFeatureReviewPrompt,
   classifyFeatureReviewTimeout,
+  fingerprintFeatureReviewFailure,
+  SAME_SHAPE_REPEAT_HALT_THRESHOLD,
   parseFeatureReviewVerdict,
   shouldSkipFeatureReview,
   type ParsedFeatureVerdict,
@@ -285,6 +288,59 @@ let visiblePlanProjection: {
   dryRun?: boolean;
   singleBranch?: boolean;
 } | null = null;
+
+/**
+ * Mark the visible plan projection as archived: any subsequent saveState
+ * call short-circuits the gate-visibility reconcile path. Called in two
+ * places in the success branch of main() — once before archiveLivingPlan
+ * moves the file out from under the reconciler, and once defensively in
+ * the finally block. Exported so the regression test (B-T1) can drive
+ * the same shutdown sequence the production code follows.
+ */
+export function markVisiblePlanArchived(): void {
+  visiblePlanProjection = null;
+}
+
+/**
+ * Read-side accessor for the projection — exported solely for tests that
+ * need to verify (a) it was non-null before the archive step and (b) it
+ * is null after. Production code never reads it through this accessor.
+ */
+export function _getVisiblePlanProjectionForTests(): unknown {
+  return visiblePlanProjection;
+}
+
+/**
+ * Set-side accessor for the projection — exported solely for tests that
+ * need to set up a realistic shutdown scenario (visiblePlanProjection
+ * pointing at a real plan file, then archive, then saveState). Production
+ * code sets visiblePlanProjection directly inside main().
+ */
+export function _setVisiblePlanProjectionForTests(
+  projection: {
+    planFile: string;
+    features: Feature[];
+    phases: Phase[];
+    skipShip?: boolean;
+    dryRun?: boolean;
+    singleBranch?: boolean;
+  } | null,
+): void {
+  visiblePlanProjection = projection;
+}
+
+/**
+ * Test-only invocation of saveState. Exported solely so B-T1 can prove
+ * that after markVisiblePlanArchived(), calling saveState (which is what
+ * the production shutdown sequence does) is a no-op for the gate-visibility
+ * reconcile path. Production callers use saveState directly inside main().
+ */
+export function _saveStateForTests(
+  state: BuildState,
+  log?: (msg: string) => void,
+): void {
+  saveState(state, { noGbrain: true, log });
+}
 
 function saveState(
   state: BuildState,
@@ -2663,12 +2719,15 @@ export function hygieneFailureResult(
     fs.mkdirSync(parsed.dir, { recursive: true });
   }
   fs.writeFileSync(hygieneLogPath, body);
-  return mockResult({
-    exitCode: 1,
-    stdout: body,
-    stderr: "",
-    logPath: hygieneLogPath,
-  });
+  return {
+    ...mockResult({
+      exitCode: 1,
+      stdout: body,
+      stderr: "",
+      logPath: hygieneLogPath,
+    }),
+    hygieneFailure: true,
+  };
 }
 
 export function archiveLivingPlan(planFile: string): string | null {
@@ -5934,6 +5993,55 @@ export function markPhaseCommittedAfterManualRecovery(args: {
 }
 
 /**
+ * Update the failure shape + same-shape streak on featureReview state.
+ * Used by runFeatureReviewIteration when an iteration ends in one of the
+ * reviewer-subprocess failure states. The outer loop reads sameShapeStreak
+ * to decide whether to halt instead of retrying.
+ */
+function updateFeatureReviewFailureShape(
+  fr: NonNullable<FeatureState["featureReview"]>,
+  failureState: "TIMEOUT" | "HYGIENE_FAULT" | "EXEC_ERROR" | "MISSING_VERDICT",
+  resultLogPath: string,
+): void {
+  // For HYGIENE_FAULT, the log path written by hygieneFailureResult is
+  // ends with `-hygiene.log` and contains the dirty-paths listing the
+  // fingerprint cares about. For other failure states the path doesn't
+  // carry shape information, but fingerprintFeatureReviewFailure handles
+  // those cases by returning the state name itself.
+  const hygieneLogPath =
+    failureState === "HYGIENE_FAULT" && resultLogPath.endsWith("-hygiene.log")
+      ? resultLogPath
+      : undefined;
+  const shape = fingerprintFeatureReviewFailure({
+    failureState,
+    hygieneLogPath,
+  });
+  if (shape === null) {
+    clearFeatureReviewFailureShape(fr);
+    return;
+  }
+  if (fr.lastFailureShape === shape) {
+    // Default to 0, not 1: a torn state-file write that left lastFailureShape
+    // set but sameShapeStreak undefined would otherwise jump straight to
+    // streak=2 → immediate halt on the FIRST matching iteration. Treating
+    // undefined as 0 (no prior count recorded) means we count this iteration
+    // as 1 and require one more matching iteration to halt — the actual
+    // two-strikes contract.
+    fr.sameShapeStreak = (fr.sameShapeStreak ?? 0) + 1;
+  } else {
+    fr.lastFailureShape = shape;
+    fr.sameShapeStreak = 1;
+  }
+}
+
+function clearFeatureReviewFailureShape(
+  fr: NonNullable<FeatureState["featureReview"]>,
+): void {
+  delete fr.lastFailureShape;
+  delete fr.sameShapeStreak;
+}
+
+/**
  * Single iteration of the feature-level review loop. Builds the prompt,
  * spawns the configured reviewer (see configure.cm featureReview role),
  * parses the verdict, and applies the verdict's side effects:
@@ -6052,16 +6160,38 @@ async function runFeatureReviewIteration(args: {
     parentBeforeRole = refreshParentWorkspaceSnapshot(
       args.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
     );
-    result = await runRoleTask({
-      role: args.roles.featureReview,
-      inputFilePath,
-      outputFilePath,
-      cwd: args.cwd,
-      slug,
-      phaseNumber: `feature-${args.feature.number}`,
-      iteration: args.iteration,
-      logPrefix: "feature-review",
-    });
+    // Codex provider routes through runCodexFeatureReview — implementor's
+    // workspace-write sandbox and "files changed / tests run" prompt template
+    // were producing TIMEOUT-rebranded UNCLEAR verdicts and tripping the
+    // post-agent hygiene gate when the reviewer mutated audit files. The
+    // dedicated reviewer path uses a read-only sandbox and a verdict-sentinel
+    // prompt. Other providers still go through runRoleTask for now —
+    // follow-up commits will give gemini/kimi/claude the same treatment.
+    if (args.roles.featureReview.provider === "codex") {
+      const resolved = resolveRoleTimeouts(args.roles.featureReview);
+      result = await runCodexFeatureReview({
+        inputFilePath,
+        outputFilePath,
+        cwd: args.cwd,
+        slug,
+        phaseNumber: `feature-${args.feature.number}`,
+        iteration: args.iteration,
+        reasoning: args.roles.featureReview.reasoning,
+        model: args.roles.featureReview.model,
+        timeoutMs: resolved.primaryMs,
+      });
+    } else {
+      result = await runRoleTask({
+        role: args.roles.featureReview,
+        inputFilePath,
+        outputFilePath,
+        cwd: args.cwd,
+        slug,
+        phaseNumber: `feature-${args.feature.number}`,
+        iteration: args.iteration,
+        logPrefix: "feature-review",
+      });
+    }
   }
   result = applyMutableAgentHygiene({
     result,
@@ -6095,9 +6225,13 @@ async function runFeatureReviewIteration(args: {
     artifactRaw = result.stdout || "";
   }
   let verdict = parseFeatureReviewVerdict(artifactRaw);
+  // Initial finalVerdict. UNCLEAR (no `## VERDICT` sentinel) is MISSING_VERDICT
+  // not TIMEOUT — the old code collapsed every non-PASS shape onto TIMEOUT,
+  // which hid the prompt-contract violation behind a generic timeout label.
+  // The classifyFeatureReviewResult helper produces the right discriminator.
   fr.finalVerdict =
     verdict.verdict === "UNCLEAR"
-      ? "TIMEOUT" // surface unclear as the closest existing enum so dashboards don't choke
+      ? "MISSING_VERDICT"
       : (verdict.verdict as any);
 
   let timedOutWithStructuredVerdict = false;
@@ -6112,13 +6246,33 @@ async function runFeatureReviewIteration(args: {
       if (timeoutClassification.kind === "pass-evidence-timeout") {
         fr.timeoutEvidence = "pass";
       }
+      updateFeatureReviewFailureShape(fr, "TIMEOUT", result.logPath);
       return { verdict, action: "unclear", outputFilePath };
     }
   }
 
   if (!timedOutWithStructuredVerdict && result.exitCode !== 0) {
-    fr.finalVerdict = "TIMEOUT";
+    // Non-zero exit, watchdog didn't fire. Two shapes (see
+    // classifyFeatureReviewResult for the full taxonomy):
+    //   - hygieneFailure: applyMutableAgentHygiene caught a worktree mutation.
+    //     Distinct fix path — same-shape repeats here are a signal to halt
+    //     rather than retry.
+    //   - everything else: transport, quota, crash. Generic retry-or-bail.
+    const failureState = result.hygieneFailure ? "HYGIENE_FAULT" : "EXEC_ERROR";
+    fr.finalVerdict = failureState;
+    updateFeatureReviewFailureShape(fr, failureState, result.logPath);
     return { verdict, action: "unclear", outputFilePath };
+  }
+
+  // Exit 0 (or timed-out-with-structured-verdict). If the parsed verdict is
+  // still UNCLEAR at this point, mark MISSING_VERDICT and track its shape.
+  // The successful verdict branches below clear the shape on PASS / REDO /
+  // NEEDS_PHASES.
+  if (verdict.verdict === "UNCLEAR" && !timedOutWithStructuredVerdict) {
+    fr.finalVerdict = "MISSING_VERDICT";
+    updateFeatureReviewFailureShape(fr, "MISSING_VERDICT", result.logPath);
+  } else {
+    clearFeatureReviewFailureShape(fr);
   }
 
   if (verdict.verdict === "FEATURE_PASS") {
@@ -9364,9 +9518,6 @@ async function runLearnFaultPatternsMode(args: Args): Promise<number> {
   return 2;
 }
 
-/** Hard wall-clock budget for end-of-build auto-drain (30 min). */
-const AUTO_DRAIN_BUDGET_MS = 30 * 60 * 1000;
-
 export async function runAutoDrainIfEnabled(
   args: Args,
   state: BuildState | null,
@@ -9377,13 +9528,13 @@ export async function runAutoDrainIfEnabled(
   const runIdFilter = state?.launch?.runId ?? state?.slug;
   if (!runIdFilter) return;
 
-  // 30-min wall-clock budget. When the orchestrator's fault queue gets stuck
-  // (e.g. on cross-project faults pre-78882e79 or any future regression),
-  // the budget caps end-of-build wall time. AbortSignal threads down to
-  // spawnInvestigatorCapture so the in-flight investigator child receives
-  // SIGTERM + 5s grace + SIGKILL — no orphaned children eating CPU after
-  // the orchestrator exits (plan v1.40.7.0 §Change 3, codex finding #8).
-  const drainAbort = AbortSignal.timeout(AUTO_DRAIN_BUDGET_MS);
+  // No per-call AbortSignal here. End-of-build callers wrap this in
+  // `runWithDeadline(AUTO_DRAIN_DEADLINE_MS, ...)` (PR #70) — the outer
+  // 60-second deadline supersedes any inner budget, and process.exit
+  // below reaps orphaned investigators via the OS. The `signal?` field
+  // on DrainHaltEventsOptions stays available for callers that DO want
+  // explicit child-kill semantics (e.g. a future non-end-of-build use of
+  // drain that runs under a longer-lived host process).
 
   try {
     const startMs = Date.now();
@@ -9397,7 +9548,6 @@ export async function runAutoDrainIfEnabled(
       severityMin: "MEDIUM" as HaltSeverity,
       investigatorTimeoutMs: 10 * 60 * 1000,
       runIdFilter,
-      signal: drainAbort,
     };
     const result = state
       ? await drainFaultsForBuildRun(
@@ -9630,6 +9780,13 @@ async function main() {
   console.log(`Plan: ${args.planFile}`);
   console.log(`Features parsed: ${features.length}`);
   console.log(`Phases parsed: ${phases.length}`);
+  // Surface the feature-review cap so the operator's mental model matches
+  // reality. The same-shape repeat detector halts earlier in practice
+  // (after 2 identical failures), so this is the upper bound on truly
+  // novel reviewer iterations.
+  console.log(
+    `Feature-review cap: ${args.featureReviewMaxIter} iterations per feature (halts earlier on same-shape repeats)`,
+  );
   console.log("");
   printPhaseTable(phases);
 
@@ -10697,6 +10854,55 @@ async function main() {
               // we just executed; show that value (not currentIter+1)
               // so cap=5 prints "cycle 5/5" instead of "cycle 6/5"
               // before the cap-extension prompt fires next iteration.
+
+              // Same-shape repeat halt: if two consecutive iterations
+              // returned the same failure shape (e.g. reviewer keeps
+              // editing the same audit file -> HYGIENE_FAULT with the
+              // same dirty path set), retrying is wasting budget. Halt
+              // with BLOCKED so the operator can intervene. See the
+              // tidy-haven loop incident for the failure mode this
+              // prevents (5 iterations, identical hygiene fault, ~25
+              // minutes of compute burned).
+              const streak =
+                featureState.featureReview?.sameShapeStreak ?? 0;
+              const shape = featureState.featureReview?.lastFailureShape;
+              if (streak >= SAME_SHAPE_REPEAT_HALT_THRESHOLD && shape) {
+                const reason = `feature-review halted: ${streak} consecutive iterations with the same failure shape (${shape.slice(0, 200)}). Retrying a deterministic failure is wasted compute; intervene manually.`;
+                console.error(
+                  `\n✗ Feature ${featureState.number}: ${reason}`,
+                );
+                const lastReportPath =
+                  featureState.featureReview?.outputFilePaths?.at(-1);
+                const md = buildBlockedFeatureMd({
+                  feature: featureDef,
+                  featureState,
+                  reason,
+                  lastReportPath,
+                  planFile: args.planFile,
+                  timestamp: new Date().toISOString(),
+                });
+                const blockedPath = path.join(
+                  cwd,
+                  `BLOCKED-feature-${featureState.number}.md`,
+                );
+                try {
+                  fs.writeFileSync(blockedPath, md);
+                  console.error(`  → Wrote ${blockedPath}`);
+                } catch (err) {
+                  console.error(
+                    `  → Failed to write ${blockedPath}: ${(err as Error).message}`,
+                  );
+                }
+                ensureBlockedGitignored(cwd);
+                featureState.status = "feature_blocked";
+                featureState.error = featureState.error ?? reason;
+                saveState(state, {
+                  noGbrain: args.noGbrain,
+                  log: console.warn,
+                });
+                reviewLoopAction = "blocked";
+                break;
+              }
               console.warn(
                 `  → review verdict was UNCLEAR; retrying (cycle ${currentIter}/${cap})`,
               );
@@ -11244,8 +11450,41 @@ async function main() {
         }
       }
       if (exitCode === 0 && state.completed && !args.dryRun && !args.skipShip) {
-        const archivedPath = archiveLivingPlan(state.planFile);
+        // Order matters here. Two failure shapes to avoid:
+        //
+        //   (A) ENOENT race: if we archive THEN saveState (which calls
+        //       reconcileVisiblePlanState), the reconcile reads the
+        //       inbox path stored in visiblePlanProjection and ENOENTs
+        //       because archiveLivingPlan just moved the file.
+        //
+        //   (B) Lost-gate-visibility: if we mark archived BEFORE
+        //       archiveLivingPlan and archiveLivingPlan then throws (FS
+        //       race, EPERM on encrypted vol, network FS hiccup), the
+        //       projection is now null but the inbox plan file is still
+        //       there. Subsequent saveStates lose gate-checkbox sync
+        //       for the rest of the run.
+        //
+        // The safe sequence: try archiveLivingPlan first, mark archived
+        // only AFTER it succeeded (file is now under archived/, no further
+        // inbox-path reconcile makes sense). If archiveLivingPlan throws,
+        // the projection stays valid and gate visibility keeps working
+        // against the unmoved inbox file.
+        let archivedPath: string | null = null;
+        try {
+          archivedPath = archiveLivingPlan(state.planFile);
+        } catch (err) {
+          // archiveLivingPlan failed. Leave the projection intact so
+          // gate visibility keeps reconciling against the unmoved
+          // inbox plan file for the remainder of shutdown.
+          console.warn(
+            `[plan] archiveLivingPlan failed (gate visibility preserved): ${(err as Error).message}`,
+          );
+        }
         if (archivedPath) {
+          // Archive succeeded — stop reconciling against the now-moved
+          // file. The finally block clears the projection again as
+          // belt-and-suspenders / test isolation hygiene.
+          markVisiblePlanArchived();
           state.planFile = archivedPath;
           saveState(state, { noGbrain: args.noGbrain, log: console.warn });
           console.log(`Archived living plan: ${archivedPath}`);
@@ -11259,6 +11498,13 @@ async function main() {
       }
     }
   } finally {
+    // Belt-and-suspenders for the gate-visibility reconcile race: even if
+    // shutdown hit the failure branch (so the success-path mark didn't
+    // run), make sure no further saveState calls trigger a stale-path
+    // reconcile. Module-level visiblePlanProjection persists across
+    // imports — clearing it here also prevents leakage into the next
+    // test that imports this module.
+    markVisiblePlanArchived();
     // Uninstall the wrapConsole shim FIRST so registry / lock cleanup
     // warnings below go through the real console.warn (not the wrapped
     // version, which would queue them as halt events on a run that's
@@ -11331,16 +11577,35 @@ async function main() {
   // non-fatal — preserves whatever exitCode the build produced. Opt out
   // via --no-auto-drain or GSTACK_HALT_EVENTS_OFF=1.
   //
-  // The heartbeat is intentionally still ticking here. drainFaultsForBuildRun
-  // bumps drainProcessedCount per entry, and the sidecar carries that count
-  // for the monitor's stall arm. If the heartbeat were stopped before
-  // auto-drain (as it was in the initial commit), the monitor would be blind
-  // to drain progress — the exact false-alive failure this PR fixes.
-  await runAutoDrainIfEnabled(args, state, drainProgress);
+  // Two reconciled controls layer here (PR #70 + PR #72):
+  //
+  //   - Outer 60-second AUTO_DRAIN_DEADLINE_MS (PR #70). This is the
+  //     end-of-build UX budget. The inner drain's 10-minute per-investigator
+  //     timeout is right for the standalone `gstack-build halt drain`
+  //     subcommand but wrong as a shutdown UX. process.exit below tears
+  //     down the event loop and the OS reaps orphaned investigator
+  //     children. On deadline hit, remaining queue entries stay in
+  //     pending-investigations/ for the next run.
+  //
+  //   - The heartbeat keeps ticking through this window (PR #72). Inside
+  //     the 60-second window, drainFaultsForBuildRun bumps the
+  //     drainProcessedCount counter per processed entry, the heartbeat
+  //     sidecar carries that count, and the monitor's stall arm sees real
+  //     progress. If we stopped the heartbeat BEFORE the drain (as the
+  //     initial PR #72 commit did, before the codex adversarial review
+  //     caught it), the monitor would be blind to drain progress — the
+  //     exact false-alive failure PR #72 is fixing.
+  await runWithDeadline(
+    () => runAutoDrainIfEnabled(args, state, drainProgress),
+    AUTO_DRAIN_DEADLINE_MS,
+    `auto-drain: ${AUTO_DRAIN_DEADLINE_MS / 1000}s end-of-build deadline exceeded, skipping ` +
+      "(any unprocessed halt events remain queued for next build or " +
+      "`gstack-build halt drain`)",
+  );
 
-  // NOW stop the heartbeat and clean up the sidecar — auto-drain is done
-  // and there's no more progress to publish. Order matters: stop() first so
-  // no further ticks race with the unlink.
+  // Auto-drain done (or deadlined). NOW stop the heartbeat and clean up
+  // the sidecar. Order matters: stop() first so no further ticks race
+  // with the unlink.
   if (heartbeat) {
     try {
       heartbeat.stop();
@@ -11351,6 +11616,42 @@ async function main() {
   removeHeartbeatSidecar(heartbeatPath);
 
   process.exit(exitCode);
+}
+
+/**
+ * End-of-build auto-drain deadline. The inner halt-events drain uses a
+ * 10-minute investigatorTimeoutMs which is wrong as a shutdown UX budget.
+ * Imported by tests as the canonical reference (rather than hardcoding).
+ */
+export const AUTO_DRAIN_DEADLINE_MS = 60_000;
+
+/**
+ * Race a promise against a hard millisecond deadline. If the deadline fires
+ * first, log `deadlineWarning` to console.warn and resolve `void`. The
+ * underlying work is NOT cancelled (callers should rely on process.exit or
+ * AbortSignal threading for true cancellation), but the parent stops
+ * awaiting it — useful for non-fatal end-of-build hooks where we'd rather
+ * exit late-on-its-own-terms than block shutdown.
+ *
+ * Exported only for unit testing — see auto-drain.test.ts.
+ */
+export async function runWithDeadline<T>(
+  work: () => Promise<T>,
+  deadlineMs: number,
+  deadlineWarning: string,
+): Promise<T | void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      console.warn(deadlineWarning);
+      resolve();
+    }, deadlineMs);
+  });
+  try {
+    return await Promise.race([work(), deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 export function checkWorkingTreeClean(cwd: string): {

@@ -1,5 +1,167 @@
 # TODOS
 
+## Build Orchestrator (follow-ups from streaming-log + race-fix landing)
+
+### Surface child log path in monitor / halt-event snapshots (T-MON)
+
+**What:** When `spawnCaptured` opens its live log stream, also log a single
+`[spawn] log: <path>` line, and include `logPath` in every halt-event snapshot
+emitted from a sub-agent context.
+
+**Why:** The streaming-log fix makes `ship.log` (and every other child log)
+grow in real time, but the orchestrator's `stdoutLog` is what the monitor and
+halt-event investigators tail. They currently don't know about the child log
+unless they parse the per-slug build-state directory layout. Surfacing the
+path makes "tail this exact file" a one-step instruction for users and the
+investigator subagent.
+
+**Context:** Added as part of /plan-eng-review on
+`fix/spawn-captured-streaming-and-cleanup`. Codex outside voice flagged that
+streaming `ship.log` doesn't help if monitors tail a different log. Right
+place to put the log line is the entry of `spawnCaptured`
+(`build/orchestrator/sub-agents.ts:295`); right place to thread `logPath`
+through is the snapshot builders in `build/orchestrator/halt-events.ts`.
+
+**Effort:** S
+**Priority:** P2
+**Depends on:** streaming-log fix landed
+
+### Stream progress into ship-output.md (T-SO)
+
+**What:** Change the slash-command contract so `/ship` (and `/land-and-deploy`)
+write progress into `ship-output.md` (or a sidecar `ship-progress.md`) as the
+subagent works, instead of leaving it 0 bytes until the very end.
+
+**Why:** With spawnCaptured streaming, the captured `ship.log` now grows live,
+but the subagent-authored report `ship-output.md` still sits empty for 10+
+minutes during the e2e test phase of `/ship`. That's the artifact users open
+when they want to see "what did /ship do?" — leaving it empty defeats half
+the visibility win.
+
+**Context:** Codex outside voice flagged this during /plan-eng-review on
+`fix/spawn-captured-streaming-and-cleanup`. The contract lives in
+`ship/SKILL.md.tmpl` (and per-host overrides under `hosts/`); every host
+binding has to be touched, which is why it's deferred rather than bundled
+with the streaming fix. Could also be solved by having the orchestrator
+periodically snapshot the streaming `ship.log` into `ship-output.md`, but
+that mixes captured-output and authored-report layers.
+
+**Effort:** L
+**Priority:** P3
+**Depends on:** none
+
+### Document the new spawnCaptured log format contract (T-FMT)
+
+**What:** Document the post-streaming log format in
+`build/orchestrator/README.md` (and reference from `CLAUDE.md`):
+header at top (`# command:` / `# cwd:` / `# started:`), interleaved
+`[OUT]`/`[ERR]` channel-tagged live output, `# ---- result ----` footer at
+end with `# duration_ms:` / `# exit:` / byte counts.
+
+**Why:** Existing tooling (and any future grep-based parser) that looked for
+the old `# ---- stdout ----` / `# ---- stderr ----` section markers needs to
+migrate. The old markers are gone — channel tagging happens per-line via
+`[OUT]` / `[ERR]` prefixes. Without docs, the format change is invisible
+until something breaks.
+
+**Context:** Added as part of /plan-eng-review on
+`fix/spawn-captured-streaming-and-cleanup`. Codex outside voice flagged this
+explicitly. README change is mechanical; the format is documented inline in
+`build/orchestrator/sub-agents.ts:295` as code comments — those just need to
+be pulled out into a referenced doc.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** streaming-log fix landed
+
+### Fix mid-line channel-prefix artifact in spawnCaptured (T-FMT-PARTIAL)
+
+**What:** When a child's stdout chunk arrives without a trailing newline
+and the next chunk completes that line, the continuation chunk gets a
+fresh `[OUT]` / `[ERR]` prefix prepended mid-line. The result is a single
+logical log line that contains e.g. `[OUT] partial[OUT] continuation\n` —
+ugly for humans and breaks grep-by-channel for tools that assume one
+prefix per logical line.
+
+**Why:** Cosmetic today (the streaming benefit dominates), but downstream
+parsers that grep `^\[OUT\]` to filter by channel will miss the
+continuation slice. The fix is small but touches the writeChannel hot
+path so it pairs naturally with T-FMT (documenting the new format).
+
+**Context:** Surfaced by Maintainability specialist on
+`fix/spawn-captured-streaming-and-cleanup`. The right fix is per-channel
+residual buffers (stdoutPartial, stderrPartial): concat incoming text,
+split on `\n`, prefix and write completed lines, retain the trailing
+partial. On finish(), flush any residuals with a final prefix.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** streaming-log fix landed
+
+### Adversarial review follow-ups (T-ADV)
+
+**What:** Adversarial review of `fix/spawn-captured-streaming-and-cleanup`
+surfaced several low-severity items that didn't block the ship but are
+worth picking up in a follow-up branch.
+
+- F2: `logFlushed.then(...)` lacks a `.catch` — currently the inner
+  Promise can only resolve (no reject path), but a future change adding
+  a reject path would silently swallow the spawnCaptured promise.
+  Defensive `.catch(() => resolve(...))` would prevent the latent hang.
+- F12: crash recovery (SIGKILL between archiveLivingPlan and the next
+  build start) still ENOENTs if a recovery hook reconstructs the
+  visiblePlanProjection from disk state without consulting
+  `state.planFile` (which holds the archived path after the fix). Right
+  now no such hook exists, but it's a fragile contract for future
+  resume-from-crash code.
+- F18: log file mode 0600 constrains ACL but doesn't stop root-level
+  backup daemons (Time Machine, restic-as-root) or macOS Spotlight
+  indexing under the user's privileges. Add `~/.gstack/build-state/`
+  to `mdimport` exclusions or move logs under `~/.gstack/cache/` which
+  Spotlight excludes by default.
+- F24: `AUTO_DRAIN_DEADLINE_MS = 60_000` is hardcoded. Operators with a
+  large halt-event backlog have only `--no-auto-drain` (all-or-nothing)
+  as the escape hatch. An env var like `GSTACK_AUTO_DRAIN_DEADLINE_MS`
+  would let an operator allow 3-5 minutes when warranted.
+- F29: `quote()` doesn't escape control characters (`\n`, `\r`, ANSI
+  escapes) in argv. A child whose argv contains a `\n` produces a
+  multi-line `# command:` header — downstream parsers that split on
+  the first newline would truncate the argv. Pretty low impact (callers
+  don't put untrusted content in argv) but is worth fixing for forensic
+  cleanliness.
+- F30: when `loggedStreamError` is true, the fallback `fs.writeFileSync`
+  path overwrites the file from scratch with `[OUT]`/`[ERR]`-less
+  content. Any partial body that did stream before the error gets
+  nuked. A more honest fallback would append a marker + the post-mortem
+  buffers rather than truncating.
+
+**Effort:** S each, ~M cumulative
+**Priority:** P3
+**Depends on:** none
+
+### Move markVisiblePlanArchived into archiveLivingPlan (T-ARCH)
+
+**What:** The gate-visibility ENOENT race is currently fixed by manually
+calling `markVisiblePlanArchived()` at two callsites in main()
+(success-branch + finally). A future shutdown branch that adds another
+archive callsite would silently regress the bug unless the contributor
+remembers to add a third `markVisiblePlanArchived()` call.
+
+**Why:** Make the invariant structural. Either (a) move the
+`markVisiblePlanArchived()` call inside `archiveLivingPlan` itself so
+any caller benefits automatically, or (b) wrap both in a tiny helper
+(`archiveAndStopReconciling`) that the orchestrator uses. Either way,
+the call sequence becomes uncallable in the wrong order.
+
+**Context:** Surfaced by Maintainability specialist on
+`fix/spawn-captured-streaming-and-cleanup` (M7). The B-T1 PART 3
+regression test catches the today's two callsites, but a third callsite
+added in a different branch wouldn't trip the test.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** none
+
 ## Pre-existing test failures observed on feat/release-daemon-path-fix-and-doctor
 
 ### P0: 4 unrelated tests fail before any of this branch's changes
@@ -33,6 +195,112 @@ per-test timeout (5s) being shorter than the spawn-child timeout (30s) in
 spawnSync. Fixed by adding explicit per-test timeouts (`, 15000` for 10s spawns,
 `, 35000` for 30s spawns) to 10 affected `test()` calls. No code logic changed,
 no flakiness window remains.
+
+## feature-review reviewer-role-kind follow-ups (from feat-feature-review-reviewer-role-kind branch)
+
+### P2: Extend RoleConfig with `kind: "implementor" | "reviewer"` + propagate to gemini/kimi/claude
+
+**Component:** build/orchestrator
+
+**What:** Add `kind: "implementor" | "reviewer"` field to `RoleConfig` in
+`build/orchestrator/role-config.ts`. Default `"implementor"` for back-compat.
+Mark `featureReview` and `planReview` as `kind: "reviewer"` in
+`DEFAULT_ROLE_CONFIGS`. Split `runGeminiRoleTask`, `runKimi`, and
+`runClaudeTask` into implementor/reviewer variants the same way
+`runCodexImpl` / `runCodexFeatureReview` were split. Wire `runRoleTask` in
+`cli.ts` and `sub-agents.ts` to dispatch on `role.kind` before
+`role.provider`.
+
+**Why:** The feat-feature-review-reviewer-role-kind branch fixed the codex
+feature-review path that was looping on TIMEOUT-rebranded UNCLEAR verdicts in
+production. The same architectural shape exists for gemini, kimi, and claude:
+their `runXxxRoleTask` functions use an implementor-shaped prompt template
+("Implement the changes autonomously…") which would produce the same UNCLEAR
+→ MISSING_VERDICT failure if a user ever configured `featureReview.provider`
+to one of those. They haven't yet because the configure.cm default is codex,
+but the trap is loaded.
+
+**Pros:** Defense-in-depth across all four providers. The implementor vs
+reviewer distinction becomes a first-class RoleConfig property, not a
+per-provider branch in `runFeatureReviewIteration`. Future role kinds
+(e.g. "judge", "auditor") slot in cleanly.
+
+**Cons:** Touches 4 sub-agent runners. Will need test parity across providers
+(today only codex has the reviewer-prompt argv test). The deferred work
+is roughly +250 LOC including tests.
+
+**Context:** Deferred at /ship time because the live production bug was
+codex-specific and the gemini/kimi/claude variants are prophylactic. The
+plan file at `~/.claude/plans/this-issue-is-the-streamed-stream.md` says
+to land this as a follow-up PR. Ship of feat-feature-review-reviewer-role-kind
+made the foundation: `classifyFeatureReviewResult` +
+`fingerprintFeatureReviewFailure` helpers + same-shape repeat detector +
+verdict-state split are all provider-agnostic.
+
+**Surfaced by:** Plan completion audit on /ship 2026-05-21. Plan Option B
+(structural fix across providers); codex piece landed, others deferred.
+
+### P2: Strict reviewer hygiene gate (kind-based zero-tolerance)
+
+**Component:** build/orchestrator
+
+**What:** Once `RoleConfig.kind` exists (P2 above), extend
+`applyMutableAgentHygiene` in `build/orchestrator/cli.ts` to accept the
+role kind and apply strict zero-tolerance for `kind: "reviewer"`: any dirty
+path, any new file, any commit attempt by a reviewer subagent fires
+`hygieneFailureResult` immediately with a `kind: "reviewer-mutation"`
+discriminator. The codex feature-review already gets this defense via the
+read-only-pivot-to-workspace-write decision plus the existing hygiene gate,
+but the kind-based path makes the contract explicit and provider-agnostic.
+
+**Why:** Today the hygiene gate's strictness comes from `applyGateHygiene`'s
+label-prefix heuristic (`label.startsWith("qa") || "review" || "reviewSecondary"`).
+Feature-review uses `label: "feature review"` which doesn't match, so it
+silently uses the looser `applyMutableAgentHygiene` path. Routing by role
+kind instead of label prefix removes that footgun.
+
+**Pros:** Makes the implementor vs reviewer trust boundary load-bearing in
+code. A reviewer that mutates the worktree is always a contract violation,
+not "sometimes OK because the label happened to not start with review".
+
+**Cons:** Needs the `RoleConfig.kind` field plumbing first (P2 above).
+Touches the hygiene gate. Risk of false-positive blocks on legitimate
+review-time auto-fixes (e.g. the existing test-only auto-commit path
+in `applyGateHygiene`).
+
+**Surfaced by:** Plan file design for Option B structural fix. Deferred at
+/ship 2026-05-21 with the gemini/kimi/claude provider variants.
+
+### P3: Flaky `release_queued` integration test
+
+**Component:** `build/orchestrator/__tests__/release-daemon.test.ts`
+
+**What:** The `release_queued without shippedAt/prNumber is detected as
+manual patch and reset` test passes in isolation (`bun test
+build/orchestrator/__tests__/release-daemon.test.ts`) but fails consistently
+when run as part of the full orchestrator suite (`bun test
+build/orchestrator/__tests__/`). Failure takes ~5s — looks like a
+timing-dependent test sensitive to parallel resource contention with
+sibling tests.
+
+**Why:** Flaky CI tests rot signal — every `/ship` triages it as
+pre-existing and skips, which dilutes the "is my branch green" signal.
+Either pin a per-test resource (file lock, port, etc.), increase the
+timeout if it's a slow-by-design test, or refactor the assertion to be
+order-independent.
+
+**Pros:** A green-on-every-run baseline makes /ship triage much cleaner
+and catches real regressions faster.
+
+**Cons:** Flaky tests are hard to root-cause. May need to add logging at
+the contention point to identify what's racing.
+
+**Context:** First observed during /ship of
+feat-feature-review-reviewer-role-kind (2026-05-21). Verified flaky on
+parent commit 98c7e03b before any of this branch's changes. Triaged as
+pre-existing per /ship Step 5.
+
+**Surfaced by:** /ship Test Failure Ownership Triage, classified pre-existing.
 
 ## Migration telemetry (release-daemon-style notices)
 

@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { runAutoDrainIfEnabled } from "../cli";
+import { runAutoDrainIfEnabled, runWithDeadline } from "../cli";
 import { emitManualRecoveryInvoked } from "../halt-event-helpers";
 import { emitHaltEvent } from "../halt-events";
 import {
@@ -340,5 +340,64 @@ describe("auto-drain hook contract", () => {
       path.join(skillFaults, "pending-investigations"),
     );
     expect(pending.length).toBe(1);
+  });
+});
+
+describe("runWithDeadline (end-of-build auto-drain budget)", () => {
+  // Pre-deadline, runAutoDrainIfEnabled could sit blocked up to 10 minutes
+  // because drainFaultsFromHaltEventsQueue uses investigatorTimeoutMs of
+  // 10 * 60 * 1000 (correct for the standalone halt-drain command, wrong
+  // as a post-ship UX budget). C-T1: prove the outer deadline fires AND
+  // the warning string lands.
+
+  test("C-T1: never-resolving work loses to the deadline within budget", async () => {
+    const warnings: string[] = [];
+    const oldWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map((a) => String(a)).join(" "));
+    };
+    try {
+      const startedAt = Date.now();
+      // 250ms deadline keeps the test snappy. The production callsite
+      // uses 60_000; the helper's behavior is identical at any scale.
+      const result = await runWithDeadline(
+        // Never-resolving promise simulates a drain that wedged forever.
+        () => new Promise<void>(() => {}),
+        250,
+        "auto-drain: 60s end-of-build deadline exceeded, skipping",
+      );
+      const elapsed = Date.now() - startedAt;
+      expect(elapsed).toBeGreaterThanOrEqual(200);
+      expect(elapsed).toBeLessThan(2000);
+      expect(result).toBeUndefined();
+      const deadlineWarn = warnings.find((w) =>
+        w.includes("60s end-of-build deadline exceeded"),
+      );
+      expect(deadlineWarn).toBeDefined();
+    } finally {
+      console.warn = oldWarn;
+    }
+  });
+
+  test("runWithDeadline returns the work's value when work finishes first", async () => {
+    const warnings: string[] = [];
+    const oldWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map((a) => String(a)).join(" "));
+    };
+    try {
+      const result = await runWithDeadline(
+        async () => "FAST",
+        5000,
+        "should-not-fire",
+      );
+      expect(result).toBe("FAST");
+      // No deadline warning when work wins the race.
+      expect(
+        warnings.find((w) => w.includes("should-not-fire")),
+      ).toBeUndefined();
+    } finally {
+      console.warn = oldWarn;
+    }
   });
 });

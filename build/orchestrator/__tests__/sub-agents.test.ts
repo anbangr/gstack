@@ -14,6 +14,7 @@ import {
   parseJudgeVerdict,
   buildCodexImplArgv,
   buildCodexReviewArgv,
+  buildCodexFeatureReviewArgv,
   buildClaudeTaskArgv,
   buildKimiTaskArgv,
   buildRoleTaskArgv,
@@ -30,6 +31,7 @@ import {
   resolveFallbackForRoleTask,
   resolveTimeoutFallback,
   checkPhaseScope,
+  spawnCaptured,
   type RunConfiguredRoleTaskOpts,
   type RunRoleTaskOpts,
 } from "../sub-agents";
@@ -824,6 +826,146 @@ describe("buildCodexReviewArgv (codex review invocation shape)", () => {
       const argv = buildCodexReviewArgv({
         inputFilePath: "/tmp/review-in.md",
         outputFilePath: "/tmp/review-out.md",
+        cwd: "/tmp/wt",
+      });
+      expect(argv).toContain("workspace-write");
+    });
+  });
+});
+
+describe("buildCodexFeatureReviewArgv (feature-level reviewer invocation)", () => {
+  // Why this exists: feature-review previously routed through runCodexImpl
+  // (designed for the implementor half of a dual-impl tournament). The
+  // implementor prompt + workspace-write sandbox combination produced an
+  // infinite loop of TIMEOUT-rebranded UNCLEAR verdicts because codex wrote
+  // implementor-shaped "files changed" prose, missing the `## VERDICT`
+  // sentinel parser, and also edited audit files, tripping the post-agent
+  // hygiene gate. The dedicated reviewer argv builder fixes both ends.
+  it("defaults to workspace-write sandbox (read-only blocks the reviewer's own output file)", () => {
+    // Earlier iteration of this code used `read-only`. Independent
+    // adversarial reviews flagged it before ship: codex CLI v0.128+ treats
+    // `-s read-only` as blocking ALL filesystem writes including the agreed
+    // output file, which would produce empty staged output every iteration,
+    // hit MISSING_VERDICT, and false-halt after 2 same-shape iterations.
+    // Defense-in-depth is now: prompt instruction (don't edit) + hygiene
+    // gate (catches mutations post-spawn) + same-shape repeat detector
+    // (halts on persistent mutation pattern).
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/review-in.md",
+      outputFilePath: "/tmp/review-out.md",
+      cwd: "/tmp/wt",
+    });
+    expect(argv).toContain("workspace-write");
+    expect(argv).not.toContain("read-only");
+    expect(argv).not.toContain("danger-full-access");
+  });
+
+  it("instructs codex to write the `## VERDICT` sentinel with one of the three feature verdicts", () => {
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/review-in.md",
+      outputFilePath: "/tmp/review-out.md",
+      cwd: "/tmp/wt",
+    });
+    const prompt = argv[1];
+    expect(prompt).toContain("## VERDICT");
+    expect(prompt).toContain("FEATURE_PASS");
+    expect(prompt).toContain("FEATURE_NEEDS_PHASES");
+    expect(prompt).toContain("FEATURE_REDO");
+    // Findings section is also part of the contract.
+    expect(prompt).toContain("## Findings");
+  });
+
+  it("tells codex it is a REVIEWER and not to edit files", () => {
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/review-in.md",
+      outputFilePath: "/tmp/review-out.md",
+      cwd: "/tmp/wt",
+    });
+    const prompt = argv[1];
+    expect(prompt).toContain("reviewer");
+    expect(prompt.toLowerCase()).toContain("do not edit");
+    // No "Implement the changes autonomously" — that's the implementor mode.
+    expect(prompt).not.toContain("Implement the changes autonomously");
+  });
+
+  it("embeds the inputFilePath and outputFilePath in the prompt", () => {
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/REVIEW_BRIEF.md",
+      outputFilePath: "/tmp/REVIEW_REPORT.md",
+      cwd: "/tmp/wt",
+    });
+    const prompt = argv[1];
+    expect(prompt).toContain("/tmp/REVIEW_BRIEF.md");
+    expect(prompt).toContain("/tmp/REVIEW_REPORT.md");
+  });
+
+  it("uses high reasoning effort by default", () => {
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/in.md",
+      outputFilePath: "/tmp/out.md",
+      cwd: "/tmp/wt",
+    });
+    expect(argv).toContain('model_reasoning_effort="high"');
+  });
+
+  it("honors opts.sandbox override (e.g. read-only when caller knows it's safe)", () => {
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/in.md",
+      outputFilePath: "/tmp/out.md",
+      cwd: "/tmp/wt",
+      sandbox: "read-only",
+    });
+    expect(argv).toContain("read-only");
+    expect(argv).not.toContain("workspace-write");
+  });
+
+  it("includes -m <model> when model is specified, -m before -s", () => {
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/in.md",
+      outputFilePath: "/tmp/out.md",
+      cwd: "/tmp/wt",
+      model: "gpt-feature-reviewer",
+    });
+    const mIdx = argv.indexOf("-m");
+    const sIdx = argv.indexOf("-s");
+    expect(mIdx).toBeGreaterThan(-1);
+    expect(argv[mIdx + 1]).toBe("gpt-feature-reviewer");
+    expect(sIdx).toBeGreaterThan(mIdx);
+  });
+
+  describe("GSTACK_BUILD_CODEX_FEATURE_REVIEW_SANDBOX env var", () => {
+    const ENV_VAR = "GSTACK_BUILD_CODEX_FEATURE_REVIEW_SANDBOX";
+    afterEach(() => {
+      delete process.env[ENV_VAR];
+    });
+
+    it("uses env var sandbox when opts.sandbox is not set", () => {
+      process.env[ENV_VAR] = "read-only";
+      const argv = buildCodexFeatureReviewArgv({
+        inputFilePath: "/tmp/in.md",
+        outputFilePath: "/tmp/out.md",
+        cwd: "/tmp/wt",
+      });
+      expect(argv).toContain("read-only");
+      expect(argv).not.toContain("workspace-write");
+    });
+
+    it("opts.sandbox takes precedence over env var", () => {
+      process.env[ENV_VAR] = "danger-full-access";
+      const argv = buildCodexFeatureReviewArgv({
+        inputFilePath: "/tmp/in.md",
+        outputFilePath: "/tmp/out.md",
+        cwd: "/tmp/wt",
+        sandbox: "read-only",
+      });
+      expect(argv).toContain("read-only");
+      expect(argv).not.toContain("danger-full-access");
+    });
+
+    it("falls back to workspace-write when env var is unset", () => {
+      const argv = buildCodexFeatureReviewArgv({
+        inputFilePath: "/tmp/in.md",
+        outputFilePath: "/tmp/out.md",
         cwd: "/tmp/wt",
       });
       expect(argv).toContain("workspace-write");
@@ -2499,7 +2641,12 @@ describe("stageGeminiIO", () => {
       inputFilePath: inputFileB,
       outputFilePath: outputFileB,
     });
-    stagedPaths.push(a.stagedInput, a.stagedOutput, b.stagedInput, b.stagedOutput);
+    stagedPaths.push(
+      a.stagedInput,
+      a.stagedOutput,
+      b.stagedInput,
+      b.stagedOutput,
+    );
 
     // Both runs land in the same directory (Gemini sandbox alignment).
     expect(path.dirname(a.stagedInput)).toBe(path.dirname(b.stagedInput));
@@ -2586,7 +2733,10 @@ describe("stageGeminiIO", () => {
     const inputFile = path.join(os.tmpdir(), `in-underscore-${Date.now()}.md`);
     fs.writeFileSync(inputFile, "test\n");
     stagedPaths.push(inputFile);
-    const outputFile = path.join(os.tmpdir(), `out-underscore-${Date.now()}.md`);
+    const outputFile = path.join(
+      os.tmpdir(),
+      `out-underscore-${Date.now()}.md`,
+    );
     stagedPaths.push(outputFile);
 
     const r = stageGeminiIO({
@@ -3303,6 +3453,297 @@ process.stdout.write(match ? match[1] : "");
         recursive: true,
         force: true,
       });
+    }
+  });
+});
+
+describe("spawnCaptured streaming", () => {
+  // Pre-streaming, spawnCaptured did a single fs.writeFileSync on child close.
+  // /ship-driven e2e runs that took 10+ min produced 0 bytes of visible log
+  // until the very end, so the orchestrator looked frozen for the whole window.
+  // These tests pin the new contract: header at top, channel-tagged live body,
+  // result footer at end, all via a single fd.
+
+  // Liveness assertion. The original A-T1 used a 1s child sleep and a 1s
+  // poll window — the bounds matched, so on a slow CI runner the poll could
+  // finish AFTER the child exits, in which case the [OUT] line is also
+  // visible in the post-close write — i.e. the assertion `observed.includes`
+  // would pass even if streaming were buffered to the end. The fix:
+  // 1. Extend the child's sleep to 3s so the poll-while-alive window is
+  //    unambiguously inside the run.
+  // 2. After observing the streamed line, race the pending promise against
+  //    a setImmediate-resolved promise and require setImmediate wins — this
+  //    proves the child has not yet resolved (i.e. is still running) at the
+  //    moment of observation. Returns the same observed text either way; the
+  //    failure surface is that the pending wins the race when streaming is
+  //    actually buffered-on-close.
+  async function expectStreamingWhileAlive(
+    pending: ReturnType<typeof spawnCaptured>,
+    logPath: string,
+    needle: string,
+  ): Promise<string> {
+    let observed = "";
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      try {
+        observed = fs.readFileSync(logPath, "utf8");
+      } catch {
+        // file not flushed yet, keep polling
+      }
+      if (observed.includes(needle)) break;
+    }
+    expect(observed).toContain(needle);
+
+    // Liveness check: the pending promise must NOT have resolved by the time
+    // we observe the streamed line. If pending wins the race against
+    // setImmediate, the child exited before we observed — meaning the line
+    // could have been written on close, not streamed mid-run.
+    const RACE_SENTINEL = Symbol("setImmediate-won");
+    const livenessRace = await Promise.race([
+      pending.then(() => "pending-resolved" as const),
+      new Promise<typeof RACE_SENTINEL>((r) =>
+        setImmediate(() => r(RACE_SENTINEL)),
+      ),
+    ]);
+    expect(livenessRace).toBe(RACE_SENTINEL);
+
+    return observed;
+  }
+
+  it("streams stdout to logPath while the child is still alive (A-T1)", async () => {
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "spawncaptured-stream-"),
+    );
+    const logPath = path.join(tmpDir, "streamed.log");
+    try {
+      const pending = spawnCaptured({
+        bin: "bash",
+        argv: ["-c", "echo STREAMED; sleep 3"],
+        cwd: tmpDir,
+        timeoutMs: 10000,
+        logPath,
+        closeStdin: true,
+      });
+      // Poll up to 1s for the streamed line, then prove the child is still
+      // alive at observation time. The 3s sleep gives us ~2s of headroom.
+      const observed = await expectStreamingWhileAlive(
+        pending,
+        logPath,
+        "[OUT] STREAMED",
+      );
+      // Header is at the top (preserves existing log-format contract).
+      expect(observed.split("\n")[0]).toMatch(/^# command: bash/);
+      // Let the child finish so we don't leak.
+      const result = await pending;
+      expect(result.exitCode).toBe(0);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("streams stderr with [ERR] prefix (A-T2)", async () => {
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "spawncaptured-stream-err-"),
+    );
+    const logPath = path.join(tmpDir, "stderr.log");
+    try {
+      const pending = spawnCaptured({
+        bin: "bash",
+        argv: ["-c", "echo STREAMED-ERR 1>&2; sleep 3"],
+        cwd: tmpDir,
+        timeoutMs: 10000,
+        logPath,
+        closeStdin: true,
+      });
+      await expectStreamingWhileAlive(pending, logPath, "[ERR] STREAMED-ERR");
+      await pending;
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("final log contains streamed body and footer block after close (A-T3)", async () => {
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "spawncaptured-footer-"),
+    );
+    const logPath = path.join(tmpDir, "full.log");
+    try {
+      const result = await spawnCaptured({
+        bin: "bash",
+        argv: ["-c", "echo body-line; echo body-err 1>&2; exit 0"],
+        cwd: tmpDir,
+        timeoutMs: 5000,
+        logPath,
+        closeStdin: true,
+      });
+      expect(result.exitCode).toBe(0);
+      const log = fs.readFileSync(logPath, "utf8");
+      // Header at top.
+      expect(log).toMatch(/^# command: bash/);
+      // Body contains both channels.
+      expect(log).toContain("[OUT] body-line");
+      expect(log).toContain("[ERR] body-err");
+      // Footer at end. Match across newlines; the `# duration_ms:` line must
+      // come AFTER the `# ---- result ----` marker (single fd, in-order).
+      const resultIdx = log.indexOf("# ---- result ----");
+      const durationIdx = log.indexOf("# duration_ms:");
+      const exitIdx = log.indexOf("# exit: 0");
+      expect(resultIdx).toBeGreaterThan(0);
+      expect(durationIdx).toBeGreaterThan(resultIdx);
+      expect(exitIdx).toBeGreaterThan(durationIdx);
+      // Byte-counts present and non-trivial.
+      expect(log).toMatch(/# stdout_bytes: \d+/);
+      expect(log).toMatch(/# stderr_bytes: \d+/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("writer error is logged via console.warn but does not throw (A-T4)", async () => {
+    // Construct a logPath whose parent does not exist. createWriteStream
+    // returns a stream that emits 'error' on first write (ENOENT). This
+    // exercises the ws.on('error') path: the run should still complete
+    // successfully, console.warn should fire exactly once, and the result
+    // object should still resolve cleanly.
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "spawncaptured-werr-"),
+    );
+    const badLogPath = path.join(tmpDir, "no-such-dir", "log.txt");
+    const warnings: string[] = [];
+    const oldWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map((a) => String(a)).join(" "));
+    };
+    try {
+      const result = await spawnCaptured({
+        bin: "bash",
+        argv: ["-c", "echo unaffected"],
+        cwd: tmpDir,
+        timeoutMs: 5000,
+        logPath: badLogPath,
+        closeStdin: true,
+      });
+      // Child runs and exits normally even though the log writer never
+      // reached disk.
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("unaffected");
+      // Exactly one writer-error warning surfaced (NOT swallowed silently).
+      const writerErrors = warnings.filter((w) =>
+        w.includes("log writer error"),
+      );
+      expect(writerErrors.length).toBeGreaterThanOrEqual(1);
+      expect(writerErrors[0]).toContain(badLogPath);
+    } finally {
+      console.warn = oldWarn;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  // F5 — channel-prefix mid-line corruption.
+  // The original naive `text.split(/(?<=\n)/).map(prefix).join('')` form
+  // would inject a fresh `[OUT] `/`[ERR] ` prefix mid-line whenever a
+  // child chunked output mid-line. Cross-channel interleave is worse:
+  // it could make a stdout fragment look like part of a stderr line.
+  // These tests pin the corrected behavior.
+
+  it("A-T5: chunked stdout (no terminator in chunk 1) does not inject mid-line prefix", async () => {
+    // Use printf with explicit pauses so chunk 1 arrives without \n, then
+    // chunk 2 completes the line. If the naive split-and-prefix form ran,
+    // the log would contain `[OUT] foo [OUT] bar\n` — a spurious prefix.
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "spawncaptured-f5-stdout-"),
+    );
+    const logPath = path.join(tmpDir, "chunked.log");
+    try {
+      const result = await spawnCaptured({
+        bin: "bash",
+        argv: ["-c", "printf 'foo '; sleep 0.2; printf 'bar\\n'"],
+        cwd: tmpDir,
+        timeoutMs: 5000,
+        logPath,
+        closeStdin: true,
+      });
+      expect(result.exitCode).toBe(0);
+      const log = fs.readFileSync(logPath, "utf8");
+      // Exactly one [OUT] prefix on the "foo bar" line. Spurious mid-line
+      // prefix would produce `[OUT] foo [OUT] bar\n`.
+      expect(log).toContain("[OUT] foo bar\n");
+      expect(log).not.toContain("foo [OUT] bar");
+      // Channel count check: the body has exactly one [OUT] occurrence
+      // for this content. Header has no channel tags.
+      const outCount = (log.match(/\[OUT\]/g) || []).length;
+      expect(outCount).toBe(1);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("A-T6: cross-channel interleave mid-line does not smear OUT into ERR", async () => {
+    // Sequence: OUT "foo " (no \n), ERR "warn\n", OUT "bar\n".
+    // Without per-channel line-start tracking, the disk content would be
+    // `[OUT] foo [ERR] warn\n[OUT] bar\n` — readers see "foo warn" as
+    // a single ERR line, completely wrong about which channel said
+    // "foo". The fix injects a `[OUT] (cont)\n` continuation marker
+    // when the active channel switches mid-line.
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "spawncaptured-f5-cross-"),
+    );
+    const logPath = path.join(tmpDir, "cross.log");
+    try {
+      const result = await spawnCaptured({
+        bin: "bash",
+        argv: [
+          "-c",
+          "printf 'foo '; sleep 0.2; printf 'warn\\n' 1>&2; sleep 0.2; printf 'bar\\n'",
+        ],
+        cwd: tmpDir,
+        timeoutMs: 5000,
+        logPath,
+        closeStdin: true,
+      });
+      expect(result.exitCode).toBe(0);
+      const log = fs.readFileSync(logPath, "utf8");
+      // "foo " must NEVER appear immediately followed by "[ERR]" on the
+      // same visible line — the continuation marker breaks them apart.
+      expect(log).not.toMatch(/\[OUT\] foo \[ERR\]/);
+      // "warn" is an ERR line, "bar" is an OUT line, and both must
+      // appear with their own prefix on their own line.
+      expect(log).toMatch(/\[ERR\] warn$/m);
+      expect(log).toMatch(/\[OUT\] bar$/m);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("A-T7: trailing partial line at EOF is flushed with a newline before the footer", async () => {
+    // Child exits before emitting a terminator. The pre-streaming model
+    // produced a log with no trailing newline between the last [OUT]
+    // line and the `# ---- result ----` footer, which made the result
+    // header look like a continuation of the last [OUT] line. The fix
+    // injects a synthetic newline at finish() time so the footer
+    // always starts at column 0.
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "spawncaptured-f5-partial-"),
+    );
+    const logPath = path.join(tmpDir, "partial.log");
+    try {
+      const result = await spawnCaptured({
+        bin: "bash",
+        // No trailing \n on "tail".
+        argv: ["-c", "printf 'head\\ntail'"],
+        cwd: tmpDir,
+        timeoutMs: 5000,
+        logPath,
+        closeStdin: true,
+      });
+      expect(result.exitCode).toBe(0);
+      const log = fs.readFileSync(logPath, "utf8");
+      // The footer marker is at line start, not appended to "[OUT] tail".
+      expect(log).toMatch(/\n# ---- result ----\n/);
+      // The last body line is "[OUT] tail" terminated by exactly one \n.
+      expect(log).toMatch(/\[OUT\] tail\n\n?# ---- result ----/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });
