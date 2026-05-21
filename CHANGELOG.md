@@ -12,27 +12,27 @@ A fifth failure class (plan-review CRITICAL → re-synthesis cross-run RESOLVED)
 
 End-to-end verified on the dev machine. Numbers from `bun test build/orchestrator/__tests__/` and from the inbox drain itself.
 
-| Surface | Before | After | Δ |
-| --- | --- | --- | --- |
-| `snapshot.stdoutTail` on emitted halt events | always `""` | last 200 lines of `agent-stdout.log` | real context restored |
-| Codex investigations of `gbrain put canonical` noise | every drain | never (`KNOWN_BENIGN_WARN_PATTERNS` skips) | -3 events from current backlog |
-| Codex investigations of Kimi→Gemini fallback success warns | every drain | never (paired RESOLVED collapses pre-dispatch) | future events |
-| Codex investigations of broader runRoleTask primary→backup recoveries | every drain | never (Class 4 applied to non-Configured path too) | future events |
-| Review-loop overrun log | "cycle 6/5" before the prompt fires | "cycle 5/5" then prompt | off-by-one closed |
-| `discardBlindExecutionChanges` on gemini sandbox escape | refuses ("workTreeContents not captured") | rolls back cleanly | rollback unblocked |
+| Surface                                                               | Before                                    | After                                              | Δ                              |
+| --------------------------------------------------------------------- | ----------------------------------------- | -------------------------------------------------- | ------------------------------ |
+| `snapshot.stdoutTail` on emitted halt events                          | always `""`                               | last 200 lines of `agent-stdout.log`               | real context restored          |
+| Codex investigations of `gbrain put canonical` noise                  | every drain                               | never (`KNOWN_BENIGN_WARN_PATTERNS` skips)         | -3 events from current backlog |
+| Codex investigations of Kimi→Gemini fallback success warns            | every drain                               | never (paired RESOLVED collapses pre-dispatch)     | future events                  |
+| Codex investigations of broader runRoleTask primary→backup recoveries | every drain                               | never (Class 4 applied to non-Configured path too) | future events                  |
+| Review-loop overrun log                                               | "cycle 6/5" before the prompt fires       | "cycle 5/5" then prompt                            | off-by-one closed              |
+| `discardBlindExecutionChanges` on gemini sandbox escape               | refuses ("workTreeContents not captured") | rolls back cleanly                                 | rollback unblocked             |
 
-| Test surfaces added | Cases | Lines |
-| --- | --- | --- |
-| wrap-console snapshot + benign patterns | T1-T3 | ~80 |
-| helperCtxFor stdoutLog plumbing | T_CTX1-2 | ~50 |
-| emitHaltEventResolved helper | T_HER1-3 | ~95 |
-| drain-faults pair collapse | T4-T6 + load shape | ~180 |
-| review-loop cap off-by-one | T12 | ~30 |
-| BLIND_EXECUTION rollback unblocked | T13, T13b | ~50 |
-| Kimi→Gemini fallback RESOLVED | T7a-c | ~60 |
-| runRoleTask Class 4 + runId chain | T7d-i | ~100 |
-| Legacy snapshot backfill | T_LBF1-4 | ~165 |
-| Total | **26 cases / 9 files** | **~810 LoC test** |
+| Test surfaces added                     | Cases                  | Lines             |
+| --------------------------------------- | ---------------------- | ----------------- |
+| wrap-console snapshot + benign patterns | T1-T3                  | ~80               |
+| helperCtxFor stdoutLog plumbing         | T_CTX1-2               | ~50               |
+| emitHaltEventResolved helper            | T_HER1-3               | ~95               |
+| drain-faults pair collapse              | T4-T6 + load shape     | ~180              |
+| review-loop cap off-by-one              | T12                    | ~30               |
+| BLIND_EXECUTION rollback unblocked      | T13, T13b              | ~50               |
+| Kimi→Gemini fallback RESOLVED           | T7a-c                  | ~60               |
+| runRoleTask Class 4 + runId chain       | T7d-i                  | ~100              |
+| Legacy snapshot backfill                | T_LBF1-4               | ~165              |
+| Total                                   | **26 cases / 9 files** | **~810 LoC test** |
 
 ### What this means for builders
 
@@ -73,6 +73,57 @@ The DETECTED+RESOLVED pair-collapse pattern works on TWO paths:
 - Queue side: the new pair-collapse pre-pass at the top of `drainFaultsFromHaltEventsQueue` reads `pending-investigations/` JSON files via `loadPendingEntries`.
 
 These are symmetric but use different inputs. New producers of transient warnings + recovery should call `emitHaltEventResolved` after the recovery succeeds so the queue-side collapse picks it up.
+
+## [build skill 1.26.0] — 2026-05-21
+
+**Silent sub-agents no longer get killed for being silent.** The stall watchdog now has a CPU-time mode that samples kernel CPU usage per pid in the child's process group, so providers that print nothing while they think (`kimi --print --final-message-only`, `codex exec` without `--json`) are kept alive as long as they're actually doing work. Stdout activity still resets the timer as a safety net. Opt in with `GSTACK_BUILD_WATCHDOG_CPU=1`; macOS + Linux only, Windows and minimal containers degrade to the existing stream-mode watchdog with a one-line notice.
+
+### The numbers that matter
+
+End-to-end verified on `build/orchestrator/__tests__/stall-watchdog.test.ts` (405 LoC of new test surface). Probe overhead measured on a developer laptop with `ps -o pid=,cputime= -g <pgid>` against a real sub-agent process tree.
+
+| Surface                               | Before                        | After                                               | Δ                               |
+| ------------------------------------- | ----------------------------- | --------------------------------------------------- | ------------------------------- |
+| Watchdog modes                        | `stream`, `mtime`             | `stream`, `mtime`, `cpu`                            | +1                              |
+| Liveness signal for silent sub-agents | stdout only (kill at stallMs) | kernel CPU delta OR stdout                          | no more false-positive kills    |
+| `parseCpuTime` accepted forms         | `[HH:]MM:SS[.ss]`             | `[DD-][HH:]MM:SS[.ss]`                              | Linux ≥1-day cputime now parsed |
+| `ps` probe at attach time             | none                          | one `spawnSync` per orchestrator process (memoized) | platform graceful-degrade       |
+| Per-pid tracking in process group     | n/a                           | `Map<pid, cpuMs>` snapshot per tick                 | new                             |
+
+### What this means for builders
+
+If you've been padding `GSTACK_BUILD_KIMI_TIMEOUT` upward to stop kimi from getting SIGTERM'd halfway through a long `--final-message-only` run, you can stop. Set `GSTACK_BUILD_WATCHDOG_CPU=1` and let the kernel decide whether the process is doing work. The stall window stays as a true silence-detector for genuinely deadlocked processes (no CPU, no stdout). Long-lived pair-agent shells with ≥1 day of accumulated CPU also no longer look frozen — the days-prefix parse bug that silently zeroed `cputime` on Linux is fixed.
+
+### Itemized changes
+
+#### Added
+
+- `cpu` mode in `build/orchestrator/stall-watchdog.ts` — third `StallWatchdogMode` variant alongside `stream` and `mtime`. Keeps the `stream` stdout/stderr listeners AND polls per-pid CPU via `sampleCpuFn`. Non-zero stdout OR positive CPU delta on any pid in the group resets the activity timer.
+- `parseCpuTime(raw: string): number` — exported helper that parses `[DD-][HH:]MM:SS[.ss]` ps cputime cells. Returns milliseconds; returns 0 on unparseable input (never throws — the watchdog must not crash on a weird ps line). Rejects leading-minus inputs so negative deltas can't sneak into the activity math.
+- `sampleProcessTreeCpuMs(pid)` default sampler — shells out to `ps -o pid=,cputime= -g <pgid>` and returns `Map<pid, cpuMs>` for every live pid in the group, or `null` when the group is gone / the platform call failed. Null is NOT treated as activity.
+- `psAvailableForWatchdog()` in `build/orchestrator/sub-agents.ts` — cached `ps` probe at attach time. Win32 short-circuits to false; macOS + Linux run the actual `ps -o pid=,cputime= -g <pid>` we'll use later, against the current process pid. Memoized — one probe per orchestrator process.
+- `GSTACK_BUILD_WATCHDOG_CPU=1` env var — opt-in for cpu-mode liveness. Documented in `build/README.md`'s env var table.
+- Stderr notice when `GSTACK_BUILD_WATCHDOG_CPU=1` is set on a platform without `ps` — one-line "ignored, using stream-mode" so a user opt-in can't silently kill every silent sub-agent at stallMs.
+
+#### Changed
+
+- `attachStallWatchdog` source-type discriminated union widened from `stream | mtime` to `stream | mtime | cpu`. All call sites still pass `stream` by default; `cpu` is opt-in via env var on the `spawnCaptured` path.
+- `killProcessAndGroup` signature reformatted (no behavior change).
+- `build/SKILL.md.tmpl` and generated `build/SKILL.md` skill version bumped from 1.25.0 to 1.26.0.
+
+#### Fixed
+
+- Parent-workspace hygiene snapshot is now refreshed immediately before each gate/role launch and reused for the post-launch comparison, instead of taking one stale snapshot at phase entry and reusing it across every retry. Pre-fix, retrying a gate after the agent legitimately committed a fix would compare against a stale `before` snapshot and flag the legitimate commit as parent-window damage. `cli.ts:runReviewGates`, `runFeatureReviewIteration`, and the three `runPhase` role-launch branches (`runRoleTask`, fix loop, rerun) now thread a `refreshParentWorkspaceSnapshot(parentWorkspace)` result through `applyResult`.
+- Plan parser now emits a warning when consecutive non-code phases look like a split phase (first has implementation gate only, second has review gate only, both same kind, same feature, adjacent in source). Catches the most common synthesis mistake before it reaches the orchestrator. Renders as `Phases X ("...") and Y ("...") look like a split <kind> phase; merge them into one [<kind>] phase containing both **<Implementation>** and **<Review>** checkboxes.`
+
+#### For contributors
+
+- 405 LoC of new test surface in `build/orchestrator/__tests__/stall-watchdog.test.ts` covers cpu-mode happy path, multi-pid CPU delta, stdout-still-resets-in-cpu-mode safety net, `null` sample handling, group-disappears handling, and `parseCpuTime` edge cases (days prefix, leading minus, malformed input).
+- New `build/orchestrator/__tests__/parser.test.ts` cases pin the split-phase warning shape across `writing`, `experiment`, `research`, and `manual` kinds; matching plan-review prompt snapshots updated in `__snapshots__/plan-review-prompts.test.ts.snap`.
+- `test/test-isolation-lint.test.ts` hardened: GSTACK_HOME isolation scope is now linted across the full test tree (not just a curated allowlist), and the lint rejects per-test `GSTACK_HOME` helper hooks that re-introduce the leak pattern.
+- `build/orchestrator/__tests__/skill-fault-detector.test.ts` and `halt-events-e2e.test.ts` updated to write GSTACK_HOME-isolated fault state instead of polluting the developer's real `~/.gstack/skill-faults/`.
+- New design + plan docs at `docs/superpowers/specs/2026-05-20-build-regression-fixes-design.md` and `docs/superpowers/plans/2026-05-20-build-regression-fixes.md`.
+- Completed skill-fault detector planning docs archived to `inbox/archive/` (housekeeping).
 
 ## [build skill 1.25.0] — 2026-05-20
 
