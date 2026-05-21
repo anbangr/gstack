@@ -3543,11 +3543,191 @@ export function ensureFeatureBranch(args: {
   return true;
 }
 
+function isCorruptRepoError(stderr: string): boolean {
+  const text = stderr || "";
+  return (
+    text.includes("did not send all necessary objects") ||
+    text.includes("bad object refs/heads/")
+  );
+}
+
+function corruptRepoResult(error: string): {
+  ok: false;
+  haltKind: "GIT_REPO_CORRUPT";
+  error: string;
+} {
+  return {
+    ok: false,
+    haltKind: "GIT_REPO_CORRUPT",
+    error:
+      `${error}\n` +
+      `Repository appears corrupt (GIT_REPO_CORRUPT). Recovery commands:\n` +
+      `  git fsck --full\n` +
+      `  git remote prune origin`,
+  };
+}
+
+/**
+ * Before `git fetch`, enumerate refs and move any malformed ones to
+ * `.git/quarantine/<sanitized>.ref` with a sidecar JSON.  No ref content is
+ * deleted — everything is restorable via the recorded recovery command.
+ *
+ * Kill switch: set `GSTACK_DISABLE_REF_QUARANTINE=1` to skip enumeration.
+ */
+export function quarantineMalformedRefs(cwd: string): {
+  quarantined: number;
+  skipped?: boolean;
+} {
+  if (process.env.GSTACK_DISABLE_REF_QUARANTINE === "1") {
+    return { quarantined: 0, skipped: true };
+  }
+
+  const gitDirResult = spawnSync(
+    "git",
+    ["-C", cwd, "rev-parse", "--git-dir"],
+    { cwd, encoding: "utf8" },
+  );
+  if (gitDirResult.status !== 0) {
+    return { quarantined: 0 };
+  }
+  const gitDir = path.resolve(cwd, gitDirResult.stdout.trim());
+
+  // Enumerate loose refs by walking the filesystem.  git for-each-ref
+  // silently skips refs with broken names (it prints a warning to stderr),
+  // so a filesystem walk is required to discover malformed refs.
+  const refs: string[] = [];
+  for (const prefix of ["refs/heads", "refs/remotes"]) {
+    const dir = path.join(gitDir, prefix);
+    if (!fs.existsSync(dir)) continue;
+    const walk = (relDir: string): void => {
+      const absDir = path.join(dir, relDir);
+      for (const entry of fs.readdirSync(absDir)) {
+        const absPath = path.join(absDir, entry);
+        const relPath = relDir ? `${relDir}/${entry}` : entry;
+        const st = fs.statSync(absPath);
+        if (st.isDirectory()) {
+          walk(relPath);
+        } else {
+          refs.push(`${prefix}/${relPath}`);
+        }
+      }
+    };
+    walk("");
+  }
+
+  // Determine which refs are malformed.
+  const malformed = new Set<string>();
+  const sanitizedNames = new Map<string, string[]>();
+  for (const ref of refs) {
+    const checkResult = spawnSync("git", ["check-ref-format", ref], {
+      cwd,
+      encoding: "utf8",
+    });
+    // Strip the refs/heads/ or refs/remotes/ prefix for the filesystem name.
+    const shortRef = ref.replace(/^refs\/(heads\/|remotes\/)/, "");
+    const sanitized = shortRef.replace(/[^A-Za-z0-9._-]/g, "-");
+    const list = sanitizedNames.get(sanitized) ?? [];
+    list.push(ref);
+    sanitizedNames.set(sanitized, list);
+
+    if (checkResult.status !== 0) {
+      malformed.add(ref);
+    }
+  }
+
+  // Collect every ref whose sanitized name collides with a malformed ref.
+  const toQuarantine = new Set<string>();
+  for (const badRef of malformed) {
+    const shortRef = badRef.replace(/^refs\/(heads\/|remotes\/)/, "");
+    const sanitized = shortRef.replace(/[^A-Za-z0-9._-]/g, "-");
+    for (const r of sanitizedNames.get(sanitized) ?? []) {
+      toQuarantine.add(r);
+    }
+  }
+
+  let quarantined = 0;
+  const quarantineDir = path.join(gitDir, "quarantine");
+  const usedNames = new Set<string>();
+
+  for (const ref of toQuarantine) {
+    // Resolve SHA (may be missing in an already-corrupt repo).
+    // git rev-parse often fails for broken ref names, so fall back to reading
+    // the loose-ref file directly.
+    const refRelPath = ref.replace(/^refs\//, "").replace(/\//g, path.sep);
+    const looseRefPath = path.join(gitDir, "refs", refRelPath);
+    let originalSha: string | null = null;
+    const shaResult = spawnSync("git", ["-C", cwd, "rev-parse", ref], {
+      cwd,
+      encoding: "utf8",
+    });
+    if (shaResult.status === 0) {
+      originalSha = shaResult.stdout.trim();
+    } else if (fs.existsSync(looseRefPath)) {
+      const content = fs.readFileSync(looseRefPath, "utf8").trim();
+      if (/^[0-9a-f]{40}$/i.test(content)) {
+        originalSha = content;
+      }
+    }
+
+    const shortRef = ref.replace(/^refs\/(heads\/|remotes\/)/, "");
+    let sanitized = shortRef.replace(/[^A-Za-z0-9._-]/g, "-");
+    let quarantineName = sanitized;
+    let counter = 1;
+    while (usedNames.has(quarantineName)) {
+      quarantineName = `${sanitized}-${counter}`;
+      counter++;
+    }
+    usedNames.add(quarantineName);
+
+    fs.mkdirSync(quarantineDir, { recursive: true });
+
+    const refFile = path.join(quarantineDir, `${quarantineName}.ref`);
+    const sidecarFile = path.join(quarantineDir, `${quarantineName}.json`);
+
+    const sourceRefPath = path.join(gitDir, "refs", refRelPath);
+
+    if (fs.existsSync(sourceRefPath)) {
+      fs.copyFileSync(sourceRefPath, refFile);
+      fs.unlinkSync(sourceRefPath);
+    }
+
+    const effectiveSha = originalSha ?? "0000000000000000000000000000000000000000";
+    const isNullSha = /^0{40}$/i.test(effectiveSha);
+    const quotedRef = ref.replace(/'/g, "'\\''");
+    // git update-ref refuses bad ref names, so add a filesystem fallback that
+    // directly recreates the loose-ref file when update-ref fails.
+    const recoveryCommand =
+      `git update-ref '${quotedRef}' ${isNullSha ? "0000000000000000000000000000000000000000" : effectiveSha} || ` +
+      `(mkdir -p '${path.dirname(looseRefPath).replace(/'/g, "'\\''")}' && echo '${effectiveSha}' > '${looseRefPath.replace(/'/g, "'\\''")}')`;
+    const sidecar = {
+      originalRef: ref,
+      originalSha: isNullSha ? null : originalSha,
+      timestamp: new Date().toISOString(),
+      reason: "invalid ref format",
+      recoveryCommand,
+    };
+    fs.writeFileSync(sidecarFile, JSON.stringify(sidecar, null, 2) + "\n");
+
+    console.log(`[quarantine] moved invalid ref ${ref} to ${refFile}`);
+    console.log(`[quarantine] recovery: ${sidecar.recoveryCommand}`);
+
+    quarantined++;
+  }
+
+  return { quarantined };
+}
+
 export function syncLandedBase(cwd: string): {
   ok: boolean;
   branch?: string;
   error?: string;
+  haltKind?: string;
 } {
+  const q = quarantineMalformedRefs(cwd);
+  if (q.quarantined > 0) {
+    console.log(`[sync] quarantined ${q.quarantined} malformed ref(s)`);
+  }
+
   // Worktree-safe: only fetch, never checkout. A linked worktree cannot check
   // out a branch that is already checked out in the primary clone. Fetching
   // updates origin/<base> so callers can branch from that tracking ref directly.
@@ -3556,7 +3736,11 @@ export function syncLandedBase(cwd: string): {
     encoding: "utf8",
   });
   if (fetch.status !== 0) {
-    return { ok: false, error: fetch.stderr || fetch.stdout };
+    const err = fetch.stderr || fetch.stdout || "";
+    if (isCorruptRepoError(err)) {
+      return corruptRepoResult(err);
+    }
+    return { ok: false, error: err };
   }
   const baseRef = detectRemoteBaseRef(cwd);
   const base = baseRef.replace(/^origin\//, "");
@@ -3566,13 +3750,22 @@ export function syncLandedBase(cwd: string): {
 export function syncFeatureBranchWithBase(
   cwd: string,
   branch: string,
-): { ok: boolean; baseRef?: string; conflicts?: string[]; error?: string } {
+): { ok: boolean; baseRef?: string; conflicts?: string[]; error?: string; haltKind?: string } {
+  const q = quarantineMalformedRefs(cwd);
+  if (q.quarantined > 0) {
+    console.log(`[sync] quarantined ${q.quarantined} malformed ref(s)`);
+  }
+
   const fetch = spawnSync("git", ["fetch", "origin"], {
     cwd,
     encoding: "utf8",
   });
   if (fetch.status !== 0) {
-    return { ok: false, error: fetch.stderr || fetch.stdout };
+    const err = fetch.stderr || fetch.stdout || "";
+    if (isCorruptRepoError(err)) {
+      return corruptRepoResult(err);
+    }
+    return { ok: false, error: err };
   }
   const baseRef = detectRemoteBaseRef(cwd);
   const checkout = spawnSync("git", ["checkout", branch], {
