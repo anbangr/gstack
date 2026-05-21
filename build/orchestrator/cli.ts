@@ -5962,7 +5962,13 @@ function updateFeatureReviewFailureShape(
     return;
   }
   if (fr.lastFailureShape === shape) {
-    fr.sameShapeStreak = (fr.sameShapeStreak ?? 1) + 1;
+    // Default to 0, not 1: a torn state-file write that left lastFailureShape
+    // set but sameShapeStreak undefined would otherwise jump straight to
+    // streak=2 → immediate halt on the FIRST matching iteration. Treating
+    // undefined as 0 (no prior count recorded) means we count this iteration
+    // as 1 and require one more matching iteration to halt — the actual
+    // two-strikes contract.
+    fr.sameShapeStreak = (fr.sameShapeStreak ?? 0) + 1;
   } else {
     fr.lastFailureShape = shape;
     fr.sameShapeStreak = 1;

@@ -2617,23 +2617,24 @@ export async function runCodexImpl(opts: {
  *  1. The prompt tells codex it is a REVIEWER. It must read the prepared
  *     review prompt from inputFilePath verbatim, then write a verdict-shaped
  *     report with `## VERDICT\n<FEATURE_PASS|FEATURE_NEEDS_PHASES|FEATURE_REDO>`
- *     to outputFilePath. The reviewer must NOT edit any other file.
+ *     to outputFilePath. The prompt explicitly forbids editing any other file.
  *
- *  2. Sandbox defaults to `read-only`. The reviewer's job is to read commits
- *     and report — it has no business mutating the worktree. Under
- *     `workspace-write` the agent would happily polish files it found
- *     imperfect, tripping the post-agent hygiene gate and looping. Override
- *     via `GSTACK_BUILD_CODEX_FEATURE_REVIEW_SANDBOX` if you need the rare
- *     hybrid mode.
+ *  2. Sandbox = `workspace-write` (default). NOT `read-only`. Under codex
+ *     CLI v0.128+, `-s read-only` blocks ALL filesystem writes including the
+ *     reviewer's own output file → empty staged output → MISSING_VERDICT
+ *     every iteration → false halt-with-BLOCKED after 2 iterations. This was
+ *     the failure mode independent adversarial reviews flagged before ship.
  *
- * Note that codex still needs to write the OUTPUT file. Callers stage that
- * file inside `.llm-tmp/` via stageCodexIO before invoking; even with
- * sandbox=read-only, codex can write the explicit output path because we
- * pass it as the agreed target in the prompt (codex treats the named output
- * file as a permitted write target). If a future codex CLI version makes
- * read-only block all writes including the explicit output path, flip the
- * default to `workspace-write` and rely on the strict reviewer hygiene
- * check to catch mutations.
+ *     The defense-in-depth model is now:
+ *       a) Prompt instruction: "Do NOT edit any file in the worktree"
+ *          (deterministic for compliant reviewers, advisory for adversarial)
+ *       b) Hygiene gate at cli.ts:applyMutableAgentHygiene catches any
+ *          worktree mutation post-spawn and converts it to HYGIENE_FAULT
+ *       c) Same-shape repeat detector halts the loop after 2 identical
+ *          HYGIENE_FAULTs (cli.ts outer loop)
+ *
+ *     Override via `GSTACK_BUILD_CODEX_FEATURE_REVIEW_SANDBOX` if you need a
+ *     stricter or looser sandbox.
  */
 export function buildCodexFeatureReviewArgv(opts: {
   inputFilePath: string;
@@ -2656,7 +2657,7 @@ export function buildCodexFeatureReviewArgv(opts: {
     (process.env.GSTACK_BUILD_CODEX_FEATURE_REVIEW_SANDBOX as
       | CodexSandbox
       | undefined) ||
-    "read-only";
+    "workspace-write";
 
   const reasoning = opts.reasoning || "high";
 

@@ -206,24 +206,53 @@ export function fingerprintFeatureReviewFailure(args: {
   // hygiene log body contains lines like:
   //   feature review left the working tree dirty:
   //      M audit/2026-05-21-autonomy-audit.md
+  //      MM src/staged-then-modified.ts
   //      ?? .llm-tmp/foo
   // Capture every porcelain-shaped line under the dirty-tree banner.
+  // Porcelain status is two chars (XY): X = staged status, Y = unstaged
+  // status, each one of M/A/D/R/C/?/U/!. After trim, the first char must be
+  // a porcelain code (leading space stripped). Accept either one porcelain
+  // char + space + path (the trimmed " M file" or "M  file" form) or two
+  // porcelain chars + space + path (the "MM file", "AM file", "??" form).
+  // The previous regex missed two-char combinations like "MM" (modified in
+  // both index and worktree), "AM" (added then modified), "MD" (modified
+  // then deleted) — common when a reviewer stages and then re-edits.
+  const porcelainPrefix = /^[MADRC?U!](?:[MADRC?U!]|\s)\s*\S/;
   const dirtyLines = body
     .split("\n")
     .map((line) => line.trim())
-    .filter((line) => /^(M |A |D |R |C |\?\? |\?\?|UU )/.test(line));
+    .filter((line) => porcelainPrefix.test(line));
   if (dirtyLines.length === 0) {
     // Hygiene gate fired for a non-dirty reason (parent-workspace mutation,
-    // empty output, no-new-commit). Fall back to the full hygiene-log body
-    // hash so distinct hygiene-failure shapes still produce distinct
-    // fingerprints. Use a stable substring (first 200 chars) to avoid
-    // tiny formatting drift over time.
-    const condensed = body.replace(/\s+/g, " ").trim().slice(0, 200);
+    // empty output, no-new-commit). Fall back to a body hash so distinct
+    // hygiene-failure shapes still produce distinct fingerprints.
+    //
+    // Strip lines that vary per iteration (the "Original agent log: <path>"
+    // line written by hygieneFailureResult embeds the iteration number into
+    // the log filename, so it differs every iteration and would defeat the
+    // same-shape detector). Strip ISO dates from anywhere in the body so a
+    // reviewer iteration that crosses midnight (or runs at a different time
+    // of day) still produces a matching fingerprint.
+    const condensed = body
+      .split("\n")
+      .filter((line) => !/^Original agent log:/.test(line.trim()))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .replace(/\b\d{4}-\d{2}-\d{2}\b/g, "<YYYY-MM-DD>")
+      .trim()
+      .slice(0, 200);
     return `HYGIENE_FAULT:other:${condensed}`;
   }
   // Sort + dedupe so reviewer agents that report dirty paths in
-  // nondeterministic order still match against the same shape.
-  const sorted = Array.from(new Set(dirtyLines)).sort();
+  // nondeterministic order still match against the same shape. Normalize
+  // ISO dates inside paths so a reviewer touching `audit/2026-05-21-foo.md`
+  // on iter 1 and `audit/2026-05-22-foo.md` on iter 2 (after midnight) still
+  // fingerprints to the same shape — the date stamp is incidental, the file
+  // role is what matters for "same shape".
+  const normalized = dirtyLines.map((line) =>
+    line.replace(/\b\d{4}-\d{2}-\d{2}\b/g, "<YYYY-MM-DD>"),
+  );
+  const sorted = Array.from(new Set(normalized)).sort();
   return `HYGIENE_FAULT:dirty:${sorted.join("|")}`;
 }
 

@@ -840,14 +840,22 @@ describe("buildCodexFeatureReviewArgv (feature-level reviewer invocation)", () =
   // implementor-shaped "files changed" prose, missing the `## VERDICT`
   // sentinel parser, and also edited audit files, tripping the post-agent
   // hygiene gate. The dedicated reviewer argv builder fixes both ends.
-  it("defaults to read-only sandbox (reviewer must not mutate the worktree)", () => {
+  it("defaults to workspace-write sandbox (read-only blocks the reviewer's own output file)", () => {
+    // Earlier iteration of this code used `read-only`. Independent
+    // adversarial reviews flagged it before ship: codex CLI v0.128+ treats
+    // `-s read-only` as blocking ALL filesystem writes including the agreed
+    // output file, which would produce empty staged output every iteration,
+    // hit MISSING_VERDICT, and false-halt after 2 same-shape iterations.
+    // Defense-in-depth is now: prompt instruction (don't edit) + hygiene
+    // gate (catches mutations post-spawn) + same-shape repeat detector
+    // (halts on persistent mutation pattern).
     const argv = buildCodexFeatureReviewArgv({
       inputFilePath: "/tmp/review-in.md",
       outputFilePath: "/tmp/review-out.md",
       cwd: "/tmp/wt",
     });
-    expect(argv).toContain("read-only");
-    expect(argv).not.toContain("workspace-write");
+    expect(argv).toContain("workspace-write");
+    expect(argv).not.toContain("read-only");
     expect(argv).not.toContain("danger-full-access");
   });
 
@@ -899,15 +907,15 @@ describe("buildCodexFeatureReviewArgv (feature-level reviewer invocation)", () =
     expect(argv).toContain('model_reasoning_effort="high"');
   });
 
-  it("honors opts.sandbox override (e.g. workspace-write for legacy compat)", () => {
+  it("honors opts.sandbox override (e.g. read-only when caller knows it's safe)", () => {
     const argv = buildCodexFeatureReviewArgv({
       inputFilePath: "/tmp/in.md",
       outputFilePath: "/tmp/out.md",
       cwd: "/tmp/wt",
-      sandbox: "workspace-write",
+      sandbox: "read-only",
     });
-    expect(argv).toContain("workspace-write");
-    expect(argv).not.toContain("read-only");
+    expect(argv).toContain("read-only");
+    expect(argv).not.toContain("workspace-write");
   });
 
   it("includes -m <model> when model is specified, -m before -s", () => {
@@ -931,14 +939,14 @@ describe("buildCodexFeatureReviewArgv (feature-level reviewer invocation)", () =
     });
 
     it("uses env var sandbox when opts.sandbox is not set", () => {
-      process.env[ENV_VAR] = "workspace-write";
+      process.env[ENV_VAR] = "read-only";
       const argv = buildCodexFeatureReviewArgv({
         inputFilePath: "/tmp/in.md",
         outputFilePath: "/tmp/out.md",
         cwd: "/tmp/wt",
       });
-      expect(argv).toContain("workspace-write");
-      expect(argv).not.toContain("read-only");
+      expect(argv).toContain("read-only");
+      expect(argv).not.toContain("workspace-write");
     });
 
     it("opts.sandbox takes precedence over env var", () => {
@@ -953,13 +961,13 @@ describe("buildCodexFeatureReviewArgv (feature-level reviewer invocation)", () =
       expect(argv).not.toContain("danger-full-access");
     });
 
-    it("falls back to read-only when env var is unset", () => {
+    it("falls back to workspace-write when env var is unset", () => {
       const argv = buildCodexFeatureReviewArgv({
         inputFilePath: "/tmp/in.md",
         outputFilePath: "/tmp/out.md",
         cwd: "/tmp/wt",
       });
-      expect(argv).toContain("read-only");
+      expect(argv).toContain("workspace-write");
     });
   });
 });

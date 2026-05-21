@@ -462,8 +462,12 @@ GATE FAIL
       hygieneLogPath: "/fake-hygiene.log",
       readFileFn: () => log,
     });
+    // ISO dates inside paths are normalized to <YYYY-MM-DD> so a reviewer
+    // iteration that crosses midnight (or runs at a different day) still
+    // matches a same-shape repeat — the file role is what matters, not the
+    // calendar day in the filename.
     expect(shape).toBe(
-      "HYGIENE_FAULT:dirty:M audit/2026-05-21-autonomy-audit.md",
+      "HYGIENE_FAULT:dirty:M audit/<YYYY-MM-DD>-autonomy-audit.md",
     );
   });
 
@@ -564,6 +568,106 @@ GATE FAIL
       readFileFn: () => log,
     });
     expect(shape).toBe(shape2);
+  });
+
+  it("HYGIENE_FAULT picks up two-char porcelain shapes (MM, AM, ?? etc) not just M / A / D", () => {
+    // Real git status --porcelain output includes two-char status codes:
+    //   M  file.ts   (modified in index, clean in worktree)
+    //    M file.ts   (clean in index, modified in worktree)
+    //   MM file.ts   (modified in both — reviewer staged then re-edited)
+    //   AM file.ts   (added in index, modified in worktree)
+    //   ?? file.ts   (untracked)
+    // The pre-fix regex only matched single-char prefixes followed by space.
+    // A reviewer that staged-then-re-edited would produce "MM file.ts",
+    // which fell through to the unreliable :other: hash path.
+    const log = `# Post-agent hygiene failure
+feature review left the working tree dirty:
+   MM src/staged-then-modified.ts
+   AM src/added-then-edited.ts
+   ?? .llm-tmp/scratch
+GATE FAIL
+`;
+    const shape = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/fake.log",
+      readFileFn: () => log,
+    });
+    // All three two-char prefixes captured; sorted alphabetically.
+    expect(shape).toBe(
+      "HYGIENE_FAULT:dirty:?? .llm-tmp/scratch|AM src/added-then-edited.ts|MM src/staged-then-modified.ts",
+    );
+  });
+
+  it("HYGIENE_FAULT shape is STABLE when a reviewer iteration crosses midnight (date in path)", () => {
+    // Reviewer touches audit/<today>-foo.md on iter 1, then audit/<tomorrow>-foo.md
+    // on iter 2 after midnight. Without date-normalization the fingerprints
+    // would differ → no same-shape halt → loop continues to cap. Normalize
+    // ISO dates so the file role matches across the day boundary.
+    const log = (date: string) => `# Post-agent hygiene failure
+feature review left the working tree dirty:
+   M audit/${date}-autonomy-audit.md
+GATE FAIL
+`;
+    const monday = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/a.log",
+      readFileFn: () => log("2026-05-21"),
+    });
+    const tuesday = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/b.log",
+      readFileFn: () => log("2026-05-22"),
+    });
+    expect(monday).toBe(tuesday);
+    expect(monday).toContain("<YYYY-MM-DD>");
+  });
+
+  it("HYGIENE_FAULT :other: path strips the per-iteration agent log line so non-dirty shapes match across iterations", () => {
+    // hygieneFailureResult writes "Original agent log: /…/phase-feature-1-feature-review-N.log"
+    // where N is the iteration number. The :other: condensed hash would
+    // otherwise embed that varying path → fingerprint differs every iteration
+    // → same-shape detector never halts on parent-workspace mutation or
+    // empty-output failures. Strip the line before condensing.
+    const log = (iter: number) => `# Post-agent hygiene failure
+
+feature review mutated parent workspace: /Users/foo/parent
+
+Original agent log: /Users/foo/.gstack/build-state/slug/phase-feature-1-feature-review-${iter}.log
+
+GATE FAIL
+`;
+    const iter1 = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/a.log",
+      readFileFn: () => log(1),
+    });
+    const iter2 = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/b.log",
+      readFileFn: () => log(2),
+    });
+    expect(iter1).toBe(iter2);
+    // The Original agent log path should NOT appear in the fingerprint.
+    expect(iter1).not.toContain("feature-review-1");
+    expect(iter1).not.toContain("feature-review-2");
+  });
+
+  it("HYGIENE_FAULT :other: path also normalizes ISO dates so same-shape matches across day rollover", () => {
+    const log = (date: string) => `# Post-agent hygiene failure
+feature review left an empty output summary at .llm-tmp/output-${date}.md
+GATE FAIL
+`;
+    const dayA = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/a.log",
+      readFileFn: () => log("2026-05-21"),
+    });
+    const dayB = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/b.log",
+      readFileFn: () => log("2026-05-22"),
+    });
+    expect(dayA).toBe(dayB);
   });
 
   it("SAME_SHAPE_REPEAT_HALT_THRESHOLD defaults to 2 (two-strikes-and-halt)", () => {
