@@ -77,6 +77,7 @@ const MODULE_TEST_OWNERS: Record<string, string[]> = {
   "wrap-console.ts": ["wrap-console.test.ts"],
   "state.ts": ["state.test.ts", "startup.test.ts"],
   "sub-agents.ts": ["sub-agents.test.ts", "cli-security.test.ts"],
+  "subagent-progress-parser.ts": ["subagent-progress-parser.test.ts"],
   "types.ts": [
     "cli.test.ts",
     "integration.test.ts",
