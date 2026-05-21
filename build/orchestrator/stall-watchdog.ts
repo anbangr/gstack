@@ -148,6 +148,18 @@ export interface StallWatchdogController {
    *   - undefined       — watchdog has not killed.
    */
   killReason: () => string | undefined;
+
+  /**
+   * Last classified tool name at kill time, or null if never
+   * classified. Set when parseProgress is wired and at least one
+   * ProgressEvent was emitted.
+   */
+  lastTool: () => string | null;
+
+  /**
+   * Last classified bucket at kill time, or null. Mirrors lastTool.
+   */
+  lastBucket: () => "fast" | "slow" | null;
 }
 
 /**
@@ -677,5 +689,7 @@ export function attachStallWatchdog(
       if (!stopped && !killed) recordActivity();
     },
     killReason: () => killReason,
+    lastTool: () => lastClassifiedTool,
+    lastBucket: () => lastClassifiedBucket,
   };
 }
