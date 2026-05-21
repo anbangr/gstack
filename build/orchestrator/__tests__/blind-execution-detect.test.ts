@@ -279,7 +279,7 @@ describe("discardBlindExecutionChanges", () => {
 
 describe("applyMutableAgentHygiene wire-in (D6 call-site integration)", () => {
   // gpt-5.5 IMPORTANT #4 regression: probe runs BEFORE recovery.
-  it("T4.1.13: blind probe fires before recoverMutableAgentCommit on exitCode 0", () => {
+  it("T4.1.13: blind probe fires before recoverMutableAgentCommit on exitCode 0", async () => {
     const slug = `slug-${Date.now()}`;
     const wt = buildWorktreeRoot(slug);
     initRepoAt(wt);
@@ -293,7 +293,7 @@ describe("applyMutableAgentHygiene wire-in (D6 call-site integration)", () => {
       "Error executing tool read_file: Path not in workspace: /x/y\n",
     );
 
-    const result = applyMutableAgentHygiene({
+    const result = await applyMutableAgentHygiene({
       result: {
         bin: "gemini",
         argv: [],
@@ -326,7 +326,7 @@ describe("applyMutableAgentHygiene wire-in (D6 call-site integration)", () => {
   });
 
   // gpt-5.5 IMPORTANT #6 regression: probe runs even on nonzero exit.
-  it("T4.1.14: blind probe fires on exitCode 1 (nonzero exit) too", () => {
+  it("T4.1.14: blind probe fires on exitCode 1 (nonzero exit) too", async () => {
     const slug = `slug-${Date.now()}`;
     const wt = buildWorktreeRoot(slug);
     initRepoAt(wt);
@@ -338,7 +338,7 @@ describe("applyMutableAgentHygiene wire-in (D6 call-site integration)", () => {
       "Error: Path not in workspace: /something\n",
     );
 
-    const result = applyMutableAgentHygiene({
+    const result = await applyMutableAgentHygiene({
       result: {
         bin: "gemini",
         argv: [],
@@ -362,7 +362,7 @@ describe("applyMutableAgentHygiene wire-in (D6 call-site integration)", () => {
     expect(fs.readFileSync(path.join(wt, "foo.ts"), "utf8")).toBe("ORIGINAL\n");
   });
 
-  it("T4.1.15: clean log + zero exit → unchanged path (no spurious blind detection)", () => {
+  it("T4.1.15: clean log + zero exit → unchanged path (no spurious blind detection)", async () => {
     const slug = `slug-${Date.now()}`;
     const wt = buildWorktreeRoot(slug);
     initRepoAt(wt);
@@ -371,7 +371,7 @@ describe("applyMutableAgentHygiene wire-in (D6 call-site integration)", () => {
 
     // Clean tree, clean log, exit 0 — no blind, no recovery work
     const log = writeFixtureLog("agent ran fine\n");
-    const result = applyMutableAgentHygiene({
+    const result = await applyMutableAgentHygiene({
       result: {
         bin: "gemini",
         argv: [],

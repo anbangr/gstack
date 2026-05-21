@@ -936,3 +936,15 @@ auto-sync across all worktrees, run `gbrain autopilot --install` once per
 machine — gbrain's daemon handles incremental refresh on a schedule.
 
 <!-- gstack-gbrain-search-guidance:end -->
+
+## Build orchestrator environment variables
+
+- `GSTACK_DISABLE_REF_QUARANTINE=1` — Skip the malformed-ref quarantine
+  preflight that runs before `git fetch` in `syncLandedBase` and
+  `syncFeatureBranchWithBase`. Use this kill switch when you are
+  intentionally working with refs that have non-standard names and do not
+  want the orchestrator to move them to `.git/quarantine/`.
+- `GSTACK_DISABLE_AUTH_PREFLIGHT=1` — Skip `assertGeminiAuth()` /
+  `assertCodexAuth()` probes (see `sub-agents.ts`).
+- `GSTACK_DISABLE_PROVIDER_CLASSIFIER=1` — Revert to pre-PR1b cap-hit
+  behavior instead of `classifyProviderFailure()` (see `cli.ts`).
