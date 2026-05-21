@@ -6126,11 +6126,10 @@ async function runFeatureReviewIteration(args: {
     cwd: args.cwd,
     encoding: "utf8",
   });
-  // Cap to ~80KB to avoid blowing the reviewer's context window. The
-  // header explains the truncation so the reviewer knows the diff is
-  // partial.
+  // Cap to ~30KB to bound reviewer input. The header explains the
+  // truncation so the reviewer knows the diff is partial.
   let featureDiff = diffR.status === 0 ? diffR.stdout || "" : "";
-  const DIFF_CAP = 80_000;
+  const DIFF_CAP = 30_000;
   if (featureDiff.length > DIFF_CAP) {
     featureDiff =
       `[diff truncated — first ${DIFF_CAP} of ${featureDiff.length} chars shown]\n` +
