@@ -257,6 +257,24 @@ export interface SubAgentResult {
    * `timedOut` today.
    */
   stallKilled: boolean;
+  /**
+   * Number of ms of stdout/stderr silence the stall watchdog observed
+   * before firing SIGTERM. Zero when stallKilled is false. Populated
+   * from the watchdog so renderRoleStepFailure can produce a precise
+   * "<role> stalled (no output for Nms, killed by watchdog)" message
+   * instead of the misleading raw "exit null" surface. Optional for
+   * back-compat with hygieneFailureResult and phase-oversized paths
+   * that never invoke the watchdog.
+   */
+  stallSilenceMs?: number;
+  /**
+   * The POSIX signal name (SIGTERM/SIGKILL/SIGINT/etc) when the child
+   * was killed by signal rather than exiting normally. Null otherwise.
+   * Lets renderRoleStepFailure distinguish a signal_killed result from
+   * an "exited with null" result of unknown origin. Optional for the
+   * same reason as stallSilenceMs.
+   */
+  exitSignal?: string | null;
   /** Absolute path to the log file written for this invocation. */
   logPath: string;
   /** Wall-clock duration in ms. */
@@ -693,6 +711,8 @@ export function spawnCaptured(args: {
           exitCode,
           timedOut,
           stallKilled,
+          stallSilenceMs,
+          exitSignal,
           logPath: args.logPath,
           durationMs: Date.now() - startedAt,
           retries: 0,
