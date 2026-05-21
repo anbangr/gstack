@@ -214,6 +214,7 @@ import {
   markFeatureFailed,
   markPhaseFailed,
   recordProviderFailureVerdict,
+  recordRedGateZeroTestsCollected,
   recordRetryCapHit,
   rewindPhase,
 } from "./halt-event-helpers";
@@ -6846,6 +6847,17 @@ async function runPhase(args: {
             }
           }
         }
+      }
+      if (action.reason.startsWith("RED_GATE_ZERO_TESTS_COLLECTED")) {
+        const testCmd =
+          resolveTestCmdForPhase(args, cwd, phase) ?? "unknown";
+        recordRedGateZeroTestsCollected(
+          state,
+          phaseState.index,
+          testCmd,
+          helperCtxFor(state),
+        );
+        classified = true;
       }
       if (!classified) {
         recordRetryCapHit(
