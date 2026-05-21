@@ -908,6 +908,27 @@ describe("buildCodexFeatureReviewArgv (feature-level reviewer invocation)", () =
     expect(argv).toContain('model_reasoning_effort="high"');
   });
 
+  it("honors opts.reasoning override (e.g. medium for cycle-1 fast pass)", () => {
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/in.md",
+      outputFilePath: "/tmp/out.md",
+      cwd: "/tmp/wt",
+      reasoning: "medium",
+    });
+    expect(argv).toContain('model_reasoning_effort="medium"');
+    expect(argv).not.toContain('model_reasoning_effort="high"');
+  });
+
+  it("honors opts.reasoning xhigh for deep-thought escalations", () => {
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/in.md",
+      outputFilePath: "/tmp/out.md",
+      cwd: "/tmp/wt",
+      reasoning: "xhigh",
+    });
+    expect(argv).toContain('model_reasoning_effort="xhigh"');
+  });
+
   it("honors opts.sandbox override (e.g. read-only when caller knows it's safe)", () => {
     const argv = buildCodexFeatureReviewArgv({
       inputFilePath: "/tmp/in.md",

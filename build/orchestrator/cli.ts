@@ -6270,6 +6270,12 @@ async function runFeatureReviewIteration(args: {
     // follow-up commits will give gemini/kimi/claude the same treatment.
     if (args.roles.featureReview.provider === "codex") {
       const resolved = resolveRoleTimeouts(args.roles.featureReview);
+      // Cycle 1 uses reasoning=medium; cycle 2+ uses the configured reasoning
+      // (typically high). If cycle 1 returns UNCLEAR, the retry runs with
+      // the configured reasoning. Cuts p50 latency on the happy path while
+      // preserving full-depth review on contested cases.
+      const effectiveReasoning =
+        args.iteration === 1 ? "medium" : args.roles.featureReview.reasoning;
       result = await runCodexFeatureReview({
         inputFilePath,
         outputFilePath,
@@ -6277,7 +6283,7 @@ async function runFeatureReviewIteration(args: {
         slug,
         phaseNumber: `feature-${args.feature.number}`,
         iteration: args.iteration,
-        reasoning: args.roles.featureReview.reasoning,
+        reasoning: effectiveReasoning,
         model: args.roles.featureReview.model,
         timeoutMs: resolved.primaryMs,
       });
