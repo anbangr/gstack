@@ -196,6 +196,112 @@ spawnSync. Fixed by adding explicit per-test timeouts (`, 15000` for 10s spawns,
 `, 35000` for 30s spawns) to 10 affected `test()` calls. No code logic changed,
 no flakiness window remains.
 
+## feature-review reviewer-role-kind follow-ups (from feat-feature-review-reviewer-role-kind branch)
+
+### P2: Extend RoleConfig with `kind: "implementor" | "reviewer"` + propagate to gemini/kimi/claude
+
+**Component:** build/orchestrator
+
+**What:** Add `kind: "implementor" | "reviewer"` field to `RoleConfig` in
+`build/orchestrator/role-config.ts`. Default `"implementor"` for back-compat.
+Mark `featureReview` and `planReview` as `kind: "reviewer"` in
+`DEFAULT_ROLE_CONFIGS`. Split `runGeminiRoleTask`, `runKimi`, and
+`runClaudeTask` into implementor/reviewer variants the same way
+`runCodexImpl` / `runCodexFeatureReview` were split. Wire `runRoleTask` in
+`cli.ts` and `sub-agents.ts` to dispatch on `role.kind` before
+`role.provider`.
+
+**Why:** The feat-feature-review-reviewer-role-kind branch fixed the codex
+feature-review path that was looping on TIMEOUT-rebranded UNCLEAR verdicts in
+production. The same architectural shape exists for gemini, kimi, and claude:
+their `runXxxRoleTask` functions use an implementor-shaped prompt template
+("Implement the changes autonomously…") which would produce the same UNCLEAR
+→ MISSING_VERDICT failure if a user ever configured `featureReview.provider`
+to one of those. They haven't yet because the configure.cm default is codex,
+but the trap is loaded.
+
+**Pros:** Defense-in-depth across all four providers. The implementor vs
+reviewer distinction becomes a first-class RoleConfig property, not a
+per-provider branch in `runFeatureReviewIteration`. Future role kinds
+(e.g. "judge", "auditor") slot in cleanly.
+
+**Cons:** Touches 4 sub-agent runners. Will need test parity across providers
+(today only codex has the reviewer-prompt argv test). The deferred work
+is roughly +250 LOC including tests.
+
+**Context:** Deferred at /ship time because the live production bug was
+codex-specific and the gemini/kimi/claude variants are prophylactic. The
+plan file at `~/.claude/plans/this-issue-is-the-streamed-stream.md` says
+to land this as a follow-up PR. Ship of feat-feature-review-reviewer-role-kind
+made the foundation: `classifyFeatureReviewResult` +
+`fingerprintFeatureReviewFailure` helpers + same-shape repeat detector +
+verdict-state split are all provider-agnostic.
+
+**Surfaced by:** Plan completion audit on /ship 2026-05-21. Plan Option B
+(structural fix across providers); codex piece landed, others deferred.
+
+### P2: Strict reviewer hygiene gate (kind-based zero-tolerance)
+
+**Component:** build/orchestrator
+
+**What:** Once `RoleConfig.kind` exists (P2 above), extend
+`applyMutableAgentHygiene` in `build/orchestrator/cli.ts` to accept the
+role kind and apply strict zero-tolerance for `kind: "reviewer"`: any dirty
+path, any new file, any commit attempt by a reviewer subagent fires
+`hygieneFailureResult` immediately with a `kind: "reviewer-mutation"`
+discriminator. The codex feature-review already gets this defense via the
+read-only-pivot-to-workspace-write decision plus the existing hygiene gate,
+but the kind-based path makes the contract explicit and provider-agnostic.
+
+**Why:** Today the hygiene gate's strictness comes from `applyGateHygiene`'s
+label-prefix heuristic (`label.startsWith("qa") || "review" || "reviewSecondary"`).
+Feature-review uses `label: "feature review"` which doesn't match, so it
+silently uses the looser `applyMutableAgentHygiene` path. Routing by role
+kind instead of label prefix removes that footgun.
+
+**Pros:** Makes the implementor vs reviewer trust boundary load-bearing in
+code. A reviewer that mutates the worktree is always a contract violation,
+not "sometimes OK because the label happened to not start with review".
+
+**Cons:** Needs the `RoleConfig.kind` field plumbing first (P2 above).
+Touches the hygiene gate. Risk of false-positive blocks on legitimate
+review-time auto-fixes (e.g. the existing test-only auto-commit path
+in `applyGateHygiene`).
+
+**Surfaced by:** Plan file design for Option B structural fix. Deferred at
+/ship 2026-05-21 with the gemini/kimi/claude provider variants.
+
+### P3: Flaky `release_queued` integration test
+
+**Component:** `build/orchestrator/__tests__/release-daemon.test.ts`
+
+**What:** The `release_queued without shippedAt/prNumber is detected as
+manual patch and reset` test passes in isolation (`bun test
+build/orchestrator/__tests__/release-daemon.test.ts`) but fails consistently
+when run as part of the full orchestrator suite (`bun test
+build/orchestrator/__tests__/`). Failure takes ~5s — looks like a
+timing-dependent test sensitive to parallel resource contention with
+sibling tests.
+
+**Why:** Flaky CI tests rot signal — every `/ship` triages it as
+pre-existing and skips, which dilutes the "is my branch green" signal.
+Either pin a per-test resource (file lock, port, etc.), increase the
+timeout if it's a slow-by-design test, or refactor the assertion to be
+order-independent.
+
+**Pros:** A green-on-every-run baseline makes /ship triage much cleaner
+and catches real regressions faster.
+
+**Cons:** Flaky tests are hard to root-cause. May need to add logging at
+the contention point to identify what's racing.
+
+**Context:** First observed during /ship of
+feat-feature-review-reviewer-role-kind (2026-05-21). Verified flaky on
+parent commit 98c7e03b before any of this branch's changes. Triaged as
+pre-existing per /ship Step 5.
+
+**Surfaced by:** /ship Test Failure Ownership Triage, classified pre-existing.
+
 ## Migration telemetry (release-daemon-style notices)
 
 ### P3: Emit telemetry when migration scripts print user-facing banners

@@ -14,6 +14,9 @@ import {
   buildFeatureReviewPrompt,
   parseFeatureReviewVerdict,
   classifyFeatureReviewTimeout,
+  classifyFeatureReviewResult,
+  fingerprintFeatureReviewFailure,
+  SAME_SHAPE_REPEAT_HALT_THRESHOLD,
   shouldSkipFeatureReview,
   isPathInLogDir,
   FEATURE_VERDICT_PASS,
@@ -259,6 +262,419 @@ ${marker}
       expect(classification.kind).toBe("unclear-timeout");
       expect(classification.verdict.verdict).toBe("UNCLEAR");
     }
+  });
+});
+
+describe("classifyFeatureReviewResult — failure-state discriminator", () => {
+  // Pre-fix the orchestrator collapsed all non-PASS reviewer outcomes onto
+  // either FEATURE_PASS / FEATURE_NEEDS_PHASES / FEATURE_REDO or a single
+  // TIMEOUT bucket. That hid two structurally different failures behind one
+  // label:
+  //   - codex finished cleanly but wrote implementor-shaped prose (no
+  //     `## VERDICT` sentinel) — that's a prompt routing bug, not a timeout.
+  //   - codex finished cleanly but mutated the worktree, tripping the
+  //     post-agent hygiene gate — that's a sandbox bug, not a timeout.
+  // classifyFeatureReviewResult is the pure replacement that returns the
+  // right discriminator (MISSING_VERDICT, HYGIENE_FAULT, EXEC_ERROR, TIMEOUT).
+  it("returns null for FEATURE_PASS (caller stores parsed verdict)", () => {
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: 0,
+      hygieneFailure: false,
+      parsedVerdict: "FEATURE_PASS",
+    });
+    expect(state).toBeNull();
+  });
+
+  it("returns null for FEATURE_REDO (caller stores parsed verdict)", () => {
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: 0,
+      hygieneFailure: false,
+      parsedVerdict: "FEATURE_REDO",
+    });
+    expect(state).toBeNull();
+  });
+
+  it("returns null for FEATURE_NEEDS_PHASES (caller stores parsed verdict)", () => {
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: 0,
+      hygieneFailure: false,
+      parsedVerdict: "FEATURE_NEEDS_PHASES",
+    });
+    expect(state).toBeNull();
+  });
+
+  it("returns MISSING_VERDICT when exit 0 but no sentinel found", () => {
+    // The actual failure shape from the tidy-haven loop. Codex finished with
+    // exit 0, wrote a "Files changed / tests run" implementor-shaped
+    // summary, and the parser saw UNCLEAR. Old code labeled this TIMEOUT
+    // and the loop kept retrying. The right signal is MISSING_VERDICT —
+    // codex didn't follow the contract, change the prompt.
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: 0,
+      hygieneFailure: false,
+      parsedVerdict: "UNCLEAR",
+    });
+    expect(state).toBe("MISSING_VERDICT");
+  });
+
+  it("returns TIMEOUT when the stall watchdog fired (regardless of exit code)", () => {
+    const state = classifyFeatureReviewResult({
+      timedOut: true,
+      exitCode: null, // killed by signal
+      hygieneFailure: false,
+      parsedVerdict: "UNCLEAR",
+    });
+    expect(state).toBe("TIMEOUT");
+  });
+
+  it("returns TIMEOUT even when hygieneFailure also happens to be true (watchdog wins)", () => {
+    // Defensive: in theory the watchdog could fire AND a stale hygiene log
+    // could appear. The watchdog kill is the authoritative root cause —
+    // hygiene applied to a half-killed subprocess is meaningless.
+    const state = classifyFeatureReviewResult({
+      timedOut: true,
+      exitCode: 1,
+      hygieneFailure: true,
+      parsedVerdict: "UNCLEAR",
+    });
+    expect(state).toBe("TIMEOUT");
+  });
+
+  it("returns HYGIENE_FAULT when non-zero exit + hygiene gate caught a mutation", () => {
+    // The tidy-haven iteration 3 shape: codex completed (exit 0 from its
+    // own perspective) but applyMutableAgentHygiene wrapped the result with
+    // hygieneFailureResult on dirty-tree detection, producing exit 1 +
+    // hygieneFailure: true.
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: 1,
+      hygieneFailure: true,
+      parsedVerdict: "UNCLEAR",
+    });
+    expect(state).toBe("HYGIENE_FAULT");
+  });
+
+  it("returns EXEC_ERROR for non-zero exit with no hygiene log (transport/crash)", () => {
+    // Provider transport failures (Codex 403/429, stream disconnects) and
+    // CLI crashes show up here. Distinct from HYGIENE_FAULT because the fix
+    // path is "retry or surface a provider issue", not "tighten the
+    // reviewer sandbox".
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: 1,
+      hygieneFailure: false,
+      parsedVerdict: "UNCLEAR",
+    });
+    expect(state).toBe("EXEC_ERROR");
+  });
+
+  it("EXEC_ERROR also fires when exit code is null (killed by signal but not via watchdog)", () => {
+    // Rare but possible: subprocess SIGKILL from outside (oom, manual kill).
+    // Not a watchdog kill (timedOut: false) — surface as EXEC_ERROR so the
+    // dashboard doesn't claim the stall watchdog did it.
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: null,
+      hygieneFailure: false,
+      parsedVerdict: "UNCLEAR",
+    });
+    expect(state).toBe("EXEC_ERROR");
+  });
+
+  it("HYGIENE_FAULT precedence: exit 1 + hygiene + UNCLEAR returns HYGIENE_FAULT, not MISSING_VERDICT", () => {
+    // When both signals are present (a hygiene-rejected reviewer that also
+    // failed to write the sentinel), HYGIENE_FAULT is the more actionable
+    // diagnosis. The reviewer mutating the worktree IS the upstream cause
+    // of the missing verdict.
+    const state = classifyFeatureReviewResult({
+      timedOut: false,
+      exitCode: 1,
+      hygieneFailure: true,
+      parsedVerdict: "UNCLEAR",
+    });
+    expect(state).toBe("HYGIENE_FAULT");
+  });
+});
+
+describe("fingerprintFeatureReviewFailure — same-shape detection", () => {
+  // Drives the outer loop's same-shape repeat halt. Two consecutive
+  // iterations with identical fingerprints prove the failure is
+  // deterministic — retrying is wasted compute, halt with BLOCKED.
+  it("returns null for a successful verdict (caller clears the streak)", () => {
+    const shape = fingerprintFeatureReviewFailure({ failureState: null });
+    expect(shape).toBeNull();
+  });
+
+  it("returns the bare state name for TIMEOUT (no useful sub-shape)", () => {
+    const shape = fingerprintFeatureReviewFailure({ failureState: "TIMEOUT" });
+    expect(shape).toBe("TIMEOUT");
+  });
+
+  it("returns the bare state name for EXEC_ERROR", () => {
+    const shape = fingerprintFeatureReviewFailure({
+      failureState: "EXEC_ERROR",
+    });
+    expect(shape).toBe("EXEC_ERROR");
+  });
+
+  it("returns the bare state name for MISSING_VERDICT", () => {
+    const shape = fingerprintFeatureReviewFailure({
+      failureState: "MISSING_VERDICT",
+    });
+    expect(shape).toBe("MISSING_VERDICT");
+  });
+
+  it("HYGIENE_FAULT with no log path falls back to a sentinel", () => {
+    const shape = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+    });
+    expect(shape).toBe("HYGIENE_FAULT:no-log");
+  });
+
+  it("HYGIENE_FAULT with unreadable log path falls back to a sentinel", () => {
+    const shape = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/path/that/does/not/exist.log",
+      readFileFn: () => {
+        throw new Error("ENOENT");
+      },
+    });
+    expect(shape).toBe("HYGIENE_FAULT:unreadable-log");
+  });
+
+  it("HYGIENE_FAULT with a dirty-tree log returns the sorted dirty path set", () => {
+    // The actual log shape from cli.ts:hygieneFailureResult on a dirty tree.
+    const log = `# Post-agent hygiene failure
+
+feature review left the working tree dirty:
+   M audit/2026-05-21-autonomy-audit.md
+
+Original agent log: /Users/foo/...
+
+GATE FAIL
+`;
+    const shape = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/fake-hygiene.log",
+      readFileFn: () => log,
+    });
+    // ISO dates inside paths are normalized to <YYYY-MM-DD> so a reviewer
+    // iteration that crosses midnight (or runs at a different day) still
+    // matches a same-shape repeat — the file role is what matters, not the
+    // calendar day in the filename.
+    expect(shape).toBe(
+      "HYGIENE_FAULT:dirty:M audit/<YYYY-MM-DD>-autonomy-audit.md",
+    );
+  });
+
+  it("HYGIENE_FAULT shapes are STABLE across iterations modifying the same file", () => {
+    const log = (timestamp: string) => `# Post-agent hygiene failure
+
+feature review left the working tree dirty:
+   M audit/2026-05-21-autonomy-audit.md
+
+Original agent log: /Users/foo/log-${timestamp}.log
+
+GATE FAIL
+`;
+    const a = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/a.log",
+      readFileFn: () => log("09:13"),
+    });
+    const b = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/b.log",
+      readFileFn: () => log("09:18"),
+    });
+    expect(a).toBe(b);
+  });
+
+  it("HYGIENE_FAULT shapes DIFFER when the dirty file set differs", () => {
+    const log = (file: string) => `# Post-agent hygiene failure
+
+feature review left the working tree dirty:
+   M ${file}
+
+Original agent log: /Users/foo/...
+
+GATE FAIL
+`;
+    const a = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/a.log",
+      readFileFn: () => log("src/file-a.ts"),
+    });
+    const b = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/b.log",
+      readFileFn: () => log("src/file-b.ts"),
+    });
+    expect(a).not.toBe(b);
+  });
+
+  it("HYGIENE_FAULT sorts + dedupes dirty paths so order-variance still matches", () => {
+    const logA = `# Post-agent hygiene failure
+feature review left the working tree dirty:
+   M one.ts
+   M two.ts
+   M three.ts
+GATE FAIL
+`;
+    const logB = `# Post-agent hygiene failure
+feature review left the working tree dirty:
+   M three.ts
+   M one.ts
+   M two.ts
+   M one.ts
+GATE FAIL
+`;
+    const a = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/a.log",
+      readFileFn: () => logA,
+    });
+    const b = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/b.log",
+      readFileFn: () => logB,
+    });
+    expect(a).toBe(b);
+  });
+
+  it("HYGIENE_FAULT without a dirty-tree banner (e.g. parent-workspace mutation) still gets a fingerprint", () => {
+    const log = `# Post-agent hygiene failure
+
+feature review mutated parent workspace: /Users/foo/parent
+
+Original agent log: /Users/foo/log.log
+
+GATE FAIL
+`;
+    const shape = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/fake.log",
+      readFileFn: () => log,
+    });
+    expect(shape).toContain("HYGIENE_FAULT:other:");
+    // Same log body, same shape — repeats can be detected.
+    const shape2 = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/fake2.log",
+      readFileFn: () => log,
+    });
+    expect(shape).toBe(shape2);
+  });
+
+  it("HYGIENE_FAULT picks up two-char porcelain shapes (MM, AM, ?? etc) not just M / A / D", () => {
+    // Real git status --porcelain output includes two-char status codes:
+    //   M  file.ts   (modified in index, clean in worktree)
+    //    M file.ts   (clean in index, modified in worktree)
+    //   MM file.ts   (modified in both — reviewer staged then re-edited)
+    //   AM file.ts   (added in index, modified in worktree)
+    //   ?? file.ts   (untracked)
+    // The pre-fix regex only matched single-char prefixes followed by space.
+    // A reviewer that staged-then-re-edited would produce "MM file.ts",
+    // which fell through to the unreliable :other: hash path.
+    const log = `# Post-agent hygiene failure
+feature review left the working tree dirty:
+   MM src/staged-then-modified.ts
+   AM src/added-then-edited.ts
+   ?? .llm-tmp/scratch
+GATE FAIL
+`;
+    const shape = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/fake.log",
+      readFileFn: () => log,
+    });
+    // All three two-char prefixes captured; sorted alphabetically.
+    expect(shape).toBe(
+      "HYGIENE_FAULT:dirty:?? .llm-tmp/scratch|AM src/added-then-edited.ts|MM src/staged-then-modified.ts",
+    );
+  });
+
+  it("HYGIENE_FAULT shape is STABLE when a reviewer iteration crosses midnight (date in path)", () => {
+    // Reviewer touches audit/<today>-foo.md on iter 1, then audit/<tomorrow>-foo.md
+    // on iter 2 after midnight. Without date-normalization the fingerprints
+    // would differ → no same-shape halt → loop continues to cap. Normalize
+    // ISO dates so the file role matches across the day boundary.
+    const log = (date: string) => `# Post-agent hygiene failure
+feature review left the working tree dirty:
+   M audit/${date}-autonomy-audit.md
+GATE FAIL
+`;
+    const monday = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/a.log",
+      readFileFn: () => log("2026-05-21"),
+    });
+    const tuesday = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/b.log",
+      readFileFn: () => log("2026-05-22"),
+    });
+    expect(monday).toBe(tuesday);
+    expect(monday).toContain("<YYYY-MM-DD>");
+  });
+
+  it("HYGIENE_FAULT :other: path strips the per-iteration agent log line so non-dirty shapes match across iterations", () => {
+    // hygieneFailureResult writes "Original agent log: /…/phase-feature-1-feature-review-N.log"
+    // where N is the iteration number. The :other: condensed hash would
+    // otherwise embed that varying path → fingerprint differs every iteration
+    // → same-shape detector never halts on parent-workspace mutation or
+    // empty-output failures. Strip the line before condensing.
+    const log = (iter: number) => `# Post-agent hygiene failure
+
+feature review mutated parent workspace: /Users/foo/parent
+
+Original agent log: /Users/foo/.gstack/build-state/slug/phase-feature-1-feature-review-${iter}.log
+
+GATE FAIL
+`;
+    const iter1 = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/a.log",
+      readFileFn: () => log(1),
+    });
+    const iter2 = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/b.log",
+      readFileFn: () => log(2),
+    });
+    expect(iter1).toBe(iter2);
+    // The Original agent log path should NOT appear in the fingerprint.
+    expect(iter1).not.toContain("feature-review-1");
+    expect(iter1).not.toContain("feature-review-2");
+  });
+
+  it("HYGIENE_FAULT :other: path also normalizes ISO dates so same-shape matches across day rollover", () => {
+    const log = (date: string) => `# Post-agent hygiene failure
+feature review left an empty output summary at .llm-tmp/output-${date}.md
+GATE FAIL
+`;
+    const dayA = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/a.log",
+      readFileFn: () => log("2026-05-21"),
+    });
+    const dayB = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/b.log",
+      readFileFn: () => log("2026-05-22"),
+    });
+    expect(dayA).toBe(dayB);
+  });
+
+  it("SAME_SHAPE_REPEAT_HALT_THRESHOLD defaults to 2 (two-strikes-and-halt)", () => {
+    // 2 is the minimum that proves deterministic repeat — 1 is just one
+    // failure, 3+ wastes compute. Tests assume this value; surface as
+    // constant so a casual bump in production is visible.
+    expect(SAME_SHAPE_REPEAT_HALT_THRESHOLD).toBe(2);
   });
 });
 

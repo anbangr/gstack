@@ -14,6 +14,7 @@ import {
   parseJudgeVerdict,
   buildCodexImplArgv,
   buildCodexReviewArgv,
+  buildCodexFeatureReviewArgv,
   buildClaudeTaskArgv,
   buildKimiTaskArgv,
   buildRoleTaskArgv,
@@ -825,6 +826,146 @@ describe("buildCodexReviewArgv (codex review invocation shape)", () => {
       const argv = buildCodexReviewArgv({
         inputFilePath: "/tmp/review-in.md",
         outputFilePath: "/tmp/review-out.md",
+        cwd: "/tmp/wt",
+      });
+      expect(argv).toContain("workspace-write");
+    });
+  });
+});
+
+describe("buildCodexFeatureReviewArgv (feature-level reviewer invocation)", () => {
+  // Why this exists: feature-review previously routed through runCodexImpl
+  // (designed for the implementor half of a dual-impl tournament). The
+  // implementor prompt + workspace-write sandbox combination produced an
+  // infinite loop of TIMEOUT-rebranded UNCLEAR verdicts because codex wrote
+  // implementor-shaped "files changed" prose, missing the `## VERDICT`
+  // sentinel parser, and also edited audit files, tripping the post-agent
+  // hygiene gate. The dedicated reviewer argv builder fixes both ends.
+  it("defaults to workspace-write sandbox (read-only blocks the reviewer's own output file)", () => {
+    // Earlier iteration of this code used `read-only`. Independent
+    // adversarial reviews flagged it before ship: codex CLI v0.128+ treats
+    // `-s read-only` as blocking ALL filesystem writes including the agreed
+    // output file, which would produce empty staged output every iteration,
+    // hit MISSING_VERDICT, and false-halt after 2 same-shape iterations.
+    // Defense-in-depth is now: prompt instruction (don't edit) + hygiene
+    // gate (catches mutations post-spawn) + same-shape repeat detector
+    // (halts on persistent mutation pattern).
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/review-in.md",
+      outputFilePath: "/tmp/review-out.md",
+      cwd: "/tmp/wt",
+    });
+    expect(argv).toContain("workspace-write");
+    expect(argv).not.toContain("read-only");
+    expect(argv).not.toContain("danger-full-access");
+  });
+
+  it("instructs codex to write the `## VERDICT` sentinel with one of the three feature verdicts", () => {
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/review-in.md",
+      outputFilePath: "/tmp/review-out.md",
+      cwd: "/tmp/wt",
+    });
+    const prompt = argv[1];
+    expect(prompt).toContain("## VERDICT");
+    expect(prompt).toContain("FEATURE_PASS");
+    expect(prompt).toContain("FEATURE_NEEDS_PHASES");
+    expect(prompt).toContain("FEATURE_REDO");
+    // Findings section is also part of the contract.
+    expect(prompt).toContain("## Findings");
+  });
+
+  it("tells codex it is a REVIEWER and not to edit files", () => {
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/review-in.md",
+      outputFilePath: "/tmp/review-out.md",
+      cwd: "/tmp/wt",
+    });
+    const prompt = argv[1];
+    expect(prompt).toContain("reviewer");
+    expect(prompt.toLowerCase()).toContain("do not edit");
+    // No "Implement the changes autonomously" — that's the implementor mode.
+    expect(prompt).not.toContain("Implement the changes autonomously");
+  });
+
+  it("embeds the inputFilePath and outputFilePath in the prompt", () => {
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/REVIEW_BRIEF.md",
+      outputFilePath: "/tmp/REVIEW_REPORT.md",
+      cwd: "/tmp/wt",
+    });
+    const prompt = argv[1];
+    expect(prompt).toContain("/tmp/REVIEW_BRIEF.md");
+    expect(prompt).toContain("/tmp/REVIEW_REPORT.md");
+  });
+
+  it("uses high reasoning effort by default", () => {
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/in.md",
+      outputFilePath: "/tmp/out.md",
+      cwd: "/tmp/wt",
+    });
+    expect(argv).toContain('model_reasoning_effort="high"');
+  });
+
+  it("honors opts.sandbox override (e.g. read-only when caller knows it's safe)", () => {
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/in.md",
+      outputFilePath: "/tmp/out.md",
+      cwd: "/tmp/wt",
+      sandbox: "read-only",
+    });
+    expect(argv).toContain("read-only");
+    expect(argv).not.toContain("workspace-write");
+  });
+
+  it("includes -m <model> when model is specified, -m before -s", () => {
+    const argv = buildCodexFeatureReviewArgv({
+      inputFilePath: "/tmp/in.md",
+      outputFilePath: "/tmp/out.md",
+      cwd: "/tmp/wt",
+      model: "gpt-feature-reviewer",
+    });
+    const mIdx = argv.indexOf("-m");
+    const sIdx = argv.indexOf("-s");
+    expect(mIdx).toBeGreaterThan(-1);
+    expect(argv[mIdx + 1]).toBe("gpt-feature-reviewer");
+    expect(sIdx).toBeGreaterThan(mIdx);
+  });
+
+  describe("GSTACK_BUILD_CODEX_FEATURE_REVIEW_SANDBOX env var", () => {
+    const ENV_VAR = "GSTACK_BUILD_CODEX_FEATURE_REVIEW_SANDBOX";
+    afterEach(() => {
+      delete process.env[ENV_VAR];
+    });
+
+    it("uses env var sandbox when opts.sandbox is not set", () => {
+      process.env[ENV_VAR] = "read-only";
+      const argv = buildCodexFeatureReviewArgv({
+        inputFilePath: "/tmp/in.md",
+        outputFilePath: "/tmp/out.md",
+        cwd: "/tmp/wt",
+      });
+      expect(argv).toContain("read-only");
+      expect(argv).not.toContain("workspace-write");
+    });
+
+    it("opts.sandbox takes precedence over env var", () => {
+      process.env[ENV_VAR] = "danger-full-access";
+      const argv = buildCodexFeatureReviewArgv({
+        inputFilePath: "/tmp/in.md",
+        outputFilePath: "/tmp/out.md",
+        cwd: "/tmp/wt",
+        sandbox: "read-only",
+      });
+      expect(argv).toContain("read-only");
+      expect(argv).not.toContain("danger-full-access");
+    });
+
+    it("falls back to workspace-write when env var is unset", () => {
+      const argv = buildCodexFeatureReviewArgv({
+        inputFilePath: "/tmp/in.md",
+        outputFilePath: "/tmp/out.md",
         cwd: "/tmp/wt",
       });
       expect(argv).toContain("workspace-write");

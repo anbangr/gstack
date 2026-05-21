@@ -102,6 +102,167 @@ export function parseFeatureReviewVerdict(raw: string): ParsedFeatureVerdict {
   return { verdict, phasesToRedo, additionalPhasesMd, findings };
 }
 
+/**
+ * The set of states `FeatureReviewState.finalVerdict` can take when the
+ * reviewer subprocess produced a non-PASS / non-NEEDS_PHASES / non-REDO
+ * outcome. These are dashboard discriminators — each one points at a
+ * distinct fix path, so the orchestrator must not collapse them onto a
+ * single label.
+ *
+ * Why this matters: the previous code rebranded UNCLEAR onto TIMEOUT and
+ * rebranded exit-code-non-zero onto TIMEOUT, which hid the fact that the
+ * reviewer was either writing the wrong artifact shape (MISSING_VERDICT)
+ * or being rejected by the post-agent hygiene gate (HYGIENE_FAULT). Same
+ * label, different fixes. See plans/this-issue-is-the-streamed-stream.md.
+ */
+export type FeatureReviewFailureState =
+  | "TIMEOUT" // stall watchdog SIGTERM'd the subprocess
+  | "HYGIENE_FAULT" // exited non-zero, post-agent hygiene caught a mutation
+  | "EXEC_ERROR" // exited non-zero, no hygiene log (transport, crash, quota)
+  | "MISSING_VERDICT"; // exited 0, artifact had no `## VERDICT` sentinel
+
+export interface ClassifyFeatureReviewResultArgs {
+  /** True iff the stall watchdog SIGTERM'd the subprocess. */
+  timedOut: boolean;
+  /** Exit code from the subprocess (null when killed by signal). */
+  exitCode: number | null;
+  /** True iff the result was wrapped by cli.ts:hygieneFailureResult. */
+  hygieneFailure: boolean;
+  /** Parsed verdict from the artifact. UNCLEAR means no sentinel found. */
+  parsedVerdict: FeatureVerdict;
+}
+
+/**
+ * Map a feature-review subprocess result onto the dashboard's failure-state
+ * discriminator. Returns null when the result is a successful verdict
+ * (FEATURE_PASS / FEATURE_NEEDS_PHASES / FEATURE_REDO) — caller stores
+ * the parsed verdict directly. Pure function; no side effects. Tested
+ * in __tests__/feature-review.test.ts.
+ *
+ * Precedence:
+ *   1. timedOut → TIMEOUT (watchdog kill takes priority over exit code)
+ *   2. exitCode !== 0 + hygieneFailure → HYGIENE_FAULT
+ *   3. exitCode !== 0 → EXEC_ERROR
+ *   4. parsedVerdict === UNCLEAR → MISSING_VERDICT (exit 0, no sentinel)
+ *   5. otherwise → null (caller uses parsedVerdict)
+ */
+export function classifyFeatureReviewResult(
+  args: ClassifyFeatureReviewResultArgs,
+): FeatureReviewFailureState | null {
+  if (args.timedOut) {
+    return "TIMEOUT";
+  }
+  if (args.exitCode !== 0) {
+    return args.hygieneFailure ? "HYGIENE_FAULT" : "EXEC_ERROR";
+  }
+  if (args.parsedVerdict === "UNCLEAR") {
+    return "MISSING_VERDICT";
+  }
+  return null;
+}
+
+/**
+ * Compute the shape fingerprint of a failed feature-review iteration. Two
+ * iterations with the same fingerprint indicate a deterministic same-shape
+ * repeat — the orchestrator's outer loop halts rather than retrying when
+ * two of these happen in a row, because retrying a deterministic failure
+ * just burns budget.
+ *
+ * For HYGIENE_FAULT, the shape includes the sorted, deduplicated set of
+ * paths the hygiene log reported dirty. Two iterations both modifying the
+ * same file => same shape. Two iterations modifying different files =>
+ * different shape (could be that the reviewer is exploring; keep retrying).
+ *
+ * For TIMEOUT / EXEC_ERROR / MISSING_VERDICT, the shape is just the state
+ * name — these don't carry a useful sub-discriminator at the loop level.
+ *
+ * For PASS / REDO / NEEDS_PHASES (i.e. when failureState === null), this
+ * function returns null and the caller clears the streak.
+ */
+export function fingerprintFeatureReviewFailure(args: {
+  failureState: FeatureReviewFailureState | null;
+  /** Path to the hygiene log written by hygieneFailureResult, when applicable. */
+  hygieneLogPath?: string;
+  /** Optional file-read function for tests; defaults to fs.readFileSync. */
+  readFileFn?: (p: string) => string;
+}): string | null {
+  if (args.failureState === null) {
+    return null;
+  }
+  if (args.failureState !== "HYGIENE_FAULT") {
+    return args.failureState;
+  }
+  if (!args.hygieneLogPath) {
+    return "HYGIENE_FAULT:no-log";
+  }
+  let body = "";
+  try {
+    body = (args.readFileFn ?? ((p) => fs.readFileSync(p, "utf8")))(
+      args.hygieneLogPath,
+    );
+  } catch {
+    return "HYGIENE_FAULT:unreadable-log";
+  }
+  // hygiene log body contains lines like:
+  //   feature review left the working tree dirty:
+  //      M audit/2026-05-21-autonomy-audit.md
+  //      MM src/staged-then-modified.ts
+  //      ?? .llm-tmp/foo
+  // Capture every porcelain-shaped line under the dirty-tree banner.
+  // Porcelain status is two chars (XY): X = staged status, Y = unstaged
+  // status, each one of M/A/D/R/C/?/U/!. After trim, the first char must be
+  // a porcelain code (leading space stripped). Accept either one porcelain
+  // char + space + path (the trimmed " M file" or "M  file" form) or two
+  // porcelain chars + space + path (the "MM file", "AM file", "??" form).
+  // The previous regex missed two-char combinations like "MM" (modified in
+  // both index and worktree), "AM" (added then modified), "MD" (modified
+  // then deleted) — common when a reviewer stages and then re-edits.
+  const porcelainPrefix = /^[MADRC?U!](?:[MADRC?U!]|\s)\s*\S/;
+  const dirtyLines = body
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => porcelainPrefix.test(line));
+  if (dirtyLines.length === 0) {
+    // Hygiene gate fired for a non-dirty reason (parent-workspace mutation,
+    // empty output, no-new-commit). Fall back to a body hash so distinct
+    // hygiene-failure shapes still produce distinct fingerprints.
+    //
+    // Strip lines that vary per iteration (the "Original agent log: <path>"
+    // line written by hygieneFailureResult embeds the iteration number into
+    // the log filename, so it differs every iteration and would defeat the
+    // same-shape detector). Strip ISO dates from anywhere in the body so a
+    // reviewer iteration that crosses midnight (or runs at a different time
+    // of day) still produces a matching fingerprint.
+    const condensed = body
+      .split("\n")
+      .filter((line) => !/^Original agent log:/.test(line.trim()))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .replace(/\b\d{4}-\d{2}-\d{2}\b/g, "<YYYY-MM-DD>")
+      .trim()
+      .slice(0, 200);
+    return `HYGIENE_FAULT:other:${condensed}`;
+  }
+  // Sort + dedupe so reviewer agents that report dirty paths in
+  // nondeterministic order still match against the same shape. Normalize
+  // ISO dates inside paths so a reviewer touching `audit/2026-05-21-foo.md`
+  // on iter 1 and `audit/2026-05-22-foo.md` on iter 2 (after midnight) still
+  // fingerprints to the same shape — the date stamp is incidental, the file
+  // role is what matters for "same shape".
+  const normalized = dirtyLines.map((line) =>
+    line.replace(/\b\d{4}-\d{2}-\d{2}\b/g, "<YYYY-MM-DD>"),
+  );
+  const sorted = Array.from(new Set(normalized)).sort();
+  return `HYGIENE_FAULT:dirty:${sorted.join("|")}`;
+}
+
+/**
+ * Default threshold: 2 consecutive iterations of the same failure shape are
+ * enough to declare deterministic failure. Surfaced as a constant so tests
+ * and operator overrides can reference it.
+ */
+export const SAME_SHAPE_REPEAT_HALT_THRESHOLD = 2;
+
 export function classifyFeatureReviewTimeout(
   raw: string,
 ): FeatureReviewTimeoutClassification {

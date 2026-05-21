@@ -92,6 +92,7 @@ import {
   runTests,
   runCodexImpl,
   runCodexReview,
+  runCodexFeatureReview,
   parseVerdict,
   parseFailureCount,
   parseJudgeVerdict,
@@ -112,6 +113,8 @@ import {
 import {
   buildFeatureReviewPrompt,
   classifyFeatureReviewTimeout,
+  fingerprintFeatureReviewFailure,
+  SAME_SHAPE_REPEAT_HALT_THRESHOLD,
   parseFeatureReviewVerdict,
   shouldSkipFeatureReview,
   type ParsedFeatureVerdict,
@@ -2710,12 +2713,15 @@ export function hygieneFailureResult(
     fs.mkdirSync(parsed.dir, { recursive: true });
   }
   fs.writeFileSync(hygieneLogPath, body);
-  return mockResult({
-    exitCode: 1,
-    stdout: body,
-    stderr: "",
-    logPath: hygieneLogPath,
-  });
+  return {
+    ...mockResult({
+      exitCode: 1,
+      stdout: body,
+      stderr: "",
+      logPath: hygieneLogPath,
+    }),
+    hygieneFailure: true,
+  };
 }
 
 export function archiveLivingPlan(planFile: string): string | null {
@@ -5981,6 +5987,55 @@ export function markPhaseCommittedAfterManualRecovery(args: {
 }
 
 /**
+ * Update the failure shape + same-shape streak on featureReview state.
+ * Used by runFeatureReviewIteration when an iteration ends in one of the
+ * reviewer-subprocess failure states. The outer loop reads sameShapeStreak
+ * to decide whether to halt instead of retrying.
+ */
+function updateFeatureReviewFailureShape(
+  fr: NonNullable<FeatureState["featureReview"]>,
+  failureState: "TIMEOUT" | "HYGIENE_FAULT" | "EXEC_ERROR" | "MISSING_VERDICT",
+  resultLogPath: string,
+): void {
+  // For HYGIENE_FAULT, the log path written by hygieneFailureResult is
+  // ends with `-hygiene.log` and contains the dirty-paths listing the
+  // fingerprint cares about. For other failure states the path doesn't
+  // carry shape information, but fingerprintFeatureReviewFailure handles
+  // those cases by returning the state name itself.
+  const hygieneLogPath =
+    failureState === "HYGIENE_FAULT" && resultLogPath.endsWith("-hygiene.log")
+      ? resultLogPath
+      : undefined;
+  const shape = fingerprintFeatureReviewFailure({
+    failureState,
+    hygieneLogPath,
+  });
+  if (shape === null) {
+    clearFeatureReviewFailureShape(fr);
+    return;
+  }
+  if (fr.lastFailureShape === shape) {
+    // Default to 0, not 1: a torn state-file write that left lastFailureShape
+    // set but sameShapeStreak undefined would otherwise jump straight to
+    // streak=2 → immediate halt on the FIRST matching iteration. Treating
+    // undefined as 0 (no prior count recorded) means we count this iteration
+    // as 1 and require one more matching iteration to halt — the actual
+    // two-strikes contract.
+    fr.sameShapeStreak = (fr.sameShapeStreak ?? 0) + 1;
+  } else {
+    fr.lastFailureShape = shape;
+    fr.sameShapeStreak = 1;
+  }
+}
+
+function clearFeatureReviewFailureShape(
+  fr: NonNullable<FeatureState["featureReview"]>,
+): void {
+  delete fr.lastFailureShape;
+  delete fr.sameShapeStreak;
+}
+
+/**
  * Single iteration of the feature-level review loop. Builds the prompt,
  * spawns the configured reviewer (see configure.cm featureReview role),
  * parses the verdict, and applies the verdict's side effects:
@@ -6099,16 +6154,38 @@ async function runFeatureReviewIteration(args: {
     parentBeforeRole = refreshParentWorkspaceSnapshot(
       args.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
     );
-    result = await runRoleTask({
-      role: args.roles.featureReview,
-      inputFilePath,
-      outputFilePath,
-      cwd: args.cwd,
-      slug,
-      phaseNumber: `feature-${args.feature.number}`,
-      iteration: args.iteration,
-      logPrefix: "feature-review",
-    });
+    // Codex provider routes through runCodexFeatureReview — implementor's
+    // workspace-write sandbox and "files changed / tests run" prompt template
+    // were producing TIMEOUT-rebranded UNCLEAR verdicts and tripping the
+    // post-agent hygiene gate when the reviewer mutated audit files. The
+    // dedicated reviewer path uses a read-only sandbox and a verdict-sentinel
+    // prompt. Other providers still go through runRoleTask for now —
+    // follow-up commits will give gemini/kimi/claude the same treatment.
+    if (args.roles.featureReview.provider === "codex") {
+      const resolved = resolveRoleTimeouts(args.roles.featureReview);
+      result = await runCodexFeatureReview({
+        inputFilePath,
+        outputFilePath,
+        cwd: args.cwd,
+        slug,
+        phaseNumber: `feature-${args.feature.number}`,
+        iteration: args.iteration,
+        reasoning: args.roles.featureReview.reasoning,
+        model: args.roles.featureReview.model,
+        timeoutMs: resolved.primaryMs,
+      });
+    } else {
+      result = await runRoleTask({
+        role: args.roles.featureReview,
+        inputFilePath,
+        outputFilePath,
+        cwd: args.cwd,
+        slug,
+        phaseNumber: `feature-${args.feature.number}`,
+        iteration: args.iteration,
+        logPrefix: "feature-review",
+      });
+    }
   }
   result = applyMutableAgentHygiene({
     result,
@@ -6142,9 +6219,13 @@ async function runFeatureReviewIteration(args: {
     artifactRaw = result.stdout || "";
   }
   let verdict = parseFeatureReviewVerdict(artifactRaw);
+  // Initial finalVerdict. UNCLEAR (no `## VERDICT` sentinel) is MISSING_VERDICT
+  // not TIMEOUT — the old code collapsed every non-PASS shape onto TIMEOUT,
+  // which hid the prompt-contract violation behind a generic timeout label.
+  // The classifyFeatureReviewResult helper produces the right discriminator.
   fr.finalVerdict =
     verdict.verdict === "UNCLEAR"
-      ? "TIMEOUT" // surface unclear as the closest existing enum so dashboards don't choke
+      ? "MISSING_VERDICT"
       : (verdict.verdict as any);
 
   let timedOutWithStructuredVerdict = false;
@@ -6159,13 +6240,33 @@ async function runFeatureReviewIteration(args: {
       if (timeoutClassification.kind === "pass-evidence-timeout") {
         fr.timeoutEvidence = "pass";
       }
+      updateFeatureReviewFailureShape(fr, "TIMEOUT", result.logPath);
       return { verdict, action: "unclear", outputFilePath };
     }
   }
 
   if (!timedOutWithStructuredVerdict && result.exitCode !== 0) {
-    fr.finalVerdict = "TIMEOUT";
+    // Non-zero exit, watchdog didn't fire. Two shapes (see
+    // classifyFeatureReviewResult for the full taxonomy):
+    //   - hygieneFailure: applyMutableAgentHygiene caught a worktree mutation.
+    //     Distinct fix path — same-shape repeats here are a signal to halt
+    //     rather than retry.
+    //   - everything else: transport, quota, crash. Generic retry-or-bail.
+    const failureState = result.hygieneFailure ? "HYGIENE_FAULT" : "EXEC_ERROR";
+    fr.finalVerdict = failureState;
+    updateFeatureReviewFailureShape(fr, failureState, result.logPath);
     return { verdict, action: "unclear", outputFilePath };
+  }
+
+  // Exit 0 (or timed-out-with-structured-verdict). If the parsed verdict is
+  // still UNCLEAR at this point, mark MISSING_VERDICT and track its shape.
+  // The successful verdict branches below clear the shape on PASS / REDO /
+  // NEEDS_PHASES.
+  if (verdict.verdict === "UNCLEAR" && !timedOutWithStructuredVerdict) {
+    fr.finalVerdict = "MISSING_VERDICT";
+    updateFeatureReviewFailureShape(fr, "MISSING_VERDICT", result.logPath);
+  } else {
+    clearFeatureReviewFailureShape(fr);
   }
 
   if (verdict.verdict === "FEATURE_PASS") {
@@ -9640,6 +9741,13 @@ async function main() {
   console.log(`Plan: ${args.planFile}`);
   console.log(`Features parsed: ${features.length}`);
   console.log(`Phases parsed: ${phases.length}`);
+  // Surface the feature-review cap so the operator's mental model matches
+  // reality. The same-shape repeat detector halts earlier in practice
+  // (after 2 identical failures), so this is the upper bound on truly
+  // novel reviewer iterations.
+  console.log(
+    `Feature-review cap: ${args.featureReviewMaxIter} iterations per feature (halts earlier on same-shape repeats)`,
+  );
   console.log("");
   printPhaseTable(phases);
 
@@ -10687,6 +10795,55 @@ async function main() {
               // we just executed; show that value (not currentIter+1)
               // so cap=5 prints "cycle 5/5" instead of "cycle 6/5"
               // before the cap-extension prompt fires next iteration.
+
+              // Same-shape repeat halt: if two consecutive iterations
+              // returned the same failure shape (e.g. reviewer keeps
+              // editing the same audit file -> HYGIENE_FAULT with the
+              // same dirty path set), retrying is wasting budget. Halt
+              // with BLOCKED so the operator can intervene. See the
+              // tidy-haven loop incident for the failure mode this
+              // prevents (5 iterations, identical hygiene fault, ~25
+              // minutes of compute burned).
+              const streak =
+                featureState.featureReview?.sameShapeStreak ?? 0;
+              const shape = featureState.featureReview?.lastFailureShape;
+              if (streak >= SAME_SHAPE_REPEAT_HALT_THRESHOLD && shape) {
+                const reason = `feature-review halted: ${streak} consecutive iterations with the same failure shape (${shape.slice(0, 200)}). Retrying a deterministic failure is wasted compute; intervene manually.`;
+                console.error(
+                  `\n✗ Feature ${featureState.number}: ${reason}`,
+                );
+                const lastReportPath =
+                  featureState.featureReview?.outputFilePaths?.at(-1);
+                const md = buildBlockedFeatureMd({
+                  feature: featureDef,
+                  featureState,
+                  reason,
+                  lastReportPath,
+                  planFile: args.planFile,
+                  timestamp: new Date().toISOString(),
+                });
+                const blockedPath = path.join(
+                  cwd,
+                  `BLOCKED-feature-${featureState.number}.md`,
+                );
+                try {
+                  fs.writeFileSync(blockedPath, md);
+                  console.error(`  → Wrote ${blockedPath}`);
+                } catch (err) {
+                  console.error(
+                    `  → Failed to write ${blockedPath}: ${(err as Error).message}`,
+                  );
+                }
+                ensureBlockedGitignored(cwd);
+                featureState.status = "feature_blocked";
+                featureState.error = featureState.error ?? reason;
+                saveState(state, {
+                  noGbrain: args.noGbrain,
+                  log: console.warn,
+                });
+                reviewLoopAction = "blocked";
+                break;
+              }
               console.warn(
                 `  → review verdict was UNCLEAR; retrying (cycle ${currentIter}/${cap})`,
               );
