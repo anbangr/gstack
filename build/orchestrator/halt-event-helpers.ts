@@ -470,6 +470,105 @@ export function recordProviderFailureVerdict(
   }
 }
 
+// ------------------------------------------------------------------
+// PR1b-part2: provider retry budget — session cap + backoff schedule
+// ------------------------------------------------------------------
+
+/**
+ * Per-phase per-session cap on provider-retry attempts (capacity +
+ * overloaded + transport + stall). Beyond this, halt with the last
+ * provider-failure kind regardless of cause. Bounds autonomous churn
+ * during prolonged provider instability.
+ */
+export const PROVIDER_RETRY_SESSION_CAP = 6;
+
+/** Per-attempt budget for capacity/overloaded backoff inside one role step. */
+export const PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS = 3;
+/** Base backoff in ms before jitter. Doubles each attempt. */
+export const PROVIDER_CAPACITY_BACKOFF_BASE_MS = 30_000;
+/** Symmetric jitter window applied to each backoff delay. */
+export const PROVIDER_CAPACITY_BACKOFF_JITTER_MS = 15_000;
+/** Hard ceiling on a single capacity backoff sleep. */
+export const PROVIDER_CAPACITY_BACKOFF_MAX_SLEEP_MS = 300_000;
+
+/**
+ * Compute the next backoff delay for a capacity / overloaded retry.
+ * Attempt is 1-based: first retry sleeps base±jitter, second sleeps
+ * 2*base±jitter, third sleeps 4*base±jitter, all clamped to the max
+ * sleep ceiling. Returns -1 when the attempt has exceeded the cap so
+ * the caller knows to halt instead of retry.
+ *
+ * Pure function for unit-test ease — caller provides the random source.
+ */
+export function nextCapacityBackoffMs(
+  attempt: number,
+  rng: () => number = Math.random,
+): number {
+  if (attempt < 1 || attempt > PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS) {
+    return -1;
+  }
+  const base = PROVIDER_CAPACITY_BACKOFF_BASE_MS * Math.pow(2, attempt - 1);
+  // rng() in [0, 1) → jitter in [-J, +J)
+  const jitter = (rng() * 2 - 1) * PROVIDER_CAPACITY_BACKOFF_JITTER_MS;
+  const total = Math.max(0, base + jitter);
+  return Math.min(total, PROVIDER_CAPACITY_BACKOFF_MAX_SLEEP_MS);
+}
+
+/**
+ * Decide what the orchestrator should do given a provider verdict and
+ * the current per-phase provider-retry attempt count. Pure; caller
+ * actuates by sleeping, halting, or both.
+ *
+ *   kind=auth | quota                    → halt:true, sleepMs:-1
+ *   kind=capacity | overloaded           → if backoff exhausted → halt; else sleepMs from `nextCapacityBackoffMs`
+ *   kind=transport | stall               → halt:true with one-shot upstream retry already done
+ *
+ * sessionAttempts is the cumulative count for the phase. When it has
+ * hit (or would exceed) PROVIDER_RETRY_SESSION_CAP, we halt regardless
+ * of kind to bound autonomous churn.
+ */
+export function planProviderRetry(input: {
+  verdict: ProviderFailureVerdict;
+  capacityAttempt: number;
+  sessionAttempts: number;
+  rng?: () => number;
+}): { halt: boolean; sleepMs: number; reason: string } {
+  if (input.sessionAttempts >= PROVIDER_RETRY_SESSION_CAP) {
+    return {
+      halt: true,
+      sleepMs: -1,
+      reason: `provider-retry session cap reached (${PROVIDER_RETRY_SESSION_CAP})`,
+    };
+  }
+  switch (input.verdict.kind) {
+    case "auth":
+      return { halt: true, sleepMs: -1, reason: "auth required" };
+    case "quota":
+      return {
+        halt: true,
+        sleepMs: -1,
+        reason: input.verdict.resetAt
+          ? `quota exhausted, resets at ${input.verdict.resetAt}`
+          : "quota exhausted",
+      };
+    case "capacity":
+    case "overloaded": {
+      const sleep = nextCapacityBackoffMs(input.capacityAttempt, input.rng);
+      if (sleep < 0) {
+        return {
+          halt: true,
+          sleepMs: -1,
+          reason: `capacity backoff exhausted after ${PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS} attempts`,
+        };
+      }
+      return { halt: false, sleepMs: sleep, reason: "capacity backoff" };
+    }
+    case "transport":
+    case "stall":
+      return { halt: true, sleepMs: -1, reason: input.verdict.kind };
+  }
+}
+
 export function emitManualRecoveryInvoked(opts: {
   runId: string;
   stateSlug: string;

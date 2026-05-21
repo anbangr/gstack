@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.40.7.3] - 2026-05-21
+
+**Provider retry budget — primitives. The orchestrator now has a per-phase session cap on provider-retry attempts (default 6 across capacity/overloaded/transport/stall) plus a capacity-backoff schedule (3 attempts at 30s/60s/120s base ±15s jitter, ceiling 5 min). Pre-PR1b state files migrate cleanly: `iterations.successful` backfills from `iterations`, and `providerRetryAttempts` starts at 0.**
+
+This is part 2 of the tidy-haven plan's PR1b — Feature 4 of the 83-fault recurrence program. PR1b-min (#75 / v1.40.7.2) shipped the classifier; this PR ships the budget shape and helpers so the next step (wiring the helpers into `runCodexReview`'s one-shot-retry block and the sub-agent spawn function) can land as a focused change. The wiring is the only remaining piece of F4 phase 2.
+
+The helpers are pure functions for unit-test ease: `nextCapacityBackoffMs(attempt, rng?)` returns the next sleep in ms (or -1 when the budget is exhausted), and `planProviderRetry({ verdict, capacityAttempt, sessionAttempts, rng? })` synthesizes a `{ halt, sleepMs, reason }` decision from a classifier verdict plus the running counters. Callers actuate by sleeping, halting, or both — the helpers don't touch the wall clock or the orchestrator's I/O.
+
+### What changed for the user
+
+- State files written before this version load with no errors. `iterationsSuccessful` defaults to `iterations` (no false retry-cap headroom). `providerRetryAttempts` defaults to 0. Both fields are explicit in new state JSON so future autoplan / drain-faults tooling can read them.
+- No live behavior change yet — the call-site wiring lands in a follow-up. This PR establishes the schema + helpers so the next change is small and testable.
+- Constants are exported and can be tuned via a follow-up `gstack-config` knob if the defaults (cap 6, base 30s, max 3 backoff attempts, ceiling 5 min) prove wrong in real provider outages.
+
+### Itemized changes
+
+#### Added
+
+- `nextCapacityBackoffMs(attempt, rng?)` in `halt-event-helpers.ts` — pure exponential-backoff schedule with symmetric jitter and a hard sleep ceiling. Returns -1 past the attempt cap.
+- `planProviderRetry({ verdict, capacityAttempt, sessionAttempts, rng? })` in same module — decides `halt` / `sleepMs` / `reason` from a classifier verdict and the running counters. Auth/quota halt immediately; capacity/overloaded backoff; transport/stall halt (caller may keep its existing one-shot retry); session-cap halts regardless of kind.
+- Constants exported: `PROVIDER_RETRY_SESSION_CAP` (6), `PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS` (3), `PROVIDER_CAPACITY_BACKOFF_BASE_MS` (30_000), `PROVIDER_CAPACITY_BACKOFF_JITTER_MS` (15_000), `PROVIDER_CAPACITY_BACKOFF_MAX_SLEEP_MS` (300_000).
+- `CodexReviewState.iterationsSuccessful?: number` in `types.ts` — subset of `iterations` that produced a verdict-writing result. Lets the codex-iteration cap separate convergence failures from provider failures.
+- `PhaseState.providerRetryAttempts?: number` in `types.ts` — running per-phase session counter.
+- `__tests__/provider-retry-budget.test.ts` — 17 unit tests pinning the backoff schedule (deterministic RNG, jitter bounds, attempt cap, max-sleep clamp) and the retry plan (every verdict kind, session-cap precedence).
+- `__tests__/state-migration-pr1b.test.ts` — 6 unit tests pinning the load-time backfill: missing fields default correctly, explicit values are preserved, phases without `codexReview` aren't perturbed.
+
+#### Changed
+
+- `state.ts` `migrateState()`: backfills `codexReview.iterationsSuccessful = iterations` and `providerRetryAttempts = 0` when the fields are absent. Idempotent — runs on every `loadState`.
+
+### For contributors
+
+- Out of scope (next focused PR): wire `planProviderRetry()` into `runCodexReview()`'s `if (result.exitCode !== 0)` block so capacity halts trigger backoff + retry instead of failing. Also wire it into `phase-runner.ts:328-335` codex-cap fall-through so retry-cap iterations that were actually provider failures don't burn the budget.
+- The `iterationsSuccessful` counter is established but no live code increments it yet. The wiring belongs at the call sites in `phase-runner.ts` and `cli.ts` that today do `phase.codexReview!.iterations++`; they need to call a new `bumpCodexReviewIteration(phase, succeeded: boolean)` helper. Both pieces land together in the next focused PR.
+
 ## [1.40.7.2] - 2026-05-21
 
 **Codex review failures now distinguish "provider blew up" from "the agent couldn't converge." When a codex review iteration hits a capacity banner, a quota wall, a transport error, an auth prompt, or a silent stall, the orchestrator emits the right halt kind (`PROVIDER_OVERLOADED` / `PROVIDER_QUOTA_EXHAUSTED` / `PROVIDER_TRANSPORT_ERROR` / `PROVIDER_AUTH_REQUIRED` / `PROVIDER_TIMEOUT`) instead of misclassifying it as `RETRY_CAP_HIT`. Drain-faults and the investigator route by kind, so a 529 from the model no longer triggers a "convergence failed" code review.**
