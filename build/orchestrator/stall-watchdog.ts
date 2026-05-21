@@ -35,6 +35,7 @@
 
 import * as fs from "node:fs";
 import { spawnSync, type ChildProcess } from "./child-registry";
+import type { ProgressEvent } from "./subagent-progress-parser";
 
 export type Provider = "claude" | "gemini" | "codex" | "kimi" | "shell";
 
@@ -378,6 +379,19 @@ export function attachStallWatchdog(
   let stopped = false;
   let killed = false;
   let killReason: string | undefined = undefined;
+
+  // Tool-aware state. All null when parseProgress is not provided —
+  // the legacy branches below treat null exactly as today's behavior.
+  const parseProgress = opts.parseProgress;
+  const toolStallMs = opts.toolStallMs;
+  const progressGapMs = opts.progressGapMs;
+  let currentToolBucket: "fast" | "slow" | null = null;
+  let lastClassifiedActivityAt: number | null = null;
+  let lastClassifiedTool: string | null = null;
+  // Sticky bucket — represents the bucket at the most recent classified
+  // event, preserved past TOOL_END. Task 14 wires the controller getter.
+  let lastClassifiedBucket: "fast" | "slow" | null = null;
+
   let pollHandle: unknown = null;
   let killTimerHandle: unknown = null;
 
@@ -416,6 +430,35 @@ export function attachStallWatchdog(
     // Regex test is a single short-circuit pass; the prior split-and-loop
     // allocated a string array per chunk just to discover the same answer.
     if (/\S/.test(text)) recordActivity();
+
+    // Tool-aware progress parsing. Lines are split on \n inside this
+    // chunk; each non-empty line goes to the parser. Errors swallowed —
+    // a throwing parser falls through to legacy behavior, which is
+    // exactly today's degradation.
+    if (parseProgress && !killed) {
+      for (const rawLine of text.split(/\r?\n/)) {
+        if (!rawLine) continue;
+        let evt: ProgressEvent | null = null;
+        try {
+          evt = parseProgress(rawLine, clock.now());
+        } catch {
+          // Parser threw. Treat this line as if it returned null.
+          evt = null;
+        }
+        if (evt === null) continue;
+        lastClassifiedActivityAt = clock.now();
+        lastClassifiedTool = evt.tool;
+        lastClassifiedBucket = evt.bucket;
+        if (evt.event === "TOOL_START") {
+          currentToolBucket = evt.bucket;
+        } else {
+          // TOOL_END clears the bucket (the next tick uses the legacy
+          // stallMs window until a new TOOL_START arrives). We do NOT
+          // clear lastClassifiedBucket — it's sticky for halt-event quoting.
+          currentToolBucket = null;
+        }
+      }
+    }
 
     // Auth-prompt fast-kill: if the child is asking for interactive auth,
     // kill immediately rather than waiting for the stall window.
@@ -501,7 +544,18 @@ export function attachStallWatchdog(
     }
 
     const silence = clock.now() - lastActivityAt;
-    if (silence >= stallMs) {
+    // Effective stall window:
+    //   - "slow" → toolStallMs.slow
+    //   - "fast" → toolStallMs.fast
+    //   - null   → legacy stallMs
+    // The legacy path is preserved EXACTLY when parseProgress is absent
+    // or when no TOOL_START has been observed yet.
+    let effectiveStallMs = stallMs;
+    if (currentToolBucket !== null && toolStallMs) {
+      effectiveStallMs =
+        currentToolBucket === "slow" ? toolStallMs.slow : toolStallMs.fast;
+    }
+    if (silence >= effectiveStallMs) {
       killed = true;
       killReason = killReason ?? "stall";
       try {
