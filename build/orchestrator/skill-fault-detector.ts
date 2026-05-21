@@ -76,6 +76,7 @@ export interface LearnedPattern {
   source: string; // "investigator:<report-filename>"
   learnedAt: string; // ISO 8601
   hitCount: number; // incremented each time this pattern fires
+  lastHit?: string; // ISO 8601 — updated each time this pattern fires
 }
 
 const CHECKED_IMPLEMENTATION_RE =
@@ -343,6 +344,7 @@ function persistHitCounts(learnedFaultCategories: string[]): void {
       ) {
         entry.hitCount =
           (typeof entry.hitCount === "number" ? entry.hitCount : 0) + 1;
+        entry.lastHit = new Date().toISOString();
       }
     }
     const tmpPath = `${filePath}.tmp.${process.pid}`;
