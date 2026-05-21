@@ -6122,6 +6122,11 @@ async function runFeatureReviewIteration(args: {
     null;
   let _metricsPromptBytes = 0;
   let _metricsFinalVerdict = "UNKNOWN";
+  // Effective reasoning used for THIS spawn (T9 may override role default
+  // to "medium" on cycle 1). Initialized to the role default; updated at
+  // the spawn-dispatch site so analytics reflects what actually ran.
+  let _metricsEffectiveReasoning: string =
+    args.roles.featureReview.reasoning;
   let _metricsPassEvidenceTimeout = false;
   let _metricsEndedBy:
     | "exit0"
@@ -6355,6 +6360,7 @@ async function runFeatureReviewIteration(args: {
       // preserving full-depth review on contested cases.
       const effectiveReasoning =
         args.iteration === 1 ? "medium" : args.roles.featureReview.reasoning;
+      _metricsEffectiveReasoning = effectiveReasoning;
       result = await runCodexFeatureReview({
         inputFilePath,
         outputFilePath,
@@ -6550,7 +6556,7 @@ async function runFeatureReviewIteration(args: {
         ts: new Date().toISOString(),
         feature: String(args.feature.number),
         cycle: args.iteration,
-        reasoning: args.roles.featureReview.reasoning,
+        reasoning: _metricsEffectiveReasoning,
         verdict: _metricsFinalVerdict,
         promptBytes: _metricsPromptBytes,
         outputBytes,
