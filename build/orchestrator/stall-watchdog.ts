@@ -38,6 +38,12 @@ import { spawnSync, type ChildProcess } from "./child-registry";
 
 export type Provider = "claude" | "gemini" | "codex" | "kimi" | "shell";
 
+/** Module-load compiled regex for auth-prompt detection (decision D11=11A).
+ *  Matches interactive auth banners that would hang the orchestrator
+ *  indefinitely if left unanswered. */
+export const AUTH_PROMPT_RE =
+  /Opening authentication page|Do you want to continue\? \[Y\/n\]|Please authenticate|Token expired|Sign in with Google/;
+
 export type StallWatchdogMode =
   | { mode: "stream"; child: ChildProcess }
   | { mode: "mtime"; filePath: string }
@@ -103,6 +109,8 @@ export interface StallWatchdogController {
    * that's actually busy producing output would be misread as silent.
    */
   notifyActivity: () => void;
+  /** If the watchdog killed for an auth prompt, returns "auth_required". */
+  killReason: () => string | undefined;
 }
 
 /**
@@ -333,6 +341,7 @@ export function attachStallWatchdog(
   let lastActivityAt = clock.now();
   let stopped = false;
   let killed = false;
+  let killReason: string | undefined = undefined;
   let pollHandle: unknown = null;
   let killTimerHandle: unknown = null;
 
@@ -361,6 +370,8 @@ export function attachStallWatchdog(
     lastActivityAt = clock.now();
   };
 
+  const authPromptDisabled = process.env.GSTACK_DISABLE_AUTH_PROMPT_DETECTOR === "1";
+
   const onLine = (chunk: Buffer | string) => {
     if (stopped) return;
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
@@ -369,6 +380,35 @@ export function attachStallWatchdog(
     // Regex test is a single short-circuit pass; the prior split-and-loop
     // allocated a string array per chunk just to discover the same answer.
     if (/\S/.test(text)) recordActivity();
+
+    // Auth-prompt fast-kill: if the child is asking for interactive auth,
+    // kill immediately rather than waiting for the stall window.
+    if (!authPromptDisabled && !killed && AUTH_PROMPT_RE.test(text)) {
+      killed = true;
+      killReason = "auth_required";
+      try {
+        opts.onStallKill?.(clock.now() - lastActivityAt);
+      } catch {
+        // Callback errors swallowed.
+      }
+      if (source.mode === "stream" || source.mode === "cpu") {
+        const pid = source.child.pid;
+        if (typeof pid === "number") {
+          killProcessAndGroup(pid, "SIGTERM");
+          killTimerHandle = clock.setTimeout(() => {
+            killProcessAndGroup(pid, "SIGKILL");
+          }, gracePeriodMs);
+        }
+        if (pollHandle !== null) {
+          clock.clearInterval(pollHandle);
+          pollHandle = null;
+        }
+        source.child.stdout?.off("data", onLine);
+        source.child.stderr?.off("data", onLine);
+      } else {
+        stop();
+      }
+    }
   };
 
   if (source.mode === "stream" || source.mode === "cpu") {
@@ -427,6 +467,7 @@ export function attachStallWatchdog(
     const silence = clock.now() - lastActivityAt;
     if (silence >= stallMs) {
       killed = true;
+      killReason = killReason ?? "stall";
       try {
         opts.onStallKill?.(silence);
       } catch {
@@ -495,5 +536,6 @@ export function attachStallWatchdog(
     notifyActivity: () => {
       if (!stopped && !killed) recordActivity();
     },
+    killReason: () => killReason,
   };
 }
