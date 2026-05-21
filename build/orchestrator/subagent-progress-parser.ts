@@ -47,10 +47,30 @@ export function parseGeminiLine(
   return null;
 }
 
+/**
+ * Codex `exec` block markers. The block shape is:
+ *   exec
+ *   /bin/zsh -lc "<cmd>" in <cwd>
+ *    succeeded in Xms:
+ * We map every `exec` line to TOOL_START with tool="Bash" (Codex's
+ * shell tool maps to our Bash bucket), and every ` succeeded in ` line
+ * to TOOL_END. Lines that contain `succeeded in` but don't start with
+ * leading whitespace are NOT matched (avoids false-matching prose).
+ */
 export function parseCodexLine(
-  _line: string,
-  _now: number,
+  line: string,
+  now: number,
 ): ProgressEvent | null {
+  if (line === "exec") {
+    const bucket = bucketFor("Bash");
+    if (bucket === null) return null;
+    return { event: "TOOL_START", tool: "Bash", bucket, ts: now };
+  }
+  if (/^ succeeded in \d+ms:?$/.test(line)) {
+    const bucket = bucketFor("Bash");
+    if (bucket === null) return null;
+    return { event: "TOOL_END", tool: "Bash", bucket, ts: now };
+  }
   return null;
 }
 
