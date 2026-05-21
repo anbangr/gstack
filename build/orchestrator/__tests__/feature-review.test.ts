@@ -15,6 +15,8 @@ import {
   parseFeatureReviewVerdict,
   classifyFeatureReviewTimeout,
   classifyFeatureReviewResult,
+  fingerprintFeatureReviewFailure,
+  SAME_SHAPE_REPEAT_HALT_THRESHOLD,
   shouldSkipFeatureReview,
   isPathInLogDir,
   FEATURE_VERDICT_PASS,
@@ -395,6 +397,180 @@ describe("classifyFeatureReviewResult — failure-state discriminator", () => {
       parsedVerdict: "UNCLEAR",
     });
     expect(state).toBe("HYGIENE_FAULT");
+  });
+});
+
+describe("fingerprintFeatureReviewFailure — same-shape detection", () => {
+  // Drives the outer loop's same-shape repeat halt. Two consecutive
+  // iterations with identical fingerprints prove the failure is
+  // deterministic — retrying is wasted compute, halt with BLOCKED.
+  it("returns null for a successful verdict (caller clears the streak)", () => {
+    const shape = fingerprintFeatureReviewFailure({ failureState: null });
+    expect(shape).toBeNull();
+  });
+
+  it("returns the bare state name for TIMEOUT (no useful sub-shape)", () => {
+    const shape = fingerprintFeatureReviewFailure({ failureState: "TIMEOUT" });
+    expect(shape).toBe("TIMEOUT");
+  });
+
+  it("returns the bare state name for EXEC_ERROR", () => {
+    const shape = fingerprintFeatureReviewFailure({
+      failureState: "EXEC_ERROR",
+    });
+    expect(shape).toBe("EXEC_ERROR");
+  });
+
+  it("returns the bare state name for MISSING_VERDICT", () => {
+    const shape = fingerprintFeatureReviewFailure({
+      failureState: "MISSING_VERDICT",
+    });
+    expect(shape).toBe("MISSING_VERDICT");
+  });
+
+  it("HYGIENE_FAULT with no log path falls back to a sentinel", () => {
+    const shape = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+    });
+    expect(shape).toBe("HYGIENE_FAULT:no-log");
+  });
+
+  it("HYGIENE_FAULT with unreadable log path falls back to a sentinel", () => {
+    const shape = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/path/that/does/not/exist.log",
+      readFileFn: () => {
+        throw new Error("ENOENT");
+      },
+    });
+    expect(shape).toBe("HYGIENE_FAULT:unreadable-log");
+  });
+
+  it("HYGIENE_FAULT with a dirty-tree log returns the sorted dirty path set", () => {
+    // The actual log shape from cli.ts:hygieneFailureResult on a dirty tree.
+    const log = `# Post-agent hygiene failure
+
+feature review left the working tree dirty:
+   M audit/2026-05-21-autonomy-audit.md
+
+Original agent log: /Users/foo/...
+
+GATE FAIL
+`;
+    const shape = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/fake-hygiene.log",
+      readFileFn: () => log,
+    });
+    expect(shape).toBe(
+      "HYGIENE_FAULT:dirty:M audit/2026-05-21-autonomy-audit.md",
+    );
+  });
+
+  it("HYGIENE_FAULT shapes are STABLE across iterations modifying the same file", () => {
+    const log = (timestamp: string) => `# Post-agent hygiene failure
+
+feature review left the working tree dirty:
+   M audit/2026-05-21-autonomy-audit.md
+
+Original agent log: /Users/foo/log-${timestamp}.log
+
+GATE FAIL
+`;
+    const a = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/a.log",
+      readFileFn: () => log("09:13"),
+    });
+    const b = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/b.log",
+      readFileFn: () => log("09:18"),
+    });
+    expect(a).toBe(b);
+  });
+
+  it("HYGIENE_FAULT shapes DIFFER when the dirty file set differs", () => {
+    const log = (file: string) => `# Post-agent hygiene failure
+
+feature review left the working tree dirty:
+   M ${file}
+
+Original agent log: /Users/foo/...
+
+GATE FAIL
+`;
+    const a = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/a.log",
+      readFileFn: () => log("src/file-a.ts"),
+    });
+    const b = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/b.log",
+      readFileFn: () => log("src/file-b.ts"),
+    });
+    expect(a).not.toBe(b);
+  });
+
+  it("HYGIENE_FAULT sorts + dedupes dirty paths so order-variance still matches", () => {
+    const logA = `# Post-agent hygiene failure
+feature review left the working tree dirty:
+   M one.ts
+   M two.ts
+   M three.ts
+GATE FAIL
+`;
+    const logB = `# Post-agent hygiene failure
+feature review left the working tree dirty:
+   M three.ts
+   M one.ts
+   M two.ts
+   M one.ts
+GATE FAIL
+`;
+    const a = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/a.log",
+      readFileFn: () => logA,
+    });
+    const b = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/b.log",
+      readFileFn: () => logB,
+    });
+    expect(a).toBe(b);
+  });
+
+  it("HYGIENE_FAULT without a dirty-tree banner (e.g. parent-workspace mutation) still gets a fingerprint", () => {
+    const log = `# Post-agent hygiene failure
+
+feature review mutated parent workspace: /Users/foo/parent
+
+Original agent log: /Users/foo/log.log
+
+GATE FAIL
+`;
+    const shape = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/fake.log",
+      readFileFn: () => log,
+    });
+    expect(shape).toContain("HYGIENE_FAULT:other:");
+    // Same log body, same shape — repeats can be detected.
+    const shape2 = fingerprintFeatureReviewFailure({
+      failureState: "HYGIENE_FAULT",
+      hygieneLogPath: "/fake2.log",
+      readFileFn: () => log,
+    });
+    expect(shape).toBe(shape2);
+  });
+
+  it("SAME_SHAPE_REPEAT_HALT_THRESHOLD defaults to 2 (two-strikes-and-halt)", () => {
+    // 2 is the minimum that proves deterministic repeat — 1 is just one
+    // failure, 3+ wastes compute. Tests assume this value; surface as
+    // constant so a casual bump in production is visible.
+    expect(SAME_SHAPE_REPEAT_HALT_THRESHOLD).toBe(2);
   });
 });
 

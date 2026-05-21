@@ -382,6 +382,24 @@ export interface FeatureReviewState {
     | "MISSING_VERDICT";
   /** Set when a timed-out review artifact had pass-like test/no-findings evidence but no parseable sentinel. */
   timeoutEvidence?: "pass";
+  /**
+   * Shape-fingerprint of the most recent failure (when finalVerdict is one of
+   * the reviewer-subprocess failure states: HYGIENE_FAULT, EXEC_ERROR,
+   * MISSING_VERDICT, TIMEOUT). Used by the outer loop's same-shape repeat
+   * detector to halt rather than retry when two consecutive iterations fail
+   * in exactly the same way (e.g. reviewer keeps editing the same audit
+   * file). For HYGIENE_FAULT this is the sorted set of dirty paths; for the
+   * others it's just the state name.
+   *
+   * Cleared on successful PASS/REDO/NEEDS_PHASES. Optional for back-compat
+   * with state files that pre-date this field.
+   */
+  lastFailureShape?: string;
+  /**
+   * Number of consecutive iterations that produced `lastFailureShape`.
+   * Resets on shape change or success. Optional for back-compat.
+   */
+  sameShapeStreak?: number;
   /** Phase indexes the reviewer asked us to reset (FEATURE_REDO). */
   phasesReset?: number[];
   /** Count of phases the reviewer appended to the plan (FEATURE_NEEDS_PHASES). */

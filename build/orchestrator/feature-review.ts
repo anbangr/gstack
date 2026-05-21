@@ -161,6 +161,79 @@ export function classifyFeatureReviewResult(
   return null;
 }
 
+/**
+ * Compute the shape fingerprint of a failed feature-review iteration. Two
+ * iterations with the same fingerprint indicate a deterministic same-shape
+ * repeat — the orchestrator's outer loop halts rather than retrying when
+ * two of these happen in a row, because retrying a deterministic failure
+ * just burns budget.
+ *
+ * For HYGIENE_FAULT, the shape includes the sorted, deduplicated set of
+ * paths the hygiene log reported dirty. Two iterations both modifying the
+ * same file => same shape. Two iterations modifying different files =>
+ * different shape (could be that the reviewer is exploring; keep retrying).
+ *
+ * For TIMEOUT / EXEC_ERROR / MISSING_VERDICT, the shape is just the state
+ * name — these don't carry a useful sub-discriminator at the loop level.
+ *
+ * For PASS / REDO / NEEDS_PHASES (i.e. when failureState === null), this
+ * function returns null and the caller clears the streak.
+ */
+export function fingerprintFeatureReviewFailure(args: {
+  failureState: FeatureReviewFailureState | null;
+  /** Path to the hygiene log written by hygieneFailureResult, when applicable. */
+  hygieneLogPath?: string;
+  /** Optional file-read function for tests; defaults to fs.readFileSync. */
+  readFileFn?: (p: string) => string;
+}): string | null {
+  if (args.failureState === null) {
+    return null;
+  }
+  if (args.failureState !== "HYGIENE_FAULT") {
+    return args.failureState;
+  }
+  if (!args.hygieneLogPath) {
+    return "HYGIENE_FAULT:no-log";
+  }
+  let body = "";
+  try {
+    body = (args.readFileFn ?? ((p) => fs.readFileSync(p, "utf8")))(
+      args.hygieneLogPath,
+    );
+  } catch {
+    return "HYGIENE_FAULT:unreadable-log";
+  }
+  // hygiene log body contains lines like:
+  //   feature review left the working tree dirty:
+  //      M audit/2026-05-21-autonomy-audit.md
+  //      ?? .llm-tmp/foo
+  // Capture every porcelain-shaped line under the dirty-tree banner.
+  const dirtyLines = body
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^(M |A |D |R |C |\?\? |\?\?|UU )/.test(line));
+  if (dirtyLines.length === 0) {
+    // Hygiene gate fired for a non-dirty reason (parent-workspace mutation,
+    // empty output, no-new-commit). Fall back to the full hygiene-log body
+    // hash so distinct hygiene-failure shapes still produce distinct
+    // fingerprints. Use a stable substring (first 200 chars) to avoid
+    // tiny formatting drift over time.
+    const condensed = body.replace(/\s+/g, " ").trim().slice(0, 200);
+    return `HYGIENE_FAULT:other:${condensed}`;
+  }
+  // Sort + dedupe so reviewer agents that report dirty paths in
+  // nondeterministic order still match against the same shape.
+  const sorted = Array.from(new Set(dirtyLines)).sort();
+  return `HYGIENE_FAULT:dirty:${sorted.join("|")}`;
+}
+
+/**
+ * Default threshold: 2 consecutive iterations of the same failure shape are
+ * enough to declare deterministic failure. Surfaced as a constant so tests
+ * and operator overrides can reference it.
+ */
+export const SAME_SHAPE_REPEAT_HALT_THRESHOLD = 2;
+
 export function classifyFeatureReviewTimeout(
   raw: string,
 ): FeatureReviewTimeoutClassification {
