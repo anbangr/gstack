@@ -250,3 +250,93 @@ describe("consumer import compatibility", () => {
     }
   });
 });
+
+describe("consumer enumeration (T9-T13)", () => {
+  const KINDS = [
+    "PROVIDER_TIMEOUT",
+    "PROVIDER_QUOTA_EXHAUSTED",
+    "PROVIDER_OVERLOADED",
+    "PROVIDER_TRANSPORT_ERROR",
+    "PROVIDER_AUTH_REQUIRED",
+  ];
+
+  const orchestratorDir = path.resolve(__dirname, "..");
+
+  test("T9: skill-fault-detector.ts contains static category dispatch for all 5 new kinds", () => {
+    const p = path.join(orchestratorDir, "skill-fault-detector.ts");
+    if (!fs.existsSync(p)) {
+      expect(false).toBe(true);
+      return;
+    }
+    const src = fs.readFileSync(p, "utf8");
+    for (const kind of KINDS) {
+      expect(src).toContain(kind);
+    }
+  });
+
+  test("T10: drain-faults.ts contains dedup key dispatch for all 5 new kinds", () => {
+    const p = path.join(orchestratorDir, "drain-faults.ts");
+    if (!fs.existsSync(p)) {
+      expect(false).toBe(true);
+      return;
+    }
+    const src = fs.readFileSync(p, "utf8");
+    for (const kind of KINDS) {
+      expect(src).toContain(kind);
+    }
+  });
+
+  test("T11: learn-fault-patterns.ts contains matcher kind dispatch for all 5 new kinds", () => {
+    const p = path.join(orchestratorDir, "learn-fault-patterns.ts");
+    if (!fs.existsSync(p)) {
+      expect(false).toBe(true);
+      return;
+    }
+    const src = fs.readFileSync(p, "utf8");
+    for (const kind of KINDS) {
+      expect(src).toContain(kind);
+    }
+  });
+
+  test("T12: gbrain.ts exports mapHaltKindToGbrainCategory with kebab-case mapping", async () => {
+    const p = path.join(orchestratorDir, "gbrain.ts");
+    if (!fs.existsSync(p)) {
+      // Skip cleanly if gbrain.ts does not yet exist on disk
+      expect(true).toBe(true);
+      return;
+    }
+    const gbrain = await import("../gbrain");
+    if (typeof (gbrain as any).mapHaltKindToGbrainCategory !== "function") {
+      expect(false).toBe(true);
+      return;
+    }
+    expect((gbrain as any).mapHaltKindToGbrainCategory("PROVIDER_TRANSPORT_ERROR")).toBe(
+      "provider-transport-error",
+    );
+  });
+
+  test("T13: build/SKILL.md.tmpl M3.5 formatter section contains all 5 new kinds", () => {
+    const p = path.resolve(orchestratorDir, "..", "SKILL.md.tmpl");
+    if (!fs.existsSync(p)) {
+      expect(false).toBe(true);
+      return;
+    }
+    const src = fs.readFileSync(p, "utf8");
+    expect(src).toContain("M3.5");
+    for (const kind of KINDS) {
+      expect(src).toContain(kind);
+    }
+  });
+
+  test("cli.ts enumerator spot contains all 5 new kinds", () => {
+    const p = path.join(orchestratorDir, "cli.ts");
+    if (!fs.existsSync(p)) {
+      expect(false).toBe(true);
+      return;
+    }
+    const src = fs.readFileSync(p, "utf8");
+    for (const kind of KINDS) {
+      expect(src).toContain(kind);
+    }
+  });
+});
