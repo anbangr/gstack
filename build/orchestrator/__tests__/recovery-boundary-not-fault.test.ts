@@ -220,4 +220,58 @@ describe("RECOVERY_BOUNDARY — miner exclusion (zero pattern proposals)", () =>
     const proposals = fs.readFileSync(proposalPath, "utf8");
     expect(proposals).toContain("NEW_PATTERN");
   });
+
+  test("edge: RECOVERY_BOUNDARY dispatch cannot append learned-pattern proposals", async () => {
+    const skillFaults = path.join(tmp, "skill-faults");
+    const pendingDir = path.join(skillFaults, "pending-investigations");
+    fs.mkdirSync(pendingDir, { recursive: true });
+
+    const faultId = "RECOVERY_BOUNDARY:all:noflag001";
+    fs.writeFileSync(
+      path.join(pendingDir, `legacy-${faultId}.json`),
+      JSON.stringify({
+        faultId,
+        runId: "legacy",
+        stateSlug: "s1",
+        kind: "RECOVERY_BOUNDARY",
+        severity: "HIGH",
+        timestamp: "2026-05-21T00:00:00.000Z",
+        message: "legacy recovery-boundary row without investigate flag",
+        pointers: {
+          stateFile: "/x",
+          stdoutLog: "/x",
+          livingPlan: "/x",
+          worktreePath: tmp,
+        },
+        snapshot: { stdoutTail: "legacy recovery-boundary row" },
+      }),
+    );
+
+    const result = await drainFaultsFromHaltEventsQueue({
+      queueDir: skillFaults,
+      max: 10,
+      severityMin: "MEDIUM",
+      inboxDir: path.join(tmp, "inbox"),
+      mockInvestigator: (he) => ({
+        faultId: he.faultId,
+        outcome: "root-cause-identified",
+        rootCause: "legacy audit row reached investigator",
+        evidence: [],
+        proposedFix: null,
+        learnedPatternProposal: {
+          category: "BAD_RECOVERY_BOUNDARY_PATTERN",
+          matcherKind: "stdout_contains",
+          pattern: "legacy recovery-boundary row",
+          severity: "HIGH",
+          description: "audit event must not become a learned pattern",
+        },
+      }),
+    });
+
+    expect(result.processed).toBe(1);
+    expect(result.proposalsAppended).toBe(0);
+    expect(fs.existsSync(path.join(skillFaults, "pending-patterns.jsonl"))).toBe(
+      false,
+    );
+  });
 });
