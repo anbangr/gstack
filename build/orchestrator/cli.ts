@@ -11181,6 +11181,15 @@ async function main() {
         }
       }
       if (exitCode === 0 && state.completed && !args.dryRun && !args.skipShip) {
+        // Stop reconciling visible gates BEFORE archiving the plan file.
+        // saveState() invokes reconcileVisiblePlanState which reads
+        // visiblePlanProjection.planFile (set once at parsePlan time with
+        // the inbox/living-plan path). archiveLivingPlan moves that file
+        // to archived/, so the very next saveState would ENOENT. Nulling
+        // the projection makes that reconcile path a no-op for the rest
+        // of shutdown. The finally block also clears it as a belt-and-
+        // suspenders guard against test/import leakage.
+        visiblePlanProjection = null;
         const archivedPath = archiveLivingPlan(state.planFile);
         if (archivedPath) {
           state.planFile = archivedPath;
@@ -11196,6 +11205,13 @@ async function main() {
       }
     }
   } finally {
+    // Belt-and-suspenders for the gate-visibility reconcile race: even if
+    // shutdown hit the failure branch (so the success-path null at line
+    // ~11183 didn't run), make sure no further saveState calls trigger a
+    // stale-path reconcile. Module-level visiblePlanProjection persists
+    // across imports — clearing it here also prevents leakage into the
+    // next test that imports this module.
+    visiblePlanProjection = null;
     // Uninstall the wrapConsole shim FIRST so registry / lock cleanup
     // warnings below go through the real console.warn (not the wrapped
     // version, which would queue them as halt events on a run that's
@@ -11272,9 +11288,54 @@ async function main() {
   // PR 6: end-of-build auto-drain of the halt-events queue. Failure is
   // non-fatal — preserves whatever exitCode the build produced. Opt out
   // via --no-auto-drain or GSTACK_HALT_EVENTS_OFF=1.
-  await runAutoDrainIfEnabled(args, state);
+  //
+  // Outer 60s deadline: the inner drainFaultsFromHaltEventsQueue uses a
+  // 10-minute investigatorTimeoutMs (correct for the standalone
+  // `gstack-build halt drain` command, where investigators legitimately
+  // take that long). At end-of-build it is the wrong UX budget — a
+  // successful run with halt events queued could otherwise sit silent
+  // for up to 10 minutes between "Archived living plan" and process exit,
+  // looking exactly like a hang. process.exit below forcibly tears down
+  // the event loop, ending any orphaned drain investigators via OS
+  // process tree.
+  await runWithDeadline(
+    () => runAutoDrainIfEnabled(args, state),
+    60_000,
+    "auto-drain: 60s end-of-build deadline exceeded, skipping " +
+      "(any unprocessed halt events remain queued for next build or " +
+      "`gstack-build halt drain`)",
+  );
 
   process.exit(exitCode);
+}
+
+/**
+ * Race a promise against a hard millisecond deadline. If the deadline fires
+ * first, log `deadlineWarning` to console.warn and resolve `void`. The
+ * underlying work is NOT cancelled (callers should rely on process.exit or
+ * AbortSignal threading for true cancellation), but the parent stops
+ * awaiting it — useful for non-fatal end-of-build hooks where we'd rather
+ * exit late-on-its-own-terms than block shutdown.
+ *
+ * Exported only for unit testing — see auto-drain.test.ts.
+ */
+export async function runWithDeadline<T>(
+  work: () => Promise<T>,
+  deadlineMs: number,
+  deadlineWarning: string,
+): Promise<T | void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      console.warn(deadlineWarning);
+      resolve();
+    }, deadlineMs);
+  });
+  try {
+    return await Promise.race([work(), deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 export function checkWorkingTreeClean(cwd: string): {
