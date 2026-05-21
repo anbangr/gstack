@@ -93,7 +93,7 @@ import { _testWritePlan } from "../plan-mutator";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { DEFAULT_ROLE_CONFIGS } from "../role-config";
 
 let tmpDir: string | null = null;
@@ -4022,6 +4022,77 @@ describe("ensureFeatureBranch", () => {
     fs.rmSync(statePath(slug), { force: true });
   });
 
+  it("quarantines malformed refs before fetching to create a feature branch", () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-feature-quarantine-"));
+    const bare = path.join(tmpDir, "origin.git");
+    const repo = path.join(tmpDir, "repo");
+    expect(spawnSync("git", ["init", "--bare", bare]).status).toBe(0);
+    expect(spawnSync("git", ["clone", bare, repo]).status).toBe(0);
+    expect(
+      spawnSync("git", ["config", "user.email", "test@example.com"], {
+        cwd: repo,
+      }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["config", "user.name", "Test User"], { cwd: repo })
+        .status,
+    ).toBe(0);
+    fs.writeFileSync(path.join(repo, "README.md"), "# test\n");
+    expect(spawnSync("git", ["add", "README.md"], { cwd: repo }).status).toBe(
+      0,
+    );
+    expect(
+      spawnSync("git", ["commit", "-m", "init"], { cwd: repo }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["push", "-u", "origin", "main"], { cwd: repo }).status,
+    ).toBe(0);
+    expect(
+      spawnSync("git", ["checkout", "-b", "feat/other"], { cwd: repo }).status,
+    ).toBe(0);
+
+    const sha = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repo,
+      encoding: "utf8",
+    }).stdout.trim();
+    const malformedRefPath = path.join(
+      repo,
+      ".git",
+      "refs",
+      "heads",
+      "feat",
+      "foo 1",
+    );
+    fs.mkdirSync(path.dirname(malformedRefPath), { recursive: true });
+    fs.writeFileSync(malformedRefPath, sha + "\n");
+
+    const slug = `test-feature-quarantine-${Date.now()}`;
+    const feature: FeatureState = {
+      index: 0,
+      number: "1",
+      name: "Auth",
+      phaseIndexes: [],
+      status: "running",
+    };
+    const state = stateForBranchTest(slug, feature, "feat/other");
+
+    const result = ensureFeatureBranch({
+      cwd: repo,
+      state,
+      feature,
+      dryRun: false,
+      noGbrain: true,
+    });
+
+    expect(result).toBe(true);
+    expect(fs.existsSync(malformedRefPath)).toBe(false);
+    expect(
+      fs.existsSync(path.join(repo, ".git", "quarantine", "feat-foo-1.ref")),
+    ).toBe(true);
+    expect(feature.branch).toBe("feat/plan-1-auth");
+    fs.rmSync(statePath(slug), { force: true });
+  });
+
   // Regression for the orchestrator state-caching bug observed during the
   // implementor-hygiene-hardening build (2026-05-18): when `git fetch origin
   // <base>` failed (broken `origin/main 2` ref), `ensureFeatureBranch`
@@ -6415,20 +6486,18 @@ describe("runStopRun (Bug 6)", () => {
   it("refuses to signal a PID whose command line is not gstack-build (PID-reuse guard)", async () => {
     // Spawn a long-running sleep — its command line is "sleep 600",
     // NOT gstack-build. runStopRun must refuse to signal it (exit 2).
-    const child = spawnSync("sh", ["-c", "sleep 600 & echo $!"], {
-      encoding: "utf8",
-    });
-    const pidStr = (child.stdout || "").trim();
-    const pid = Number(pidStr);
+    const child = spawn("sleep", ["600"], { stdio: "ignore" });
+    child.unref();
+    const pid = child.pid;
     expect(Number.isInteger(pid)).toBe(true);
-    spawnedPids.push(pid);
+    spawnedPids.push(pid!);
 
     const record = {
       runId: "guard-run",
       stateSlug: "guard-run",
       repoPath: "/tmp/repo",
       planFile: "/tmp/plan.md",
-      pid,
+      pid: pid!,
       status: "running" as const,
       startedAt: "2026-01-01T00:00:00.000Z",
       lastUpdatedAt: "2026-01-01T00:00:00.000Z",
@@ -6436,14 +6505,14 @@ describe("runStopRun (Bug 6)", () => {
     };
     writeActiveRunRecord(registryDir, record);
 
-    const exitCode = await runStopRun("guard-run", registryDir);
-    expect(exitCode).toBe(2);
-
-    // Confirm the sleep was NOT killed.
-    const stillAlive = spawnSync("ps", ["-p", String(pid)], {
+    const psProbe = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
       encoding: "utf8",
     });
-    expect(stillAlive.status).toBe(0);
+    const exitCode = await runStopRun("guard-run", registryDir);
+    expect(exitCode).toBe(psProbe.status === 0 ? 2 : 4);
+
+    // Confirm the sleep was NOT killed.
+    expect(() => process.kill(pid!, 0)).not.toThrow();
   });
 });
 

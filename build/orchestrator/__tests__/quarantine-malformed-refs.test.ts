@@ -214,11 +214,12 @@ describe("quarantineMalformedRefs", () => {
 
     const sha = git(["rev-parse", "HEAD"], tmpDir);
 
-    // Both sanitize to "feat-foo-1"
+    // Both are malformed and both sanitize to "feat-foo-1"
     const refA = path.join(tmpDir, ".git", "refs", "heads", "feat", "foo 1");
-    const refB = path.join(tmpDir, ".git", "refs", "heads", "feat-foo-1");
+    const refB = path.join(tmpDir, ".git", "refs", "heads", "feat", "foo?1");
     fs.mkdirSync(path.dirname(refA), { recursive: true });
     fs.writeFileSync(refA, sha + "\n");
+    fs.mkdirSync(path.dirname(refB), { recursive: true });
     fs.writeFileSync(refB, sha + "\n");
 
     const result = fn(tmpDir);
@@ -236,7 +237,34 @@ describe("quarantineMalformedRefs", () => {
       JSON.parse(fs.readFileSync(path.join(quarantineDir, s), "utf8")).originalRef,
     );
     expect(originals).toContain("refs/heads/feat/foo 1");
-    expect(originals).toContain("refs/heads/feat-foo-1");
+    expect(originals).toContain("refs/heads/feat/foo?1");
+  });
+
+  test("edge: valid refs are not quarantined when their sanitized name collides", () => {
+    const fn = quarantineFn();
+    if (typeof fn !== "function") {
+      expect(false).toBe(true);
+      return;
+    }
+
+    const sha = git(["rev-parse", "HEAD"], tmpDir);
+
+    const malformedRefPath = path.join(tmpDir, ".git", "refs", "heads", "feat", "foo 1");
+    const validRefPath = path.join(tmpDir, ".git", "refs", "heads", "feat-foo-1");
+    fs.mkdirSync(path.dirname(malformedRefPath), { recursive: true });
+    fs.writeFileSync(malformedRefPath, sha + "\n");
+    fs.writeFileSync(validRefPath, sha + "\n");
+
+    const result = fn(tmpDir);
+    expect(result.quarantined).toBe(1);
+
+    const quarantineDir = path.join(tmpDir, ".git", "quarantine");
+    const sidecars = fs.readdirSync(quarantineDir).filter((f) => f.endsWith(".json"));
+    expect(sidecars.length).toBe(1);
+    const sidecar = JSON.parse(fs.readFileSync(path.join(quarantineDir, sidecars[0]), "utf8"));
+    expect(sidecar.originalRef).toBe("refs/heads/feat/foo 1");
+    expect(fs.existsSync(validRefPath)).toBe(true);
+    expect(fs.readFileSync(validRefPath, "utf8").trim()).toBe(sha);
   });
 
   // ----------------------------------------------------------------
