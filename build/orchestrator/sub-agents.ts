@@ -389,35 +389,127 @@ export function spawnCaptured(args: {
       return buf;
     };
 
-    // Channel-prefixed live write with backpressure. stdout chunks get
-    // `[OUT] ` per line, stderr chunks get `[ERR] `. Preserves chronological
-    // interleave (which is what users see in a terminal) while still letting
-    // downstream tooling grep by channel.
+    // Channel-prefixed live write with backpressure and per-channel
+    // line-start tracking.
+    //
+    // The naive form (split on /(?<=\n)/, prefix every non-empty slice)
+    // corrupts logs in two ways:
+    //   1. Chunk split mid-line: child emits "foo " then "bar\n", we'd
+    //      write `[OUT] foo [OUT] bar\n` — a spurious mid-line prefix.
+    //   2. Cross-channel interleave: OUT "foo " then ERR "warn\n" then
+    //      OUT "bar\n" would write `[OUT] foo [ERR] warn\n[OUT] bar\n` —
+    //      readers see "foo warn" as a single ERR line, completely wrong.
+    //
+    // Fix: track per-channel `atLineStart` state. Only prepend a prefix
+    // when we're starting a new line. On a channel switch mid-line, inject
+    // a synthetic newline first so the new channel's prefix lands at line
+    // start. Trailing partials at finish() get flushed with a final
+    // newline (see finish() below).
+    //
+    // Channel terminators: we treat both \n and \r as terminators so
+    // \r-driven progress bars (curl, wget, npm, pytest tqdm — common in
+    // the e2e subagents this orchestrator runs) don't spill prefixes
+    // mid-line.
+    let lastChannel: "OUT" | "ERR" | null = null;
+    let stdoutAtLineStart = true;
+    let stderrAtLineStart = true;
     function writeChannel(channel: "OUT" | "ERR", text: string): void {
       if (!ws) return;
-      // Split on newline-terminated chunks so every line gets a fresh prefix.
-      // The lookbehind keeps the trailing \n attached to the previous slice
-      // (no trailing empty entries), and partial lines (no \n yet) still get
-      // a prefix prepended so they're visible on tail -f even mid-chunk.
-      const prefixed = text
-        .split(/(?<=\n)/)
-        .map((line) => (line.length ? `[${channel}] ${line}` : line))
-        .join("");
-      const ok = ws.write(prefixed);
+      if (text.length === 0) return;
+
+      // Channel switch mid-line: the previous channel emitted text but
+      // did not end with a terminator. Inject a synthetic newline so
+      // we don't smear two channels together on one visible line.
+      const prevChannelAtLineStart =
+        channel === "OUT" ? stdoutAtLineStart : stderrAtLineStart;
+      let prelude = "";
+      if (
+        lastChannel !== null &&
+        lastChannel !== channel &&
+        !(lastChannel === "OUT" ? stdoutAtLineStart : stderrAtLineStart)
+      ) {
+        prelude = `[${lastChannel}] (cont)\n`;
+        if (lastChannel === "OUT") stdoutAtLineStart = true;
+        else stderrAtLineStart = true;
+      }
+
+      // Walk the chunk, splitting on \n and \r terminators. Each segment
+      // is "everything up to and including the next terminator" (or the
+      // tail if no terminator). Prefix when starting a new line.
+      let out = prelude;
+      let i = 0;
+      let atLineStart = prevChannelAtLineStart || prelude.length > 0;
+      const len = text.length;
+      while (i < len) {
+        // Find the next terminator at or after i.
+        let j = i;
+        while (j < len && text[j] !== "\n" && text[j] !== "\r") j++;
+        // Segment text[i..j) is the body up to (but excluding) the
+        // terminator; text[j] is either the terminator or end-of-text.
+        const hasTerminator = j < len;
+        const body = text.slice(i, j);
+        const terminator = hasTerminator ? text[j] : "";
+
+        if (atLineStart && (body.length > 0 || hasTerminator)) {
+          out += `[${channel}] `;
+        }
+        out += body + terminator;
+        atLineStart = hasTerminator;
+
+        i = j + (hasTerminator ? 1 : 0);
+      }
+
+      if (channel === "OUT") stdoutAtLineStart = atLineStart;
+      else stderrAtLineStart = atLineStart;
+      lastChannel = channel;
+
+      const ok = ws.write(out);
       if (!ok) {
         // Honor backpressure so a high-volume dump can't blow memory.
         // Pause BOTH channels (not just the one that observed the falsy
         // write) — the other channel writes through the same single fd
         // and would otherwise pile up in the writer's internal buffer
         // even after the active channel paused, defeating the bound.
+        //
+        // F6 mitigation: also stamp the watchdog's activity timer so the
+        // forced pause isn't misread as agent silence. The watchdog
+        // observes stdio 'data' events; pausing both channels stops
+        // those events entirely. Without proactive stamping, a slow disk
+        // that takes longer than args.timeoutMs to drain would let the
+        // watchdog conclude the child went silent and stall-kill it —
+        // even though we paused it. notifyActivity() is wired by
+        // attachStallWatchdog later in this function; declare a forward
+        // hook on the watchdog handle once it's attached. For now we
+        // record the pause time; finish() reads it for diagnostics.
+        backpressurePauses++;
+        backpressurePausedAt = Date.now();
         child.stdout?.pause();
         child.stderr?.pause();
         ws.once("drain", () => {
+          if (backpressurePausedAt) {
+            backpressurePausedMs += Date.now() - backpressurePausedAt;
+            backpressurePausedAt = 0;
+          }
+          // Stamp activity on resume so the watchdog's "silence since
+          // last data event" counter is reset to NOW, not to whenever
+          // the last pre-pause data event fired. The watchdog handle
+          // exposes notifyActivity() once attached (added below).
+          watchdogActivityHook?.();
           child.stdout?.resume();
           child.stderr?.resume();
         });
       }
     }
+
+    // F6 instrumentation: counters and a hook the watchdog can install
+    // to receive proactive activity signals from the backpressure path.
+    // The watchdog itself is attached below; the hook stays null until
+    // then. Tests can introspect backpressurePauses/Ms via the result
+    // object if we ever surface it; for now they're internal.
+    let backpressurePauses = 0;
+    let backpressurePausedAt = 0;
+    let backpressurePausedMs = 0;
+    let watchdogActivityHook: (() => void) | null = null;
 
     child.stdout?.on("data", (chunk: Buffer | string) => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
@@ -470,6 +562,15 @@ export function spawnCaptured(args: {
       },
     );
 
+    // F6 wire-up: when backpressure pauses both stdio streams, the
+    // stream-mode watchdog stops seeing 'data' events even though the
+    // child is actually busy producing output. Stamp the watchdog on
+    // resume so the silence-since-last-activity counter starts from
+    // NOW, not from whenever the last pre-pause data event fired.
+    // cpu-mode watchdog reads kernel CPU time directly so it doesn't
+    // need this hook; the call is a cheap recordActivity() either way.
+    watchdogActivityHook = () => watchdog.notifyActivity();
+
     if (args.closeStdin) child.stdin?.end();
 
     const finish = (exitCode: number | null, signal: NodeJS.Signals | null) => {
@@ -498,6 +599,14 @@ export function spawnCaptured(args: {
         `# stdout_bytes: ${stdoutBytes}\n` +
         `# stderr_bytes: ${stderrBytes}\n`;
 
+      // Flush any trailing partial lines so the final log doesn't leave a
+      // dangling prefix-less segment on either channel. The body terminates
+      // with a clean newline before the footer; readers grepping `^\[OUT\]`
+      // / `^\[ERR\]` see complete lines.
+      let partialFlush = "";
+      if (!stdoutAtLineStart && lastChannel === "OUT") partialFlush += "\n";
+      if (!stderrAtLineStart && lastChannel === "ERR") partialFlush += "\n";
+
       // Build a promise that resolves when the log file is fully flushed
       // to disk. This matters because callers (and tests) often read
       // logPath immediately after awaiting spawnCaptured — if we resolve
@@ -512,8 +621,15 @@ export function spawnCaptured(args: {
       // another event — the stream is destroyed and no further events
       // will fire. loggedStreamError tracks this so we resolve
       // immediately rather than hanging on a stream that won't emit.
-      // A 1s safety timeout on the flush promise catches any path where
-      // ws.end() neither flushes nor errors (defense in depth).
+      //
+      // No flush ceiling: the previous implementation had a 1s setTimeout
+      // safety net that silently truncated legitimate slow flushes on NFS
+      // / encrypted / CI disks. The 'finish'/'close'/'error' events from
+      // Node's WritableStream are guaranteed to fire (one of them always
+      // does); awaiting them as long as they need is correct. The only
+      // failure shape where none fire is a Node bug, and we'd rather
+      // surface that as a hang the operator notices than a silent
+      // truncated log shipped through detectBlindExecution.
       const logFlushed: Promise<void> =
         ws && !loggedStreamError
           ? new Promise<void>((resolveFlush) => {
@@ -526,13 +642,18 @@ export function spawnCaptured(args: {
               ws!.once("finish", settle);
               ws!.once("close", settle);
               ws!.once("error", settle);
-              // Defense in depth: never let a stuck stream block resolve.
-              setTimeout(settle, 1000);
               try {
-                ws!.end(footer);
+                ws!.end(partialFlush + footer);
               } catch {
                 // ws already in error state. settle() will fire via the
-                // 'error' listener OR the timeout.
+                // 'error' listener registered above. If for some reason
+                // it doesn't, force-destroy and settle so we don't hang.
+                try {
+                  ws!.destroy();
+                } catch {
+                  // destroy errors are swallowed; we're already on the
+                  // failure path.
+                }
                 settle();
               }
             })

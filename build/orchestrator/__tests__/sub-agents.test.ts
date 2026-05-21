@@ -3497,4 +3497,112 @@ describe("spawnCaptured streaming", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  // F5 — channel-prefix mid-line corruption.
+  // The original naive `text.split(/(?<=\n)/).map(prefix).join('')` form
+  // would inject a fresh `[OUT] `/`[ERR] ` prefix mid-line whenever a
+  // child chunked output mid-line. Cross-channel interleave is worse:
+  // it could make a stdout fragment look like part of a stderr line.
+  // These tests pin the corrected behavior.
+
+  it("A-T5: chunked stdout (no terminator in chunk 1) does not inject mid-line prefix", async () => {
+    // Use printf with explicit pauses so chunk 1 arrives without \n, then
+    // chunk 2 completes the line. If the naive split-and-prefix form ran,
+    // the log would contain `[OUT] foo [OUT] bar\n` — a spurious prefix.
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "spawncaptured-f5-stdout-"),
+    );
+    const logPath = path.join(tmpDir, "chunked.log");
+    try {
+      const result = await spawnCaptured({
+        bin: "bash",
+        argv: ["-c", "printf 'foo '; sleep 0.2; printf 'bar\\n'"],
+        cwd: tmpDir,
+        timeoutMs: 5000,
+        logPath,
+        closeStdin: true,
+      });
+      expect(result.exitCode).toBe(0);
+      const log = fs.readFileSync(logPath, "utf8");
+      // Exactly one [OUT] prefix on the "foo bar" line. Spurious mid-line
+      // prefix would produce `[OUT] foo [OUT] bar\n`.
+      expect(log).toContain("[OUT] foo bar\n");
+      expect(log).not.toContain("foo [OUT] bar");
+      // Channel count check: the body has exactly one [OUT] occurrence
+      // for this content. Header has no channel tags.
+      const outCount = (log.match(/\[OUT\]/g) || []).length;
+      expect(outCount).toBe(1);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("A-T6: cross-channel interleave mid-line does not smear OUT into ERR", async () => {
+    // Sequence: OUT "foo " (no \n), ERR "warn\n", OUT "bar\n".
+    // Without per-channel line-start tracking, the disk content would be
+    // `[OUT] foo [ERR] warn\n[OUT] bar\n` — readers see "foo warn" as
+    // a single ERR line, completely wrong about which channel said
+    // "foo". The fix injects a `[OUT] (cont)\n` continuation marker
+    // when the active channel switches mid-line.
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "spawncaptured-f5-cross-"),
+    );
+    const logPath = path.join(tmpDir, "cross.log");
+    try {
+      const result = await spawnCaptured({
+        bin: "bash",
+        argv: [
+          "-c",
+          "printf 'foo '; sleep 0.2; printf 'warn\\n' 1>&2; sleep 0.2; printf 'bar\\n'",
+        ],
+        cwd: tmpDir,
+        timeoutMs: 5000,
+        logPath,
+        closeStdin: true,
+      });
+      expect(result.exitCode).toBe(0);
+      const log = fs.readFileSync(logPath, "utf8");
+      // "foo " must NEVER appear immediately followed by "[ERR]" on the
+      // same visible line — the continuation marker breaks them apart.
+      expect(log).not.toMatch(/\[OUT\] foo \[ERR\]/);
+      // "warn" is an ERR line, "bar" is an OUT line, and both must
+      // appear with their own prefix on their own line.
+      expect(log).toMatch(/\[ERR\] warn$/m);
+      expect(log).toMatch(/\[OUT\] bar$/m);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("A-T7: trailing partial line at EOF is flushed with a newline before the footer", async () => {
+    // Child exits before emitting a terminator. The pre-streaming model
+    // produced a log with no trailing newline between the last [OUT]
+    // line and the `# ---- result ----` footer, which made the result
+    // header look like a continuation of the last [OUT] line. The fix
+    // injects a synthetic newline at finish() time so the footer
+    // always starts at column 0.
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "spawncaptured-f5-partial-"),
+    );
+    const logPath = path.join(tmpDir, "partial.log");
+    try {
+      const result = await spawnCaptured({
+        bin: "bash",
+        // No trailing \n on "tail".
+        argv: ["-c", "printf 'head\\ntail'"],
+        cwd: tmpDir,
+        timeoutMs: 5000,
+        logPath,
+        closeStdin: true,
+      });
+      expect(result.exitCode).toBe(0);
+      const log = fs.readFileSync(logPath, "utf8");
+      // The footer marker is at line start, not appended to "[OUT] tail".
+      expect(log).toMatch(/\n# ---- result ----\n/);
+      // The last body line is "[OUT] tail" terminated by exactly one \n.
+      expect(log).toMatch(/\[OUT\] tail\n\n?# ---- result ----/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
