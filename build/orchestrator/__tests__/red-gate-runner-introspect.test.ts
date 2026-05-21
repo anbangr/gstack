@@ -82,7 +82,9 @@ describe("extractTestCount — T1-T7 core cases", () => {
       "bun",
     );
     expect(result.source).toBe("json");
-    expect(result.collected).toBeGreaterThanOrEqual(0);
+    expect(result.collected).toBe(6);
+    expect(result.passed).toBe(5);
+    expect(result.failed).toBe(1);
   });
 
   // T5: mocha fallback
@@ -156,6 +158,45 @@ describe("extractTestCount — edge cases", () => {
     );
     expect(result.source).toBe("stdout-fallback");
     expect(result.collected).toBeGreaterThanOrEqual(4);
+  });
+
+  test("edge: pytest JSON report file is cleaned up after parse", () => {
+    const jsonPath = path.join(tmp, "pytest-report.json");
+    fs.writeFileSync(
+      jsonPath,
+      JSON.stringify({
+        report: { summary: { collected: 2, passed: 2, failed: 0 } },
+      }),
+    );
+
+    const result = extractTestCount(
+      { stdout: "", jsonReportPath: jsonPath },
+      "pytest",
+    );
+
+    expect(result).toEqual({
+      collected: 2,
+      passed: 2,
+      failed: 0,
+      source: "json",
+    });
+    expect(fs.existsSync(jsonPath)).toBe(false);
+  });
+
+  test("edge: vitest skips invalid brace-like stdout before JSON", () => {
+    const stdout = [
+      "{not valid json}",
+      JSON.stringify({ numTotalTests: 3, numPassedTests: 3, numFailedTests: 0 }),
+    ].join("\n");
+
+    const result = extractTestCount({ stdout }, "vitest");
+
+    expect(result).toEqual({
+      collected: 3,
+      passed: 3,
+      failed: 0,
+      source: "json",
+    });
   });
 
   // Edge: bun test with no --coverage flag → stdout regex fallback

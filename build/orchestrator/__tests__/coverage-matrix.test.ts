@@ -73,6 +73,7 @@ const MODULE_TEST_OWNERS: Record<string, string[]> = {
     "sub-agents.test.ts",
     "drain-faults.test.ts",
   ],
+  "test-runner-introspect.ts": ["red-gate-runner-introspect.test.ts"],
   "validate-living-plan.ts": ["../../../test/skill-fault-detector.test.ts"],
   "wrap-console.ts": ["wrap-console.test.ts"],
   "state.ts": ["state.test.ts", "startup.test.ts"],
