@@ -1,5 +1,44 @@
 # Changelog
 
+## [1.40.7.0] - 2026-05-21
+
+**Halt taxonomy foundation: the orchestrator now distinguishes five real provider failure shapes (timeout, quota, overload, transport, auth-required) from generic phase failures. Plus a `FailureRender` shape and per-pattern hit tracking so the static fault detector can grow without coupling the renderer.**
+
+This is PR1a of the tidy-haven series — Feature 3 of the 11-feature plan to address the 83 fault patterns we learned earlier in the session. The halt taxonomy and `FailureRender` shape land here so downstream PRs (PR1b classifier wiring, PR4 stall rendering, PR3 red-gate runner check) have something to consume.
+
+### What changed for the user
+
+When the orchestrator halts on a provider error, the halt event now carries the right kind. A Gemini timeout no longer shows up as `RETRY_CAP_HIT: codex hit cap after 0 iterations` (a misclassification we've seen at the boundary between subprocess failure and codex review iteration counting). A Claude 529 no longer shows up as a code/test failure. A `You've hit your limit` quota banner no longer shows up as a transient retry-cap.
+
+Five new top-level halt kinds: `PROVIDER_TIMEOUT`, `PROVIDER_QUOTA_EXHAUSTED`, `PROVIDER_OVERLOADED`, `PROVIDER_TRANSPORT_ERROR`, `PROVIDER_AUTH_REQUIRED`. Each gets its own `record*` emitter in `halt-event-helpers.ts` and is enumerated by all six consumers (skill-fault-detector, drain-faults, learn-fault-patterns, gbrain, SKILL.md M3.5 formatter, cli.ts FAIL handler dispatch).
+
+New `FailureRender` shape (`{kind, role, summary, evidenceLogPath?, stallSilenceMs?, totalMs?, exitCode?, signal?}`) and `renderRoleStepFailure(role, result)` helper in `halt-event-helpers.ts`. Definition-only here so PR1b's classifier and PR4's role-step rendering have a shared shape to consume.
+
+Per-pattern hit tracking in `~/.gstack/skill-faults/learned-patterns.json`: the static detector now bumps `hitCount` and `lastHit` every time a pattern matches. Enables the "recurrence rate per build hour" success metric for the tidy-haven program (D16=16A on the source plan).
+
+### Itemized changes
+
+#### Added
+
+- 5 new top-level halt kinds in `halt-event-helpers.ts`: `PROVIDER_TIMEOUT`, `PROVIDER_QUOTA_EXHAUSTED`, `PROVIDER_OVERLOADED`, `PROVIDER_TRANSPORT_ERROR`, `PROVIDER_AUTH_REQUIRED`. Each with a `recordProvider*` helper that calls `emit()` the same shape as `recordRetryCapHit`.
+- `FailureRender` type + `renderRoleStepFailure(role, result): FailureRender` helper in `halt-event-helpers.ts`. Definition only — PR4 will wire the 5 call sites.
+- Hit-counter wiring in `skill-fault-detector.ts`: matched learned patterns increment `hitCount` and update `lastHit`. Atomic file rewrite via tmp+rename.
+- New test files: `__tests__/halt-taxonomy.test.ts`, `__tests__/render-role-step-failure.shape.test.ts`, `__tests__/learned-pattern-hit-tracking.test.ts`.
+
+#### Changed
+
+- 6 consumers enumerate the new halt kinds: `skill-fault-detector.ts` (static category mapping), `drain-faults.ts` (printer + dedup key), `learn-fault-patterns.ts` (matcher kinds), `gbrain.ts` (category mapping), SKILL.md M3.5 report formatter (treats each as its own bucket), `cli.ts` FAIL handler (dispatch is wired in PR1b — this PR just exposes the helpers).
+- Provider-kind dedup in `drain-faults.ts`: events sharing `(runId, kind)` for the new `PROVIDER_*` kinds collapse to one investigation per drain pass, instead of N redundant codex calls on the same evidence.
+
+#### Fixed
+
+- Test isolation leak: `learned-pattern-hit-tracking.test.ts` called `drainFaultsFromHaltEventsQueue` without `inboxDir`, leaking `2026-MM-DD-halt-*.md` files into the worktree's `inbox/` directory on every test run. Now passes `inboxDir: path.join(home, "inbox")` so the auto-file sink lands inside the test's isolated tmp dir.
+
+#### For contributors
+
+- This is build skill 1.27.1. The taxonomy + shape is foundation work for PR1b (classifier wiring), PR4 (stall rendering), PR3 (red-gate runner check). The classifier dispatch at `cli.ts:6298-6308` is intentionally NOT wired in this PR — that's PR1b's load-bearing change.
+- The build worktree itself shipped this PR while building against the very faults the PR fixes. F3's review hit a real Claude session-quota wall at 11:40am Asia/Shanghai; F3's hygiene gate flagged its own auto-filed PROVIDER_QUOTA_EXHAUSTED report; the test-isolation bug surfaced when F4's branch creation tried to checkout off F3's tip. All recovered via state surgery and `--mark-phase-committed`. Meta-confirmation that PR1b + PR4 are the next-most-important PRs.
+
 ## [Unreleased - fork-local: build skill 1.27.0] - 2026-05-21
 
 **Orchestrator stall detection: the monitor now catches a wedged build instead of waiting forever. Pairs with the 60-second auto-drain deadline from build skill 1.26.1 (#70) to close two distinct failure modes of the end-of-build hang.**
