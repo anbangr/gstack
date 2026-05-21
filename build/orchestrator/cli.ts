@@ -2122,9 +2122,16 @@ export function validatePostAgentHygiene(opts: {
   };
   const dirty = contentHashDelta(opts.before, filteredAfter, opts.cwd);
   if (dirty.length > 0) {
-    errors.push(
-      `${opts.label} left the working tree dirty:\n${dirty.map((line) => `  ${line}`).join("\n")}`,
-    );
+    let msg = `${opts.label} left the working tree dirty:\n${dirty.map((line) => `  ${line}`).join("\n")}`;
+    if (opts.reviewGate) {
+      const nonTestPaths = dirty
+        .map((line) => porcelainStatusToPath(line))
+        .filter((p) => !isTestOnlyPath(p, DEFAULT_QA_TEST_PATH_GLOBS));
+      if (nonTestPaths.length > 0) {
+        msg += `\n  the constraint was in the prompt; reviewer edited production paths anyway`;
+      }
+    }
+    errors.push(msg);
   }
 
   return { ok: errors.length === 0, errors };
@@ -4119,7 +4126,7 @@ export function buildCodexReviewBody(
   hardeningNotes?: string,
   originIssueLogPath?: string,
 ): string {
-  return [
+  const body = [
     `# Review Gate — Phase ${phase.number}: ${phase.name} (iter ${iteration})`,
     "",
     `Branch: ${branch}`,
@@ -4159,12 +4166,18 @@ export function buildCodexReviewBody(
     `1. Run the slash command specified by the runner prompt on the current branch's working tree against its base.`,
     `2. If iteration > 1, this is a re-run after an earlier gate tried to fix findings — be especially thorough.`,
     `3. Use --yolo / workspace-write file tools to inspect the actual code; don't ask the orchestrator to inline anything.`,
-    `4. Fix bugs as you find them (workspace-write sandbox is enabled). This includes running any data-generation or corpus-driver scripts described in the phase if their output files are missing — writing code that could produce them is not the same as producing them. Execute the script, verify the output files exist, and commit them.`,
-    `5. Write your full review report to the output file path (provided in the shell prompt).`,
-    `6. The output file MUST end with a single line: \`GATE PASS\` if no remaining issues, or \`GATE FAIL\` with a list of remaining issues.`,
+    `4. If you find a bug in production code, write a failing test that pins it; do NOT edit production source files (the post-agent hygiene gate will reject the phase if you do). Surface the bug in your report as a recommended follow-up [code] phase.`,
+    `5. You may execute data-generation or corpus-driver scripts described in the phase and commit their output files (data is not production code).`,
+    `6. Write your full review report to the output file path (provided in the shell prompt).`,
+    `7. The output file MUST end with a single line: \`GATE PASS\` if no remaining issues, or \`GATE FAIL\` with a list of remaining issues.`,
   ]
     .filter(Boolean)
     .join("\n");
+
+  return (
+    body +
+    "\n\nDIFF SCOPE: file edits in this phase are limited to: test/**, **/__tests__/**, **/*.test.*, **/*.spec.*, **/conftest.py, **/spec/**, plus committed data outputs from item 5. Edits to anything else fail the post-agent hygiene gate.\n"
+  );
 }
 
 export function buildOriginVerificationBody(args: {
