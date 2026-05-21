@@ -41,3 +41,5 @@ supabase/.temp/
 docs/throughput-*.json
 build/configure.cm
 .llm-tmp/
+# gstack-build convergence-failure reports — see /docs or run `gstack-build` for context
+BLOCKED*.md
