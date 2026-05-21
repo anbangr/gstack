@@ -125,6 +125,11 @@ import {
   writeFeatureReviewMetrics,
   watchFirstWrite,
 } from "./feature-review-metrics";
+import {
+  computeCacheKey,
+  lookupCache,
+  storeCache,
+} from "./feature-review-cache";
 import { runPlanReview, SYNTH_REVISION_PROMPT } from "./plan-reviewer";
 import { runPlanReviewLoop } from "./plan-review-loop";
 import { shipAndDeploy, shipOnly } from "./ship";
@@ -6131,6 +6136,66 @@ async function runFeatureReviewIteration(args: {
     logDir(slug),
     `feature-${args.feature.number}-review-${args.iteration}-output.md`,
   );
+
+  // T14: verdict cache lookup. Only PASS verdicts are cached. Key includes
+  // feature content, sorted phase committedShas (from T7), plan body, and
+  // reviewer role label. Cache hit → skip spawn entirely and return a
+  // synthesized PASS verdict. Sits BEFORE the try block so a cache hit
+  // bypasses the metrics-writing finally — we don't want phantom 0ms
+  // entries in feature-review-metrics.jsonl for hits.
+  //
+  // Missing-committedSha case: computeCacheKey returns "" and we fall
+  // through to the normal spawn. lookupCache("", slug) is also a guarded
+  // no-op so we don't need to gate the call.
+  let _cacheKey = "";
+  if (!args.dryRun) {
+    let _planBody = "";
+    try {
+      _planBody = fs.readFileSync(args.planFile, "utf8");
+    } catch {
+      // Plan file missing or unreadable → empty body. computeCacheKey
+      // still produces a key (or "" if phases lack committedSha); a
+      // truly missing plan will mismatch any prior key with real body.
+    }
+    _cacheKey = computeCacheKey({
+      feature: args.feature,
+      phaseStates: args.state.phases,
+      planBody: _planBody,
+      reviewerRoleLabel: roleLabel(args.roles.featureReview),
+    });
+    if (_cacheKey) {
+      const hit = lookupCache(_cacheKey, slug);
+      if (hit) {
+        console.log(
+          `  ↻ feature-review cache hit (cached PASS from ${hit.cachedAt}, iter ${hit.iteration}); skipping spawn`,
+        );
+        // Persist into featureState so featureReviewAlreadySatisfied catches
+        // it on next iteration too. Reconstruct a minimal ParsedFeatureVerdict
+        // — the caller only consumes verdict + action.
+        if (!args.featureState.featureReview) {
+          args.featureState.featureReview = {
+            iterations: 0,
+            outputLogPaths: [],
+            outputFilePaths: [],
+          };
+        }
+        const fr = args.featureState.featureReview;
+        fr.iterations += 1;
+        fr.finalVerdict = "FEATURE_PASS";
+        return {
+          verdict: {
+            verdict: "FEATURE_PASS",
+            phasesToRedo: [],
+            additionalPhasesMd: "",
+            findings: "(cached PASS — no fresh review performed)",
+          },
+          action: "ship",
+          outputFilePath: hit.outputFilePath,
+        };
+      }
+    }
+  }
+
   try {
 
   // Containment-checked prior report (F2 trust-boundary defense).
@@ -6411,6 +6476,19 @@ async function runFeatureReviewIteration(args: {
   }
 
   if (verdict.verdict === "FEATURE_PASS") {
+    // T14: persist PASS to the disk cache so a future /build run with
+    // identical inputs (feature content + phase shas + plan + reviewer)
+    // can skip the spawn. Empty _cacheKey (missing committedSha or
+    // dryRun) skips the write — storeCache also no-ops on empty keys.
+    if (_cacheKey && !args.dryRun) {
+      storeCache(_cacheKey, slug, {
+        verdict: "FEATURE_PASS",
+        iteration: args.iteration,
+        outputFilePath,
+        cachedAt: new Date().toISOString(),
+        originalSlug: slug,
+      });
+    }
     return { verdict, action: "ship", outputFilePath };
   }
 
