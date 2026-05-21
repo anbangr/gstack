@@ -599,6 +599,48 @@ export function attachStallWatchdog(
         stop();
       }
     }
+
+    // Progress-gap arm. Gated on:
+    //   - parseProgress is wired,
+    //   - we've seen at least one classified event in this run,
+    //   - the gap since the last classified event exceeds progressGapMs.
+    // Independent of lastActivityAt — that's the whole point. A subagent
+    // that's babbling but not making classifiable progress should be
+    // killed even if stdout is fresh.
+    if (
+      !killed &&
+      parseProgress &&
+      progressGapMs !== undefined &&
+      lastClassifiedActivityAt !== null
+    ) {
+      const gap = clock.now() - lastClassifiedActivityAt;
+      if (gap >= progressGapMs) {
+        killed = true;
+        killReason = "progress_gap";
+        try {
+          opts.onStallKill?.(gap);
+        } catch {
+          // Callback errors are swallowed.
+        }
+        if (source.mode === "stream" || source.mode === "cpu") {
+          const pid = source.child.pid;
+          if (typeof pid === "number") {
+            killProcessAndGroup(pid, "SIGTERM");
+            killTimerHandle = clock.setTimeout(() => {
+              killProcessAndGroup(pid, "SIGKILL");
+            }, gracePeriodMs);
+          }
+          if (pollHandle !== null) {
+            clock.clearInterval(pollHandle);
+            pollHandle = null;
+          }
+          source.child.stdout?.off("data", onLine);
+          source.child.stderr?.off("data", onLine);
+        } else {
+          stop();
+        }
+      }
+    }
   };
 
   pollHandle = clock.setInterval(poll, pollIntervalMs);

@@ -133,7 +133,9 @@ describe("attachStallWatchdog tool-aware", () => {
         parseProgress: (line) =>
           line === "TOOL_START_SLOW" ? slowToolStart(clock.now()) : null,
         toolStallMs: { fast: 90_000, slow: 600_000 },
-        progressGapMs: 300_000,
+        // progressGapMs must exceed the 8-min test window so the gap arm
+        // doesn't fire before the slow silence window (10min) does.
+        progressGapMs: 900_000, // 15 min
       },
     );
 
@@ -173,6 +175,55 @@ describe("attachStallWatchdog tool-aware", () => {
     expect(killedSilenceMs).not.toBeNull();
     expect(killedSilenceMs! >= 90_000).toBe(true);
     expect(w.killReason()).toBe("silence");
+
+    w.stop();
+  });
+
+  it("kills with killReason=progress_gap when noisy stdout has no parsed events", () => {
+    const { clock, advance } = makeFakeClock();
+    const { child, emitStdout } = makeFakeChild();
+    let killedSilenceMs: number | null = null;
+
+    const w = attachStallWatchdog(
+      { mode: "stream", child },
+      {
+        stallMs: 60_000,
+        provider: "shell",
+        clock,
+        onStallKill: (s) => {
+          killedSilenceMs = s;
+        },
+        parseProgress: (line) =>
+          line === "TOOL_START_FAST" ? fastToolStart(clock.now()) : null,
+        toolStallMs: { fast: 90_000, slow: 600_000 },
+        progressGapMs: 300_000, // 5 min
+      },
+    );
+
+    // Seed a classified event so the gap detector is "armed".
+    emitStdout("TOOL_START_FAST\n");
+    // Now emit noisy non-classified lines every 30s for 6 minutes. The
+    // stdout chunks keep lastActivityAt fresh (so legacy stallMs never
+    // trips), but parseProgress returns null for "noise" so
+    // lastClassifiedActivityAt is frozen. After progressGapMs (5min)
+    // the gap arm MUST fire even though stdout is healthy.
+    //
+    // Note: currentToolBucket stays "fast" the whole time (no TOOL_END
+    // event in this fixture). Fast window is 90s, but noisy stdout
+    // resets lastActivityAt every chunk, so the fast window never
+    // closes. That's the bug we're testing — the gap detector must
+    // still fire even with bucket="fast" and fresh lastActivityAt.
+
+    for (let i = 0; i < 12; i++) {
+      advance(30_000); // 30s
+      emitStdout("noise\n");
+    }
+    // 12 * 30s = 360s = 6 min. Gap threshold is 5 min, so the watchdog
+    // should have fired between minute 5 and minute 6.
+
+    expect(w.stallKilled()).toBe(true);
+    expect(w.killReason()).toBe("progress_gap");
+    expect(killedSilenceMs).not.toBeNull();
 
     w.stop();
   });
