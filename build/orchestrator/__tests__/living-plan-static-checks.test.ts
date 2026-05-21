@@ -405,8 +405,13 @@ const x = 1;
   it("T8: the synthesizer wrapper bounds retries at 3 attempts", () => {
     const tmpl = fs.readFileSync(TEMPLATE, "utf8");
     // The shell wrapper must contain the bounded-retry guard.
+    expect(tmpl).toMatch(/while true; do/);
+    expect(tmpl).toMatch(/_spawn_synthesizer "\$_SYNTH_PROMPT_PATH"/);
     expect(tmpl).toMatch(/"\$_SYNTH_ROUND"\s+-ge\s+3/);
     expect(tmpl).toMatch(/_SYNTH_ROUND=\$\(\(_SYNTH_ROUND\s*\+\s*1\)\)/);
+    expect(tmpl).toMatch(
+      /_SYNTH_PROMPT_PATH="\$BUILD_TMP_DIR\/build-synthesis-revision-input\.md"/,
+    );
   });
 
   it("T8: on persistent failure the wrapper halts instead of looping forever", () => {
@@ -415,5 +420,13 @@ const x = 1;
       /PLAN_SYNTHESIS_INVALID.*structural gate failed after 2 retries/,
     );
     expect(tmpl).toMatch(/exit 1/);
+  });
+
+  it("T8: revision prompt includes static-check violations, not only structural fields", () => {
+    const tmpl = fs.readFileSync(TEMPLATE, "utf8");
+    expect(tmpl).toMatch(/staticViolations/);
+    expect(tmpl).toMatch(/Imported identifiers are used in the same phase/);
+    expect(tmpl).toMatch(/Acceptance file paths exist, are exempt, or are planned/);
+    expect(tmpl).toMatch(/Quoted file:line snippets still match/);
   });
 });
