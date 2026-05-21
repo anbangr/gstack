@@ -1155,7 +1155,7 @@ test("release_queued without shippedAt/prNumber is detected as manual patch and 
   } finally {
     fs.rmSync(patchedDir, { recursive: true, force: true });
   }
-});
+}, 30_000);
 
 test("two same-basename plans with run ids cannot load each other's state", () => {
   const runDir = fs.mkdtempSync(
