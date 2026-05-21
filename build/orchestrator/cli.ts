@@ -210,7 +210,7 @@ import {
 import { renderPlanStatusTable, resolvePlanSelection } from "./plan-selection";
 import {
   classifyProviderFailure,
-  emitManualRecoveryInvoked,
+  emitRecoveryBoundary,
   markFeatureFailed,
   markPhaseFailed,
   recordProviderFailureVerdict,
@@ -10090,7 +10090,7 @@ async function main() {
   }
 
   if (args.mode === "drain-faults") {
-    emitManualRecoveryInvoked({
+    emitRecoveryBoundary({
       runId: args.runId ?? "drain-faults",
       stateSlug: args.planFile
         ? deriveStateSlug(args.planFile)
@@ -10116,7 +10116,7 @@ async function main() {
   }
 
   if (args.mode === "mark-shipped") {
-    emitManualRecoveryInvoked({
+    emitRecoveryBoundary({
       runId: args.runId ?? "mark-shipped",
       stateSlug: deriveStateSlug(args.planFile),
       message:
@@ -10437,7 +10437,7 @@ async function main() {
     if (!setupFailed && state && args.markPhaseCommitted) {
       {
         const ctx = helperCtxFor(state);
-        emitManualRecoveryInvoked({
+        emitRecoveryBoundary({
           runId: ctx.runId,
           stateSlug: ctx.stateSlug,
           message: `--mark-phase-committed invoked for phase ${args.markPhaseCommitted}`,
@@ -10773,34 +10773,9 @@ async function main() {
             featureState.status === "committed" &&
             !featureState.completedAt
           ) {
-            // Emit SILENT_STATE_MUTATION BEFORE the destructive rewrite so the
-            // halt-events queue captures the original shape (the polis
-            // hand-merged-feature class). Mutation behavior unchanged in this
-            // PR; a follow-up will decide whether to keep re-processing or
-            // treat the merge as authoritative.
-            {
-              const ctx = helperCtxFor(state);
-              emitHaltEvent({
-                kind: "SILENT_STATE_MUTATION",
-                runId: ctx.runId,
-                stateSlug: ctx.stateSlug,
-                severity: severityFor("SILENT_STATE_MUTATION"),
-                message:
-                  `Feature ${featureState.number} status="committed" without completedAt — ` +
-                  `orchestrator re-processing (mergeSha=${featureState.mergeSha ?? "absent"}, prNumber=${featureState.prNumber ?? "absent"})`,
-                pointers: ctx.pointers,
-                snapshot: buildHaltSnapshot({
-                  state,
-                  stdoutLogPath: ctx.pointers.stdoutLog,
-                  worktreePath: ctx.pointers.worktreePath,
-                  featureIndex,
-                }),
-              });
-            }
             console.warn(
-              `⚠ Feature ${featureState.number} status is "committed" but completedAt is missing — ` +
-                `this indicates a manual JSON state patch that bypassed ship+land+verify. ` +
-                `Re-processing the feature so the pipeline runs.`,
+              `STATE_DRIFT:missing_completedAt feature "${featureState.name}" (feature ${featureState.number}) is committed but has no completedAt. ` +
+                `Recover with: gstack-build mark-shipped --plan ${state.planFile} --feature ${featureState.number}`,
             );
             // Reset to phases_done so resumeAtShip routes us into the ship
             // path on the next checks (status==="phases_done" → resumeAtShip

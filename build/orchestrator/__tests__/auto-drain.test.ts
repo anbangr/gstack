@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { runAutoDrainIfEnabled, runWithDeadline } from "../cli";
-import { emitManualRecoveryInvoked } from "../halt-event-helpers";
+import { emitRecoveryBoundary } from "../halt-event-helpers";
 import { emitHaltEvent } from "../halt-events";
 import {
   createDrainProgressCounter,
@@ -315,7 +315,7 @@ describe("auto-drain hook contract", () => {
 
   test("auto-drain leaves unrelated run events pending", async () => {
     const skillFaults = path.join(tmp, "skill-faults");
-    emitManualRecoveryInvoked({
+    emitRecoveryBoundary({
       runId: "other-project-run",
       stateSlug: "other-project",
       message: "--mark-phase-committed invoked for phase 1.1",
