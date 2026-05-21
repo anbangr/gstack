@@ -209,6 +209,32 @@ Call \`recordProviderTimeout\` in \`phase-runner.ts\`.
     expect(r.stderr).toMatch(/registry entry must land with orchestrator/i);
   });
 
+  it("T4: returns non-zero when registry and orchestrator work split across phases in one feature", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Split phase wiring
+
+Origin trace: test
+Acceptance: registry and orchestrator must ship atomically
+
+### Phase 1: Add registry entry
+- [ ] **Implementation**: add entry
+- [ ] **Review**: review
+
+Add \`recordProviderTimeout\` to \`child-registry.ts\`.
+
+### Phase 2: Wire orchestrator
+- [ ] **Implementation**: wire it
+- [ ] **Review**: review
+
+Call \`recordProviderTimeout\` in \`phase-runner.ts\`.
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/registry entry must land with orchestrator/i);
+  });
+
   // ─────────────────────────────────────────────────────────────────────────
   // T5 — helper file:line stale
   // ─────────────────────────────────────────────────────────────────────────
