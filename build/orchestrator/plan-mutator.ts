@@ -97,29 +97,84 @@ function normalizePhaseName(name: string): string {
   return name.trim();
 }
 
-/** Parse plan lines and return a Map from phaseId to array of 1-based heading line numbers. */
-function buildPhaseMap(lines: string[]): Map<string, number[]> {
-  const map = new Map<string, number[]>();
+const FEATURE_HEADING_RE = /^##\s+Feature\s+(\d+(?:\.\d+)?)\s*:/i;
+const PHASE_HEADING_RE =
+  /^###\s+Phase\s+(\d+(?:\.\d+)?(?:[a-z]|\.review-\d+)?)\s*(?:\[[^\]]*\])?\s*:\s*(.+?)\s*$/i;
+
+interface PhaseIdentity {
+  featureNumber?: string;
+  number: string;
+  name: string;
+}
+
+interface ParsedPhaseLocation {
+  phaseId: string;
+  headingLine: number;
+  markerLines: number[];
+}
+
+function phaseIdFromParts(
+  featureNumber: string | undefined,
+  phaseNumber: string,
+  phaseName: string,
+): string {
+  return `${featureNumber ?? "0"}.${phaseNumber}.${normalizePhaseName(phaseName)}`;
+}
+
+function phaseIdFromIdentity(phase: PhaseIdentity): string {
+  return phaseIdFromParts(phase.featureNumber, phase.number, phase.name);
+}
+
+function validPhaseIdentity(
+  phase: Partial<PhaseIdentity> | undefined,
+): PhaseIdentity | undefined {
+  if (!phase?.number || !phase.name) return undefined;
+  return {
+    featureNumber: phase.featureNumber,
+    number: phase.number,
+    name: phase.name,
+  };
+}
+
+/** Parse plan lines into stable phase locations keyed by feature/phase/name. */
+function buildPhaseLocations(
+  lines: string[],
+  expectedMarker: string,
+): ParsedPhaseLocation[] {
+  const locations: ParsedPhaseLocation[] = [];
+  let currentFeatureNumber = "0";
   for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(/^###\s+Phase\s+(\d+(?:\.\d+)?):\s*(.*)$/);
+    const fm = lines[i].match(FEATURE_HEADING_RE);
+    if (fm) {
+      currentFeatureNumber = fm[1];
+      continue;
+    }
+    const m = lines[i].match(PHASE_HEADING_RE);
     if (!m) continue;
-    const phaseNumber = m[1];
-    const phaseName = normalizePhaseName(m[2]);
-    let featureNumber = "0";
-    for (let j = i - 1; j >= 0; j--) {
-      const fm = lines[j].match(/^##\s+Feature\s+(\d+):/);
-      if (fm) {
-        featureNumber = fm[1];
-        break;
+    locations.push({
+      phaseId: phaseIdFromParts(currentFeatureNumber, m[1], m[2]),
+      headingLine: i + 1,
+      markerLines: [],
+    });
+  }
+
+  for (let idx = 0; idx < locations.length; idx++) {
+    const loc = locations[idx];
+    const start = loc.headingLine;
+    const nextHeading = locations[idx + 1]?.headingLine ?? lines.length + 1;
+    for (let lineNumber = start + 1; lineNumber < nextHeading; lineNumber++) {
+      const line = lines[lineNumber - 1];
+      if (FEATURE_HEADING_RE.test(line)) break;
+      if (
+        line.includes(expectedMarker) &&
+        /^(\s*-\s+\[)([ xX])(\])/.test(line)
+      ) {
+        loc.markerLines.push(lineNumber);
       }
     }
-    const phaseId = `${featureNumber}.${phaseNumber}.${phaseName}`;
-    if (!map.has(phaseId)) {
-      map.set(phaseId, []);
-    }
-    map.get(phaseId)!.push(i + 1);
   }
-  return map;
+
+  return locations;
 }
 
 /** Find the nearest phase heading at or above a 1-based line number. */
@@ -128,19 +183,19 @@ function findPhaseHeadingAbove(
   lineNumber: number,
 ): { line: number; phaseId: string } | null {
   for (let i = lineNumber - 1; i >= 0; i--) {
-    const m = lines[i].match(/^###\s+Phase\s+(\d+(?:\.\d+)?):\s*(.*)$/);
+    const m = lines[i].match(PHASE_HEADING_RE);
     if (m) {
       const phaseNumber = m[1];
       const phaseName = normalizePhaseName(m[2]);
       let featureNumber = "0";
       for (let j = i - 1; j >= 0; j--) {
-        const fm = lines[j].match(/^##\s+Feature\s+(\d+):/);
+        const fm = lines[j].match(FEATURE_HEADING_RE);
         if (fm) {
           featureNumber = fm[1];
           break;
         }
       }
-      const phaseId = `${featureNumber}.${phaseNumber}.${phaseName}`;
+      const phaseId = phaseIdFromParts(featureNumber, phaseNumber, phaseName);
       return { line: i + 1, phaseId };
     }
   }
@@ -155,32 +210,31 @@ function resolveStaleLine(
   planFile: string,
   originalLineNumber: number,
   expectedMarker: string,
+  expectedPhase?: Partial<PhaseIdentity>,
 ): { lineNumber: number } | { error: string } | null {
   const content = fs.readFileSync(planFile, "utf8");
   const lines = content.split(/\r?\n/);
+  const expectedIdentity = validPhaseIdentity(expectedPhase);
 
-  const heading = findPhaseHeadingAbove(lines, originalLineNumber);
-  if (!heading) return null;
+  const fallbackHeading = expectedIdentity
+    ? null
+    : findPhaseHeadingAbove(lines, originalLineNumber);
+  const phaseId = expectedIdentity
+    ? phaseIdFromIdentity(expectedIdentity)
+    : fallbackHeading?.phaseId;
+  if (!phaseId) return null;
 
-  const phaseMap = buildPhaseMap(lines);
-  const duplicateLines = phaseMap.get(heading.phaseId);
-  if (duplicateLines && duplicateLines.length > 1) {
+  const phaseLocations = buildPhaseLocations(lines, expectedMarker);
+  const matches = phaseLocations.filter((loc) => loc.phaseId === phaseId);
+  if (matches.length > 1) {
     return {
-      error: `PLAN_MUTATOR_DUPLICATE_HEADING: duplicate phase heading "${heading.phaseId}" at lines ${duplicateLines.join(", ")}`,
+      error: `PLAN_MUTATOR_DUPLICATE_HEADING: duplicate phase heading "${phaseId}" at lines ${matches.map((loc) => loc.headingLine).join(", ")}`,
     };
   }
 
-  // Search from the heading line for the expectedMarker in a checkbox line.
-  // Stop at the next feature heading or phase heading.
-  for (let i = heading.line - 1; i < lines.length; i++) {
-    if (i > heading.line - 1 && /^##\s/.test(lines[i])) break;
-    if (i > heading.line - 1 && /^###\s+Phase\s+/.test(lines[i])) break;
-    if (
-      lines[i].includes(expectedMarker) &&
-      /^(\s*-\s+\[)([ xX])(\])/.test(lines[i])
-    ) {
-      return { lineNumber: i + 1 };
-    }
+  const match = matches[0];
+  if (match?.markerLines.length) {
+    return { lineNumber: match.markerLines[0] };
   }
 
   return null;
@@ -200,6 +254,7 @@ export function setCheckboxState(args: {
   lineNumber: number;
   checked: boolean;
   expectedMarker?: string;
+  expectedPhase?: Partial<PhaseIdentity>;
 }): FlipResult {
   const content = fs.readFileSync(args.planFile, "utf8");
   const lines = content.split(/\r?\n/);
@@ -219,6 +274,7 @@ export function setCheckboxState(args: {
       args.planFile,
       args.lineNumber,
       args.expectedMarker,
+      args.expectedPhase,
     );
     if (resolved && "error" in resolved) {
       return { flipped: false, alreadyChecked: false, error: resolved.error };
@@ -262,6 +318,7 @@ export function setCheckboxStatusNote(args: {
   planFile: string;
   lineNumber: number;
   expectedMarker?: string;
+  expectedPhase?: Partial<PhaseIdentity>;
   note: string;
 }): StatusNoteResult {
   const content = fs.readFileSync(args.planFile, "utf8");
@@ -282,6 +339,7 @@ export function setCheckboxStatusNote(args: {
       args.planFile,
       args.lineNumber,
       args.expectedMarker,
+      args.expectedPhase,
     );
     if (resolved && "error" in resolved) {
       return { updated: false, alreadyPresent: false, error: resolved.error };
@@ -329,6 +387,7 @@ export function flipCheckbox(args: {
    * If provided, we verify it appears on the target line before flipping;
    * if not, we error out (the plan was edited under us). */
   expectedMarker?: string;
+  expectedPhase?: Partial<PhaseIdentity>;
 }): FlipResult {
   return setCheckboxState({ ...args, checked: true });
 }
@@ -344,6 +403,8 @@ export function flipPhaseCheckboxes(args: {
   reviewLine: number;
   /** Phase kind — determines the expected checkbox label. Defaults to "code". */
   kind?: PhaseKind;
+  /** Stable phase identity used to recover when stale lines drift above the phase. */
+  phase?: Partial<PhaseIdentity>;
 }): { implementation: FlipResult; review: FlipResult } {
   const implMarker = IMPL_MARKER_BY_KIND[args.kind ?? "code"];
   const reviewMarker = REVIEW_MARKER_BY_KIND[args.kind ?? "code"];
@@ -351,11 +412,13 @@ export function flipPhaseCheckboxes(args: {
     planFile: args.planFile,
     lineNumber: args.implementationLine,
     expectedMarker: implMarker,
+    expectedPhase: args.phase,
   });
   const review = flipCheckbox({
     planFile: args.planFile,
     lineNumber: args.reviewLine,
     expectedMarker: reviewMarker,
+    expectedPhase: args.phase,
   });
   return { implementation, review };
 }
@@ -384,6 +447,7 @@ export function flipTestSpecCheckbox(
       planFile,
       lineNumber: phase.testSpecCheckboxLine,
       expectedMarker: TEST_SPEC_MARKER,
+      expectedPhase: phase,
     });
   }
   return { flipped: false, alreadyChecked: true };
@@ -572,7 +636,7 @@ export function unflipPhaseCheckboxes(
     let idx = t.line - 1;
     let line = lines[idx];
     if (!line.includes(t.marker)) {
-      const resolved = resolveStaleLine(planFile, t.line, t.marker);
+      const resolved = resolveStaleLine(planFile, t.line, t.marker, phase);
       if (resolved && "error" in resolved) {
         errors.push(`${t.label}: ${resolved.error}`);
         continue;
@@ -649,6 +713,7 @@ export function reconcilePhaseCheckboxes(
       planFile,
       lineNumber: phase.testSpecCheckboxLine,
       expectedMarker: TEST_SPEC_MARKER,
+      expectedPhase: phase,
     });
     if (r.error) errors.push(`test-spec: ${r.error}`);
     else if (r.flipped) flipped++;
@@ -659,6 +724,7 @@ export function reconcilePhaseCheckboxes(
     implementationLine: phase.implementationCheckboxLine,
     reviewLine: phase.reviewCheckboxLine,
     kind: phase.kind,
+    phase,
   });
   if (result.implementation.error)
     errors.push(`impl: ${result.implementation.error}`);

@@ -539,6 +539,7 @@ function reconcilePhaseVisibleGates(
         lineNumber: gs.line,
         checked: shouldBeDone,
         expectedMarker: PHASE_GATE_MARKERS[gateKey],
+        expectedPhase: phase,
       });
       if (result.flipped) {
         gs.done = shouldBeDone;
@@ -6061,6 +6062,7 @@ export function markPhaseCommittedAfterManualRecovery(args: {
       implementationLine: phase.implementationCheckboxLine,
       reviewLine: phase.reviewCheckboxLine,
       kind: phase.kind,
+      phase,
     });
     if (flips.implementation.error || flips.review.error) {
       return {
@@ -6890,6 +6892,7 @@ async function runPhase(args: {
           implementationLine: phase.implementationCheckboxLine,
           reviewLine: phase.reviewCheckboxLine,
           kind: phase.kind,
+          phase,
         });
         if (flips.implementation.error || flips.review.error) {
           state.failedAtPhase = phase.index;
