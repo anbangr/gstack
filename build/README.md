@@ -285,13 +285,18 @@ is still running.
 - `judge` judges dual-implementor tournaments.
 - `qa`, `ship`, and `land` run QA and release commands.
 
-Two additional roles are **template-only** — they are consumed by the skill
-prompt via `jq` and are intentionally absent from the CLI's `ROLE_DEFINITIONS`.
-They have no CLI flags or env var overrides:
+One additional role is **template-only** — it is consumed by the skill
+prompt via `jq` and is intentionally absent from the CLI's `ROLE_DEFINITIONS`.
+It has no CLI flags or env var overrides:
 
 - `planSynthesizer` — synthesizes the living plan from the source plan.
-- `featureVerifier` — checks origin-plan coverage after each feature ships and
-  runs the final completion exam.
+
+As of v1.28.0 (T12), `featureVerifier` is a real CLI role with full
+`GSTACK_BUILD_FEATURE_VERIFIER_*` env var support and is invoked
+automatically as a pre-merge gate before each `/ship` trigger. The post-ship
+verification path in the skill template remains for `--skip-ship` flows and
+as a fallback when the pre-merge gate is bypassed via
+`--skip-pre-merge-verify`.
 
 `/context-save` is host-owned `/build` behavior, not a configured build role:
 Codex-running `/build` saves Codex context, and Claude-running `/build` saves
@@ -394,6 +399,10 @@ the root cause, re-run the same `gstack-build` command to resume.
 | `--origin-plan <file>`         | Source plan to verify after each feature and archive after final completion.                                                                                                           |
 | `--max-codex-iter N`           | Override the review gate loop cap.                                                                                                                                                     |
 | `--skip-clean-check`           | Bypass tracked dirty-file preflight.                                                                                                                                                   |
+| `--skip-feature-review`        | Skip the per-feature meta-review pass.                                                                                                                                                 |
+| `--skip-pre-merge-verify`      | Skip the pre-`/ship` `featureVerifier` acceptance-criteria audit (T12). Useful in CI or when the verifier is misconfigured.                                                            |
+| `--strict-pre-merge-verify`    | Treat UNCLEAR pre-merge verifier verdicts as failures that halt ship. Default behavior is to log and proceed.                                                                          |
+| `--feature-review-max-iter N`  | Cap on per-feature review cycles before hard-fail (default 3).                                                                                                                         |
 
 ## Environment Variables
 
@@ -447,26 +456,33 @@ Role env vars use `GSTACK_BUILD_<ROLE>_<FIELD>`, where role is
 `PROVIDER`, `MODEL`, `REASONING`, or `COMMAND`. CLI flags override env vars;
 env vars override defaults.
 
-The template-only roles (`planSynthesizer`, `featureVerifier`) are read directly
-from `configure.cm` by the skill via `jq` and have no corresponding env var
-overrides. To change their models, edit `configure.cm`.
+The template-only role (`planSynthesizer`) is read directly from
+`configure.cm` by the skill via `jq` and has no corresponding env var
+overrides. To change its model, edit `configure.cm`. `featureVerifier` is a
+full CLI role (since v1.28.0) and accepts the standard
+`GSTACK_BUILD_FEATURE_VERIFIER_PROVIDER` / `_MODEL` / `_REASONING` /
+`_COMMAND` overrides.
 
 ## Module Map
 
-| File                               | Responsibility                                                         |
-| ---------------------------------- | ---------------------------------------------------------------------- |
-| `SKILL.md.tmpl`                    | Human-facing `/build` workflow and CLI-monitoring instructions.        |
-| `configure.cm`                     | Role routing, retry caps, and timeouts (source of truth for defaults). |
-| `bin/gstack-build-phase-guardrail` | Post-feature guardrail: PR merged, origin/main up to date, tree clean. |
-| `orchestrator/cli.ts`              | CLI args, startup gates, lock, main loop, ship guardrails.             |
-| `orchestrator/parser.ts`           | Markdown plan parser.                                                  |
-| `orchestrator/phase-runner.ts`     | Pure phase state machine.                                              |
-| `orchestrator/sub-agents.ts`       | Gemini, Codex, Claude, test, verdict, and judge wrappers.              |
-| `orchestrator/plan-mutator.ts`     | Atomic checkbox updates in the plan file.                              |
-| `orchestrator/state.ts`            | Local JSON state, gbrain mirror, lock files, log paths.                |
-| `orchestrator/worktree.ts`         | Dual-impl worktree creation, teardown, and winner apply.               |
-| `orchestrator/ship.ts`             | Final `/ship` plus `/land-and-deploy` delegation.                      |
-| `orchestrator/types.ts`            | Shared phase and build state types.                                    |
+| File                                     | Responsibility                                                         |
+| ---------------------------------------- | ---------------------------------------------------------------------- |
+| `SKILL.md.tmpl`                          | Human-facing `/build` workflow and CLI-monitoring instructions.        |
+| `configure.cm`                           | Role routing, retry caps, and timeouts (source of truth for defaults). |
+| `bin/gstack-build-phase-guardrail`       | Post-feature guardrail: PR merged, origin/main up to date, tree clean. |
+| `orchestrator/cli.ts`                    | CLI args, startup gates, lock, main loop, ship guardrails.             |
+| `orchestrator/parser.ts`                 | Markdown plan parser.                                                  |
+| `orchestrator/phase-runner.ts`           | Pure phase state machine.                                              |
+| `orchestrator/sub-agents.ts`             | Gemini, Codex, Claude, test, verdict, and judge wrappers.              |
+| `orchestrator/plan-mutator.ts`           | Atomic checkbox updates in the plan file.                              |
+| `orchestrator/state.ts`                  | Local JSON state, gbrain mirror, lock files, log paths.                |
+| `orchestrator/worktree.ts`               | Dual-impl worktree creation, teardown, and winner apply.               |
+| `orchestrator/ship.ts`                   | Final `/ship` plus `/land-and-deploy` delegation.                      |
+| `orchestrator/feature-review.ts`         | Per-feature meta-review pass with same-shape repeat detection.         |
+| `orchestrator/feature-review-metrics.ts` | JSONL instrumentation for feature-review baseline + tuning.            |
+| `orchestrator/feature-review-cache.ts`   | Verdict cache that skips re-review on unchanged FEATURE_PASS.          |
+| `orchestrator/feature-verifier.ts`       | Pre-merge `featureVerifier` gate + post-merge tree-hash audit.         |
+| `orchestrator/types.ts`                  | Shared phase and build state types.                                    |
 
 ## Testing
 
