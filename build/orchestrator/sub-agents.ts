@@ -415,6 +415,18 @@ export interface SubAgentResult {
    * same reason as stallSilenceMs.
    */
   exitSignal?: string | null;
+  /**
+   * Why the stall watchdog killed, when stallKilled is true. Absent
+   * otherwise. See stall-watchdog.ts killReason() for the union.
+   */
+  killReason?: string;
+  /**
+   * Last classified tool at kill time. Null when never classified or
+   * tool-aware path inactive.
+   */
+  lastTool?: string | null;
+  /** Last classified bucket at kill time. */
+  lastBucket?: "fast" | "slow" | null;
   /** Absolute path to the log file written for this invocation. */
   logPath: string;
   /** Wall-clock duration in ms. */
@@ -887,6 +899,9 @@ export function spawnCaptured(args: {
           stallKilled,
           stallSilenceMs,
           exitSignal,
+          killReason: watchdog.killReason(),
+          lastTool: watchdog.lastTool(),
+          lastBucket: watchdog.lastBucket(),
           logPath: args.logPath,
           durationMs: Date.now() - startedAt,
           retries: 0,
