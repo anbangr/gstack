@@ -19,7 +19,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./child-registry";
 import type { RoleConfig } from "./role-config";
 import { logDir, ensureLogDir } from "./state";
 import type { Feature, FeatureState } from "./types";
