@@ -981,6 +981,7 @@ fi
         "--skip-clean-check",
         "--no-plan-review",
         "--no-gbrain",
+        "--skip-pre-merge-verify",
         "--release-mode",
         "auto-land",
         "--ship-provider",

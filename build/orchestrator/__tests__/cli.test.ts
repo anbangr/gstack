@@ -5370,6 +5370,7 @@ describe("ship failure sets state.failureReason at paused paths", () => {
         "--release-mode",
         "queued",
         "--skip-feature-review",
+        "--skip-pre-merge-verify",
         "--no-plan-review",
         "--skip-clean-check",
         "--no-gbrain",

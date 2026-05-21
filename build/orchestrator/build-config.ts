@@ -65,6 +65,7 @@ const ROLE_KEYS: RoleKey[] = [
   "land",
   "judge",
   "featureReview",
+  "featureVerifier",
   "monitorAgent",
   "planReviewer",
 ];
@@ -194,6 +195,7 @@ function withMigratedRoles(value: unknown, filePath: string): unknown {
   delete roles.contextSave;
   for (const key of [
     "featureReview",
+    "featureVerifier",
     "monitorAgent",
     "planReviewer",
   ] as const) {

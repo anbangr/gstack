@@ -46,6 +46,14 @@ export interface RoleConfigs {
    */
   featureReview: RoleConfig;
   /**
+   * Post-implementation acceptance auditor. Runs once per feature BEFORE
+   * /ship triggers, comparing the feature's implementation against its
+   * acceptance criteria in the living plan. Returns PASS or GAPS — GAPS
+   * aborts the ship trigger and surfaces the gap to the user. Default
+   * comes from build/configure.cm.
+   */
+  featureVerifier: RoleConfig;
+  /**
    * Advisory supervisor for `gstack-build monitor --supervise`. The
    * deterministic monitor still owns run identity/recovery; this role only
    * diagnoses blocking monitor events and returns structured escalation JSON.
@@ -71,6 +79,7 @@ export const ROLE_DEFINITIONS = [
   ["land", "land", "GSTACK_BUILD_LAND"],
   ["judge", "judge", "GSTACK_BUILD_JUDGE"],
   ["featureReview", "feature-review", "GSTACK_BUILD_FEATURE_REVIEW"],
+  ["featureVerifier", "feature-verifier", "GSTACK_BUILD_FEATURE_VERIFIER"],
   ["monitorAgent", "monitor-agent", "GSTACK_BUILD_MONITOR_AGENT"],
   ["planReviewer", "plan-reviewer", "GSTACK_BUILD_PLANREVIEWER"],
 ] as const satisfies readonly [keyof RoleConfigs, string, string][];

@@ -2633,6 +2633,15 @@ Release daemon lifecycle:
 
 2. **Feature Verification (configured subagent)**: After shipping, delegate origin-plan coverage check to a fresh configured `featureVerifier` subagent — the main agent never re-reads the full source plan.
 
+   > **Note (T12, v1.27+):** The orchestrator CLI now runs `featureVerifier`
+   > automatically BEFORE `/ship` triggers (pre-merge gate). On a GAPS
+   > verdict, the ship trigger aborts and the feature is paused with the
+   > gap list surfaced to stderr. The post-ship verification below remains
+   > as a fallback / second pass for flows that bypass the CLI's pre-merge
+   > gate (e.g., `--skip-pre-merge-verify` was set, or the agent invoked
+   > `/ship` directly without the CLI). For the default flow, this section
+   > is informational — the pre-merge gate has already run.
+
    Resolve the landed base ref from the target repo before writing verifier input:
    ```bash
    _VERIFY_BASE_REF=$(cd "$repoPath" && git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
@@ -2820,7 +2829,7 @@ After ALL features are complete:
 - **Bias for action**: Keep the loop going. Do not write meta-commentary.
 - **Strict adherence**: Stick to the plan. Do not expand scope unless strictly necessary to make the code compile. STOP and report the error if a file or command is missing — do NOT guess.
 - **Fail forward**: If a subagent fails, try once more. Escalate to the user only after two failed attempts.
-- **Model Routing Discipline**: Use the role config from `build/configure.cm` plus CLI/env overrides. Defaults are data, not prose; check the config file before naming a model or provider. Note: `planSynthesizer` and `featureVerifier` are template-only roles consumed by jq — they are intentionally absent from the CLI's `ROLE_DEFINITIONS` and require no CLI flags or env vars.
+- **Model Routing Discipline**: Use the role config from `build/configure.cm` plus CLI/env overrides. Defaults are data, not prose; check the config file before naming a model or provider. Note: `planSynthesizer` is a template-only role consumed by jq — it is intentionally absent from the CLI's `ROLE_DEFINITIONS` and requires no CLI flags or env vars. As of T12 (v1.27+), `featureVerifier` IS in the CLI's `ROLE_DEFINITIONS` and runs as a pre-merge gate before each `/ship` trigger. Override via `GSTACK_BUILD_FEATURE_VERIFIER_*` env vars; bypass with `--skip-pre-merge-verify`.
 
 ## Role Configuration Fallbacks
 

@@ -120,6 +120,7 @@ import {
   type ParsedFeatureVerdict,
 } from "./feature-review";
 import { promptYesNo, buildBlockedFeatureMd } from "./feature-review-prompt";
+import { runFeatureVerifier } from "./feature-verifier";
 import {
   writeFeatureReviewMetrics,
   watchFirstWrite,
@@ -793,6 +794,14 @@ export interface Args {
    * cost-sensitive runs).
    */
   skipFeatureReview: boolean;
+  /**
+   * Skip the per-feature pre-merge featureVerifier acceptance-criteria audit
+   * (T12). The verifier compares each feature's committed-but-not-yet-merged
+   * work against its acceptance criteria; GAPS aborts the ship trigger.
+   * Default off — the gate runs unless this flag is set or the run is in
+   * --dry-run. Useful in CI or when the verifier is misconfigured.
+   */
+  skipPreMergeVerify: boolean;
   /** Cap on per-feature review cycles. Defaults to BUILD_DEFAULTS.limits.featureReviewMaxIterations (3). */
   featureReviewMaxIter: number;
   /** Skip the planReviewer second-opinion pass at startup. */
@@ -972,6 +981,7 @@ export function parseArgs(argv: string[]): Args {
     commitDirty: false,
     stopRun: undefined,
     skipFeatureReview: false,
+    skipPreMergeVerify: false,
     featureReviewMaxIter: DEFAULT_FEATURE_REVIEW_MAX_ITER,
     noPlanReview: false,
     planReviewerModel: undefined,
@@ -1056,6 +1066,7 @@ export function parseArgs(argv: string[]): Args {
         i++;
       }
     } else if (a === "--skip-feature-review") args.skipFeatureReview = true;
+    else if (a === "--skip-pre-merge-verify") args.skipPreMergeVerify = true;
     else if (a === "--no-plan-review") args.noPlanReview = true;
     else if (a === "--plan-reviewer-model") {
       const next = argv[++i];
@@ -2853,6 +2864,9 @@ Flags:
                        /land-and-deploy behavior.
   --skip-clean-check   Skip the pre-build working tree dirty check.
   --skip-feature-review  Skip the per-feature meta-review pass.
+  --skip-pre-merge-verify  Skip the pre-/ship featureVerifier acceptance-
+                       criteria audit (T12). Useful in CI or when the
+                       verifier is misconfigured.
   --feature-review-max-iter N  Cap on per-feature review cycles before
                        hard-fail (F4 will swap this for an interactive
                        prompt to allow a 4th cycle).
@@ -11201,6 +11215,62 @@ async function main() {
               outcome: "running",
               pauseState: "running",
             });
+            // Pre-merge verifier (T12). Audits the feature against its
+            // acceptance criteria BEFORE ship. On GAPS verdict, abort the
+            // ship trigger and pause the feature so the user can resolve
+            // before retrying. Skipped in --dry-run (the wrapping `if`
+            // already excludes dry-run) and under --skip-pre-merge-verify.
+            // UNCLEAR verdicts (e.g. base-branch undetectable, subprocess
+            // failed, output missing sentinel) are best-effort: warn and
+            // proceed — verifier is a quality gate, not a hard prerequisite.
+            if (
+              !args.skipPreMergeVerify &&
+              args.roles.featureVerifier
+            ) {
+              console.log(
+                `\n▶ Feature ${featureState.number} pre-merge verify (${roleLabel(args.roles.featureVerifier)})`,
+              );
+              const verifierResult = await runFeatureVerifier({
+                feature: featureDef,
+                featureState,
+                planFile: args.planFile,
+                cwd,
+                slug: `${slug}-feature-${featureState.number}`,
+                role: args.roles.featureVerifier,
+                dryRun: args.dryRun,
+                dispatcher: (opts) => runRoleTask(opts),
+              });
+              if (verifierResult.verdict === "GAPS") {
+                featureState.status = "paused";
+                const gapsList =
+                  verifierResult.gaps.length > 0
+                    ? verifierResult.gaps.map((g) => `- ${g}`).join("\n")
+                    : "- (verifier reported GAPS but listed no specific gap)";
+                featureState.error = `pre-merge verifier reported GAPS:\n${gapsList}\nFull report: ${verifierResult.outputFilePath}`;
+                state.failureReason = `Feature ${featureState.number}: pre-merge verifier GAPS (see ${verifierResult.outputFilePath})`;
+                saveState(state, {
+                  noGbrain: args.noGbrain,
+                  log: console.warn,
+                });
+                console.error(
+                  `✗ Feature ${featureState.number}: pre-merge verifier GAPS`,
+                );
+                console.error(gapsList);
+                console.error(
+                  `  Full report: ${verifierResult.outputFilePath}`,
+                );
+                exitCode = 1;
+                break;
+              }
+              if (verifierResult.verdict === "UNCLEAR") {
+                console.warn(
+                  `  → pre-merge verify returned UNCLEAR (${verifierResult.reason ?? "no reason"}); proceeding. See ${verifierResult.outputFilePath}`,
+                );
+              } else {
+                console.log(`  → pre-merge verify PASS`);
+              }
+            }
+
             console.log(
               args.releaseMode === "queued"
                 ? `\n▶ Feature ${featureState.number} complete. Running /ship and queueing PR for release daemon.`
