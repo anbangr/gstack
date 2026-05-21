@@ -3600,13 +3600,22 @@ export function quarantineMalformedRefs(cwd: string): {
     return { quarantined: 0 };
   }
   const gitDir = path.resolve(cwd, gitDirResult.stdout.trim());
+  const commonDirResult = spawnSync(
+    "git",
+    ["-C", cwd, "rev-parse", "--git-common-dir"],
+    { cwd, encoding: "utf8" },
+  );
+  const commonDir =
+    commonDirResult.status === 0 && commonDirResult.stdout.trim()
+      ? path.resolve(cwd, commonDirResult.stdout.trim())
+      : gitDir;
 
   // Enumerate loose refs by walking the filesystem.  git for-each-ref
   // silently skips refs with broken names (it prints a warning to stderr),
   // so a filesystem walk is required to discover malformed refs.
   const refs: string[] = [];
   for (const prefix of ["refs/heads", "refs/remotes"]) {
-    const dir = path.join(gitDir, prefix);
+    const dir = path.join(commonDir, prefix);
     if (!fs.existsSync(dir)) continue;
     const walk = (relDir: string): void => {
       const absDir = path.join(dir, relDir);
@@ -3637,7 +3646,7 @@ export function quarantineMalformedRefs(cwd: string): {
   }
 
   let quarantined = 0;
-  const quarantineDir = path.join(gitDir, "quarantine");
+  const quarantineDir = path.join(commonDir, "quarantine");
   const usedNames = new Set<string>();
   if (fs.existsSync(quarantineDir)) {
     for (const entry of fs.readdirSync(quarantineDir)) {
@@ -3652,7 +3661,7 @@ export function quarantineMalformedRefs(cwd: string): {
     // git rev-parse often fails for broken ref names, so fall back to reading
     // the loose-ref file directly.
     const refRelPath = ref.replace(/^refs\//, "").replace(/\//g, path.sep);
-    const looseRefPath = path.join(gitDir, "refs", refRelPath);
+    const looseRefPath = path.join(commonDir, "refs", refRelPath);
     let originalSha: string | null = null;
     const shaResult = spawnSync("git", ["-C", cwd, "rev-parse", ref], {
       cwd,
@@ -3685,7 +3694,7 @@ export function quarantineMalformedRefs(cwd: string): {
     const refFile = path.join(quarantineDir, `${quarantineName}.ref`);
     const sidecarFile = path.join(quarantineDir, `${quarantineName}.json`);
 
-    const sourceRefPath = path.join(gitDir, "refs", refRelPath);
+    const sourceRefPath = path.join(commonDir, "refs", refRelPath);
 
     const effectiveSha = originalSha ?? "0000000000000000000000000000000000000000";
     const isNullSha = /^0{40}$/i.test(effectiveSha);

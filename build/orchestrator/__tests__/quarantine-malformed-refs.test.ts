@@ -56,7 +56,14 @@ describe("quarantineMalformedRefs", () => {
 
     const sha = git(["rev-parse", "HEAD"], tmpDir);
     // Create a Finder-duplicate-shaped malformed ref: trailing space + digit
-    const malformedRefPath = path.join(tmpDir, ".git", "refs", "heads", "feat", "foo 1");
+    const malformedRefPath = path.join(
+      tmpDir,
+      ".git",
+      "refs",
+      "heads",
+      "feat",
+      "foo 1",
+    );
     fs.mkdirSync(path.dirname(malformedRefPath), { recursive: true });
     fs.writeFileSync(malformedRefPath, sha + "\n");
 
@@ -86,7 +93,14 @@ describe("quarantineMalformedRefs", () => {
     }
 
     const sha = git(["rev-parse", "HEAD"], tmpDir);
-    const malformedRefPath = path.join(tmpDir, ".git", "refs", "heads", "feat", "foo 1");
+    const malformedRefPath = path.join(
+      tmpDir,
+      ".git",
+      "refs",
+      "heads",
+      "feat",
+      "foo 1",
+    );
     fs.mkdirSync(path.dirname(malformedRefPath), { recursive: true });
     fs.writeFileSync(malformedRefPath, sha + "\n");
 
@@ -144,7 +158,14 @@ describe("quarantineMalformedRefs", () => {
     }
 
     const sha = git(["rev-parse", "HEAD"], tmpDir);
-    const malformedRefPath = path.join(tmpDir, ".git", "refs", "heads", "feat", "foo 1");
+    const malformedRefPath = path.join(
+      tmpDir,
+      ".git",
+      "refs",
+      "heads",
+      "feat",
+      "foo 1",
+    );
     fs.mkdirSync(path.dirname(malformedRefPath), { recursive: true });
     fs.writeFileSync(malformedRefPath, sha + "\n");
 
@@ -313,5 +334,44 @@ describe("quarantineMalformedRefs", () => {
     expect(files.length).toBe(1);
     expect(files[0]).not.toContain("\\");
     expect(files[0]).toContain("feat-");
+  });
+
+  test("edge: linked worktree quarantines malformed refs from the common git dir", () => {
+    const fn = quarantineFn();
+    if (typeof fn !== "function") {
+      expect(false).toBe(true);
+      return;
+    }
+
+    const worktreeDir = path.join(tmpDir, "linked-worktree");
+    git(["worktree", "add", "-b", "feat/worktree", worktreeDir], tmpDir);
+
+    const sha = git(["rev-parse", "HEAD"], tmpDir);
+    const malformedRefPath = path.join(
+      tmpDir,
+      ".git",
+      "refs",
+      "heads",
+      "feat",
+      "foo 1",
+    );
+    fs.mkdirSync(path.dirname(malformedRefPath), { recursive: true });
+    fs.writeFileSync(malformedRefPath, sha + "\n");
+
+    const result = fn(worktreeDir);
+
+    expect(result.quarantined).toBe(1);
+    expect(fs.existsSync(malformedRefPath)).toBe(false);
+    expect(
+      fs.existsSync(path.join(tmpDir, ".git", "quarantine", "feat-foo-1.ref")),
+    ).toBe(true);
+    const sidecar = JSON.parse(
+      fs.readFileSync(
+        path.join(tmpDir, ".git", "quarantine", "feat-foo-1.json"),
+        "utf8",
+      ),
+    );
+    expect(sidecar.originalRef).toBe("refs/heads/feat/foo 1");
+    expect(sidecar.originalSha).toBe(sha);
   });
 });
