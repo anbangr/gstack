@@ -1,5 +1,29 @@
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  beforeAll,
+  afterAll,
+} from "bun:test";
 import { extractCoverageTarget } from "../sub-agents";
+
+// PR4-rest: stub auth preflight off so tests that mock kimi/gemini/codex
+// via PATH don't get caught by the new preflight probe. Dedicated
+// preflight tests live in __tests__/gemini-auth-preflight.test.ts.
+let _origAuthPreflightEnv: string | undefined;
+beforeAll(() => {
+  _origAuthPreflightEnv = process.env.GSTACK_DISABLE_AUTH_PREFLIGHT;
+  process.env.GSTACK_DISABLE_AUTH_PREFLIGHT = "1";
+});
+afterAll(() => {
+  if (_origAuthPreflightEnv === undefined) {
+    delete process.env.GSTACK_DISABLE_AUTH_PREFLIGHT;
+  } else {
+    process.env.GSTACK_DISABLE_AUTH_PREFLIGHT = _origAuthPreflightEnv;
+  }
+});
 import { evaluateMonitorOnce } from "../monitor";
 import {
   buildGeminiTestSpecPrompt,

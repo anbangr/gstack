@@ -1,4 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  beforeAll,
+  afterAll,
+} from "bun:test";
 import {
   parseVerdict,
   stripAnsi,
@@ -39,6 +47,23 @@ import { deriveGeminiTmpKey } from "../state";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+// PR4-rest: stub codex/gemini auth preflight off so tests that mock the
+// bin via PATH don't get caught by the new preflight probe. Tests that
+// specifically exercise the preflight live in
+// __tests__/gemini-auth-preflight.test.ts.
+let _origAuthPreflightEnv: string | undefined;
+beforeAll(() => {
+  _origAuthPreflightEnv = process.env.GSTACK_DISABLE_AUTH_PREFLIGHT;
+  process.env.GSTACK_DISABLE_AUTH_PREFLIGHT = "1";
+});
+afterAll(() => {
+  if (_origAuthPreflightEnv === undefined) {
+    delete process.env.GSTACK_DISABLE_AUTH_PREFLIGHT;
+  } else {
+    process.env.GSTACK_DISABLE_AUTH_PREFLIGHT = _origAuthPreflightEnv;
+  }
+});
 
 describe("stripAnsi", () => {
   it("removes ANSI color codes", () => {

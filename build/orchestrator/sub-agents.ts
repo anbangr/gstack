@@ -64,6 +64,134 @@ function geminiBin(): string {
   return process.env.GEMINI_BIN || "gemini";
 }
 
+// ------------------------------------------------------------------
+// Auth preflight probes (cached per-process)
+// ------------------------------------------------------------------
+
+let _geminiAuthPromise:
+  | Promise<{ ok: boolean; reason?: string; skipped?: boolean }>
+  | undefined;
+let _geminiAuthCache: { ok: boolean; reason?: string; skipped?: boolean } | undefined;
+
+let _codexAuthPromise:
+  | Promise<{ ok: boolean; reason?: string; skipped?: boolean }>
+  | undefined;
+let _codexAuthCache: { ok: boolean; reason?: string; skipped?: boolean } | undefined;
+
+function resolveBinInPath(bin: string): string {
+  if (path.isAbsolute(bin)) return bin;
+  const pathEnv = process.env.PATH ?? "";
+  for (const dir of pathEnv.split(path.delimiter)) {
+    const candidate = path.join(dir, bin);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // not executable or not found
+    }
+  }
+  return bin;
+}
+
+function probeAuthSync(
+  bin: string,
+  argv: string[],
+  timeoutMs: number,
+): { ok: boolean; reason?: string } {
+  const resolvedBin = resolveBinInPath(bin);
+  try {
+    const result = registeredSpawnSync(resolvedBin, argv, {
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: timeoutMs,
+    });
+    if (result.status === 0) return { ok: true };
+    const stdout =
+      typeof result.stdout === "string" ? result.stdout : "";
+    const stderr =
+      typeof result.stderr === "string" ? result.stderr : "";
+    return {
+      ok: false,
+      reason: stdout.trim() || stderr.trim() || `exit ${result.status}`,
+    };
+  } catch (err) {
+    return { ok: false, reason: (err as Error).message };
+  }
+}
+
+export async function assertGeminiAuth(): Promise<{
+  ok: boolean;
+  reason?: string;
+  skipped?: boolean;
+}> {
+  if (process.env.GSTACK_DISABLE_AUTH_PREFLIGHT === "1") {
+    return { ok: true, skipped: true };
+  }
+  if (_geminiAuthCache) return _geminiAuthCache;
+  if (_geminiAuthPromise) return _geminiAuthPromise;
+
+  _geminiAuthPromise = (async () => {
+    const bin = geminiBin();
+    const primary = probeAuthSync(bin, ["auth", "status"], 5000);
+    if (primary.ok) {
+      _geminiAuthCache = primary;
+      return primary;
+    }
+    const fallback = probeAuthSync(bin, ["--version"], 5000);
+    if (fallback.ok) {
+      _geminiAuthCache = fallback;
+      return fallback;
+    }
+    const result = {
+      ok: false,
+      reason: `Gemini auth required (${primary.reason || fallback.reason})`,
+    };
+    _geminiAuthCache = result;
+    return result;
+  })();
+
+  return _geminiAuthPromise;
+}
+
+export function _resetAuthPreflightForTests(): void {
+  _geminiAuthCache = undefined;
+  _geminiAuthPromise = undefined;
+  _codexAuthCache = undefined;
+  _codexAuthPromise = undefined;
+}
+
+export async function assertCodexAuth(): Promise<{
+  ok: boolean;
+  reason?: string;
+  skipped?: boolean;
+}> {
+  if (process.env.GSTACK_DISABLE_AUTH_PREFLIGHT === "1") {
+    return { ok: true, skipped: true };
+  }
+  if (_codexAuthCache) return _codexAuthCache;
+  if (_codexAuthPromise) return _codexAuthPromise;
+
+  _codexAuthPromise = (async () => {
+    const primary = probeAuthSync(CODEX_BIN, ["auth", "status"], 5000);
+    if (primary.ok) {
+      _codexAuthCache = primary;
+      return primary;
+    }
+    const fallback = probeAuthSync(CODEX_BIN, ["--version"], 5000);
+    if (fallback.ok) {
+      _codexAuthCache = fallback;
+      return fallback;
+    }
+    const result = {
+      ok: false,
+      reason: `Codex auth required (${primary.reason || fallback.reason})`,
+    };
+    _codexAuthCache = result;
+    return result;
+  })();
+
+  return _codexAuthPromise;
+}
+
 /**
  * Cached probe for `ps` availability with the flags cpu-mode needs.
  * Runs the actual command we'll use later (`ps -o pid=,cputime= -g <pid>`)
@@ -1204,6 +1332,20 @@ export async function runCodexReview(opts: {
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
 
+  const codexAuth = await assertCodexAuth();
+  if (!codexAuth.ok) {
+    return {
+      stdout: "",
+      stderr: codexAuth.reason ?? "Codex auth preflight failed",
+      exitCode: 1,
+      timedOut: false,
+      stallKilled: false,
+      logPath: "",
+      durationMs: 0,
+      retries: 0,
+    };
+  }
+
   const { stagedInput, stagedOutput, cleanup } = stageCodexIO({
     slug: opts.slug,
     phaseNumber: opts.phaseNumber,
@@ -1364,6 +1506,21 @@ export async function runRoleTask(opts: {
   timeoutMs?: number;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
+
+  const geminiAuth = await assertGeminiAuth();
+  if (!geminiAuth.ok) {
+    return {
+      stdout: "",
+      stderr: geminiAuth.reason ?? "Gemini auth preflight failed",
+      exitCode: 1,
+      timedOut: false,
+      stallKilled: false,
+      logPath: "",
+      durationMs: 0,
+      retries: 0,
+    };
+  }
+
   const {
     stagedInput,
     stagedOutput,
@@ -1397,7 +1554,10 @@ export async function runRoleTask(opts: {
     cwd: opts.cwd,
     timeoutMs: opts.timeoutMs ?? GEMINI_TIMEOUT_MS,
     logPath,
-    closeStdin: false,
+    closeStdin: true,
+    ...(process.env.GSTACK_KEEP_GEMINI_STDIN_OPEN === "1"
+      ? { closeStdin: false }
+      : {}),
   });
 
   cleanupStaged();

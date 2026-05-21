@@ -1,5 +1,49 @@
 # Changelog
 
+## [1.40.7.4] - 2026-05-21
+
+**Gemini and Codex now skip-or-stop before doing anything destructive. Auth preflight runs once per process — if `gemini auth status` (or `--version` fallback) returns non-zero, the orchestrator halts with a clear "run `gemini auth login`" message instead of letting the stalled subprocess silently burn 25 minutes of watchdog timeout. The stall-watchdog also matches an auth-prompt regex on stdout chunks and kills the child immediately on a match, so mid-build re-auth prompts never silently hang anymore. Gemini stdin defaults to closed, removing one more pre-stdin-prompt hang surface.**
+
+This is the rest of the tidy-haven plan's PR4 — F5 phase 2. PR4-min (#74 / v1.40.7.1) shipped the renderer wiring; this PR adds the three guardrails the original plan called for: Gemini stdin close, `assertGeminiAuth()` + `assertCodexAuth()` preflight, and an `AUTH_PROMPT_RE` regex in `stall-watchdog.ts`. The auth work was written by the orchestrator (Gemini fallback) during the autonomous build but got committed alongside ~2500 lines of unrelated overreach deletions; this PR cherry-picks just the safe additions, drops the destructive changes, and adds the kill-switches the plan specified.
+
+Three kill switches are baked in, one per guardrail:
+
+- `GSTACK_DISABLE_AUTH_PREFLIGHT=1` — skip `assertGeminiAuth()` / `assertCodexAuth()`.
+- `GSTACK_KEEP_GEMINI_STDIN_OPEN=1` — revert `closeStdin: true` to the prior behavior.
+- `GSTACK_DISABLE_AUTH_PROMPT_DETECTOR=1` — disable the watchdog stdout matcher.
+
+### What changed for the user
+
+- A missing or expired Gemini login surfaces at the start of the very first sub-agent call (5s probe) instead of as a 25-minute stall watchdog timeout. The error message includes the recovery command (`gemini auth login`).
+- Same for Codex (`codex auth login`) with the same 5s probe; falls back to `--version` when the CLI version doesn't ship `auth status`.
+- Mid-build auth prompts (the kind that appear when a Google session expires partway through a feature) get caught by the watchdog stdout matcher and the child is killed in seconds, with `killReason: "auth_required"` surfacing through to the FailureRender renderer.
+- Gemini spawns now close stdin by default — matches the Codex sub-agent shape and removes the "interactive prompt blocks forever" failure class.
+
+### Itemized changes
+
+#### Added
+
+- `assertGeminiAuth()` and `assertCodexAuth()` in `build/orchestrator/sub-agents.ts` — per-process cached probes. Runs `<bin> auth status` (5s timeout) → falls back to `<bin> --version`. Both return `{ ok: boolean; reason?: string; skipped?: boolean }`. Skipped when `GSTACK_DISABLE_AUTH_PREFLIGHT=1`.
+- `_resetAuthPreflightForTests()` test-only export so dedicated preflight tests can re-run the probe with different mocks.
+- `AUTH_PROMPT_RE` exported from `stall-watchdog.ts` — single compiled regex matched against stdout chunks. Matches: `Opening authentication page`, `Do you want to continue? [Y/n]`, `Please authenticate`, `Token expired`, `Sign in with Google`. On match, the watchdog kills the child with `killReason: "auth_required"`.
+- `StallWatchdogController.killReason(): string | undefined` accessor so callers (sub-agents.ts) can distinguish stall-from-silence (undefined) from stall-from-auth-prompt ("auth_required").
+- `__tests__/gemini-auth-preflight.test.ts` — 8 cases covering: cached success on second call, `--version` fallback, halt with clear message on probe failure, skip when env var is set, separate Gemini vs Codex caches, propagation through `runRoleTask` and `runCodexReview`.
+- `__tests__/auth-prompt-watchdog.test.ts` — 4 cases covering: each regex banner triggers immediate kill, `GSTACK_DISABLE_AUTH_PROMPT_DETECTOR=1` opt-out, `killReason()` returns "auth_required" after a match, normal stalls (no banner) still set `killReason()` to undefined.
+- `__tests__/gemini-stdin-close.test.ts` — 4 cases covering: default `closeStdin: true`, `GSTACK_KEEP_GEMINI_STDIN_OPEN=1` reverts to `closeStdin: false`, the env var only affects Gemini (Codex unchanged), the env var value comparison is case-sensitive.
+
+#### Changed
+
+- `runRoleTask()` and `runCodexReview()` in `sub-agents.ts`: call the matching preflight before spawning. On `ok: false`, return a synthetic SubAgentResult with `exitCode: 1`, `stderr: <recovery hint>`, so the caller's normal failure path (including PR1b-min's classifier) handles it.
+- `runRoleTask()` Gemini spawn: `closeStdin: true` by default; `GSTACK_KEEP_GEMINI_STDIN_OPEN=1` reverts to `closeStdin: false`.
+- `attachStallWatchdog()` `onLine` handler: tests stdout chunks against `AUTH_PROMPT_RE` in addition to the existing `\S`-byte activity detector. Hits trigger a SIGTERM kill of the child + the process group, with the standard grace-period SIGKILL escalation.
+- `__tests__/sub-agents.test.ts`, `__tests__/cli.test.ts`, `__tests__/integration.test.ts`: opt out of the auth preflight via `GSTACK_DISABLE_AUTH_PREFLIGHT=1` at `beforeAll` / in spawnSync env blocks. Existing tests stub kimi/gemini/codex bins via PATH and aren't aware of the new probe; the env var keeps them isolated from the new code path.
+
+### For contributors
+
+- Dedicated preflight tests live in `__tests__/gemini-auth-preflight.test.ts`. The whole-process opt-out (`GSTACK_DISABLE_AUTH_PREFLIGHT=1`) is the canonical way to silence preflight in any new test that PATH-stubs the bin.
+- The watchdog regex is module-load-frozen by design (decision D11=11A from the plan). If you need to extend it, add the new banner to the alternation in `stall-watchdog.ts` and add a test case to `auth-prompt-watchdog.test.ts`.
+- `_resetAuthPreflightForTests()` is the cache-clear hook for tests that need to exercise the live probe path. Outside tests, the cache is intentionally process-global to keep auth probes off the hot path.
+
 ## [1.40.7.3] - 2026-05-21
 
 **Provider retry budget — primitives. The orchestrator now has a per-phase session cap on provider-retry attempts (default 6 across capacity/overloaded/transport/stall) plus a capacity-backoff schedule (3 attempts at 30s/60s/120s base ±15s jitter, ceiling 5 min). Pre-PR1b state files migrate cleanly: `iterations.successful` backfills from `iterations`, and `providerRetryAttempts` starts at 0.**
