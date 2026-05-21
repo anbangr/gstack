@@ -1,5 +1,120 @@
 # Changelog
 
+## [1.40.7.2] - 2026-05-21
+
+**Codex review failures now distinguish "provider blew up" from "the agent couldn't converge." When a codex review iteration hits a capacity banner, a quota wall, a transport error, an auth prompt, or a silent stall, the orchestrator emits the right halt kind (`PROVIDER_OVERLOADED` / `PROVIDER_QUOTA_EXHAUSTED` / `PROVIDER_TRANSPORT_ERROR` / `PROVIDER_AUTH_REQUIRED` / `PROVIDER_TIMEOUT`) instead of misclassifying it as `RETRY_CAP_HIT`. Drain-faults and the investigator route by kind, so a 529 from the model no longer triggers a "convergence failed" code review.**
+
+This is the minimum-viable PR1b from the tidy-haven plan — Feature 4 of the 83-fault recurrence program. The full PR1b spec also adds split retry semantics (exponential backoff for capacity, immediate halt for quota) plus a state-migration for `iterations.successful`; both deferred to a follow-up so we can ship the classification primitive fast and start measuring whether real provider 529s stop being labeled as codex retry caps.
+
+The wiring lives at `cli.ts:6463` — the FAIL handler that used to unconditionally call `recordRetryCapHit("codex", N)`. Now it first reads the latest codex review log and runs `classifyProviderFailure()` against it. If the verdict is non-null, the right `PROVIDER_*` halt fires instead of the cap-hit halt; otherwise behavior is unchanged. Kill switch: `GSTACK_DISABLE_PROVIDER_CLASSIFIER=1` reverts to pre-PR1b behavior.
+
+### What changed for the user
+
+- Provider 529s (capacity exhausted, overloaded) during codex review surface as `PROVIDER_OVERLOADED` halts, not retry caps. The post-mortem investigator now knows to wait and resume instead of looking for code bugs.
+- Provider quota walls (`You've hit your limit`) surface as `PROVIDER_QUOTA_EXHAUSTED`, optionally with the provider's stated reset time parsed from the banner.
+- Provider transport errors (ECONNRESET, socket hang up) surface as `PROVIDER_TRANSPORT_ERROR` so the retry harness sees them as transient.
+- Provider auth prompts (401 Unauthorized, "please re-authenticate") surface as `PROVIDER_AUTH_REQUIRED` with a clear recovery hint.
+- Silent stalls (watchdog SIGTERM, wall-clock timeout) surface as `PROVIDER_TIMEOUT` instead of being absorbed into the cap-hit count.
+
+### Itemized changes
+
+#### Added
+
+- `classifyProviderFailure({ text, stallKilled?, timedOut? })` in `build/orchestrator/halt-event-helpers.ts` — pure classifier returning `{ kind, evidence, resetAt? }` or `null`. Regex precedence: auth → quota → capacity → overloaded → transport → stall.
+- `recordProviderFailureVerdict(state, phaseIdx, role, verdict, ctx)` in the same module — dispatch helper that calls the matching `recordProviderX` emitter based on verdict kind.
+- `__tests__/classify-provider-failure.test.ts` — 17 unit tests covering every regex branch, the precedence rules (auth wins over stall, quota wins over capacity), and the 5 emit paths through `recordProviderFailureVerdict`.
+
+#### Changed
+
+- `build/orchestrator/cli.ts` FAIL handler at line 6463: before falling through to `recordRetryCapHit("codex")`, reads the most-recent `phaseState.codexReview.outputLogPaths` entry and runs `classifyProviderFailure()` against it. On a non-null verdict, emits the matching `PROVIDER_*` halt and skips the cap-hit. Gated behind `GSTACK_DISABLE_PROVIDER_CLASSIFIER=1` for opt-out.
+
+### For contributors
+
+- Out of scope for this PR (deferred to F4 phases 2+3 of the tidy-haven plan): exponential-backoff retry for capacity/overloaded inside the sub-agent spawn function, immediate halt for quota, the `iterations.successful` counter, the state-load migration that backfills `iterations.successful` from `iterations.total`, and the hard 6-attempt session cap. These all build on top of the classifier landed here.
+- Out of scope: extending classification to the `phase-runner.ts:328-335` codex-cap fall-through. The FAIL handler at `cli.ts:6463` is the high-traffic site; the phase-runner site fires only when iterations exceed the configured max, which is rarer.
+- The classifier reads `phaseState.codexReview.outputLogPaths`. Other roles (gemini, dual-impl, test-fix) have their own log paths; widening the classifier to those sites is straightforward once we want to.
+
+## [1.40.7.1] - 2026-05-21
+
+**Stall kills, signal kills, and auth prompts now surface honestly. The "exit null" / "exit 0" mystery messages that buried the real reason a sub-agent died are replaced with concrete diagnostics like `test-spec writer stalled (no output for 480000ms, killed by watchdog)`.**
+
+This is the minimum-viable PR4 from the tidy-haven plan — Feature 5's R4 cluster, scoped down to unblock F4 (PR1b) which was stalling on test-spec writes with no diagnostic. The full PR4 spec also adds `closeStdin: true` for Gemini and a watchdog auth-prompt detector; both deferred to a follow-up so we can ship the renderer wiring fast.
+
+### What changed for the user
+
+When a test-spec writer, fixer, dual-implementor, or judge subprocess dies, the orchestrator's `phase.error` and halt-event message now carry the actual reason. The 4 call sites at `phase-runner.ts:626` (test-spec), `:704` (fix), `:716` (dual-impl), and `:827` (judge) all stopped surfacing `Gemini test-spec step failed: exit ${result.exitCode}` (which formats as `exit null` when killed by signal). They now call `renderRoleStepFailureMessage(role, result)` which inspects `stallKilled`, `timedOut`, `exitSignal`, and `killReason` to produce one of:
+
+- `test-spec writer stalled (no output for 480000ms, killed by watchdog)`
+- `test-fixer timed out after 900000ms wall clock`
+- `dual implementation killed by signal SIGTERM`
+- `dual-impl judge exited 1`
+- `test-spec writer halted: authentication required (try \`gemini auth login\` or \`codex auth login\`)`
+
+`SubAgentResult` gained two optional fields — `stallSilenceMs` and `exitSignal` — populated by the existing `spawnCaptured` watchdog/signal-handler so the renderer has the raw numbers. Both are optional so hygiene-failure and phase-oversized fallback paths don't need to populate them.
+
+The existing-correct site at `phase-runner.ts:506-510` (RUN_GEMINI primary-impl) is intentionally left alone. It already distinguishes `timedOut` from non-zero exit; refactoring would change the user-facing string format (e.g. `Gemini timed out (after 2 retries)` becomes `... timed out after Nms wall clock`). The change is downstream of the CRITICAL R1 regression test from the source plan — preserve the working site.
+
+### Itemized changes
+
+#### Added
+
+- `renderRoleStepFailureMessage(role, result): string` in `halt-event-helpers.ts`. Thin wrapper around `renderRoleStepFailure` that produces a single-line human-readable string for all 5 `FailureRender` kinds. Used by the 4 wired phase-runner sites.
+- `stallSilenceMs?: number` field on `SubAgentResult`. Populated from the stall-watchdog's `stallSilenceMs` local at `spawnCaptured` resolve() time. Zero when stallKilled is false.
+- `exitSignal?: string | null` field on `SubAgentResult`. Populated from the child's `exit` event signal arg. Null when exited normally.
+- 8-case test file `__tests__/render-role-step-failure-message.test.ts` covering all 5 kinds plus precedence (stalled wins over signal_killed even when SIGTERM is present), role-name interpolation, and missing-optional-fields safety.
+
+#### Changed
+
+- `phase-runner.ts:626` (test-spec): `\`Gemini test-spec step failed: exit ${result.exitCode}\``→`renderRoleStepFailureMessage("test-spec writer", result)`.
+- `phase-runner.ts:704` (fix): `\`Gemini fix step failed: exit ${result.exitCode}\``→`renderRoleStepFailureMessage("test-fixer", result)`.
+- `phase-runner.ts:716` (RUN_DUAL_IMPL): `\`Dual implementation failed: exit ${result.exitCode}\``→`renderRoleStepFailureMessage("dual implementation", result)`.
+- `phase-runner.ts:828` (RUN_JUDGE): `\`Judge failed: exit ${result.exitCode}\``→`renderRoleStepFailureMessage("dual-impl judge", result)`.
+- `phase-runner.test.ts:1049` assertion updated from `/failed/i` to `/timed out/i` to match the new diagnostic-bearing message shape.
+
+#### For contributors
+
+- Deferred from the full PR4 spec: `closeStdin: true` for Gemini spawn at `sub-agents.ts:1041-1048` and watchdog auth-prompt detector in `stall-watchdog.ts`. Both are worthwhile but the renderer wiring is the critical-path piece for unblocking F4's test-spec stall investigation. Follow-up PR.
+- Build skill version unchanged at 1.27.1. No SKILL.md.tmpl edit; the changes are internal orchestrator behavior, not user-facing skill behavior.
+
+## [1.40.7.0] - 2026-05-21
+
+**Halt taxonomy foundation: the orchestrator now distinguishes five real provider failure shapes (timeout, quota, overload, transport, auth-required) from generic phase failures. Plus a `FailureRender` shape and per-pattern hit tracking so the static fault detector can grow without coupling the renderer.**
+
+This is PR1a of the tidy-haven series — Feature 3 of the 11-feature plan to address the 83 fault patterns we learned earlier in the session. The halt taxonomy and `FailureRender` shape land here so downstream PRs (PR1b classifier wiring, PR4 stall rendering, PR3 red-gate runner check) have something to consume.
+
+### What changed for the user
+
+When the orchestrator halts on a provider error, the halt event now carries the right kind. A Gemini timeout no longer shows up as `RETRY_CAP_HIT: codex hit cap after 0 iterations` (a misclassification we've seen at the boundary between subprocess failure and codex review iteration counting). A Claude 529 no longer shows up as a code/test failure. A `You've hit your limit` quota banner no longer shows up as a transient retry-cap.
+
+Five new top-level halt kinds: `PROVIDER_TIMEOUT`, `PROVIDER_QUOTA_EXHAUSTED`, `PROVIDER_OVERLOADED`, `PROVIDER_TRANSPORT_ERROR`, `PROVIDER_AUTH_REQUIRED`. Each gets its own `record*` emitter in `halt-event-helpers.ts` and is enumerated by all six consumers (skill-fault-detector, drain-faults, learn-fault-patterns, gbrain, SKILL.md M3.5 formatter, cli.ts FAIL handler dispatch).
+
+New `FailureRender` shape (`{kind, role, summary, evidenceLogPath?, stallSilenceMs?, totalMs?, exitCode?, signal?}`) and `renderRoleStepFailure(role, result)` helper in `halt-event-helpers.ts`. Definition-only here so PR1b's classifier and PR4's role-step rendering have a shared shape to consume.
+
+Per-pattern hit tracking in `~/.gstack/skill-faults/learned-patterns.json`: the static detector now bumps `hitCount` and `lastHit` every time a pattern matches. Enables the "recurrence rate per build hour" success metric for the tidy-haven program (D16=16A on the source plan).
+
+### Itemized changes
+
+#### Added
+
+- 5 new top-level halt kinds in `halt-event-helpers.ts`: `PROVIDER_TIMEOUT`, `PROVIDER_QUOTA_EXHAUSTED`, `PROVIDER_OVERLOADED`, `PROVIDER_TRANSPORT_ERROR`, `PROVIDER_AUTH_REQUIRED`. Each with a `recordProvider*` helper that calls `emit()` the same shape as `recordRetryCapHit`.
+- `FailureRender` type + `renderRoleStepFailure(role, result): FailureRender` helper in `halt-event-helpers.ts`. Definition only — PR4 will wire the 5 call sites.
+- Hit-counter wiring in `skill-fault-detector.ts`: matched learned patterns increment `hitCount` and update `lastHit`. Atomic file rewrite via tmp+rename.
+- New test files: `__tests__/halt-taxonomy.test.ts`, `__tests__/render-role-step-failure.shape.test.ts`, `__tests__/learned-pattern-hit-tracking.test.ts`.
+
+#### Changed
+
+- 6 consumers enumerate the new halt kinds: `skill-fault-detector.ts` (static category mapping), `drain-faults.ts` (printer + dedup key), `learn-fault-patterns.ts` (matcher kinds), `gbrain.ts` (category mapping), SKILL.md M3.5 report formatter (treats each as its own bucket), `cli.ts` FAIL handler (dispatch is wired in PR1b — this PR just exposes the helpers).
+- Provider-kind dedup in `drain-faults.ts`: events sharing `(runId, kind)` for the new `PROVIDER_*` kinds collapse to one investigation per drain pass, instead of N redundant codex calls on the same evidence.
+
+#### Fixed
+
+- Test isolation leak: `learned-pattern-hit-tracking.test.ts` called `drainFaultsFromHaltEventsQueue` without `inboxDir`, leaking `2026-MM-DD-halt-*.md` files into the worktree's `inbox/` directory on every test run. Now passes `inboxDir: path.join(home, "inbox")` so the auto-file sink lands inside the test's isolated tmp dir.
+
+#### For contributors
+
+- This is build skill 1.27.1. The taxonomy + shape is foundation work for PR1b (classifier wiring), PR4 (stall rendering), PR3 (red-gate runner check). The classifier dispatch at `cli.ts:6298-6308` is intentionally NOT wired in this PR — that's PR1b's load-bearing change.
+- The build worktree itself shipped this PR while building against the very faults the PR fixes. F3's review hit a real Claude session-quota wall at 11:40am Asia/Shanghai; F3's hygiene gate flagged its own auto-filed PROVIDER_QUOTA_EXHAUSTED report; the test-isolation bug surfaced when F4's branch creation tried to checkout off F3's tip. All recovered via state surgery and `--mark-phase-committed`. Meta-confirmation that PR1b + PR4 are the next-most-important PRs.
+
 ## [Unreleased - fork-local: build skill 1.27.0] - 2026-05-21
 
 **Orchestrator stall detection: the monitor now catches a wedged build instead of waiting forever. Pairs with the 60-second auto-drain deadline from build skill 1.26.1 (#70) to close two distinct failure modes of the end-of-build hang.**
@@ -44,6 +159,13 @@ For callers that drive drain outside the end-of-build path (a future long-lived 
 - New helper `test/helpers/build-state.ts` exporting `makeMockState()`. Used by drain-faults tests now that they need a real BuildState. Centralizes the mock so a future BuildState schema change ripples through one file.
 - New `build/orchestrator/__tests__/monitor-heartbeat-integration.test.ts` exercising the full heartbeat.ts → sidecar file → monitor.ts read path with a real bun child process (no mocks, deterministic, ~1s runtime via a 500ms threshold override).
 - 5 mandatory regression tests added per the iron-rule in `/plan-eng-review`: `MONITOR_BLIND_TO_STUCK_ORCHESTRATOR`, `HEARTBEAT_REFLECTS_STATE_MOVEMENT`, `DRAIN_FOR_BUILD_RUN_BUMPS_PROGRESS`, `MONITOR_REJECTS_CROSS_RUN_SIDECAR`, `ABORT_KILLS_INVESTIGATOR_CHILD`.
+
+## [1.40.6.1] - 2026-05-21
+
+### Added
+
+- `audit/2026-05-21-autonomy-audit.md` — Phase 0 autonomy audit across 83 promoted fault patterns from `learned-patterns.json`. Classifies each pattern as A (genuine code bug, 30), B (overreach/synthesizer blind-spot, 15), or C (symptom/folds into another row, 38). Maps every pattern to source code references and recommended PR fixes (PR1a–PR8).
+- `.gitignore` now ignores `BLOCKED*.md` convergence-failure reports generated by `gstack-build`.
 
 ## [Unreleased - fork-local] - 2026-05-20
 
@@ -221,6 +343,18 @@ These are projections from the bundle-1 case study (real production build, 4 rou
 - Integration tests in `build/orchestrator/__tests__/integration/`: bundle-1 trajectory, adaptive bail on re-raises, synth disputes path
 - Layer 4 E2E in `test/skill-e2e-build-convergence.test.ts` (gate tier, ~$0.50/run with real Codex)
 - Design spec: [docs/superpowers/specs/2026-05-19-build-plan-review-convergence-design.md](docs/superpowers/specs/2026-05-19-build-plan-review-convergence-design.md)
+
+## [1.40.6.0] - 2026-05-21
+
+**New `measure-halt-recurrence` script computes 7-day halt-recurrence baselines per category.**
+
+Reads `~/.gstack/skill-faults/learned-patterns.json`, sums `hitCount` per category within a rolling 7-day window, and writes a dated baseline JSON file to `~/.gstack/halt-recurrence-baseline-YYYY-MM-DD.json`. Run via `bun run measure-halt-recurrence`.
+
+### Added
+
+- `scripts/measure-halt-recurrence.ts` — core aggregation logic with typed interfaces (`LearnedPattern`, `PerCategoryResult`, `BaselineResult`), 7-day rolling window filter, and per-category hit summation with most-recent `lastHit` tracking.
+- `build/orchestrator/__tests__/measure-halt-recurrence.test.ts` — 12 tests covering empty input, single/multi-category aggregation, 7-day window exclusion, missing `hitCount`/`lastHit` edge cases, daylight-saving UTC boundary, output filename format, and idempotency.
+- `package.json` script alias `measure-halt-recurrence` for one-command execution.
 
 ## [1.40.5.0] - 2026-05-20
 

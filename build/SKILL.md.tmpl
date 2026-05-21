@@ -1,7 +1,7 @@
 ---
 name: build
 preamble-tier: 4
-version: 1.27.0
+version: 1.27.1
 description: |
   gstack autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -1302,6 +1302,10 @@ To recover:
 After the monitor exits, scan its output for skill-fault detections and dispatch investigators.
 The `fault_investigator_model` is read from `configure.cm` and faults are written to `~/.gstack/skill-faults/`.
 Drain-faults is RESOLVED-aware: a `SKILL_FAULT_DETECTED` followed by a matching `SKILL_FAULT_RESOLVED` in the same log is treated as a closed transient session and skipped — no investigator runs for it.
+
+Halt-event kinds that flow through this step (including provider failures):
+PROVIDER_TIMEOUT, PROVIDER_QUOTA_EXHAUSTED, PROVIDER_OVERLOADED,
+PROVIDER_TRANSPORT_ERROR, PROVIDER_AUTH_REQUIRED.
 
 ```bash
 _MONITOR_EXIT="${_MONITOR_EXIT:-0}"
