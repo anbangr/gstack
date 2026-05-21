@@ -92,6 +92,100 @@ function joinPlanLines(original: string, lines: string[]): string {
   );
 }
 
+/** Normalize a phase name for stable phaseId comparison. */
+function normalizePhaseName(name: string): string {
+  return name.trim();
+}
+
+/** Parse plan lines and return a Map from phaseId to array of 1-based heading line numbers. */
+function buildPhaseMap(lines: string[]): Map<string, number[]> {
+  const map = new Map<string, number[]>();
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^###\s+Phase\s+(\d+(?:\.\d+)?):\s*(.*)$/);
+    if (!m) continue;
+    const phaseNumber = m[1];
+    const phaseName = normalizePhaseName(m[2]);
+    let featureNumber = "0";
+    for (let j = i - 1; j >= 0; j--) {
+      const fm = lines[j].match(/^##\s+Feature\s+(\d+):/);
+      if (fm) {
+        featureNumber = fm[1];
+        break;
+      }
+    }
+    const phaseId = `${featureNumber}.${phaseNumber}.${phaseName}`;
+    if (!map.has(phaseId)) {
+      map.set(phaseId, []);
+    }
+    map.get(phaseId)!.push(i + 1);
+  }
+  return map;
+}
+
+/** Find the nearest phase heading at or above a 1-based line number. */
+function findPhaseHeadingAbove(
+  lines: string[],
+  lineNumber: number,
+): { line: number; phaseId: string } | null {
+  for (let i = lineNumber - 1; i >= 0; i--) {
+    const m = lines[i].match(/^###\s+Phase\s+(\d+(?:\.\d+)?):\s*(.*)$/);
+    if (m) {
+      const phaseNumber = m[1];
+      const phaseName = normalizePhaseName(m[2]);
+      let featureNumber = "0";
+      for (let j = i - 1; j >= 0; j--) {
+        const fm = lines[j].match(/^##\s+Feature\s+(\d+):/);
+        if (fm) {
+          featureNumber = fm[1];
+          break;
+        }
+      }
+      const phaseId = `${featureNumber}.${phaseNumber}.${phaseName}`;
+      return { line: i + 1, phaseId };
+    }
+  }
+  return null;
+}
+
+/** Attempt to resolve a stale line number by re-parsing the plan from disk.
+ *  Returns `{ lineNumber: N }` on success, `{ error: string }` on duplicate heading,
+ *  or `null` when the marker is genuinely deleted.
+ */
+function resolveStaleLine(
+  planFile: string,
+  originalLineNumber: number,
+  expectedMarker: string,
+): { lineNumber: number } | { error: string } | null {
+  const content = fs.readFileSync(planFile, "utf8");
+  const lines = content.split(/\r?\n/);
+
+  const heading = findPhaseHeadingAbove(lines, originalLineNumber);
+  if (!heading) return null;
+
+  const phaseMap = buildPhaseMap(lines);
+  const duplicateLines = phaseMap.get(heading.phaseId);
+  if (duplicateLines && duplicateLines.length > 1) {
+    return {
+      error: `PLAN_MUTATOR_DUPLICATE_HEADING: duplicate phase heading "${heading.phaseId}" at lines ${duplicateLines.join(", ")}`,
+    };
+  }
+
+  // Search from the heading line for the expectedMarker in a checkbox line.
+  // Stop at the next feature heading or phase heading.
+  for (let i = heading.line - 1; i < lines.length; i++) {
+    if (i > heading.line - 1 && /^##\s/.test(lines[i])) break;
+    if (i > heading.line - 1 && /^###\s+Phase\s+/.test(lines[i])) break;
+    if (
+      lines[i].includes(expectedMarker) &&
+      /^(\s*-\s+\[)([ xX])(\])/.test(lines[i])
+    ) {
+      return { lineNumber: i + 1 };
+    }
+  }
+
+  return null;
+}
+
 /**
  * Set a checkbox at a 1-based line number to a specific state (checked or
  * unchecked). Handles both the "flip to checked" and "flip to unchecked"
@@ -121,6 +215,17 @@ export function setCheckboxState(args: {
   const line = lines[idx];
 
   if (args.expectedMarker && !line.includes(args.expectedMarker)) {
+    const resolved = resolveStaleLine(
+      args.planFile,
+      args.lineNumber,
+      args.expectedMarker,
+    );
+    if (resolved && "error" in resolved) {
+      return { flipped: false, alreadyChecked: false, error: resolved.error };
+    }
+    if (resolved && "lineNumber" in resolved) {
+      return setCheckboxState({ ...args, lineNumber: resolved.lineNumber });
+    }
     return {
       flipped: false,
       alreadyChecked: false,
@@ -173,6 +278,17 @@ export function setCheckboxStatusNote(args: {
   const line = lines[idx];
 
   if (args.expectedMarker && !line.includes(args.expectedMarker)) {
+    const resolved = resolveStaleLine(
+      args.planFile,
+      args.lineNumber,
+      args.expectedMarker,
+    );
+    if (resolved && "error" in resolved) {
+      return { updated: false, alreadyPresent: false, error: resolved.error };
+    }
+    if (resolved && "lineNumber" in resolved) {
+      return setCheckboxStatusNote({ ...args, lineNumber: resolved.lineNumber });
+    }
     return {
       updated: false,
       alreadyPresent: false,
@@ -453,13 +569,27 @@ export function unflipPhaseCheckboxes(
       );
       continue;
     }
-    const idx = t.line - 1;
-    const line = lines[idx];
+    let idx = t.line - 1;
+    let line = lines[idx];
     if (!line.includes(t.marker)) {
-      errors.push(
-        `${t.label}: line ${t.line} no longer contains "${t.marker}" — plan was edited externally; re-parse and try again`,
-      );
-      continue;
+      const resolved = resolveStaleLine(planFile, t.line, t.marker);
+      if (resolved && "error" in resolved) {
+        errors.push(`${t.label}: ${resolved.error}`);
+        continue;
+      }
+      if (resolved && "lineNumber" in resolved) {
+        const resolvedLine = resolved.lineNumber;
+        if (resolvedLine >= 1 && resolvedLine <= lines.length) {
+          idx = resolvedLine - 1;
+          line = lines[idx];
+        }
+      }
+      if (!line.includes(t.marker)) {
+        errors.push(
+          `${t.label}: line ${t.line} no longer contains "${t.marker}" — plan was edited externally; re-parse and try again`,
+        );
+        continue;
+      }
     }
     const m = line.match(checkboxRe);
     if (!m) {
