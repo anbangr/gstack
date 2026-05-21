@@ -1,0 +1,8 @@
+{
+  "comment": "Claude is invoked in default prose mode today. v1 parser returns null. When --output-format stream-json is enabled later, this fixture will be replaced with JSON lines.",
+  "rows": [
+    { "lineIndex": 0, "expected": null },
+    { "lineIndex": 1, "expected": null },
+    { "lineIndex": 2, "expected": null }
+  ]
+}

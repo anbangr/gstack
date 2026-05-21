@@ -64,3 +64,15 @@ describe("parseGeminiLine", () => {
     assertRow("gemini", parseGeminiLine);
   });
 });
+
+describe("parseKimiLine", () => {
+  it("returns null for all lines (silent by design)", () => {
+    assertRow("kimi", parseKimiLine);
+  });
+});
+
+describe("parseClaudeLine", () => {
+  it("returns null for all lines (no stream-json yet)", () => {
+    assertRow("claude", parseClaudeLine);
+  });
+});
