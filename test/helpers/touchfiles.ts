@@ -970,6 +970,14 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     "build/SKILL.md.tmpl",
     "test/fixtures/build-convergence/bundle-1-plan.md",
   ],
+
+  // PR2 — Review prompt scope constraint. Paid eval (~$0.20/run).
+  // Fires when the review prompt body or hygiene gate changes.
+  "review-prompt-scope-constraint": [
+    "build/orchestrator/cli.ts",
+    "build/SKILL.md.tmpl",
+    "test/skill-e2e-review-prompt-scope.test.ts",
+  ],
 };
 
 /**
@@ -1247,6 +1255,9 @@ export const E2E_TIERS: Record<string, "gate" | "periodic"> = {
   // for gate-tier because the assertion is structural (reRaises count), not
   // a quality score. ~$0.50/run via codex exec.
   "skill-e2e-build-convergence": "gate",
+
+  // PR2 — Review prompt scope constraint. Periodic (paid eval, ~$0.20/run).
+  "review-prompt-scope-constraint": "periodic",
 };
 
 /**
