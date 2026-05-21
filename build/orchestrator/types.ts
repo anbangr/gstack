@@ -256,6 +256,16 @@ export interface SubAgentInvocation {
 
 export interface CodexReviewState {
   iterations: number;
+  /**
+   * Subset of `iterations` that produced a verdict-writing result (GATE
+   * PASS / GATE FAIL, not transport/capacity/stall failures). Used by
+   * the codex-iteration cap so a phase that's stuck on provider 529s
+   * doesn't burn its convergence budget. PR1b: defaults to `iterations`
+   * via migrateState() so state files written before this field load
+   * cleanly. Live callers that classify a result as a provider failure
+   * should bump only `iterations`, not `iterationsSuccessful`.
+   */
+  iterationsSuccessful?: number;
   finalVerdict?: "GATE PASS" | "GATE FAIL" | "TIMEOUT";
   outputLogPaths: string[];
   /**
@@ -314,6 +324,14 @@ export interface PhaseState {
     outputLogPaths: string[];
   };
   codexReview?: CodexReviewState;
+  /**
+   * PR1b: count of provider-retry attempts (capacity / overloaded / quota
+   * / transport / stall) made for this phase, summed across role steps
+   * and codex iterations. Hard-capped at `PROVIDER_RETRY_SESSION_CAP`
+   * (default 6) to bound autonomous churn when the provider is having a
+   * prolonged bad day. Reset only on phase recovery via --reset-phase.
+   */
+  providerRetryAttempts?: number;
   /** Origin-plan verification issue report that must be fixed during the next review loop. */
   originIssueLogPath?: string;
   /** Dual-implementor tournament state (populated when --dual-impl is active). */
