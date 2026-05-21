@@ -214,6 +214,7 @@ import {
   markFeatureFailed,
   markPhaseFailed,
   recordProviderFailureVerdict,
+  recordRedGateZeroTestsCollected,
   recordRetryCapHit,
   rewindPhase,
 } from "./halt-event-helpers";
@@ -6847,6 +6848,17 @@ async function runPhase(args: {
           }
         }
       }
+      if (action.reason.startsWith("RED_GATE_ZERO_TESTS_COLLECTED")) {
+        const testCmd =
+          resolveTestCmdForPhase(args, cwd, phase) ?? "unknown";
+        recordRedGateZeroTestsCollected(
+          state,
+          phaseState.index,
+          testCmd,
+          helperCtxFor(state),
+        );
+        classified = true;
+      }
       if (!classified) {
         recordRetryCapHit(
           state,
@@ -7274,7 +7286,12 @@ async function runPhase(args: {
           });
         }
       }
-      phaseState = applyResult(phaseState, action, result);
+      const effectiveTestCmd = resolveTestCmdForPhase(args, cwd, phase);
+      phaseState = applyResult(phaseState, action, result, {
+        phaseBody: phase.body,
+        testCmd: effectiveTestCmd ?? undefined,
+        phaseKind: phase.kind,
+      });
       state.phases[phase.index] = phaseState;
       saveState(state, { noGbrain, log: console.warn });
       continue;

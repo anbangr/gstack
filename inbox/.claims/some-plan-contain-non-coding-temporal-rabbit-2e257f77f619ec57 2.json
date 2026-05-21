@@ -1,0 +1,17 @@
+{
+  "runGroupId": "20260511-140441-e2491afd",
+  "sourcePlanPath": "/Users/anbang/.claude/plans/some-plan-contain-non-coding-temporal-rabbit.md",
+  "hostname": "MacBook-Pro-4.local",
+  "pid": 25819,
+  "status": "running",
+  "createdAt": "2026-05-11T06:06:22Z",
+  "runIds": [
+    "gstack-non-coding-temporal-rabbit-20260511-140701-e2491afd"
+  ],
+  "repoPaths": [
+    "/Users/anbang/Documents/Antigravity/claude-workspace/gstack"
+  ],
+  "updatedAt": "2026-05-11T06:10:30Z",
+  "manifestedAt": "2026-05-11T06:09:11Z",
+  "runningAt": "2026-05-11T06:10:30Z"
+}

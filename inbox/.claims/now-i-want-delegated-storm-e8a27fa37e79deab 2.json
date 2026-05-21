@@ -1,0 +1,17 @@
+{
+  "runGroupId": "20260511-122548-0505f47a",
+  "sourcePlanPath": "/Users/anbang/.claude/plans/now-i-want-delegated-storm.md",
+  "hostname": "MacBook-Pro-4.local",
+  "pid": 14902,
+  "status": "running",
+  "createdAt": "2026-05-11T04:26:22Z",
+  "runIds": [
+    "gstack-delegated-storm-20260511-122548-fabe4c3f"
+  ],
+  "repoPaths": [
+    "/Users/anbang/Documents/Antigravity/claude-workspace/gstack"
+  ],
+  "updatedAt": "2026-05-11T05:23:30Z",
+  "manifestedAt": "2026-05-11T04:30:15Z",
+  "runningAt": "2026-05-11T05:23:30Z"
+}
