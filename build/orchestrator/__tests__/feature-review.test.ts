@@ -801,6 +801,25 @@ describe("buildFeatureReviewPrompt — structure", () => {
     expect(md).toContain("## Additional phases");
   });
 
+  // T2: verdict-first prompt reorder. The Output Format section must
+  // appear BEFORE the Feature body so the reviewer reads the VERDICT-first
+  // contract before being inundated with feature content. This unlocks a
+  // future tail-watcher (T5) that detects FEATURE_PASS early by reading
+  // the first ~200 bytes of the output file.
+  it("hoists the Output format section above the Feature body block", () => {
+    const md = buildFeatureReviewPrompt(defaultArgs());
+    const outputFormatAt = md.indexOf("## Output format");
+    const featureBodyAt = md.indexOf("## Feature body");
+    expect(outputFormatAt).toBeGreaterThanOrEqual(0);
+    expect(featureBodyAt).toBeGreaterThanOrEqual(0);
+    expect(outputFormatAt).toBeLessThan(featureBodyAt);
+  });
+
+  it("instructs the reviewer to write the VERDICT line in the first 200 characters", () => {
+    const md = buildFeatureReviewPrompt(defaultArgs());
+    expect(md).toContain("first 200 characters");
+  });
+
   it("does NOT reference phases from other features", () => {
     const md = buildFeatureReviewPrompt(
       defaultArgs({
