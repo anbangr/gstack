@@ -12,7 +12,7 @@ export type HaltEventKind =
   | "FEATURE_FAILED"
   | "RETRY_CAP_HIT"
   | "DUAL_IMPL_SWAP"
-  | "MANUAL_RECOVERY_INVOKED"
+  | "RECOVERY_BOUNDARY"
   | "SILENT_STATE_MUTATION"
   | "PHASE_REWIND"
   | "SOFT_HALT_WARN"
@@ -69,7 +69,7 @@ export function severityFor(kind: HaltEventKind): HaltSeverity {
     case "FEATURE_FAILED":
       return "CRITICAL";
     case "RETRY_CAP_HIT":
-    case "MANUAL_RECOVERY_INVOKED":
+    case "RECOVERY_BOUNDARY":
     case "SILENT_STATE_MUTATION":
     case "STALL_KILLED":
     case "PROVIDER_TIMEOUT":

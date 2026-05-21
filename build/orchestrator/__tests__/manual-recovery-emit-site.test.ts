@@ -2,10 +2,10 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { emitManualRecoveryInvoked } from "../halt-event-helpers";
+import { emitRecoveryBoundary } from "../halt-event-helpers";
 import { loadPendingInvestigations } from "../halt-events";
 
-describe("emitManualRecoveryInvoked helper", () => {
+describe("emitRecoveryBoundary helper", () => {
   let tmp: string;
   let origHome: string | undefined;
 
@@ -22,7 +22,7 @@ describe("emitManualRecoveryInvoked helper", () => {
 
   test("T5: helper always sets investigate:false on the emitted event", () => {
     const skillFaults = path.join(tmp, "skill-faults");
-    emitManualRecoveryInvoked({
+    emitRecoveryBoundary({
       runId: "drain-faults",
       stateSlug: "drain-faults-no-plan",
       message: "drain-faults subcommand invoked (queue)",
@@ -36,14 +36,14 @@ describe("emitManualRecoveryInvoked helper", () => {
     });
     const events = loadPendingInvestigations({ queueDir: skillFaults });
     expect(events.length).toBe(1);
-    expect(events[0].kind).toBe("MANUAL_RECOVERY_INVOKED");
+    expect(events[0].kind).toBe("RECOVERY_BOUNDARY");
     expect(events[0].investigate).toBe(false);
     expect(events[0].severity).toBe("HIGH");
   });
 
   test("T6: helper preserves runId / stateSlug / message / pointers", () => {
     const skillFaults = path.join(tmp, "skill-faults");
-    emitManualRecoveryInvoked({
+    emitRecoveryBoundary({
       runId: "mark-shipped",
       stateSlug: "build-x",
       message: "mark-shipped subcommand invoked for feature 3 (PR #42)",
@@ -65,7 +65,7 @@ describe("emitManualRecoveryInvoked helper", () => {
   });
 
   test("T7: all three manual-recovery cli sites route through the helper (static check)", () => {
-    // Goal: cli.ts must not contain any raw `kind: "MANUAL_RECOVERY_INVOKED"`
+    // Goal: cli.ts must not contain any raw `kind: "RECOVERY_BOUNDARY"`
     // emit blocks after Phase 2 — every site must go through the helper so the
     // investigate:false flag is set in exactly one place. This guards against
     // future contributors adding a new manual-recovery site and forgetting the
@@ -79,9 +79,9 @@ describe("emitManualRecoveryInvoked helper", () => {
     expect(cli).toContain("mark-shipped subcommand invoked");
     expect(cli).toContain("--mark-phase-committed invoked");
 
-    // No raw emitHaltEvent block in cli.ts should have kind: "MANUAL_RECOVERY_INVOKED".
-    // The helper is the single source of truth. severityFor("MANUAL_RECOVERY_INVOKED")
+    // No raw emitHaltEvent block in cli.ts should have kind: "RECOVERY_BOUNDARY".
+    // The helper is the single source of truth. severityFor("RECOVERY_BOUNDARY")
     // calls inside the helper file are fine; this check is scoped to cli.ts.
-    expect(cli).not.toContain('kind: "MANUAL_RECOVERY_INVOKED"');
+    expect(cli).not.toContain('kind: "RECOVERY_BOUNDARY"');
   });
 });

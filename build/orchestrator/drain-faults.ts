@@ -1467,7 +1467,7 @@ export async function drainFaultsFromHaltEventsQueue(
     // its own invocation.
     //
     // Gates (post-codex-adversarial hardening):
-    //   - kind === MANUAL_RECOVERY_INVOKED (M1 fix): the flag is scoped to
+    //   - kind === RECOVERY_BOUNDARY (M1 fix): the flag is scoped to
     //     manual-recovery audit events. A corrupted PHASE_FAILED row with
     //     investigate:false must NOT bypass investigation.
     //   - dryRun honored BEFORE the move (L1 fix): --dry-run is read-only.
@@ -1478,7 +1478,7 @@ export async function drainFaultsFromHaltEventsQueue(
     //     the file (just by the other process); but EACCES / bad queue
     //     paths leave the file in pending/ and must NOT be counted as
     //     skipped or appended to analytics.
-    if (he.investigate === false && he.kind === "MANUAL_RECOVERY_INVOKED") {
+    if (he.investigate === false && he.kind === "RECOVERY_BOUNDARY") {
       if (opts.dryRun) {
         // Dry-run mode is read-only: report the intent without moving the
         // file or writing analytics. Count under shortCircuited so the

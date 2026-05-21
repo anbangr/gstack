@@ -24,7 +24,7 @@ describe("drainFaultsFromHaltEventsQueue — investigate:false short-circuit", (
     const skillFaults = path.join(tmp, "skill-faults");
     const faultId = emitHaltEvent(
       {
-        kind: "MANUAL_RECOVERY_INVOKED",
+        kind: "RECOVERY_BOUNDARY",
         runId: "drain-faults",
         stateSlug: "drain-faults-no-plan",
         severity: "HIGH",
@@ -126,7 +126,7 @@ describe("drainFaultsFromHaltEventsQueue — investigate:false short-circuit", (
     const skillFaults = path.join(tmp, "skill-faults");
     const auditId = emitHaltEvent(
       {
-        kind: "MANUAL_RECOVERY_INVOKED",
+        kind: "RECOVERY_BOUNDARY",
         runId: "drain-faults",
         stateSlug: "drain-faults-no-plan",
         severity: "HIGH",
@@ -198,7 +198,7 @@ describe("drainFaultsFromHaltEventsQueue — investigate:false short-circuit", (
     expect(names).toContain(realId);
   });
 
-  test("M1: investigate:false on a non-MANUAL_RECOVERY_INVOKED kind STILL dispatches", async () => {
+  test("M1: investigate:false on a non-RECOVERY_BOUNDARY kind STILL dispatches", async () => {
     // Codex adversarial M1: a corrupted PHASE_FAILED row with
     // investigate:false must NOT short-circuit. The flag is scoped to
     // manual-recovery audit events only.
@@ -253,7 +253,7 @@ describe("drainFaultsFromHaltEventsQueue — investigate:false short-circuit", (
     const skillFaults = path.join(tmp, "skill-faults");
     emitHaltEvent(
       {
-        kind: "MANUAL_RECOVERY_INVOKED",
+        kind: "RECOVERY_BOUNDARY",
         runId: "drain-faults",
         stateSlug: "drain-faults-no-plan",
         severity: "HIGH",
@@ -305,7 +305,7 @@ describe("drainFaultsFromHaltEventsQueue — investigate:false short-circuit", (
     const skillFaults = path.join(tmp, "skill-faults");
     emitHaltEvent(
       {
-        kind: "MANUAL_RECOVERY_INVOKED",
+        kind: "RECOVERY_BOUNDARY",
         runId: "drain-faults",
         stateSlug: "drain-faults-no-plan",
         severity: "HIGH",
@@ -361,12 +361,12 @@ describe("drainFaultsFromHaltEventsQueue — investigate:false short-circuit", (
     const skillFaults = path.join(tmp, "skill-faults");
     const pendingDir = path.join(skillFaults, "pending-investigations");
     fs.mkdirSync(pendingDir, { recursive: true });
-    const faultId = "MANUAL_RECOVERY_INVOKED:all:abc12345";
+    const faultId = "RECOVERY_BOUNDARY:all:abc12345";
     const legacyRow = {
       faultId,
       runId: "drain-faults",
       stateSlug: "drain-faults-no-plan",
-      kind: "MANUAL_RECOVERY_INVOKED",
+      kind: "RECOVERY_BOUNDARY",
       severity: "HIGH",
       timestamp: "2026-05-19T00:00:00.000Z",
       message: "drain-faults subcommand invoked (queue)",

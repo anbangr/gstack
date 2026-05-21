@@ -67,6 +67,9 @@ export type LearnedMatcherKind =
   | "plan_regex"
   | "state_jsonpath";
 
+/** Audit-only halt kinds that short-circuit investigation dispatch. */
+export const AUDIT_HALT_KINDS = ["RECOVERY_BOUNDARY"] as const;
+
 /** Provider-halt kinds recognised by the static detector and consumers. */
 export const PROVIDER_HALT_KINDS = [
   "PROVIDER_TIMEOUT",

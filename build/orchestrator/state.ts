@@ -128,7 +128,25 @@ function ensureStateDir(): void {
   fs.mkdirSync(stateDir(), { recursive: true });
 }
 
+function upgradeHaltEventKinds(value: unknown): unknown {
+  if (typeof value === "string" && value === "MANUAL_RECOVERY_INVOKED") {
+    return "RECOVERY_BOUNDARY";
+  }
+  if (Array.isArray(value)) {
+    return value.map(upgradeHaltEventKinds);
+  }
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = upgradeHaltEventKinds(v);
+    }
+    return out;
+  }
+  return value;
+}
+
 function migrateState(state: BuildState): BuildState {
+  state = upgradeHaltEventKinds(state) as BuildState;
   state.phases = state.phases.map((ph) => {
     // PR1b: backfill iterationsSuccessful from iterations for state files
     // written before the field existed. Done in-place on each phase.
