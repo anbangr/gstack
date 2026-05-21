@@ -93,6 +93,35 @@ export interface StallWatchdogOptions {
    * shell-out implemented in `sampleProcessTreeCpuMs`.
    */
   sampleCpuFn?: (pid: number | undefined) => Map<number, number> | null;
+
+  /**
+   * Optional progress-line parser. When provided, the watchdog feeds
+   * each stdout/stderr line to this function. Non-null ProgressEvents
+   * update internal state:
+   *   - TOOL_START sets currentToolBucket and lastClassifiedActivityAt.
+   *   - TOOL_END clears currentToolBucket; lastClassifiedActivityAt updates.
+   * The effective stall window per tick depends on currentToolBucket:
+   *   - "slow" → toolStallMs.slow
+   *   - "fast" → toolStallMs.fast
+   *   - null   → legacy stallMs (today's behavior)
+   * Required pair: toolStallMs and progressGapMs must also be set when
+   * parseProgress is provided.
+   */
+  parseProgress?: (
+    line: string,
+    now: number,
+  ) => import("./subagent-progress-parser").ProgressEvent | null;
+
+  /** Tool-aware window thresholds. Required when parseProgress is set. */
+  toolStallMs?: { fast: number; slow: number };
+
+  /**
+   * Max ms the watchdog tolerates noisy stdout with no parsed events
+   * before firing SIGTERM with killReason="progress_gap". Required when
+   * parseProgress is set. Gated on having seen at least one parsed
+   * event in this run — see implementation.
+   */
+  progressGapMs?: number;
 }
 
 export interface StallWatchdogController {
@@ -109,7 +138,14 @@ export interface StallWatchdogController {
    * that's actually busy producing output would be misread as silent.
    */
   notifyActivity: () => void;
-  /** If the watchdog killed for an auth prompt, returns "auth_required". */
+  /**
+   * Why the watchdog killed. Returns:
+   *   - "auth_required" — auth-prompt fast-kill (pre-existing).
+   *   - "stall"         — legacy silence-based stall (pre-existing).
+   *   - "silence"       — tool-aware silence kill (new, when parseProgress set).
+   *   - "progress_gap"  — noisy stdout without classified progress (new).
+   *   - undefined       — watchdog has not killed.
+   */
   killReason: () => string | undefined;
 }
 
