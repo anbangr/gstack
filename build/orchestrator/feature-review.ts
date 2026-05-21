@@ -367,6 +367,21 @@ export interface FeatureReviewPromptArgs {
    */
   featureDiff: string;
   /**
+   * Per-phase diff body (key = Phase.number, e.g. "1", "2.review-1").
+   * Optional. When present, each phase's `### Phase N` block in the prompt
+   * gets a fenced `diff` block immediately under it. When absent or missing
+   * a key, that phase falls back to no per-phase diff (the mega-diff
+   * summary at the top is sufficient context).
+   */
+  phaseDiffs?: Map<string, string>;
+  /**
+   * Short summary (filenames + line counts via `git diff --stat`) of the
+   * net feature diff. Rendered at the top of the prompt as a cross-phase
+   * overview, complementing the per-phase blocks below. Capped to ~2KB
+   * by the caller. Optional — when omitted, no summary block renders.
+   */
+  featureDiffSummary?: string;
+  /**
    * Absolute path the reviewer must write its structured verdict to.
    * Codex/Claude/Gemini all support file-path output; the orchestrator
    * reads from this path after the spawn completes.
@@ -394,6 +409,53 @@ export function buildFeatureReviewPrompt(
     `Branch: ${args.branch}`,
     `Plan file: ${args.planFile}`,
     `Phases in this feature: ${args.feature.phaseIndexes.length} (indexes ${args.feature.phaseIndexes.join(", ")})`,
+    "",
+    "## Output format (REQUIRED — your verdict will be machine-parsed)",
+    "",
+    "**IMPORTANT: write the `## VERDICT` line within the first 200 characters of the output file. Findings and everything else come AFTER.** This enables the orchestrator to detect FEATURE_PASS early and short-circuit further reading.",
+    "",
+    `Write your output to ${args.outputFilePath} with EXACTLY this structure (VERDICT first):`,
+    "",
+    "```",
+    "## VERDICT",
+    "<one of: FEATURE_PASS, FEATURE_NEEDS_PHASES, FEATURE_REDO>",
+    "",
+    "## Findings",
+    "<3-10 bullets describing what you observed, both positive and negative;",
+    "always include this section regardless of verdict>",
+    "",
+    "## Phases to redo",
+    "<ONLY for FEATURE_REDO. List the phase numbers (matching the plan",
+    "headings, e.g. `1.2`, `3`) one per line as `- 3`. Reset is precise:",
+    "only the phases you list will be reset and re-run.>",
+    "",
+    "## Additional phases",
+    "<ONLY for FEATURE_NEEDS_PHASES. Write the new phase blocks verbatim,",
+    "starting with `### Phase N.review-K: <title>` headings under the",
+    "current feature. Include `- [ ] **Implementation**: <description>` and",
+    "`- [ ] **Review**: <description>` checkboxes for each — these will be",
+    "appended to the plan file and re-parsed.",
+    "",
+    `K MUST NOT collide with phase numbers already in use under this feature: ${buildPhaseNumberHistory(featurePhases)}.`,
+    "The parser/reconciler rejects duplicate phase numbers and fails closed,",
+    "blocking the feature with a recovery report. Always pick a new K.>",
+    "```",
+    "",
+    "## Verdict guidance",
+    "",
+    `- **${FEATURE_VERDICT_PASS}**: feature is complete and consistent. Ship it.`,
+    `- **${FEATURE_VERDICT_REDO}**: a small, named set of phases needs to be`,
+    "  re-run because their implementation diverged from intent or broke an",
+    "  invariant. Prefer this when the existing phase scope is correct but",
+    "  the implementation needs a redo.",
+    `- **${FEATURE_VERDICT_NEEDS_PHASES}**: a step the original plan did not`,
+    "  anticipate is required (missing migration, missing docs, missing",
+    "  integration test). Add the named phases; the orchestrator will run",
+    "  them after this cycle.",
+    "",
+    "Be ruthless about completeness; do not approve a feature whose deliverables",
+    "are not actually in the diff. But also do not redo a phase whose",
+    "implementation is sound just because the build process was noisy.",
     "",
     "## Your role",
     "",
@@ -445,6 +507,37 @@ export function buildFeatureReviewPrompt(
       sections.push(`- Error noted: ${state.error}`);
     }
     sections.push("", "Phase body:", "", phase.body.trim(), "");
+    // T8: per-phase diff block (when caller supplied a phaseDiffs map and
+    // this phase has a resolvable entry). Scopes reviewer attention to the
+    // delta this phase introduced. When absent, the cross-phase summary
+    // and (optionally) mega-diff below carry the context.
+    const perPhaseDiff = args.phaseDiffs?.get(phase.number);
+    if (perPhaseDiff) {
+      sections.push(
+        "**Per-phase diff:**",
+        "",
+        "```diff",
+        perPhaseDiff.trim() || "(empty diff)",
+        "```",
+        "",
+      );
+    }
+  }
+
+  // T8: when caller supplied a featureDiffSummary, render a cross-phase
+  // overview block. Always rendered (when present) — gives the reviewer a
+  // file-level overview even when per-phase blocks below contain detail.
+  if (args.featureDiffSummary) {
+    sections.push(
+      "## Cross-phase diff summary",
+      "",
+      "Filenames and line counts across all phases of this feature:",
+      "",
+      "```",
+      args.featureDiffSummary.trim() || "(no files changed)",
+      "```",
+      "",
+    );
   }
 
   sections.push(
@@ -454,13 +547,31 @@ export function buildFeatureReviewPrompt(
     args.featureCommitsOneline.trim() || "(no commits captured)",
     "```",
     "",
-    "## Net diff (feature start → HEAD)",
-    "",
-    "```diff",
-    args.featureDiff.trim() || "(empty diff)",
-    "```",
-    "",
   );
+
+  // T8: when per-phase diffs are present AND at least one entry has non-empty
+  // content, suppress the mega-diff body — the per-phase blocks above plus
+  // the cross-phase summary cover the same ground with less context bloat.
+  // When phaseDiffs is absent, empty, or every entry is blank (e.g. wrong
+  // branchpoint produced bogus empty diffs), fall back to the mega-diff so
+  // the reviewer always has SOMETHING to read. Adversarial review surfaced
+  // the risk of suppressing the mega-diff when per-phase content is bogus.
+  const hasPhaseDiffs =
+    !!args.phaseDiffs &&
+    args.phaseDiffs.size > 0 &&
+    Array.from(args.phaseDiffs.values()).some(
+      (d) => typeof d === "string" && d.trim().length > 0,
+    );
+  if (!hasPhaseDiffs) {
+    sections.push(
+      "## Net diff (feature start → HEAD)",
+      "",
+      "```diff",
+      args.featureDiff.trim() || "(empty diff)",
+      "```",
+      "",
+    );
+  }
 
   if (args.priorReportPath) {
     let prior = "(prior review report not readable)";
@@ -487,50 +598,12 @@ export function buildFeatureReviewPrompt(
   }
 
   sections.push(
-    "## Output format (REQUIRED — your verdict will be machine-parsed)",
+    "## Reminder: VERDICT first",
     "",
-    `Write your output to ${args.outputFilePath} with the following structure:`,
-    "",
-    "```",
-    "## VERDICT",
-    "<one of: FEATURE_PASS, FEATURE_NEEDS_PHASES, FEATURE_REDO>",
-    "",
-    "## Findings",
-    "<3-10 bullets describing what you observed, both positive and negative;",
-    "always include this section regardless of verdict>",
-    "",
-    "## Phases to redo",
-    "<ONLY for FEATURE_REDO. List the phase numbers (matching the plan",
-    "headings, e.g. `1.2`, `3`) one per line as `- 3`. Reset is precise:",
-    "only the phases you list will be reset and re-run.>",
-    "",
-    "## Additional phases",
-    "<ONLY for FEATURE_NEEDS_PHASES. Write the new phase blocks verbatim,",
-    "starting with `### Phase N.review-K: <title>` headings under the",
-    "current feature. Include `- [ ] **Implementation**: <description>` and",
-    "`- [ ] **Review**: <description>` checkboxes for each — these will be",
-    "appended to the plan file and re-parsed.",
-    "",
-    `K MUST NOT collide with phase numbers already in use under this feature: ${buildPhaseNumberHistory(featurePhases)}.`,
-    "The parser/reconciler rejects duplicate phase numbers and fails closed,",
-    "blocking the feature with a recovery report. Always pick a new K.>",
-    "```",
-    "",
-    "## Verdict guidance",
-    "",
-    `- **${FEATURE_VERDICT_PASS}**: feature is complete and consistent. Ship it.`,
-    `- **${FEATURE_VERDICT_REDO}**: a small, named set of phases needs to be`,
-    "  re-run because their implementation diverged from intent or broke an",
-    "  invariant. Prefer this when the existing phase scope is correct but",
-    "  the implementation needs a redo.",
-    `- **${FEATURE_VERDICT_NEEDS_PHASES}**: a step the original plan did not`,
-    "  anticipate is required (missing migration, missing docs, missing",
-    "  integration test). Add the named phases; the orchestrator will run",
-    "  them after this cycle.",
-    "",
-    "Be ruthless about completeness; do not approve a feature whose deliverables",
-    "are not actually in the diff. But also do not redo a phase whose",
-    "implementation is sound just because the build process was noisy.",
+    "Before writing anything else, emit the `## VERDICT` line within the first",
+    "200 characters of the output file (see the Output format section at the top",
+    "of this prompt for the full contract). Findings and additional sections come",
+    "AFTER the verdict line.",
   );
 
   return sections.join("\n");
@@ -556,19 +629,140 @@ export function isPathInLogDir(
 }
 
 /**
- * Skip heuristic: per the design, feature-review is overkill when the
- * feature is a single phase that converged on iter 1 (no rerun, no test-
- * fix loops). Returns true when the heuristic says skip.
+ * Skip heuristic (T11): feature-review is overkill when ALL of the
+ * following hold:
+ *   1. the feature has ≤ 2 phases,
+ *   2. every phase converged on iter ≤ 1 (no Codex re-iteration),
+ *   3. no phase needed a Gemini rerun off review feedback,
+ *   4. no phase needed any test-fix iterations,
+ *   5. the net diff is < 5KB (when the caller measured it), AND
+ *   6. no changed file matches an `alwaysReviewPaths` glob (when the
+ *      caller supplied both the file list and the configured patterns).
+ *
+ * Returns true when the heuristic says skip. When optional inputs are
+ * omitted the corresponding gate is treated as not-applicable (skip is
+ * still allowed). This keeps the helper callable from tests and from
+ * call sites that haven't computed git context yet.
  */
+export interface ShouldSkipFeatureReviewArgs {
+  feature: Feature;
+  phaseStates: PhaseState[];
+  /**
+   * Net diff size in bytes (caller computes via
+   * `Buffer.byteLength(featureDiff, "utf8")` or similar). Used for the
+   * <5KB threshold. When undefined, the size gate is not applied.
+   */
+  diffBytes?: number;
+  /**
+   * Changed file paths (relative to repo root) from `git diff --name-only`.
+   * Used together with `alwaysReviewPaths` for the file-path safety gate.
+   * When undefined, the safety gate is not applied.
+   */
+  changedFiles?: string[];
+  /**
+   * Configured glob patterns that ALWAYS warrant a review regardless of
+   * size/iter heuristics. Matched against `changedFiles`. When undefined
+   * or empty, no file-path safety gate is applied.
+   */
+  alwaysReviewPaths?: string[];
+}
+
 export function shouldSkipFeatureReview(
-  feature: Feature,
-  phaseStates: PhaseState[],
+  args: ShouldSkipFeatureReviewArgs,
 ): boolean {
-  if (feature.phaseIndexes.length !== 1) return false;
-  const only = phaseStates[feature.phaseIndexes[0]];
-  if (!only) return false;
-  const codexIters = only.codexReview?.iterations ?? 0;
-  const reruns = only.codexReview?.geminiReRunCount ?? 0;
-  const testFixIters = only.testFix?.iterations ?? 0;
-  return codexIters <= 1 && reruns === 0 && testFixIters === 0;
+  const { feature, phaseStates, diffBytes, changedFiles, alwaysReviewPaths } =
+    args;
+
+  // 1. ≤2 phases (broadened from "exactly 1"). Zero is defensive — a
+  // feature with no phases shouldn't reach this code path, but if it
+  // does, do not silently skip the review.
+  if (feature.phaseIndexes.length === 0) return false;
+  if (feature.phaseIndexes.length > 2) return false;
+
+  // 2-4. Every phase must have converged cleanly.
+  for (const idx of feature.phaseIndexes) {
+    const ps = phaseStates[idx];
+    if (!ps) return false;
+    const codexIters = ps.codexReview?.iterations ?? 0;
+    const reruns = ps.codexReview?.geminiReRunCount ?? 0;
+    const testFixIters = ps.testFix?.iterations ?? 0;
+    if (codexIters > 1 || reruns > 0 || testFixIters > 0) return false;
+  }
+
+  // 5. Diff size threshold (only when caller measured it).
+  if (diffBytes !== undefined && diffBytes >= 5_000) return false;
+
+  // 6. Always-review file-path safety gate.
+  if (
+    changedFiles &&
+    alwaysReviewPaths &&
+    alwaysReviewPaths.length > 0 &&
+    changedFiles.length > 0
+  ) {
+    const matchers = alwaysReviewPaths.map(compileGlob);
+    for (const file of changedFiles) {
+      if (matchers.some((m) => m(file))) return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Tiny built-in glob compiler. Avoids adding a `minimatch` / `picomatch`
+ * dependency. Supports:
+ *   - `**`        — any sequence of path segments (including empty)
+ *   - `*`         — any sequence of non-`/` chars
+ *   - `?`         — any single non-`/` char
+ *   - `[...]`     — character class, passed through to regex
+ *   - literal text
+ *
+ * Sufficient for the default `alwaysReviewPaths` patterns and pinned by
+ * tests in feature-review.test.ts. Exported for testability.
+ */
+export function compileGlob(pattern: string): (filePath: string) => boolean {
+  const re = globToRegExp(pattern);
+  return (p) => re.test(p);
+}
+
+function globToRegExp(pattern: string): RegExp {
+  let i = 0;
+  let out = "^";
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === "*" && pattern[i + 1] === "*") {
+      // ** = any sequence including /
+      out += ".*";
+      i += 2;
+      // skip following slash so `**/foo` matches both `foo` and `a/b/foo`.
+      if (pattern[i] === "/") i += 1;
+    } else if (ch === "*") {
+      out += "[^/]*";
+      i += 1;
+    } else if (ch === "?") {
+      out += "[^/]";
+      i += 1;
+    } else if (ch === "[") {
+      // character class — pass through to regex as-is
+      let j = i + 1;
+      while (j < pattern.length && pattern[j] !== "]") j += 1;
+      if (j < pattern.length) {
+        out += pattern.slice(i, j + 1);
+        i = j + 1;
+      } else {
+        // unterminated bracket — treat as literal `[`
+        out += "\\[";
+        i += 1;
+      }
+    } else if (/[.+^$()|{}\\]/.test(ch)) {
+      // regex metachars (excluding ones we handle above) — escape
+      out += "\\" + ch;
+      i += 1;
+    } else {
+      out += ch;
+      i += 1;
+    }
+  }
+  out += "$";
+  return new RegExp(out);
 }

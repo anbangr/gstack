@@ -114,5 +114,15 @@
     "judge": 600000,
     "featureReview": 1200000,
     "planReview": 300000
-  }
+  },
+  "alwaysReviewPaths": [
+    "**/security/**",
+    "**/auth/**",
+    "**/permissions/**",
+    "**/middleware/**",
+    "**/sso/**",
+    "**/crypto/**",
+    "**/*[Aa]uth*",
+    "**/*[Ss]ecurity*"
+  ]
 }

@@ -629,6 +629,10 @@ plan-review-loop.ts multi-round orchestration, triage gates, adaptive cap, histo
 drain-faults.ts skill-fault drain consumer; short-circuits audit events (investigate:false)
 halt-event-helpers.ts emitManualRecoveryInvoked() — pins investigate:false on audit events
 halt-events.ts  HaltEvent schema, markInvestigated; investigate?: boolean property
+feature-review.ts per-feature meta-review pass; same-shape fingerprint detection; UNCLEAR fail-fast
+feature-review-metrics.ts JSONL instrumentation for cycles, tokens, latency, verdict (T1)
+feature-review-cache.ts FEATURE_PASS verdict cache keyed on tree+plan hash (T14)
+feature-verifier.ts pre-merge featureVerifier CLI gate (T12) + post-merge tree-hash audit (T13)
 types.ts        Phase, PhaseState, BuildState
 ```
 

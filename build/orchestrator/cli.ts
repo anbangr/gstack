@@ -120,6 +120,21 @@ import {
   type ParsedFeatureVerdict,
 } from "./feature-review";
 import { promptYesNo, buildBlockedFeatureMd } from "./feature-review-prompt";
+import {
+  runFeatureVerifier,
+  resolveFeatureBaseRef,
+  comparePostMergeTrees,
+  detectBaseBranch,
+} from "./feature-verifier";
+import {
+  writeFeatureReviewMetrics,
+  watchFirstWrite,
+} from "./feature-review-metrics";
+import {
+  computeCacheKey,
+  lookupCache,
+  storeCache,
+} from "./feature-review-cache";
 import { runPlanReview, SYNTH_REVISION_PROMPT } from "./plan-reviewer";
 import { runPlanReviewLoop } from "./plan-review-loop";
 import { shipAndDeploy, shipOnly } from "./ship";
@@ -791,6 +806,23 @@ export interface Args {
    * cost-sensitive runs).
    */
   skipFeatureReview: boolean;
+  /**
+   * Skip the per-feature pre-merge featureVerifier acceptance-criteria audit
+   * (T12). The verifier compares each feature's committed-but-not-yet-merged
+   * work against its acceptance criteria; GAPS aborts the ship trigger.
+   * Default off — the gate runs unless this flag is set or the run is in
+   * --dry-run. Useful in CI or when the verifier is misconfigured.
+   */
+  skipPreMergeVerify: boolean;
+  /**
+   * Treat UNCLEAR verdicts from the pre-merge featureVerifier as failures
+   * that halt ship. By default UNCLEAR (e.g. base-branch undetectable,
+   * subprocess error, output had no VERIFICATION sentinel) is logged and
+   * ship proceeds. Strict mode is for environments where an unaudited
+   * feature must never reach ship — at the cost of needing a working
+   * codex + reachable origin/<base> on every feature.
+   */
+  strictPreMergeVerify: boolean;
   /** Cap on per-feature review cycles. Defaults to BUILD_DEFAULTS.limits.featureReviewMaxIterations (3). */
   featureReviewMaxIter: number;
   /** Skip the planReviewer second-opinion pass at startup. */
@@ -970,6 +1002,8 @@ export function parseArgs(argv: string[]): Args {
     commitDirty: false,
     stopRun: undefined,
     skipFeatureReview: false,
+    skipPreMergeVerify: false,
+    strictPreMergeVerify: false,
     featureReviewMaxIter: DEFAULT_FEATURE_REVIEW_MAX_ITER,
     noPlanReview: false,
     planReviewerModel: undefined,
@@ -1054,6 +1088,9 @@ export function parseArgs(argv: string[]): Args {
         i++;
       }
     } else if (a === "--skip-feature-review") args.skipFeatureReview = true;
+    else if (a === "--skip-pre-merge-verify") args.skipPreMergeVerify = true;
+    else if (a === "--strict-pre-merge-verify")
+      args.strictPreMergeVerify = true;
     else if (a === "--no-plan-review") args.noPlanReview = true;
     else if (a === "--plan-reviewer-model") {
       const next = argv[++i];
@@ -2851,6 +2888,13 @@ Flags:
                        /land-and-deploy behavior.
   --skip-clean-check   Skip the pre-build working tree dirty check.
   --skip-feature-review  Skip the per-feature meta-review pass.
+  --skip-pre-merge-verify  Skip the pre-/ship featureVerifier acceptance-
+                       criteria audit (T12). Useful in CI or when the
+                       verifier is misconfigured.
+  --strict-pre-merge-verify  Treat UNCLEAR pre-merge verifier verdicts as
+                       failures that halt ship. Default behavior is to log
+                       and proceed. Use this in environments where an
+                       unaudited feature must never reach ship.
   --feature-review-max-iter N  Cap on per-feature review cycles before
                        hard-fail (F4 will swap this for an interactive
                        prompt to allow a 4th cycle).
@@ -5727,13 +5771,19 @@ function countCommitsSinceBase(
  * Reset a phase's runtime state so the orchestrator's main loop will
  * re-run it. Used by the FEATURE_REDO verdict path. Clears the codex
  * review history, gemini invocation record, test-run/test-fix counters,
- * and committedAt timestamp; flips status back to "pending". Does NOT
- * touch the on-disk plan markdown — checkboxes will be re-flipped when
- * the phase commits again. Mirrors the behavior of the startup
- * `--reset-phase N` flag but operates on a single phase by index for
- * mid-run reset.
+ * and committedAt/committedSha tracking; flips status back to "pending".
+ * Does NOT touch the on-disk plan markdown — checkboxes will be
+ * re-flipped when the phase commits again. Mirrors the behavior of the
+ * startup `--reset-phase N` flag but operates on a single phase by
+ * index for mid-run reset.
+ *
+ * Exported for testability (T7 unit tests). Internal callers in cli.ts
+ * still use it via the same name.
  */
-function resetPhaseStateForRedo(state: BuildState, phaseIndex: number): void {
+export function resetPhaseStateForRedo(
+  state: BuildState,
+  phaseIndex: number,
+): void {
   const ps = state.phases[phaseIndex];
   if (!ps) return;
   ps.status = "pending";
@@ -5744,6 +5794,7 @@ function resetPhaseStateForRedo(state: BuildState, phaseIndex: number): void {
   delete (ps as any).testFix;
   delete (ps as any).originIssueLogPath;
   delete (ps as any).committedAt;
+  delete (ps as any).committedSha;
   delete (ps as any).error;
   delete (ps as any).redSpecAttempts;
   delete (ps as any).dualImpl;
@@ -5975,7 +6026,16 @@ export function markPhaseCommittedAfterManualRecovery(args: {
     const clearsBuildFailure =
       args.state.failedAtPhase === phase.index ||
       (args.state.failedAtPhase == null && phaseState.status === "failed");
-    args.state.phases[phase.index] = markCommitted(phaseState);
+    // T7: capture HEAD sha for per-phase diff blocks (T8). Best-effort —
+    // detached HEAD, no commits, or transient I/O leaves the field
+    // undefined; downstream consumers tolerate that.
+    const _shaR = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: args.cwd,
+      encoding: "utf8",
+    });
+    const _committedSha =
+      _shaR.status === 0 ? (_shaR.stdout || "").trim() || undefined : undefined;
+    args.state.phases[phase.index] = markCommitted(phaseState, _committedSha);
     args.state.currentPhaseIndex = findNextPhaseIndex(args.state.phases);
     if (args.state.failedAtPhase === phase.index) {
       delete args.state.failedAtPhase;
@@ -6078,6 +6138,24 @@ async function runFeatureReviewIteration(args: {
   outputFilePath: string;
 }> {
   const slug = args.state.slug;
+  // T1 metrics state — captured at well-known sites in the body, emitted
+  // once in finally so all 8 return paths share one write site.
+  const _metricsSpawnStart = Date.now();
+  let _metricsFirstWriteWatcher: ReturnType<typeof watchFirstWrite> | null =
+    null;
+  let _metricsPromptBytes = 0;
+  let _metricsFinalVerdict = "UNKNOWN";
+  // Effective reasoning used for THIS spawn (T9 may override role default
+  // to "medium" on cycle 1). Initialized to the role default; updated at
+  // the spawn-dispatch site so analytics reflects what actually ran.
+  let _metricsEffectiveReasoning: string =
+    args.roles.featureReview.reasoning;
+  let _metricsPassEvidenceTimeout = false;
+  let _metricsEndedBy:
+    | "exit0"
+    | "watchdog"
+    | "signal"
+    | "exit-nonzero" = "exit-nonzero";
   const inputFilePath = path.join(
     logDir(slug),
     `feature-${args.feature.number}-review-${args.iteration}-input.md`,
@@ -6086,6 +6164,89 @@ async function runFeatureReviewIteration(args: {
     logDir(slug),
     `feature-${args.feature.number}-review-${args.iteration}-output.md`,
   );
+
+  // T14: verdict cache lookup. Only PASS verdicts are cached. Key includes
+  // feature content, sorted phase committedShas (from T7), plan body, and
+  // reviewer role label. Cache hit → skip spawn entirely and return a
+  // synthesized PASS verdict. Sits BEFORE the try block so a cache hit
+  // bypasses the metrics-writing finally — we don't want phantom 0ms
+  // entries in feature-review-metrics.jsonl for hits.
+  //
+  // Missing-committedSha case: computeCacheKey returns "" and we fall
+  // through to the normal spawn. lookupCache("", slug) is also a guarded
+  // no-op so we don't need to gate the call.
+  let _cacheKey = "";
+  if (!args.dryRun) {
+    let _planBody = "";
+    try {
+      _planBody = fs.readFileSync(args.planFile, "utf8");
+    } catch {
+      // Plan file missing or unreadable → empty body. computeCacheKey
+      // still produces a key (or "" if phases lack committedSha); a
+      // truly missing plan will mismatch any prior key with real body.
+    }
+    // Effective reasoning matches the spawn-site override below in this
+    // same function (cycle-1 = medium, cycle 2+ = configured). Without this,
+    // a cycle-1 PASS that ran at medium would get keyed under the configured
+    // reasoning's label, then served back to a configured-high reviewer as
+    // if it were a high-reasoning verdict — silently downgrading safety.
+    const _cacheEffectiveReasoning =
+      args.roles.featureReview.provider === "codex" && args.iteration === 1
+        ? "medium"
+        : args.roles.featureReview.reasoning;
+    _cacheKey = computeCacheKey({
+      feature: args.feature,
+      phaseStates: args.state.phases,
+      planBody: _planBody,
+      reviewerRoleLabel: `${args.roles.featureReview.provider}:${args.roles.featureReview.model}:${_cacheEffectiveReasoning}`,
+    });
+    if (_cacheKey) {
+      const hit = lookupCache(_cacheKey, slug);
+      if (hit) {
+        // Validate the cached outputFilePath through the same trust-boundary
+        // check live paths use. A poisoned cache JSON could plant a path
+        // that escapes the slug log dir. Out-of-scope paths → cache miss.
+        const validatedHitPath = validateLogPathInScope(
+          hit.outputFilePath,
+          slug,
+        );
+        if (validatedHitPath === null) {
+          console.warn(
+            `  ↻ feature-review cache entry rejected: outputFilePath ${hit.outputFilePath} is out of slug scope; treating as miss`,
+          );
+        } else {
+          console.log(
+            `  ↻ feature-review cache hit (cached PASS from ${hit.cachedAt}, iter ${hit.iteration}); skipping spawn`,
+          );
+          // Persist into featureState so featureReviewAlreadySatisfied catches
+          // it on next iteration too. Reconstruct a minimal ParsedFeatureVerdict
+          // — the caller only consumes verdict + action.
+          if (!args.featureState.featureReview) {
+            args.featureState.featureReview = {
+              iterations: 0,
+              outputLogPaths: [],
+              outputFilePaths: [],
+            };
+          }
+          const fr = args.featureState.featureReview;
+          fr.iterations += 1;
+          fr.finalVerdict = "FEATURE_PASS";
+          return {
+            verdict: {
+              verdict: "FEATURE_PASS",
+              phasesToRedo: [],
+              additionalPhasesMd: "",
+              findings: "(cached PASS — no fresh review performed)",
+            },
+            action: "ship",
+            outputFilePath: validatedHitPath,
+          };
+        }
+      }
+    }
+  }
+
+  try {
 
   // Containment-checked prior report (F2 trust-boundary defense).
   const priorRaw = args.featureState.featureReview?.outputFilePaths?.at(-1);
@@ -6096,9 +6257,19 @@ async function runFeatureReviewIteration(args: {
   // Compute feature commits + diff. Best-effort — if either git call
   // fails (no commits yet, detached HEAD, etc) we pass an empty string
   // and the prompt builder embeds a `(no commits captured)` note.
-  const branchPoint = args.featureState.branch
-    ? `${args.featureState.branch}^{tree}` // first commit on the feature branch is fine; we just need an ancestor
-    : "HEAD~10";
+  //
+  // Resolve the actual fork point via `git merge-base origin/<base> HEAD`.
+  // The legacy `branch^{tree}` pattern silently produced empty diffs when
+  // the branch hadn't moved the tree away from main, hiding real changes
+  // from the reviewer (cross-model adversarial review surfaced this).
+  // Fall back to the legacy pattern only when base detection fails (e.g.
+  // no origin/main, no origin/master) so a repo without a canonical base
+  // still gets a non-crashing review.
+  const branchPoint =
+    resolveFeatureBaseRef({ cwd: args.cwd }) ??
+    (args.featureState.branch
+      ? `${args.featureState.branch}^{tree}`
+      : "HEAD~10");
   const commitsR = spawnSync(
     "git",
     ["log", `${branchPoint}..HEAD`, "--oneline", "--no-decorate"],
@@ -6110,15 +6281,73 @@ async function runFeatureReviewIteration(args: {
     cwd: args.cwd,
     encoding: "utf8",
   });
-  // Cap to ~80KB to avoid blowing the reviewer's context window. The
-  // header explains the truncation so the reviewer knows the diff is
-  // partial.
+  // Cap to ~30KB to bound reviewer input. The header explains the
+  // truncation so the reviewer knows the diff is partial.
   let featureDiff = diffR.status === 0 ? diffR.stdout || "" : "";
-  const DIFF_CAP = 80_000;
+  const DIFF_CAP = 30_000;
   if (featureDiff.length > DIFF_CAP) {
     featureDiff =
       `[diff truncated — first ${DIFF_CAP} of ${featureDiff.length} chars shown]\n` +
       featureDiff.slice(0, DIFF_CAP);
+  }
+
+  // T8: per-phase diffs. Map phase.number → git diff <prev>..<this> (10KB
+  // cap each). Only populated when consecutive phase commits resolve via
+  // committedSha (set by T7 at every commit; cleared on REDO). When any
+  // step fails (missing sha, rev-parse fail), that phase is skipped and the
+  // reviewer falls back to the mega-diff for that delta.
+  const PHASE_DIFF_CAP = 10_000;
+  const phaseDiffs = new Map<string, string>();
+  // First phase's base is the feature's branch point (best-effort resolve).
+  // Subsequent phases' base is the previous phase's committedSha.
+  const baseR = spawnSync(
+    "git",
+    ["rev-parse", branchPoint],
+    { cwd: args.cwd, encoding: "utf8" },
+  );
+  let prevSha: string | null =
+    baseR.status === 0 ? (baseR.stdout || "").trim() || null : null;
+  for (const phaseIdx of args.feature.phaseIndexes) {
+    const ps = args.state.phases[phaseIdx];
+    const thisSha = ps?.committedSha;
+    if (!prevSha || !thisSha) {
+      // Skip — reviewer will see the unified mega-diff (fall-through path
+      // in the prompt builder when phaseDiffs ends up empty).
+      continue;
+    }
+    const phaseDiffR = spawnSync(
+      "git",
+      ["diff", `${prevSha}..${thisSha}`],
+      { cwd: args.cwd, encoding: "utf8" },
+    );
+    if (phaseDiffR.status === 0 && phaseDiffR.stdout) {
+      let body = phaseDiffR.stdout;
+      if (body.length > PHASE_DIFF_CAP) {
+        body =
+          `[per-phase diff truncated — first ${PHASE_DIFF_CAP} of ${body.length} chars shown]\n` +
+          body.slice(0, PHASE_DIFF_CAP);
+      }
+      phaseDiffs.set(ps.number, body);
+    }
+    prevSha = thisSha;
+  }
+
+  // Cross-phase summary (git diff --stat). Always cheap, useful even when
+  // per-phase didn't resolve. Cap at ~2KB defensively.
+  let featureDiffSummary = "";
+  const SUMMARY_CAP = 2_000;
+  const statR = spawnSync(
+    "git",
+    ["diff", "--stat", `${branchPoint}..HEAD`],
+    { cwd: args.cwd, encoding: "utf8" },
+  );
+  if (statR.status === 0) {
+    featureDiffSummary = statR.stdout || "";
+    if (featureDiffSummary.length > SUMMARY_CAP) {
+      featureDiffSummary =
+        `[summary truncated — first ${SUMMARY_CAP} of ${featureDiffSummary.length} chars shown]\n` +
+        featureDiffSummary.slice(0, SUMMARY_CAP);
+    }
   }
 
   const promptBody = buildFeatureReviewPrompt({
@@ -6132,10 +6361,19 @@ async function runFeatureReviewIteration(args: {
     priorReportPath,
     featureCommitsOneline,
     featureDiff,
+    phaseDiffs,
+    featureDiffSummary,
     outputFilePath,
   });
   fs.writeFileSync(inputFilePath, promptBody);
   fs.writeFileSync(outputFilePath, "");
+  _metricsPromptBytes = Buffer.byteLength(promptBody, "utf8");
+  if (!args.dryRun) {
+    _metricsFirstWriteWatcher = watchFirstWrite(
+      outputFilePath,
+      _metricsSpawnStart,
+    );
+  }
 
   const before = args.dryRun ? null : captureGitSnapshot(args.cwd);
   let parentBeforeRole: {
@@ -6171,6 +6409,13 @@ async function runFeatureReviewIteration(args: {
     // follow-up commits will give gemini/kimi/claude the same treatment.
     if (args.roles.featureReview.provider === "codex") {
       const resolved = resolveRoleTimeouts(args.roles.featureReview);
+      // Cycle 1 uses reasoning=medium; cycle 2+ uses the configured reasoning
+      // (typically high). If cycle 1 returns UNCLEAR, the retry runs with
+      // the configured reasoning. Cuts p50 latency on the happy path while
+      // preserving full-depth review on contested cases.
+      const effectiveReasoning =
+        args.iteration === 1 ? "medium" : args.roles.featureReview.reasoning;
+      _metricsEffectiveReasoning = effectiveReasoning;
       result = await runCodexFeatureReview({
         inputFilePath,
         outputFilePath,
@@ -6178,7 +6423,7 @@ async function runFeatureReviewIteration(args: {
         slug,
         phaseNumber: `feature-${args.feature.number}`,
         iteration: args.iteration,
-        reasoning: args.roles.featureReview.reasoning,
+        reasoning: effectiveReasoning,
         model: args.roles.featureReview.model,
         timeoutMs: resolved.primaryMs,
       });
@@ -6202,6 +6447,15 @@ async function runFeatureReviewIteration(args: {
     label: "feature review",
     parentWorkspace: parentBeforeRole,
   });
+  if (result.timedOut) {
+    _metricsEndedBy = "watchdog";
+  } else if (result.exitCode === 0) {
+    _metricsEndedBy = "exit0";
+  } else if (result.exitCode === null) {
+    _metricsEndedBy = "signal";
+  } else {
+    _metricsEndedBy = "exit-nonzero";
+  }
 
   // Persist iteration onto featureState.featureReview.
   if (!args.featureState.featureReview) {
@@ -6227,6 +6481,7 @@ async function runFeatureReviewIteration(args: {
     artifactRaw = result.stdout || "";
   }
   let verdict = parseFeatureReviewVerdict(artifactRaw);
+  _metricsFinalVerdict = verdict.verdict;
   // Initial finalVerdict. UNCLEAR (no `## VERDICT` sentinel) is MISSING_VERDICT
   // not TIMEOUT — the old code collapsed every non-PASS shape onto TIMEOUT,
   // which hid the prompt-contract violation behind a generic timeout label.
@@ -6240,6 +6495,10 @@ async function runFeatureReviewIteration(args: {
   if (result.timedOut) {
     const timeoutClassification = classifyFeatureReviewTimeout(artifactRaw);
     verdict = timeoutClassification.verdict;
+    _metricsFinalVerdict = verdict.verdict;
+    if (timeoutClassification.kind === "pass-evidence-timeout") {
+      _metricsPassEvidenceTimeout = true;
+    }
     if (timeoutClassification.kind === "structured-verdict") {
       fr.finalVerdict = verdict.verdict as any;
       timedOutWithStructuredVerdict = true;
@@ -6278,6 +6537,19 @@ async function runFeatureReviewIteration(args: {
   }
 
   if (verdict.verdict === "FEATURE_PASS") {
+    // T14: persist PASS to the disk cache so a future /build run with
+    // identical inputs (feature content + phase shas + plan + reviewer)
+    // can skip the spawn. Empty _cacheKey (missing committedSha or
+    // dryRun) skips the write — storeCache also no-ops on empty keys.
+    if (_cacheKey && !args.dryRun) {
+      storeCache(_cacheKey, slug, {
+        verdict: "FEATURE_PASS",
+        iteration: args.iteration,
+        outputFilePath,
+        cachedAt: new Date().toISOString(),
+        originalSlug: slug,
+      });
+    }
     return { verdict, action: "ship", outputFilePath };
   }
 
@@ -6323,6 +6595,35 @@ async function runFeatureReviewIteration(args: {
   }
 
   return { verdict, action: "unclear", outputFilePath };
+  } finally {
+    _metricsFirstWriteWatcher?.stop();
+    if (!args.dryRun) {
+      const spawnEnd = Date.now();
+      const wallMs = spawnEnd - _metricsSpawnStart;
+      const firstWriteMs = _metricsFirstWriteWatcher?.firstWriteAt() ?? null;
+      let outputBytes = 0;
+      try {
+        outputBytes = fs.statSync(outputFilePath).size;
+      } catch {
+        // file may not exist on early failure
+      }
+      writeFeatureReviewMetrics({
+        ts: new Date().toISOString(),
+        feature: String(args.feature.number),
+        cycle: args.iteration,
+        reasoning: _metricsEffectiveReasoning,
+        verdict: _metricsFinalVerdict,
+        promptBytes: _metricsPromptBytes,
+        outputBytes,
+        wallMs,
+        spawnToFirstWriteMs: firstWriteMs,
+        firstWriteToCompletionMs:
+          firstWriteMs !== null ? wallMs - firstWriteMs : null,
+        endedBy: _metricsEndedBy,
+        passEvidenceTimeout: _metricsPassEvidenceTimeout,
+      });
+    }
+  }
 }
 
 async function runPhase(args: {
@@ -6534,7 +6835,18 @@ async function runPhase(args: {
           return "failed";
         }
       }
-      phaseState = markCommitted(phaseState);
+      // T7: capture HEAD sha for per-phase diff blocks (T8). Best-effort —
+      // detached HEAD, no commits, or transient I/O leaves the field
+      // undefined; downstream consumers tolerate that.
+      const _shaR = spawnSync("git", ["rev-parse", "HEAD"], {
+        cwd,
+        encoding: "utf8",
+      });
+      const _committedSha =
+        _shaR.status === 0
+          ? (_shaR.stdout || "").trim() || undefined
+          : undefined;
+      phaseState = markCommitted(phaseState, _committedSha);
       state.phases[phase.index] = phaseState;
       state.currentPhaseIndex = phase.index + 1;
       saveState(state, { noGbrain, log: console.warn });
@@ -10655,11 +10967,57 @@ async function main() {
           //                          running, continue outer loop
           //   UNCLEAR / cap-hit    → F3 ships hard-fail; F4 adds the user
           //                          stdin prompt for a 4th cycle
+          // T11: compute git-context inputs for the broadened skip heuristic
+          // (≤2 phases + diff-size gate + alwaysReviewPaths safety). Best-
+          // effort — if any git call fails, the corresponding gate falls
+          // back to not-applicable inside shouldSkipFeatureReview.
+          let _skipDiffBytes: number | undefined = undefined;
+          let _skipChangedFiles: string[] | undefined = undefined;
+          try {
+            // Mirror runFeatureReviewIteration's branchPoint resolution.
+            // Resolve actual fork point via git merge-base; fall back to
+            // the legacy `branch^{tree}` pattern only when base detection
+            // fails. Without this, a clean small diff against a branch
+            // whose tree hash matches main would compute to an empty
+            // file set and bypass the alwaysReviewPaths safety gate.
+            const _bp =
+              resolveFeatureBaseRef({ cwd }) ??
+              (featureState.branch
+                ? `${featureState.branch}^{tree}`
+                : "HEAD~10");
+            const _filesR = spawnSync(
+              "git",
+              ["diff", "--name-only", `${_bp}..HEAD`],
+              { cwd, encoding: "utf8" },
+            );
+            if (_filesR.status === 0) {
+              _skipChangedFiles = (_filesR.stdout || "")
+                .split("\n")
+                .map((l) => l.trim())
+                .filter((l) => l.length > 0);
+            }
+            const _diffR = spawnSync(
+              "git",
+              ["diff", `${_bp}..HEAD`],
+              { cwd, encoding: "utf8" },
+            );
+            if (_diffR.status === 0) {
+              _skipDiffBytes = Buffer.byteLength(_diffR.stdout || "", "utf8");
+            }
+          } catch {
+            // Best-effort; leave inputs undefined.
+          }
           const skipReview =
             args.skipFeatureReview ||
             resumeAfterLanding ||
             featureReviewAlreadySatisfied(featureState) ||
-            shouldSkipFeatureReview(featureDef, state.phases);
+            shouldSkipFeatureReview({
+              feature: featureDef,
+              phaseStates: state.phases,
+              diffBytes: _skipDiffBytes,
+              changedFiles: _skipChangedFiles,
+              alwaysReviewPaths: BUILD_DEFAULTS.alwaysReviewPaths,
+            });
           if (
             !args.skipFeatureReview &&
             !resumeAfterLanding &&
@@ -11042,11 +11400,112 @@ async function main() {
               outcome: "running",
               pauseState: "running",
             });
+            // Pre-merge verifier (T12). Audits the feature against its
+            // acceptance criteria BEFORE ship. On GAPS verdict, abort the
+            // ship trigger and pause the feature so the user can resolve
+            // before retrying. Skipped in --dry-run (the wrapping `if`
+            // already excludes dry-run) and under --skip-pre-merge-verify.
+            // UNCLEAR verdicts (e.g. base-branch undetectable, subprocess
+            // failed, output missing sentinel) are best-effort: warn and
+            // proceed — verifier is a quality gate, not a hard prerequisite.
+            if (
+              !args.skipPreMergeVerify &&
+              args.roles.featureVerifier
+            ) {
+              console.log(
+                `\n▶ Feature ${featureState.number} pre-merge verify (${roleLabel(args.roles.featureVerifier)})`,
+              );
+              const verifierResult = await runFeatureVerifier({
+                feature: featureDef,
+                featureState,
+                planFile: args.planFile,
+                cwd,
+                slug: `${slug}-feature-${featureState.number}`,
+                role: args.roles.featureVerifier,
+                dryRun: args.dryRun,
+                dispatcher: (opts) => runRoleTask(opts),
+              });
+              if (verifierResult.verdict === "GAPS") {
+                featureState.status = "paused";
+                const gapsList =
+                  verifierResult.gaps.length > 0
+                    ? verifierResult.gaps.map((g) => `- ${g}`).join("\n")
+                    : "- (verifier reported GAPS but listed no specific gap)";
+                featureState.error = `pre-merge verifier reported GAPS:\n${gapsList}\nFull report: ${verifierResult.outputFilePath}`;
+                state.failureReason = `Feature ${featureState.number}: pre-merge verifier GAPS (see ${verifierResult.outputFilePath})`;
+                saveState(state, {
+                  noGbrain: args.noGbrain,
+                  log: console.warn,
+                });
+                console.error(
+                  `✗ Feature ${featureState.number}: pre-merge verifier GAPS`,
+                );
+                console.error(gapsList);
+                console.error(
+                  `  Full report: ${verifierResult.outputFilePath}`,
+                );
+                exitCode = 1;
+                break;
+              }
+              if (verifierResult.verdict === "UNCLEAR") {
+                if (args.strictPreMergeVerify) {
+                  // Strict mode: UNCLEAR halts ship. Use this when codex
+                  // misconfigurations or subprocess failures must NOT slip
+                  // an unaudited feature past the gate.
+                  featureState.status = "paused";
+                  featureState.error = `pre-merge verifier returned UNCLEAR (${verifierResult.reason ?? "no reason"}); strict mode halted ship. Full report: ${verifierResult.outputFilePath}`;
+                  state.failureReason = `Feature ${featureState.number}: pre-merge verifier UNCLEAR in strict mode (see ${verifierResult.outputFilePath})`;
+                  saveState(state, {
+                    noGbrain: args.noGbrain,
+                    log: console.warn,
+                  });
+                  console.error(
+                    `✗ Feature ${featureState.number}: pre-merge verifier UNCLEAR (--strict-pre-merge-verify)`,
+                  );
+                  console.error(
+                    `  Reason: ${verifierResult.reason ?? "no reason given"}`,
+                  );
+                  console.error(
+                    `  Full report: ${verifierResult.outputFilePath}`,
+                  );
+                  console.error(
+                    `  To proceed anyway, drop --strict-pre-merge-verify or use --skip-pre-merge-verify.`,
+                  );
+                  exitCode = 1;
+                  break;
+                }
+                console.warn(
+                  `  → pre-merge verify returned UNCLEAR (${verifierResult.reason ?? "no reason"}); proceeding. See ${verifierResult.outputFilePath}`,
+                );
+                console.warn(
+                  `    (Use --strict-pre-merge-verify to halt on UNCLEAR.)`,
+                );
+              } else {
+                console.log(`  → pre-merge verify PASS`);
+              }
+            }
+
             console.log(
               args.releaseMode === "queued"
                 ? `\n▶ Feature ${featureState.number} complete. Running /ship and queueing PR for release daemon.`
                 : `\n▶ Feature ${featureState.number} complete. Running /ship + /land-and-deploy.`,
             );
+            // T13 post-merge tree-hash audit. Capture the feature branch's
+            // HEAD tree BEFORE ship+land. After the merge lands (auto-land
+            // mode only — queued mode merges async via release-daemon, so
+            // the audit runs in SKILL.md.tmpl instead), compare the pre-tree
+            // against the merge-commit tree. When they differ, the squash
+            // resolved a conflict in a way that mutated landed behavior —
+            // exactly the case pre-merge verify cannot catch.
+            let _preMergeTree: string | null = null;
+            if (args.releaseMode === "auto-land") {
+              const _ptR = spawnSync("git", ["rev-parse", "HEAD^{tree}"], {
+                cwd,
+                encoding: "utf8",
+              });
+              _preMergeTree =
+                _ptR.status === 0 ? (_ptR.stdout || "").trim() || null : null;
+            }
             const result =
               args.releaseMode === "queued"
                 ? await shipOnly({
@@ -11179,6 +11638,51 @@ async function main() {
               saveState(state, { noGbrain: args.noGbrain, log: console.warn });
               exitCode = 1;
               break;
+            }
+            // T13 post-merge tree-hash audit (auto-land only; queued
+            // mode's merge is async and audited via SKILL.md.tmpl).
+            // Non-blocking: surface the delta to the user; never gate.
+            if (args.releaseMode === "auto-land" && _preMergeTree) {
+              try {
+                const _bbDetect = detectBaseBranch({ cwd });
+                const _postBaseRef = _bbDetect.baseBranch
+                  ? `origin/${_bbDetect.baseBranch}`
+                  : "HEAD"; // fallback: current HEAD's tree
+                const _postR = spawnSync(
+                  "git",
+                  ["rev-parse", `${_postBaseRef}^{tree}`],
+                  { cwd, encoding: "utf8" },
+                );
+                const _postTree =
+                  _postR.status === 0
+                    ? (_postR.stdout || "").trim() || null
+                    : null;
+                const _audit = comparePostMergeTrees(_preMergeTree, _postTree);
+                if (_audit.verdict === "DELTA_DETECTED") {
+                  console.warn(
+                    `  ⚠ POST_MERGE_AUDIT: DELTA_DETECTED — squash mutated landed tree`,
+                  );
+                  console.warn(`    pre:  ${_audit.preTree}`);
+                  console.warn(`    post: ${_audit.postTree}`);
+                  console.warn(
+                    `    Inspect with: git diff ${_audit.preTree} ${_audit.postTree}`,
+                  );
+                } else if (_audit.verdict === "NO_DELTA") {
+                  console.log(
+                    `  ✓ POST_MERGE_AUDIT: NO_DELTA — landed tree matches feature branch`,
+                  );
+                } else if (process.env.GSTACK_BUILD_DEBUG) {
+                  console.log(
+                    `  · POST_MERGE_AUDIT: SKIPPED (${_audit.reason ?? "unknown"})`,
+                  );
+                }
+              } catch (err) {
+                if (process.env.GSTACK_BUILD_DEBUG) {
+                  console.warn(
+                    `  · POST_MERGE_AUDIT: error during audit — ${err instanceof Error ? err.message : String(err)}`,
+                  );
+                }
+              }
             }
             featureState.shippedAt =
               featureState.shippedAt ?? new Date().toISOString();
@@ -11429,6 +11933,14 @@ async function main() {
       } while (exitCode === 0 && rerunAutonomousLoop);
 
       if (exitCode === 0 && args.singleBranch && !args.dryRun) {
+        // T12 pre-merge gate note (--single-branch mode): the per-feature
+        // runFeatureVerifier call lives in the !singleBranch ship-trigger
+        // path. For single-branch mode, the plan-level finalOriginCheck
+        // (verifyOriginPlanFeature) earlier in this block serves the same
+        // role — it audits the FULL plan against landed code before /ship.
+        // Per-feature featureVerifier is intentionally NOT invoked here:
+        // running it on a synthetic "plan" feature would conflict with
+        // finalOriginCheck and double-spend codex budget.
         console.log(
           args.releaseMode === "queued"
             ? "\n▶ Plan complete. Running /ship and queueing PR for release daemon."

@@ -1,7 +1,7 @@
 ---
 name: build
 preamble-tier: 4
-version: 1.27.1
+version: 1.28.0
 description: |
   gstack autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -1897,6 +1897,15 @@ Release daemon lifecycle:
 
 2. **Feature Verification (configured subagent)**: After shipping, delegate origin-plan coverage check to a fresh configured `featureVerifier` subagent — the main agent never re-reads the full source plan.
 
+   > **Note (T12, v1.27+):** The orchestrator CLI now runs `featureVerifier`
+   > automatically BEFORE `/ship` triggers (pre-merge gate). On a GAPS
+   > verdict, the ship trigger aborts and the feature is paused with the
+   > gap list surfaced to stderr. The post-ship verification below remains
+   > as a fallback / second pass for flows that bypass the CLI's pre-merge
+   > gate (e.g., `--skip-pre-merge-verify` was set, or the agent invoked
+   > `/ship` directly without the CLI). For the default flow, this section
+   > is informational — the pre-merge gate has already run.
+
    Resolve the landed base ref from the target repo before writing verifier input:
    ```bash
    _VERIFY_BASE_REF=$(cd "$repoPath" && git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
@@ -1961,6 +1970,32 @@ Release daemon lifecycle:
    ```
 
    Read `$BUILD_TMP_DIR/build-verify-feature-<N>-output.md`. If `VERIFICATION: GAPS`, record the issues in the living plan and restart that feature's implementation loop.
+
+2.5. **Post-Merge Tree-Hash Audit (T13)**: After the merge has landed (queued mode: release-daemon has merged the PR; auto-land mode: `/land-and-deploy` returned), compare the feature branch HEAD tree against the squash-merge commit tree. When they differ, the squash resolved a conflict in a way that mutated behavior — exactly the case the pre-merge verifier could not catch.
+
+   ```bash
+   # Resolve the merge commit SHA via gh
+   _MERGE_COMMIT=$(gh pr view "$_PR_NUMBER" --json mergeCommit -q '.mergeCommit.oid' 2>/dev/null || echo "")
+   if [ -z "$_MERGE_COMMIT" ]; then
+     echo "POST_MERGE_AUDIT: SKIPPED — could not resolve merge commit for PR #$_PR_NUMBER" >&2
+   else
+     _PRE_TREE=$(git -C "$repoPath" rev-parse "$_FEATURE_BRANCH^{tree}" 2>/dev/null || echo "")
+     _POST_TREE=$(git -C "$repoPath" rev-parse "${_MERGE_COMMIT}^{tree}" 2>/dev/null || echo "")
+     if [ -z "$_PRE_TREE" ] || [ -z "$_POST_TREE" ]; then
+       echo "POST_MERGE_AUDIT: SKIPPED — pre=$_PRE_TREE post=$_POST_TREE" >&2
+     elif [ "$_PRE_TREE" = "$_POST_TREE" ]; then
+       echo "POST_MERGE_AUDIT: NO_DELTA — landed tree matches feature branch"
+     else
+       echo "POST_MERGE_AUDIT: DELTA_DETECTED — squash mutated tree" >&2
+       echo "  pre:  $_PRE_TREE" >&2
+       echo "  post: $_POST_TREE" >&2
+       echo "  Inspecting diff:" >&2
+       git -C "$repoPath" diff "$_PRE_TREE" "$_POST_TREE" 2>&1 | head -200 >&2
+     fi
+   fi
+   ```
+
+   Non-blocking: this is an audit signal, not a gate. The merge has already happened. If DELTA_DETECTED, surface to the user — they may want to inspect the squash resolution.
 
 3. **Feature Guardrail Verification**: After ship + land-and-deploy, run the guardrail script. The feature branch name is the branch the CLI created for this feature — extract it from the CLI state file or monitoring logs before this step, and store as `_FEATURE_BRANCH`:
    ```bash
@@ -2084,7 +2119,7 @@ After ALL features are complete:
 - **Bias for action**: Keep the loop going. Do not write meta-commentary.
 - **Strict adherence**: Stick to the plan. Do not expand scope unless strictly necessary to make the code compile. STOP and report the error if a file or command is missing — do NOT guess.
 - **Fail forward**: If a subagent fails, try once more. Escalate to the user only after two failed attempts.
-- **Model Routing Discipline**: Use the role config from `build/configure.cm` plus CLI/env overrides. Defaults are data, not prose; check the config file before naming a model or provider. Note: `planSynthesizer` and `featureVerifier` are template-only roles consumed by jq — they are intentionally absent from the CLI's `ROLE_DEFINITIONS` and require no CLI flags or env vars.
+- **Model Routing Discipline**: Use the role config from `build/configure.cm` plus CLI/env overrides. Defaults are data, not prose; check the config file before naming a model or provider. Note: `planSynthesizer` is a template-only role consumed by jq — it is intentionally absent from the CLI's `ROLE_DEFINITIONS` and requires no CLI flags or env vars. As of T12 (v1.27+), `featureVerifier` IS in the CLI's `ROLE_DEFINITIONS` and runs as a pre-merge gate before each `/ship` trigger. Override via `GSTACK_BUILD_FEATURE_VERIFIER_*` env vars; bypass with `--skip-pre-merge-verify`.
 
 ## Role Configuration Fallbacks
 

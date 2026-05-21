@@ -2283,3 +2283,111 @@ known failure modes.
 **Depends on / blocked by:** v1.40.1.0 (the `--test-framework` flag and
 `Framework` type union must exist before the plan-file block has anything
 to feed). Already shipped.
+
+
+## feature-review optimisation follow-ups (build skill v1.28.0)
+
+### P2: Run the streaming spike to decide if verdict-tail / acceptedEarlyExit is worth building
+
+**What:** Phase 0 metrics capture `spawnToFirstWriteMs` and
+`firstWriteToCompletionMs` for every featureReview spawn (T1, commit
+`ab107504`). Run `/build` on 2-3 real plans, then read
+`~/.gstack/analytics/feature-review-metrics.jsonl` and decide whether
+codex writes its output file incrementally (the T3 spike). If
+`firstWriteToCompletionMs` p50 >= 60s on PASS verdicts, build the
+tail-watcher (T5) + `acceptedEarlyExit` flag (T4) to short-circuit codex
+once `## VERDICT\nFEATURE_PASS` lands. If p50 < 30s, the machinery would
+save nothing — close as won't-ship.
+
+**Why:** The plan deferred T3-T5 explicitly because they hinge on
+empirical data this branch's instrumentation finally produces.
+
+**Effort:** Spike + decision ~1h human. T5 if proceed: 6h human / 1h CC.
+
+**Priority:** P2
+
+### P2: Pre-existing skill-md drift tests
+
+**What:** 15 tests in `build/orchestrator/__tests__/skill-md.test.ts`
+fail because they assert specific historical strings in SKILL.md that
+have drifted as the docs evolved. Red on every /ship run for weeks
+(including on bare main).
+
+**Why:** Pollutes signal. Every /ship triage step has to skip these.
+A future regression in a real path would be drowned out.
+
+**Effort:** ~2h human / ~30min CC.
+
+**Priority:** P2
+
+### P3: Run paid evals T15/T16 to validate cycle-1 reasoning=medium quality
+
+**What:** Two paid eval tests defined in the plan but deferred —
+`test/skill-e2e-feature-review-verdict-first.test.ts` and
+`test/skill-e2e-feature-review-reasoning-medium.test.ts`. Confirms codex
+still emits parseable verdicts under T2's reordered prompt AND that
+cycle-1 reasoning=medium doesn't blow the UNCLEAR rate past baseline +
+10pp.
+
+**Why:** T9's ship rule says "revert cycle-1 override if medium's UNCLEAR
+rate exceeds baseline + 10pp." Without the eval we can't measure.
+
+**Effort:** ~2h human / ~20min CC each, ~$10-30 each in codex spend.
+
+**Priority:** P3
+
+### P3: Cache pruning helper for ~/.gstack/projects/{slug}/feature-review-cache/
+
+**What:** T14's verdict cache writes one JSON per unique feature input
+hash. Over time the directory accumulates dead entries (old plan bodies,
+old feature SHAs). Add a pruning helper: drop entries older than 90 days
+OR beyond a count cap.
+
+**Effort:** ~2h human / ~20min CC.
+
+**Priority:** P3
+
+### P3: Parallelize featureVerifier and /ship pre-merge prep
+
+**What:** Pre-merge featureVerifier (T12) runs to completion BEFORE
+`shipOnly`/`shipAndDeploy`. A `--parallel-verify` flag could run verifier
+and /ship pre-merge prep concurrently, shaving ~1-2 min off the happy
+path.
+
+**Cons:** Signal coordination, error aggregation, partial-failure
+rollback.
+
+**Effort:** ~4h human / ~1h CC.
+
+**Priority:** P3
+
+### P3: Extend cycle-1 reasoning=medium fast-pass to gemini/kimi/claude providers
+
+**What:** T9's cycle-1 reasoning=medium override only fires when
+`args.roles.featureReview.provider === "codex"`. Replicate after T15/T16
+confirm codex behaves well at medium.
+
+**Effort:** ~3h human / ~30min CC.
+
+**Priority:** P3
+
+### P3: Tighten globToRegExp in shouldSkipFeatureReview to path-segment boundaries
+
+**What:** The mini glob compiler in `feature-review.ts:globToRegExp`
+treats `**/foo` as `^.*foo$`, which matches `xfoo` and `bar/yfoo`.
+Default `alwaysReviewPaths` is safe today. Future entries like
+`**/admin` would unexpectedly match `super-admin-but-not-really.ts`.
+
+**Effort:** ~1h human / ~15min CC.
+
+**Priority:** P3
+
+### P3: Phase artifact registry (refactor PhaseState ad-hoc fields)
+
+**What:** T7 added `committedSha?: string` to PhaseState. If a third
+consumer of phase metadata appears, extract a typed `PhaseArtifact`
+registry. Dormant — track so it doesn't accumulate silently.
+
+**Effort:** When a third consumer arrives.
+
+**Priority:** P3 (dormant)

@@ -37,6 +37,14 @@ export interface BuildDefaults {
   roles: RoleConfigs;
   limits: BuildLimits;
   timeoutsMs: BuildTimeoutsMs;
+  /**
+   * Glob patterns for files that always warrant a feature-review even when
+   * the size/iter skip heuristic would otherwise skip. Defense against the
+   * case where a small, clean diff happens to weaken a security control.
+   * When undefined or empty, no file-path safety gate is applied.
+   * See shouldSkipFeatureReview in feature-review.ts (T11).
+   */
+  alwaysReviewPaths: string[];
 }
 
 export const DEFAULT_BUILD_CONFIG_FILE = path.join(
@@ -57,6 +65,7 @@ const ROLE_KEYS: RoleKey[] = [
   "land",
   "judge",
   "featureReview",
+  "featureVerifier",
   "monitorAgent",
   "planReviewer",
 ];
@@ -118,8 +127,59 @@ export function loadBuildDefaults(
     ],
     `${filePath}:timeoutsMs`,
   ) as unknown as BuildTimeoutsMs;
+  const alwaysReviewPaths = validateAlwaysReviewPaths(
+    withMigratedAlwaysReviewPaths(
+      (config as unknown as { alwaysReviewPaths?: unknown }).alwaysReviewPaths,
+      filePath,
+    ),
+    `${filePath}:alwaysReviewPaths`,
+  );
 
-  return { roles, limits, timeoutsMs };
+  return { roles, limits, timeoutsMs, alwaysReviewPaths };
+}
+
+/**
+ * Backfill alwaysReviewPaths when missing from an older user-edited
+ * configure.cm. Pulls from the in-tree default; if loading the default
+ * file itself, leave as-is so a missing/invalid value still surfaces.
+ */
+function withMigratedAlwaysReviewPaths(
+  value: unknown,
+  filePath: string,
+): unknown {
+  if (value !== undefined) return value;
+  const isLoadingDefault =
+    path.resolve(filePath) === path.resolve(DEFAULT_BUILD_CONFIG_FILE);
+  if (isLoadingDefault) return value;
+  try {
+    const parsed = JSON.parse(
+      fs.readFileSync(DEFAULT_BUILD_CONFIG_FILE, "utf8"),
+    ) as { alwaysReviewPaths?: unknown };
+    return parsed.alwaysReviewPaths;
+  } catch {
+    return value;
+  }
+}
+
+function validateAlwaysReviewPaths(value: unknown, label: string): string[] {
+  // Treat missing as empty array (safety gate disabled) rather than throwing.
+  // The default file always defines it, so this only matters for older
+  // user-edited configs where the migration also didn't find a default.
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new Error(`${label} must be an array of strings when present`);
+  }
+  const out: string[] = [];
+  for (let i = 0; i < value.length; i += 1) {
+    const item = value[i];
+    if (typeof item !== "string" || item.length === 0) {
+      throw new Error(
+        `${label}[${i}] must be a non-empty string glob pattern`,
+      );
+    }
+    out.push(item);
+  }
+  return out;
 }
 
 function withMigratedRoles(value: unknown, filePath: string): unknown {
@@ -135,6 +195,7 @@ function withMigratedRoles(value: unknown, filePath: string): unknown {
   delete roles.contextSave;
   for (const key of [
     "featureReview",
+    "featureVerifier",
     "monitorAgent",
     "planReviewer",
   ] as const) {
