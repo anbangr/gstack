@@ -29,6 +29,15 @@ import type {
   LearnedMatcherKind,
 } from "./skill-fault-detector";
 
+// Provider-halt kinds that the matcher pipeline recognises.
+const PROVIDER_HALT_KINDS = [
+  "PROVIDER_TIMEOUT",
+  "PROVIDER_QUOTA_EXHAUSTED",
+  "PROVIDER_OVERLOADED",
+  "PROVIDER_TRANSPORT_ERROR",
+  "PROVIDER_AUTH_REQUIRED",
+] as const;
+
 export interface PendingProposal {
   /** ISO 8601 timestamp the investigator queued the proposal. */
   ts?: string;

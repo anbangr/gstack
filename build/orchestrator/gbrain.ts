@@ -103,3 +103,11 @@ export function stripFrontmatter(content: string): string {
   // Everything after the closing fence + newline is the body.
   return after.slice(closeIdx + 5).replace(/^\s*\n/, '');
 }
+
+/**
+ * Map a HaltEvent kind to the kebab-case category name used in gbrain.
+ * E.g. "PROVIDER_TRANSPORT_ERROR" → "provider-transport-error".
+ */
+export function mapHaltKindToGbrainCategory(kind: string): string {
+  return kind.toLowerCase().replace(/_/g, '-');
+}

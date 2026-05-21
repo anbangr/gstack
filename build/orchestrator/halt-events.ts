@@ -17,7 +17,12 @@ export type HaltEventKind =
   | "PHASE_REWIND"
   | "SOFT_HALT_WARN"
   | "SOFT_HALT_ERROR"
-  | "STALL_KILLED";
+  | "STALL_KILLED"
+  | "PROVIDER_TIMEOUT"
+  | "PROVIDER_QUOTA_EXHAUSTED"
+  | "PROVIDER_OVERLOADED"
+  | "PROVIDER_TRANSPORT_ERROR"
+  | "PROVIDER_AUTH_REQUIRED";
 
 export type HaltSeverity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
 
@@ -67,6 +72,11 @@ export function severityFor(kind: HaltEventKind): HaltSeverity {
     case "MANUAL_RECOVERY_INVOKED":
     case "SILENT_STATE_MUTATION":
     case "STALL_KILLED":
+    case "PROVIDER_TIMEOUT":
+    case "PROVIDER_QUOTA_EXHAUSTED":
+    case "PROVIDER_OVERLOADED":
+    case "PROVIDER_TRANSPORT_ERROR":
+    case "PROVIDER_AUTH_REQUIRED":
       return "HIGH";
     case "PHASE_REWIND":
     case "DUAL_IMPL_SWAP":
