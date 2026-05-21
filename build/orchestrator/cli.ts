@@ -9682,6 +9682,13 @@ async function main() {
   console.log(`Plan: ${args.planFile}`);
   console.log(`Features parsed: ${features.length}`);
   console.log(`Phases parsed: ${phases.length}`);
+  // Surface the feature-review cap so the operator's mental model matches
+  // reality. The same-shape repeat detector halts earlier in practice
+  // (after 2 identical failures), so this is the upper bound on truly
+  // novel reviewer iterations.
+  console.log(
+    `Feature-review cap: ${args.featureReviewMaxIter} iterations per feature (halts earlier on same-shape repeats)`,
+  );
   console.log("");
   printPhaseTable(phases);
 
