@@ -292,7 +292,7 @@ function pickProviderForBin(bin: string): Provider {
  * window, not a wall-clock budget. A sub-agent that keeps emitting tool-use
  * or status lines runs as long as it needs.
  */
-function spawnCaptured(args: {
+export function spawnCaptured(args: {
   bin: string;
   argv: string[];
   cwd?: string;
@@ -309,6 +309,38 @@ function spawnCaptured(args: {
     let stderrBuf = "";
     let stdoutBytes = 0;
     let stderrBytes = 0;
+    // Live log streaming: open the log file when the child spawns so callers
+    // can `tail -f` it instead of waiting for child close to see anything.
+    // Pre-streaming, finish() did a single fs.writeFileSync at the end, which
+    // is why /ship-driven e2e runs appeared frozen for 10+ min while the
+    // Kimi subagent produced 100MB+ of stdout that nobody could see.
+    let ws: fs.WriteStream | null = null;
+    let loggedStreamError = false;
+    try {
+      ws = fs.createWriteStream(args.logPath);
+      ws.on("error", (err) => {
+        loggedStreamError = true;
+        console.warn(
+          `[spawn] log writer error for ${args.logPath}: ${err.message}; ` +
+            `continuing without log streaming`,
+        );
+      });
+      // Header at TOP (preserves existing log-format contract — downstream
+      // tooling that greps `# command:` from the head of the file still works).
+      // Final result metadata (duration, exit, byte counts) lands in finish()
+      // via ws.end(footer) — single fd, no separate appendFileSync race.
+      ws.write(
+        `# command: ${args.bin} ${args.argv.map(quote).join(" ")}\n` +
+          `# cwd: ${args.cwd || process.cwd()}\n` +
+          `# started: ${new Date(startedAt).toISOString()}\n` +
+          `\n# ---- live output ----\n`,
+      );
+    } catch {
+      // createWriteStream sync-throws on extreme cases (e.g. logPath dir
+      // doesn't exist). finish() detects ws === null and skips ws.end().
+      loggedStreamError = true;
+      ws = null;
+    }
 
     // Use spawn (not execFile) for two reasons:
     //   1. We need real-time stream events for the StallWatchdog. execFile
@@ -333,15 +365,40 @@ function spawnCaptured(args: {
       return buf;
     };
 
+    // Channel-prefixed live write with backpressure. stdout chunks get
+    // `[OUT] ` per line, stderr chunks get `[ERR] `. Preserves chronological
+    // interleave (which is what users see in a terminal) while still letting
+    // downstream tooling grep by channel.
+    function writeChannel(channel: "OUT" | "ERR", text: string): void {
+      if (!ws) return;
+      // Split on newline-terminated chunks so every line gets a fresh prefix.
+      // The lookbehind keeps the trailing \n attached to the previous slice
+      // (no trailing empty entries), and partial lines (no \n yet) still get
+      // a prefix prepended so they're visible on tail -f even mid-chunk.
+      const prefixed = text
+        .split(/(?<=\n)/)
+        .map((line) => (line.length ? `[${channel}] ${line}` : line))
+        .join("");
+      const ok = ws.write(prefixed);
+      if (!ok) {
+        // Honor backpressure so a 5MB+ e2e dump can't blow memory.
+        const src = channel === "OUT" ? child.stdout : child.stderr;
+        src?.pause();
+        ws.once("drain", () => src?.resume());
+      }
+    }
+
     child.stdout?.on("data", (chunk: Buffer | string) => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       stdoutBytes += text.length;
       stdoutBuf = truncate(stdoutBuf + text);
+      writeChannel("OUT", text);
     });
     child.stderr?.on("data", (chunk: Buffer | string) => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       stderrBytes += text.length;
       stderrBuf = truncate(stderrBuf + text);
+      writeChannel("ERR", text);
     });
 
     // Watchdog mode: env-var opt-in for CPU-time liveness probing. Stream
@@ -391,23 +448,49 @@ function spawnCaptured(args: {
       // as a non-timeout failure.
       const timedOut = stallKilled;
 
-      try {
-        fs.writeFileSync(
-          args.logPath,
-          `# command: ${args.bin} ${args.argv.map(quote).join(" ")}\n` +
-            `# cwd: ${args.cwd || process.cwd()}\n` +
-            `# started: ${new Date(startedAt).toISOString()}\n` +
-            `# duration_ms: ${Date.now() - startedAt}\n` +
-            `# timed_out: ${timedOut}\n` +
-            `# stall_killed: ${stallKilled}\n` +
-            `# stall_silence_ms: ${stallSilenceMs}\n` +
-            `# exit: ${exitCode ?? signal ?? "unknown"}\n` +
-            `# stdout_bytes: ${stdoutBytes}\n` +
-            `# stderr_bytes: ${stderrBytes}\n` +
-            `\n# ---- stdout ----\n${stdoutBuf}\n# ---- stderr ----\n${stderrBuf}\n`,
-        );
-      } catch {
-        // Log file write failures shouldn't sink the orchestrator.
+      // Footer goes through the SAME fd as the streamed body. Calling
+      // ws.end(footerBytes) on a stream that already wrote the header and
+      // body is race-free, unlike the pre-streaming model that did a single
+      // fs.writeFileSync on close. If we ever opened a separate fd with
+      // appendFileSync after ws.end(), buffered ws writes could land AFTER
+      // the appended footer and corrupt the log.
+      const footer =
+        (loggedStreamError
+          ? `\n# WARNING: log writer hit error; body may be truncated\n`
+          : "") +
+        `\n# ---- result ----\n` +
+        `# duration_ms: ${Date.now() - startedAt}\n` +
+        `# timed_out: ${timedOut}\n` +
+        `# stall_killed: ${stallKilled}\n` +
+        `# stall_silence_ms: ${stallSilenceMs}\n` +
+        `# exit: ${exitCode ?? signal ?? "unknown"}\n` +
+        `# stdout_bytes: ${stdoutBytes}\n` +
+        `# stderr_bytes: ${stderrBytes}\n`;
+
+      if (ws) {
+        try {
+          ws.end(footer);
+        } catch {
+          // ws already in error state. The console.warn above already
+          // surfaced the underlying cause; no further action.
+        }
+      } else {
+        // No live stream (createWriteStream sync-threw at spawn time). Fall
+        // back to a single best-effort write so the log file at least exists.
+        try {
+          fs.writeFileSync(
+            args.logPath,
+            `# command: ${args.bin} ${args.argv.map(quote).join(" ")}\n` +
+              `# cwd: ${args.cwd || process.cwd()}\n` +
+              `# started: ${new Date(startedAt).toISOString()}\n` +
+              `# WARNING: live log stream unavailable\n` +
+              footer +
+              `\n# ---- stdout (post-mortem) ----\n${stdoutBuf}\n` +
+              `# ---- stderr (post-mortem) ----\n${stderrBuf}\n`,
+          );
+        } catch {
+          // Log file write failures shouldn't sink the orchestrator.
+        }
       }
 
       resolve({
