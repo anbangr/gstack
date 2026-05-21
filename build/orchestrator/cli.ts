@@ -3498,15 +3498,24 @@ export function ensureFeatureBranch(args: {
   // implementor-hygiene-hardening build after a broken
   // `refs/remotes/origin/main 2` macOS Finder dupe made `git fetch origin
   // main` fail).
+  const q = quarantineMalformedRefs(args.cwd);
+  if (q.quarantined > 0) {
+    console.log(`[sync] quarantined ${q.quarantined} malformed ref(s)`);
+  }
+
   const fetchBase = spawnSync("git", ["fetch", "origin", base], {
     cwd: args.cwd,
     encoding: "utf8",
   });
   if (fetchBase.status !== 0) {
+    const fetchErr = fetchBase.stderr || fetchBase.stdout || "";
+    const renderedErr = isCorruptRepoError(fetchErr)
+      ? corruptRepoResult(fetchErr).error
+      : fetchErr;
     markFeatureFailed(
       args.state,
       args.feature.index,
-      `failed to fetch origin/${base} before feature branch: ${fetchBase.stderr || fetchBase.stdout}`,
+      `failed to fetch origin/${base} before feature branch: ${renderedErr}`,
       helperCtxFor(args.state),
     );
     saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
@@ -3616,40 +3625,29 @@ export function quarantineMalformedRefs(cwd: string): {
   }
 
   // Determine which refs are malformed.
-  const malformed = new Set<string>();
-  const sanitizedNames = new Map<string, string[]>();
+  const malformed: string[] = [];
   for (const ref of refs) {
     const checkResult = spawnSync("git", ["check-ref-format", ref], {
       cwd,
       encoding: "utf8",
     });
-    // Strip the refs/heads/ or refs/remotes/ prefix for the filesystem name.
-    const shortRef = ref.replace(/^refs\/(heads\/|remotes\/)/, "");
-    const sanitized = shortRef.replace(/[^A-Za-z0-9._-]/g, "-");
-    const list = sanitizedNames.get(sanitized) ?? [];
-    list.push(ref);
-    sanitizedNames.set(sanitized, list);
-
     if (checkResult.status !== 0) {
-      malformed.add(ref);
-    }
-  }
-
-  // Collect every ref whose sanitized name collides with a malformed ref.
-  const toQuarantine = new Set<string>();
-  for (const badRef of malformed) {
-    const shortRef = badRef.replace(/^refs\/(heads\/|remotes\/)/, "");
-    const sanitized = shortRef.replace(/[^A-Za-z0-9._-]/g, "-");
-    for (const r of sanitizedNames.get(sanitized) ?? []) {
-      toQuarantine.add(r);
+      malformed.push(ref);
     }
   }
 
   let quarantined = 0;
   const quarantineDir = path.join(gitDir, "quarantine");
   const usedNames = new Set<string>();
+  if (fs.existsSync(quarantineDir)) {
+    for (const entry of fs.readdirSync(quarantineDir)) {
+      if (entry.endsWith(".ref") || entry.endsWith(".json")) {
+        usedNames.add(entry.replace(/\.(ref|json)$/, ""));
+      }
+    }
+  }
 
-  for (const ref of toQuarantine) {
+  for (const ref of malformed) {
     // Resolve SHA (may be missing in an already-corrupt repo).
     // git rev-parse often fails for broken ref names, so fall back to reading
     // the loose-ref file directly.
@@ -3660,7 +3658,10 @@ export function quarantineMalformedRefs(cwd: string): {
       cwd,
       encoding: "utf8",
     });
-    if (shaResult.status === 0) {
+    if (
+      shaResult.status === 0 &&
+      /^[0-9a-f]{40}$/i.test(shaResult.stdout.trim())
+    ) {
       originalSha = shaResult.stdout.trim();
     } else if (fs.existsSync(looseRefPath)) {
       const content = fs.readFileSync(looseRefPath, "utf8").trim();
@@ -3686,11 +3687,6 @@ export function quarantineMalformedRefs(cwd: string): {
 
     const sourceRefPath = path.join(gitDir, "refs", refRelPath);
 
-    if (fs.existsSync(sourceRefPath)) {
-      fs.copyFileSync(sourceRefPath, refFile);
-      fs.unlinkSync(sourceRefPath);
-    }
-
     const effectiveSha = originalSha ?? "0000000000000000000000000000000000000000";
     const isNullSha = /^0{40}$/i.test(effectiveSha);
     const quotedRef = ref.replace(/'/g, "'\\''");
@@ -3707,6 +3703,15 @@ export function quarantineMalformedRefs(cwd: string): {
       recoveryCommand,
     };
     fs.writeFileSync(sidecarFile, JSON.stringify(sidecar, null, 2) + "\n");
+
+    if (fs.existsSync(sourceRefPath)) {
+      try {
+        fs.renameSync(sourceRefPath, refFile);
+      } catch (err) {
+        fs.rmSync(sidecarFile, { force: true });
+        throw err;
+      }
+    }
 
     console.log(`[quarantine] moved invalid ref ${ref} to ${refFile}`);
     console.log(`[quarantine] recovery: ${sidecar.recoveryCommand}`);
