@@ -1,5 +1,79 @@
 # TODOS
 
+## Build Orchestrator (follow-ups from streaming-log + race-fix landing)
+
+### Surface child log path in monitor / halt-event snapshots (T-MON)
+
+**What:** When `spawnCaptured` opens its live log stream, also log a single
+`[spawn] log: <path>` line, and include `logPath` in every halt-event snapshot
+emitted from a sub-agent context.
+
+**Why:** The streaming-log fix makes `ship.log` (and every other child log)
+grow in real time, but the orchestrator's `stdoutLog` is what the monitor and
+halt-event investigators tail. They currently don't know about the child log
+unless they parse the per-slug build-state directory layout. Surfacing the
+path makes "tail this exact file" a one-step instruction for users and the
+investigator subagent.
+
+**Context:** Added as part of /plan-eng-review on
+`fix/spawn-captured-streaming-and-cleanup`. Codex outside voice flagged that
+streaming `ship.log` doesn't help if monitors tail a different log. Right
+place to put the log line is the entry of `spawnCaptured`
+(`build/orchestrator/sub-agents.ts:295`); right place to thread `logPath`
+through is the snapshot builders in `build/orchestrator/halt-events.ts`.
+
+**Effort:** S
+**Priority:** P2
+**Depends on:** streaming-log fix landed
+
+### Stream progress into ship-output.md (T-SO)
+
+**What:** Change the slash-command contract so `/ship` (and `/land-and-deploy`)
+write progress into `ship-output.md` (or a sidecar `ship-progress.md`) as the
+subagent works, instead of leaving it 0 bytes until the very end.
+
+**Why:** With spawnCaptured streaming, the captured `ship.log` now grows live,
+but the subagent-authored report `ship-output.md` still sits empty for 10+
+minutes during the e2e test phase of `/ship`. That's the artifact users open
+when they want to see "what did /ship do?" — leaving it empty defeats half
+the visibility win.
+
+**Context:** Codex outside voice flagged this during /plan-eng-review on
+`fix/spawn-captured-streaming-and-cleanup`. The contract lives in
+`ship/SKILL.md.tmpl` (and per-host overrides under `hosts/`); every host
+binding has to be touched, which is why it's deferred rather than bundled
+with the streaming fix. Could also be solved by having the orchestrator
+periodically snapshot the streaming `ship.log` into `ship-output.md`, but
+that mixes captured-output and authored-report layers.
+
+**Effort:** L
+**Priority:** P3
+**Depends on:** none
+
+### Document the new spawnCaptured log format contract (T-FMT)
+
+**What:** Document the post-streaming log format in
+`build/orchestrator/README.md` (and reference from `CLAUDE.md`):
+header at top (`# command:` / `# cwd:` / `# started:`), interleaved
+`[OUT]`/`[ERR]` channel-tagged live output, `# ---- result ----` footer at
+end with `# duration_ms:` / `# exit:` / byte counts.
+
+**Why:** Existing tooling (and any future grep-based parser) that looked for
+the old `# ---- stdout ----` / `# ---- stderr ----` section markers needs to
+migrate. The old markers are gone — channel tagging happens per-line via
+`[OUT]` / `[ERR]` prefixes. Without docs, the format change is invisible
+until something breaks.
+
+**Context:** Added as part of /plan-eng-review on
+`fix/spawn-captured-streaming-and-cleanup`. Codex outside voice flagged this
+explicitly. README change is mechanical; the format is documented inline in
+`build/orchestrator/sub-agents.ts:295` as code comments — those just need to
+be pulled out into a referenced doc.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** streaming-log fix landed
+
 ## Pre-existing test failures observed on feat/release-daemon-path-fix-and-doctor
 
 ### P0: 4 unrelated tests fail before any of this branch's changes
