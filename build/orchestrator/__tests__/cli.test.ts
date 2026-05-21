@@ -3338,9 +3338,7 @@ describe("markPhaseCommittedAfterManualRecovery", () => {
       phase: Phase;
       state: BuildState;
     } {
-      const dir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "gstack-dirty-guard-"),
-      );
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-dirty-guard-"));
       // Init a real git repo so `git status --porcelain` runs.
       spawnSync("git", ["init", "-q", "-b", "main", dir], { encoding: "utf8" });
       spawnSync("git", ["-C", dir, "config", "user.email", "t@t"], {
@@ -3406,7 +3404,12 @@ describe("markPhaseCommittedAfterManualRecovery", () => {
     }
 
     it("refuses to mark when worktree is dirty and no flag is passed", () => {
-      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      const {
+        tmpDir: dir,
+        planFile,
+        phase,
+        state,
+      } = setupDirtyWorktreeFixture();
       // Dirty the tree.
       fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
 
@@ -3436,7 +3439,12 @@ describe("markPhaseCommittedAfterManualRecovery", () => {
     });
 
     it("--force-dirty marks anyway, preserves the dirty state (warn-only)", () => {
-      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      const {
+        tmpDir: dir,
+        planFile,
+        phase,
+        state,
+      } = setupDirtyWorktreeFixture();
       fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
 
       const result = markPhaseCommittedAfterManualRecovery({
@@ -3462,7 +3470,12 @@ describe("markPhaseCommittedAfterManualRecovery", () => {
     });
 
     it("--commit-dirty stages + commits dirty files before marking", () => {
-      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      const {
+        tmpDir: dir,
+        planFile,
+        phase,
+        state,
+      } = setupDirtyWorktreeFixture();
       fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
 
       const result = markPhaseCommittedAfterManualRecovery({
@@ -3503,7 +3516,12 @@ describe("markPhaseCommittedAfterManualRecovery", () => {
     });
 
     it("--force-dirty and --commit-dirty are mutually exclusive", () => {
-      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      const {
+        tmpDir: dir,
+        planFile,
+        phase,
+        state,
+      } = setupDirtyWorktreeFixture();
       fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
 
       const result = markPhaseCommittedAfterManualRecovery({
@@ -3524,7 +3542,12 @@ describe("markPhaseCommittedAfterManualRecovery", () => {
     });
 
     it("clean tree marks without invoking the guard (no flags needed)", () => {
-      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      const {
+        tmpDir: dir,
+        planFile,
+        phase,
+        state,
+      } = setupDirtyWorktreeFixture();
       // No dirty file — tree is clean from setup.
 
       const result = markPhaseCommittedAfterManualRecovery({
@@ -3543,7 +3566,12 @@ describe("markPhaseCommittedAfterManualRecovery", () => {
       // No cwd passed → no git inspection → no refusal. This preserves
       // backward compat for existing tests that exercise the state-only
       // transition without setting up a real git fixture.
-      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      const {
+        tmpDir: dir,
+        planFile,
+        phase,
+        state,
+      } = setupDirtyWorktreeFixture();
       fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
 
       const result = markPhaseCommittedAfterManualRecovery({
@@ -3563,7 +3591,12 @@ describe("markPhaseCommittedAfterManualRecovery", () => {
       // `<git error: ...>` in snapshot.status. Filtering those out treats
       // them as "clean" → silent guard bypass. Now we surface the error
       // and refuse, unless --force-dirty is passed.
-      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      const {
+        tmpDir: dir,
+        planFile,
+        phase,
+        state,
+      } = setupDirtyWorktreeFixture();
       // Point cwd at a non-git directory so captureGitSnapshot fails.
       const nonGitDir = fs.mkdtempSync(
         path.join(os.tmpdir(), "gstack-not-a-git-repo-"),
@@ -3589,7 +3622,12 @@ describe("markPhaseCommittedAfterManualRecovery", () => {
     });
 
     it("--force-dirty bypasses git-error fail-closed (operator accepts unknown state)", () => {
-      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      const {
+        tmpDir: dir,
+        planFile,
+        phase,
+        state,
+      } = setupDirtyWorktreeFixture();
       const nonGitDir = fs.mkdtempSync(
         path.join(os.tmpdir(), "gstack-not-a-git-repo-"),
       );
@@ -3613,7 +3651,12 @@ describe("markPhaseCommittedAfterManualRecovery", () => {
     });
 
     it("dryRun skips the dirty-tree guard (preview mode never inspects worktree)", () => {
-      const { tmpDir: dir, planFile, phase, state } = setupDirtyWorktreeFixture();
+      const {
+        tmpDir: dir,
+        planFile,
+        phase,
+        state,
+      } = setupDirtyWorktreeFixture();
       fs.writeFileSync(path.join(dir, "dirty.txt"), "uncommitted\n");
 
       const result = markPhaseCommittedAfterManualRecovery({
@@ -6329,5 +6372,113 @@ describe("HELP_TEXT mentions --stop-run (Bug 6)", () => {
 
   it("--mark-phase-committed help mentions feature-relative form (Bug 3)", () => {
     expect(HELP_TEXT).toContain("<feature>.<phase>");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-T1 (REGRESSION) — gate-visibility reconcile must not ENOENT after
+// archiveLivingPlan moves the plan file
+// ---------------------------------------------------------------------------
+//
+// Before this fix, the orchestrator shutdown sequence (cli.ts:~11183) did:
+//   1. archiveLivingPlan(state.planFile)  → moves inbox/X.md → archived/X.md
+//   2. state.planFile = archivedPath
+//   3. saveState(...)                     → triggers reconcileVisiblePlanState
+//                                            with the STALE inbox path stored
+//                                            in visiblePlanProjection.planFile
+//   4. ENOENT warning every time
+//
+// The fix is two lines: `visiblePlanProjection = null` before step 1, and a
+// defensive null in the finally block. This test pins the property the fix
+// relies on: reconcileVisiblePlanState requires the file to exist, so the
+// only safe path after archive is to skip the reconcile entirely.
+describe("B-T1: gate-visibility reconcile ENOENT race", () => {
+  let tmpDir: string;
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "reconcile-enoent-"));
+  });
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("archiveLivingPlan moves the file (the ENOENT precondition)", () => {
+    // Build the minimum inbox/living-plan/ scaffold that archiveLivingPlan
+    // recognizes: it requires the basename of the parent directory of the
+    // plan to be 'living-plan' and its parent to be 'inbox'.
+    const inboxDir = path.join(tmpDir, "inbox", "living-plan");
+    fs.mkdirSync(inboxDir, { recursive: true });
+    const planPath = path.join(inboxDir, "demo.md");
+    fs.writeFileSync(planPath, "# demo plan\n");
+    expect(fs.existsSync(planPath)).toBe(true);
+
+    const archived = archiveLivingPlan(planPath);
+    expect(archived).not.toBeNull();
+    expect(archived).toContain("/archived/");
+    // The original inbox path no longer exists — this is the failure mode
+    // the gate-visibility race used to trip on.
+    expect(fs.existsSync(planPath)).toBe(false);
+    expect(fs.existsSync(archived as string)).toBe(true);
+  });
+
+  it("reconcileVisiblePlanState throws ENOENT when called with a missing planFile + gates needing flip (proves the race)", () => {
+    const missing = path.join(tmpDir, "does-not-exist.md");
+    const state = {
+      slug: "test",
+      planFile: missing,
+      branch: "test",
+      currentPhaseIndex: 0,
+      currentFeatureIndex: 0,
+      features: [
+        {
+          number: "1",
+          status: "committed" as const,
+          phaseIndices: [0],
+        },
+      ],
+      // Phase status `committed` triggers a non-empty projection from
+      // phaseGateProjection, so the reconciler will try to flip a gate
+      // checkbox — which calls setCheckboxState → fs.readFileSync, which
+      // is where ENOENT lands.
+      phases: [
+        {
+          index: 0,
+          number: "1.1",
+          name: "test",
+          status: "committed" as const,
+        },
+      ],
+      startedAt: new Date().toISOString(),
+      lastUpdatedAt: new Date().toISOString(),
+    } as unknown as Parameters<typeof reconcileVisiblePlanState>[3];
+    const features = [
+      { index: 0, number: "1", name: "test", phaseIndices: [0] },
+    ] as unknown as Parameters<typeof reconcileVisiblePlanState>[1];
+    // A phase with at least one gate that the projection thinks should be
+    // done. The reconciler tries to flip the checkbox, hits readFileSync
+    // on the missing path, and ENOENTs. The fix makes this entire call
+    // path unreachable after archive (visiblePlanProjection = null).
+    const phases = [
+      {
+        index: 0,
+        number: "1.1",
+        name: "test",
+        kind: "code",
+        gates: {
+          // Gate keys MUST match phaseGateProjection's output. For status
+          // 'committed' the projection wants test_spec/verify_red/
+          // implementation/green_tests/review_qa = true. With our gate
+          // state of done=false, the reconciler tries to flip → calls
+          // setCheckboxState → fs.readFileSync(planFile) → ENOENT.
+          test_spec: { line: 1, done: false },
+          verify_red: { line: 2, done: false },
+          implementation: { line: 3, done: false },
+          green_tests: { line: 4, done: false },
+          review_qa: { line: 5, done: false },
+        },
+      },
+    ] as unknown as Parameters<typeof reconcileVisiblePlanState>[2];
+    expect(() =>
+      reconcileVisiblePlanState(missing, features, phases, state),
+    ).toThrow(/ENOENT|no such file/);
   });
 });
