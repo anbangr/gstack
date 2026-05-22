@@ -263,9 +263,12 @@ export type FailureRender =
  * Convert a sub-agent result into a structured FailureRender.
  *
  * Precedence (first match wins):
- *   1. stallKilled  → stalled
- *   2. timedOut     → timed_out
- *   3. killReason   → auth_required (when "auth_required")
+ *   1. killReason   → auth_required (when "auth_required") — wins over stallKilled
+ *                     because the watchdog sets stallKilled=true alongside the
+ *                     auth_required reason; without this ordering the more
+ *                     specific auth_required render is shadowed.
+ *   2. stallKilled  → stalled
+ *   3. timedOut     → timed_out
  *   4. exitSignal   → signal_killed
  *   5. exitCode     → exited
  */
@@ -282,11 +285,21 @@ export function renderRoleStepFailure(
     killReason?: string;
   },
 ): FailureRender {
+  if (result.killReason === "auth_required") {
+    return {
+      kind: "auth_required",
+      summary: `${role} halted: authentication required (try \`gemini auth login\` or \`codex auth login\`)`,
+    };
+  }
   if (result.stallKilled) {
     const ms = result.stallSilenceMs ?? 0;
+    const reasonLabel =
+      result.killReason === "progress_gap"
+        ? `no classified progress for ${ms}ms`
+        : `no output for ${ms}ms`;
     return {
       kind: "stalled",
-      summary: `${role} stalled (no output for ${ms}ms, killed by watchdog)`,
+      summary: `${role} stalled (${reasonLabel}, killed by watchdog)`,
       stallSilenceMs: ms,
     };
   }
@@ -295,12 +308,6 @@ export function renderRoleStepFailure(
     return {
       kind: "timed_out",
       summary: `${role} timed out after ${ms}ms wall clock`,
-    };
-  }
-  if (result.killReason === "auth_required") {
-    return {
-      kind: "auth_required",
-      summary: `${role} halted: authentication required (try \`gemini auth login\` or \`codex auth login\`)`,
     };
   }
   if (result.exitCode === null && result.exitSignal) {

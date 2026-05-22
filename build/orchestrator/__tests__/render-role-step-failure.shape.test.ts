@@ -100,6 +100,45 @@ describe("renderRoleStepFailure", () => {
     expect(result.kind).toBe("stalled");
   });
 
+  test("edge: auth_required wins when stallKilled AND killReason=auth_required", () => {
+    // The auth-prompt fast-kill in stall-watchdog sets stallKilled=true
+    // AND killReason="auth_required". Before the precedence fix the more
+    // generic "stalled" render shadowed the auth_required render, hiding
+    // the actionable diagnostic.
+    if (typeof helpers.renderRoleStepFailure !== "function") {
+      expect(false).toBe(true);
+      return;
+    }
+    const result = helpers.renderRoleStepFailure("gemini", {
+      ...baseResult(),
+      stallKilled: true,
+      stallSilenceMs: 1000,
+      killReason: "auth_required",
+    }) as FailureRender;
+    expect(result.kind).toBe("auth_required");
+    expect(result.summary).toContain("gemini auth login");
+  });
+
+  test("edge: progress_gap summary distinguishes from stdout silence", () => {
+    // For killReason="progress_gap" the watchdog fired despite noisy
+    // stdout. The summary string must reflect that ("no classified
+    // progress") rather than claim "no output" — that wording was
+    // silent diagnostic corruption before the fix.
+    if (typeof helpers.renderRoleStepFailure !== "function") {
+      expect(false).toBe(true);
+      return;
+    }
+    const result = helpers.renderRoleStepFailure("kimi", {
+      ...baseResult(),
+      stallKilled: true,
+      stallSilenceMs: 300_000,
+      killReason: "progress_gap",
+    }) as FailureRender;
+    expect(result.kind).toBe("stalled");
+    expect(result.summary).toContain("no classified progress");
+    expect(result.summary).not.toContain("no output");
+  });
+
   test("edge: helper is pure and side-effect-free", () => {
     if (typeof helpers.renderRoleStepFailure !== "function") {
       expect(false).toBe(true);
