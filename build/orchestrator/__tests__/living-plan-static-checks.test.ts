@@ -592,4 +592,50 @@ Wrong forms (DON'T do this):
     expect(generated).toMatch(/HEADING SHAPE/);
     expect(generated).toMatch(/`## Feature 1 - Foo`.*REJECTED/);
   });
+
+  it("T9-nested-fence: 4-backtick fence with embedded 3-backtick stays closed (N1 regression)", () => {
+    // CommonMark fences: an opening run of N chars can only be closed
+    // by a bare run of >= N of the same char. Without length-aware
+    // tracking, the inner 3-backtick line would close the outer 4-tick
+    // fence and silently unmask later "## Feature" lines as scannable.
+    const plan = tmpPlan(
+      dir,
+      "# Plan\n\n" +
+        "Documentation:\n\n" +
+        "````markdown\n" +
+        "Example of WRONG heading:\n" +
+        "```\n" +
+        "## Feature 1 - inside-nested-fence\n" +
+        "```\n" +
+        "````\n\n" +
+        "## Feature 2 - real-outside-fence\n",
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/feature-heading-shape/);
+    // Real heading flagged:
+    expect(r.stderr).toMatch(/real-outside-fence/);
+    // Heading inside the nested fence NOT flagged:
+    expect(r.stderr).not.toMatch(/inside-nested-fence/);
+  });
+
+  it("T9-tilde-fence: tilde-fenced examples are also skipped (N2 regression)", () => {
+    // CommonMark allows ~~~ fences alongside backticks. Plan authors
+    // may use them to nest backtick examples without escaping.
+    const plan = tmpPlan(
+      dir,
+      "# Plan\n\n" +
+        "Example:\n\n" +
+        "~~~markdown\n" +
+        "## Feature 1 - tilde-fenced-example\n" +
+        "~~~\n\n" +
+        "(no real features)\n",
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    // Tilde-fenced content does NOT trigger the diagnostic:
+    expect(r.stderr).not.toMatch(/feature-heading-shape/);
+    // Legacy phantom-row emits since plan has no real features:
+    expect(r.stderr).toMatch(/"featureNumber":0,"featureName":""/);
+  });
 });

@@ -433,19 +433,65 @@ function truncateExample(line: string): string {
   return line.slice(0, MAX_EXAMPLE_LENGTH) + "... (truncated)";
 }
 
+/**
+ * Match a fenced-code-block delimiter per CommonMark rules:
+ *   - 3 or more backticks OR 3 or more tildes (matching the opening char)
+ *   - Optional leading whitespace (up to 3 spaces before counts as fence;
+ *     4+ would be an indented code block per CommonMark, but we accept
+ *     them here too — plan files rarely deep-indent fences and the cost
+ *     of being permissive is lower than the cost of missing a fence)
+ *   - Optional info string after the open fence; closing fence is a bare
+ *     run of fence chars with optional trailing whitespace only.
+ *
+ * A fence opened with N chars can only be closed by ≥ N of the SAME
+ * char on a line by itself. This matters because plan authors who
+ * document the format may use longer outer fences to embed shorter
+ * inner fences in their examples:
+ *
+ *     ```` markdown            <- outer (4 backticks)
+ *     Example of a wrong heading inside a code block:
+ *     ```                       <- inner; must NOT close outer
+ *     ## Feature 1 - wrong
+ *     ```
+ *     ````                      <- closes outer
+ *
+ * Without length tracking, the inner 3-backtick line would close the
+ * outer prematurely and unmask later headings as scannable lines.
+ */
+function parseFenceOpen(
+  line: string,
+): { char: "`" | "~"; length: number } | null {
+  const m = /^\s{0,3}(`{3,}|~{3,})/.exec(line);
+  if (!m) return null;
+  return { char: m[1][0] as "`" | "~", length: m[1].length };
+}
+
+function isFenceClose(
+  line: string,
+  open: { char: "`" | "~"; length: number },
+): boolean {
+  // Closing fence: same char, ≥ open length, optional trailing whitespace
+  // only (no info string allowed on the close).
+  const pattern = new RegExp(`^\\s{0,3}\\${open.char}{${open.length},}\\s*$`);
+  return pattern.test(line);
+}
+
 function findMisshapenFeatureHeadings(content: string): string[] {
   const lines = content.split("\n");
   const bad: string[] = [];
-  let inFence = false;
+  let openFence: { char: "`" | "~"; length: number } | null = null;
   for (const line of lines) {
-    // Track fenced-code-block state. A line that starts with three or
-    // more backticks toggles the fence. We skip lines inside a fence so
-    // documentation examples don't false-positive.
-    if (/^\s*```/.test(line)) {
-      inFence = !inFence;
+    if (openFence) {
+      if (isFenceClose(line, openFence)) {
+        openFence = null;
+      }
       continue;
     }
-    if (inFence) continue;
+    const fence = parseFenceOpen(line);
+    if (fence) {
+      openFence = fence;
+      continue;
+    }
 
     // Heading lines that start with `## Feature <digits>` but don't have
     // the canonical colon separator immediately after the digits.
