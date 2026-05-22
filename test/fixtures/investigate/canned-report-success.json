@@ -1,0 +1,30 @@
+{
+  "faultId": "PHASE_FAILED:p3:a4f2b1c8",
+  "outcome": "root-cause-identified",
+  "rootCause": "The phase's plan does not specify a stop condition the codex reviewer accepts; each round adds new feedback because the acceptance bar is missing.",
+  "evidence": [
+    "test/fixtures/investigate/state-with-recent-errors.json:9",
+    "test/fixtures/investigate/stdout-log.txt:896"
+  ],
+  "proposedFix": {
+    "options": [
+      {
+        "label": "Add an explicit acceptance checklist to the phase plan",
+        "description": "Prepend an 'Acceptance' section listing test commands + lint checks; codex stops requesting changes once all items are check-marked.",
+        "blast_radius": "narrow"
+      },
+      {
+        "label": "Lower codex review iteration cap to 3 and escalate to plan-mutator",
+        "description": "On cap-hit, mutate the plan via plan-mutator rather than retrying the same review loop.",
+        "blast_radius": "medium"
+      }
+    ]
+  },
+  "learnedPatternProposal": {
+    "category": "PLAN_REVIEW_STALEMATE_NO_ACCEPTANCE",
+    "matcherKind": "stdout_regex",
+    "pattern": "codex review round \\d+ changes-requested\\n.*iteration cap reached",
+    "severity": "HIGH",
+    "description": "Codex reviewer never converges because the plan has no explicit acceptance criteria."
+  }
+}

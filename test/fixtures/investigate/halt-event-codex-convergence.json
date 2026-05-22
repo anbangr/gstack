@@ -1,0 +1,23 @@
+{
+  "faultId": "PHASE_FAILED:p3:a4f2b1c8",
+  "runId": "test-run-investigate-001",
+  "stateSlug": "feat-investigate-subcommand",
+  "kind": "PHASE_FAILED",
+  "severity": "HIGH",
+  "timestamp": "2026-05-22T10:15:00.000Z",
+  "message": "Phase 3 codex review never converged after 7 iterations",
+  "investigate": true,
+  "pointers": {
+    "stateFile": "/tmp/gstack-investigate-test/state.json",
+    "stdoutLog": "/tmp/gstack-investigate-test/stdout.log",
+    "livingPlan": "/tmp/gstack-investigate-test/living-plan.md",
+    "worktreePath": "/tmp/gstack-investigate-test/worktree"
+  },
+  "snapshot": {
+    "phase": { "index": 3, "title": "Wire up the CLI", "status": "failed" },
+    "failureReason": "codexReview iteration cap (7) exhausted; last verdict: changes-requested",
+    "iterationHistory": { "testRun": 4, "testFix": 2, "codexReview": 7 },
+    "worktreeHead": "deadbeef1234",
+    "stdoutTail": "[2026-05-22T10:14:55Z] codex review round 7: changes-requested\n[2026-05-22T10:14:58Z] iteration cap reached, halting phase"
+  }
+}

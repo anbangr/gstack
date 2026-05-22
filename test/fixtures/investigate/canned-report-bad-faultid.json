@@ -1,0 +1,8 @@
+{
+  "faultId": "WRONG_FAULT_ID:p0:00000000",
+  "outcome": "root-cause-identified",
+  "rootCause": "irrelevant",
+  "evidence": [],
+  "proposedFix": null,
+  "learnedPatternProposal": null
+}
