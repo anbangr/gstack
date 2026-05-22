@@ -139,7 +139,11 @@ import {
 import { runPlanReview, SYNTH_REVISION_PROMPT } from "./plan-reviewer";
 import { runPlanReviewLoop } from "./plan-review-loop";
 import { shipAndDeploy, shipOnly } from "./ship";
-import { runReleaseDaemon, retryReleaseQueueRecord } from "./release-daemon";
+import {
+  runReleaseDaemon,
+  retryReleaseQueueRecord,
+  isAllowedFeatureBranch,
+} from "./release-daemon";
 import {
   defaultReleaseQueueDir,
   markPrQueued,
@@ -12939,10 +12943,28 @@ async function processMergeBranch(args: {
           );
           return false;
         }
+        // Gate `branch` against the same safe-ref grammar the release-daemon
+        // uses (release-daemon.ts:isAllowedFeatureBranch) before injecting it
+        // into landOnly's privileged kimi prompt. If validation fails, fall
+        // back to undefined so landOnly takes the unscoped legacy prompt path
+        // rather than passing shell-metacharacter or flag-confusable refs
+        // through to the sub-agent.
+        const branchGate = isAllowedFeatureBranch(branch);
+        const safeFeatureBranch = branchGate.ok ? branch : undefined;
+        const safePrNumber = branchGate.ok
+          ? (openPRNumber ?? undefined)
+          : undefined;
+        if (!branchGate.ok) {
+          console.warn(
+            `  ⚠ feature branch ${JSON.stringify(branch)} failed safe-ref gate (${branchGate.reason}) — falling back to unscoped landing prompt`,
+          );
+        }
         result = await landOnly({
           cwd: args.cwd,
           slug: `${args.slug}-${branchSlug}`,
           landRole: args.roles.land,
+          prNumber: safePrNumber,
+          featureBranch: safeFeatureBranch,
         });
       } else {
         result = await shipAndDeploy({
