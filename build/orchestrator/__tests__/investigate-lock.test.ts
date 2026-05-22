@@ -80,7 +80,6 @@ describe("releaseFaultLock", () => {
   test("is idempotent when lockfile already gone", () => {
     const handle: FaultLockHandle = {
       lockPath: path.join(tmpRoot, "nonexistent.lock"),
-      acquiredAt: new Date().toISOString(),
     };
     expect(() => releaseFaultLock(handle)).not.toThrow();
   });

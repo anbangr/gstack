@@ -9,7 +9,6 @@ export interface FaultLockPayload {
 
 export interface FaultLockHandle {
   lockPath: string;
-  acquiredAt: string;
 }
 
 const DEFAULT_MAX_AGE_MS = 60 * 60 * 1000;
@@ -40,30 +39,47 @@ export function acquireFaultLock(args: {
   const runDir = path.join(faultsDir, args.runId);
   fs.mkdirSync(runDir, { recursive: true });
   const lockPath = path.join(runDir, `.${args.faultId}.lock`);
-  const acquiredAt = new Date().toISOString();
-  const payload: FaultLockPayload = { pid: process.pid, acquiredAt };
 
-  if (fs.existsSync(lockPath)) {
-    let existing: FaultLockPayload | null = null;
+  const MAX_RETRIES = 2;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    let fd: number;
     try {
-      existing = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-    } catch {
-      existing = null;
-    }
-    if (existing && !isLockStale(existing, Date.now(), maxAgeMs)) {
-      return null;
-    }
-    try {
-      fs.unlinkSync(lockPath);
+      fd = fs.openSync(lockPath, "wx", 0o600);
     } catch (err: any) {
-      if (err.code !== "ENOENT") throw err;
+      if (err.code !== "EEXIST") throw err;
+      // Lock file already exists — read it and decide.
+      let existing: FaultLockPayload | null = null;
+      try {
+        existing = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+      } catch {
+        existing = null;
+      }
+      if (existing && !isLockStale(existing, Date.now(), maxAgeMs)) {
+        return null;
+      }
+      // Stale or corrupt — reclaim and retry.
+      try {
+        fs.unlinkSync(lockPath);
+      } catch (unlinkErr: any) {
+        if (unlinkErr.code !== "ENOENT") throw unlinkErr;
+      }
+      continue;
     }
+
+    // Exclusive create succeeded — write payload and close.
+    const payload: FaultLockPayload = {
+      pid: process.pid,
+      acquiredAt: new Date().toISOString(),
+    };
+    try {
+      fs.writeSync(fd, JSON.stringify(payload));
+    } finally {
+      fs.closeSync(fd);
+    }
+    return { lockPath };
   }
 
-  const tmpPath = `${lockPath}.tmp.${process.pid}`;
-  fs.writeFileSync(tmpPath, JSON.stringify(payload), { mode: 0o600 });
-  fs.renameSync(tmpPath, lockPath);
-  return { lockPath, acquiredAt };
+  return null;
 }
 
 export function releaseFaultLock(handle: FaultLockHandle): void {
