@@ -466,24 +466,28 @@ full CLI role (since v1.28.0) and accepts the standard
 
 ## Module Map
 
-| File                                     | Responsibility                                                         |
-| ---------------------------------------- | ---------------------------------------------------------------------- |
-| `SKILL.md.tmpl`                          | Human-facing `/build` workflow and CLI-monitoring instructions.        |
-| `configure.cm`                           | Role routing, retry caps, and timeouts (source of truth for defaults). |
-| `bin/gstack-build-phase-guardrail`       | Post-feature guardrail: PR merged, origin/main up to date, tree clean. |
-| `orchestrator/cli.ts`                    | CLI args, startup gates, lock, main loop, ship guardrails.             |
-| `orchestrator/parser.ts`                 | Markdown plan parser.                                                  |
-| `orchestrator/phase-runner.ts`           | Pure phase state machine.                                              |
-| `orchestrator/sub-agents.ts`             | Gemini, Codex, Claude, test, verdict, and judge wrappers.              |
-| `orchestrator/plan-mutator.ts`           | Atomic checkbox updates in the plan file.                              |
-| `orchestrator/state.ts`                  | Local JSON state, gbrain mirror, lock files, log paths.                |
-| `orchestrator/worktree.ts`               | Dual-impl worktree creation, teardown, and winner apply.               |
-| `orchestrator/ship.ts`                   | Final `/ship` plus `/land-and-deploy` delegation.                      |
-| `orchestrator/feature-review.ts`         | Per-feature meta-review pass with same-shape repeat detection.         |
-| `orchestrator/feature-review-metrics.ts` | JSONL instrumentation for feature-review baseline + tuning.            |
-| `orchestrator/feature-review-cache.ts`   | Verdict cache that skips re-review on unchanged FEATURE_PASS.          |
-| `orchestrator/feature-verifier.ts`       | Pre-merge `featureVerifier` gate + post-merge tree-hash audit.         |
-| `orchestrator/types.ts`                  | Shared phase and build state types.                                    |
+| File                                           | Responsibility                                                         |
+| ---------------------------------------------- | ---------------------------------------------------------------------- |
+| `SKILL.md.tmpl`                                | Human-facing `/build` workflow and CLI-monitoring instructions.        |
+| `configure.cm`                                 | Role routing, retry caps, and timeouts (source of truth for defaults). |
+| `bin/gstack-build-phase-guardrail`             | Post-feature guardrail: PR merged, origin/main up to date, tree clean. |
+| `orchestrator/cli.ts`                          | CLI args, startup gates, lock, main loop, ship guardrails.             |
+| `orchestrator/parser.ts`                       | Markdown plan parser.                                                  |
+| `orchestrator/phase-runner.ts`                 | Pure phase state machine.                                              |
+| `orchestrator/sub-agents.ts`                   | Gemini, Codex, Claude, test, verdict, and judge wrappers.              |
+| `orchestrator/plan-mutator.ts`                 | Atomic checkbox updates in the plan file.                              |
+| `orchestrator/state.ts`                        | Local JSON state, gbrain mirror, lock files, log paths.                |
+| `orchestrator/worktree.ts`                     | Dual-impl worktree creation, teardown, and winner apply.               |
+| `orchestrator/ship.ts`                         | Final `/ship` plus `/land-and-deploy` delegation.                      |
+| `orchestrator/feature-review.ts`               | Per-feature meta-review pass with same-shape repeat detection.         |
+| `orchestrator/feature-review-metrics.ts`       | JSONL instrumentation for feature-review baseline + tuning.            |
+| `orchestrator/feature-review-cache.ts`         | Verdict cache that skips re-review on unchanged FEATURE_PASS.          |
+| `orchestrator/feature-verifier.ts`             | Pre-merge `featureVerifier` gate + post-merge tree-hash audit.         |
+| `orchestrator/types.ts`                        | Shared phase and build state types.                                    |
+| `orchestrator/investigate-mode.ts`             | `/build investigate` entry: context resolution, briefing + hint.       |
+| `orchestrator/investigate-context.ts`          | Resolves context from active run / halt event / symptoms to briefing.  |
+| `orchestrator/investigate-report-writer.ts`    | Validates `InvestigationReport`, writes machine + bug-report artifacts.|
+| `orchestrator/investigate-lock.ts`             | `O_EXCL` fault lock with nonce, stale reclaim, ownership verification. |
 
 ## Testing
 

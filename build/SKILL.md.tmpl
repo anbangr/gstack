@@ -2167,3 +2167,34 @@ GSTACK_BUILD_PRIMARY_IMPL_BACKUP_MODEL=<backup-model-name>
 The default `configure.cm` sets a Gemini backup for `primaryImpl`, `testFixer`, `ship`, and `land`.
 
 **Liveness model (no retry-on-timeout).** `timeoutMs` and `backupTimeoutMs` are STALL WINDOWS — max ms of stdout silence before the watchdog kills. A sub-agent that keeps emitting output runs as long as it needs. Same-budget retry on a stalled process is gone (it would just stall again on the same window); on stall the primary fails once and the backup takes over with `backupMs` (half of primary, floored at 60s). Transport-failure retries (Codex TLS / 429 / stream disconnect) still fire — those are a different failure mode and unaffected. Worst-case wait at 900s default: `primary stall window` + `backup stall window` ≈ 22.5 min, not 60 min.
+
+## /build investigate — manual fault investigation
+
+When the user invokes `/build investigate` (with or without a fault id), follow this flow:
+
+1. **Run the CLI to get a briefing.**
+
+   ```bash
+   gstack-build investigate [<faultId>] [--symptoms "..."] [--state <path>]
+   ```
+
+   The CLI emits a JSON briefing block to stdout between `<<<GSTACK_INVESTIGATE_BRIEFING>>>` and `<<<END>>>` markers. Parse the JSON. If the CLI exits non-zero, read its stderr — the most common cases are exit 2 (bad args, fault not found) and exit 3 (no active run; ask the user to pass `--state`, `--run-id`, or `--symptoms`).
+
+2. **Run the four-phase /investigate methodology** against the briefing's file pointers (`statePath`, `stdoutLogPath`, `livingPlanPath`, `worktreePath`) and the inlined `stdoutTail`. The four phases are mandatory:
+
+   - **Investigate** — Read the symptoms. Use the file pointers to gather more context. Note when pointers reference files that no longer exist (worktree cleaned up, log rotated) — that's signal too.
+   - **Analyze** — Trace the code path from symptom back to candidate causes. Name the pattern: race condition, nil propagation, state corruption, integration boundary failure, configuration drift, stale cache, swallowed error.
+   - **Hypothesize** — State a specific, testable claim. If state has advanced past the halt point on disk, use `outcome: "self-healed"`. If you cannot make a confident call, use `outcome: "no-context"`. If this halt has been investigated before, use `outcome: "duplicate-of"` with a `duplicateOfPath`.
+   - **Implement** — Propose 1-3 fix options labeled by blast_radius (narrow / medium / wide). If the halt shape is a reusable detector pattern, include a `learnedPatternProposal` — but only when the category is genuinely new.
+
+3. **Write your report as JSON** to a tmp path. The schema is the `InvestigationReport` from `build/orchestrator/investigator-dispatch.ts:24-56`. The `faultId` field MUST equal the briefing's faultId.
+
+4. **Call investigate-finalize** with that tmp path. The CLI prints the exact `finalizeHint` string back to you in the briefing — use it verbatim. The hint embeds the lock nonce, severity, and source from the briefing so finalize can verify lock ownership and apply correct severity gating:
+
+   ```bash
+   gstack-build investigate-finalize --run-id <id> --fault-id <id> --nonce <hex> --severity <S> --source <X> --report <tmp-path>
+   ```
+
+   `investigate-finalize` validates the report, writes `~/.gstack/skill-faults/<runId>/<faultId>.md` (machine report) and — for HIGH/CRITICAL only, and only when `source` is not `symptoms` — `inbox/BUGREPORT-<date>-<slug>.md` (human bug report). It returns exit 0 on success, 1 when the outcome is `needs-human` or `no-context`, and 2 on validation failure.
+
+5. **Surface the paths to the user.** Print the machine report path and (if written) the bug report path. If the report includes a `learnedPatternProposal`, tell the user to run `gstack-build learn-fault-patterns` to absorb it.
