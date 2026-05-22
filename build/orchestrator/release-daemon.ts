@@ -719,9 +719,14 @@ function checkoutScratchWorktree(
       }
       const currentBranch = (branchCheck.stdout || "").trim();
       if (currentBranch !== record.featureBranch) {
+        const remoteTrackingRef = `refs/remotes/origin/${record.featureBranch}`;
         const fetched = spawnSync(
           "git",
-          ["fetch", "origin", record.featureBranch],
+          [
+            "fetch",
+            "origin",
+            `+refs/heads/${record.featureBranch}:${remoteTrackingRef}`,
+          ],
           { cwd: resolvedWorktree, encoding: "utf8" },
         );
         if (fetched.status !== 0) {
@@ -731,7 +736,7 @@ function checkoutScratchWorktree(
         }
         const reset = spawnSync(
           "git",
-          ["reset", "--hard", `origin/${record.featureBranch}`],
+          ["reset", "--hard", remoteTrackingRef],
           { cwd: resolvedWorktree, encoding: "utf8" },
         );
         if (reset.status !== 0) {

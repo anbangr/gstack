@@ -2290,13 +2290,15 @@ describe("processReleaseQueueRecord worktree branch correction", () => {
       ([cmd, args]) =>
         cmd === "git" &&
         args[0] === "fetch" &&
-        args.includes("feat/target"),
+        args.includes(
+          "+refs/heads/feat/target:refs/remotes/origin/feat/target",
+        ),
     );
     const resetCalls = spawnCalls.filter(
       ([cmd, args]) =>
         cmd === "git" &&
         args[0] === "reset" &&
-        args.includes("origin/feat/target"),
+        args.includes("refs/remotes/origin/feat/target"),
     );
 
     expect(fetchCalls.length).toBeGreaterThan(0);
