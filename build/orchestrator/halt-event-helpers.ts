@@ -378,7 +378,7 @@ const PROVIDER_QUOTA_RE =
 const PROVIDER_TRANSPORT_RE =
   /ECONNRESET|ECONNREFUSED|EHOSTUNREACH|EAI_AGAIN|socket hang up|read ECONNRESET|HTTP\/2 stream .* refused/i;
 const PROVIDER_AUTH_RE =
-  /authentication required|please (?:log in|sign in|re-?authenticate)|invalid (?:api )?key|401 Unauthorized|token expired/i;
+  /authentication required|please (?:authenticate|log in|sign in|re-?authenticate)|invalid (?:api )?key|401 Unauthorized|token expired/i;
 const PROVIDER_RESET_AT_RE =
   /resets? at ([0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?)/i;
 
@@ -396,6 +396,9 @@ export function classifyProviderFailure(input: {
   timedOut?: boolean;
 }): ProviderFailureVerdict | null {
   const text = input.text ?? "";
+  const logEvidence = parseRoleLogFailureEvidence(text);
+  const stallKilled = input.stallKilled ?? logEvidence.stallKilled;
+  const timedOut = input.timedOut ?? logEvidence.timedOut;
 
   // Auth wins over everything: it'll never self-resolve.
   if (PROVIDER_AUTH_RE.test(text)) {
@@ -436,15 +439,42 @@ export function classifyProviderFailure(input: {
   }
   // Watchdog kill / wall-clock kill — last in precedence so explicit
   // banners win over the silent-stall heuristic.
-  if (input.stallKilled || input.timedOut) {
+  if (stallKilled || timedOut) {
     return {
       kind: "stall",
-      evidence: input.stallKilled
+      evidence: stallKilled
         ? "sub-agent stdout silent past watchdog threshold"
         : "sub-agent exceeded wall-clock timeout",
     };
   }
   return null;
+}
+
+export function parseRoleLogFailureEvidence(text: string): {
+  timedOut?: boolean;
+  stallKilled?: boolean;
+  stallSilenceMs?: number;
+  exit?: string;
+  stdoutBytes?: number;
+  stderrBytes?: number;
+} {
+  const readBool = (name: string): boolean | undefined => {
+    const m = text.match(new RegExp(`^# ${name}:\\s*(true|false)\\s*$`, "im"));
+    return m ? m[1] === "true" : undefined;
+  };
+  const readNumber = (name: string): number | undefined => {
+    const m = text.match(new RegExp(`^# ${name}:\\s*(\\d+)\\s*$`, "im"));
+    return m ? Number(m[1]) : undefined;
+  };
+  const exit = text.match(/^# exit:\s*(.+)\s*$/im)?.[1]?.trim();
+  return {
+    timedOut: readBool("timed_out"),
+    stallKilled: readBool("stall_killed"),
+    stallSilenceMs: readNumber("stall_silence_ms"),
+    exit,
+    stdoutBytes: readNumber("stdout_bytes"),
+    stderrBytes: readNumber("stderr_bytes"),
+  };
 }
 
 function firstMatchSnippet(text: string, re: RegExp): string {

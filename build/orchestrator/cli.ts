@@ -139,7 +139,11 @@ import {
 import { runPlanReview, SYNTH_REVISION_PROMPT } from "./plan-reviewer";
 import { runPlanReviewLoop } from "./plan-review-loop";
 import { shipAndDeploy, shipOnly } from "./ship";
-import { runReleaseDaemon, retryReleaseQueueRecord } from "./release-daemon";
+import {
+  runReleaseDaemon,
+  retryReleaseQueueRecord,
+  isAllowedFeatureBranch,
+} from "./release-daemon";
 import {
   defaultReleaseQueueDir,
   markPrQueued,
@@ -740,7 +744,9 @@ export interface Args {
     | "doctor"
     | "drain-faults"
     | "mark-shipped"
-    | "learn-fault-patterns";
+    | "learn-fault-patterns"
+    | "investigate"
+    | "investigate-finalize";
   /** learn-fault-patterns: dry-run only — print diff against learned-patterns.json. */
   learnFaultPatternsDryRun?: boolean;
   /** learn-fault-patterns: comma-separated faultIds to promote. */
@@ -917,6 +923,23 @@ export interface Args {
   markShippedPr?: number;
   /** Merge SHA override for mark-shipped (otherwise read from gh pr view). */
   markShippedMergeSha?: string;
+  investigateFaultId?: string;
+  investigateRunId?: string;
+  investigateStatePath?: string;
+  investigateRunDir?: string;
+  investigateSymptoms?: string;
+  investigateSeverityOverride?: "CRITICAL" | "HIGH" | "MEDIUM";
+  investigateNoInbox?: boolean;
+  investigateReportPath?: string;
+  investigateNonce?: string;
+  investigateSeverity?: "CRITICAL" | "HIGH" | "MEDIUM";
+  investigateSource?:
+    | "auto-detect"
+    | "explicit-fault-id"
+    | "explicit-state"
+    | "explicit-run-id"
+    | "symptoms"
+    | "user-picked";
 }
 
 /**
@@ -1435,6 +1458,85 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.markShippedMergeSha = next;
+    } else if (a === "--state") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--state requires a value");
+        process.exit(2);
+      }
+      args.investigateStatePath = next;
+    } else if (a === "--run-dir") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--run-dir requires a value");
+        process.exit(2);
+      }
+      args.investigateRunDir = next;
+    } else if (a === "--symptoms") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--symptoms requires a value");
+        process.exit(2);
+      }
+      args.investigateSymptoms = next;
+    } else if (a === "--severity-override") {
+      const next = argv[++i];
+      if (next === "CRITICAL" || next === "HIGH" || next === "MEDIUM") {
+        args.investigateSeverityOverride = next;
+      } else {
+        console.error(
+          "--severity-override expects CRITICAL, HIGH, or MEDIUM",
+        );
+        process.exit(2);
+      }
+    } else if (a === "--no-inbox") {
+      args.investigateNoInbox = true;
+    } else if (a === "--fault-id") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--fault-id requires a value");
+        process.exit(2);
+      }
+      args.investigateFaultId = next;
+    } else if (a === "--report") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--report requires a value");
+        process.exit(2);
+      }
+      args.investigateReportPath = next;
+    } else if (a === "--nonce") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--nonce requires a value");
+        process.exit(2);
+      }
+      args.investigateNonce = next;
+    } else if (a === "--severity") {
+      const next = argv[++i];
+      if (next === "CRITICAL" || next === "HIGH" || next === "MEDIUM") {
+        args.investigateSeverity = next;
+      } else {
+        console.error("--severity expects CRITICAL, HIGH, or MEDIUM");
+        process.exit(2);
+      }
+    } else if (a === "--source") {
+      const next = argv[++i];
+      if (
+        next === "auto-detect" ||
+        next === "explicit-fault-id" ||
+        next === "explicit-state" ||
+        next === "explicit-run-id" ||
+        next === "symptoms" ||
+        next === "user-picked"
+      ) {
+        args.investigateSource = next;
+      } else {
+        console.error(
+          "--source expects auto-detect, explicit-fault-id, explicit-state, explicit-run-id, symptoms, or user-picked",
+        );
+        process.exit(2);
+      }
     } else if (a === "--help" || a === "-h") {
       printHelp();
       process.exit(0);
@@ -1651,6 +1753,13 @@ export function parseArgs(argv: string[]): Args {
     ) {
       args.dryRun = true;
     }
+  } else if (positional[0] === "investigate") {
+    args.mode = "investigate";
+    args.investigateFaultId = args.investigateFaultId ?? positional[1];
+    args.investigateRunId = args.investigateRunId ?? args.runId;
+  } else if (positional[0] === "investigate-finalize") {
+    args.mode = "investigate-finalize";
+    args.investigateRunId = args.investigateRunId ?? args.runId;
   } else if (positional.length === 1) {
     args.planFile = path.resolve(positional[0]);
     if (
@@ -1668,7 +1777,7 @@ export function parseArgs(argv: string[]): Args {
     }
   } else {
     console.error(
-      "usage: gstack-build <plan-file> [flags]\n       gstack-build merge [flags]\n       gstack-build monitor --manifest <path> [--once|--watch]\n       gstack-build plan-status --gstack-repo <path> [--project-root <path>] [--json]\n       gstack-build learn-fault-patterns [--dry-run | --promote <ids> | --auto-promote]   (-h for help)",
+      "usage: gstack-build <plan-file> [flags]\n       gstack-build merge [flags]\n       gstack-build monitor --manifest <path> [--once|--watch]\n       gstack-build plan-status --gstack-repo <path> [--project-root <path>] [--json]\n       gstack-build learn-fault-patterns [--dry-run | --promote <ids> | --auto-promote]\n       gstack-build investigate [<faultId>] [flags]\n       gstack-build investigate-finalize --run-id <id> --fault-id <id> --report <path>   (-h for help)",
     );
     process.exit(2);
   }
@@ -2896,6 +3005,19 @@ Modes:
                         codexReview from on-disk review/qa artifacts.
   doctor                Read-only audit: flag state/plan/artifact drift.
                         Suggests the right reconcile invocation.
+  investigate [<faultId>] [flags]
+                        Manually investigate a build fault using the four-phase
+                        /investigate methodology in the current Claude session.
+                        Auto-detects the latest active run when no args given.
+                        Flags: --run-id, --state, --run-dir, --symptoms,
+                        --severity-override, --no-inbox.
+  investigate-finalize --run-id <id> --fault-id <id> --report <path>
+                       [--nonce <hex>] [--severity <S>] [--source <X>] [--no-inbox]
+                        Validate the report file written by the Claude session
+                        and persist both the machine report and (for HIGH/CRITICAL)
+                        the human bug report. Called by the Claude session via
+                        the briefing's finalizeHint; the nonce, severity, and
+                        source flags are echoed verbatim from the briefing.
 
 Flags:
   --print-only         Parse and show phase table; exit.
@@ -4413,6 +4535,10 @@ export function buildCodexReviewBody(
   );
 }
 
+function phaseAllowsGateSourceFixes(phase: Phase): boolean {
+  return phase.kind === "code" && /fix-on-review/i.test(phase.body);
+}
+
 export function buildOriginVerificationBody(args: {
   feature: FeatureState;
   featureDef?: Feature;
@@ -4925,6 +5051,7 @@ async function runJudgeRole(opts: {
 
 async function runReviewGates(opts: {
   roles: RoleConfigs;
+  phase: Phase;
   inputFilePath: string;
   cwd: string;
   slug: string;
@@ -4990,6 +5117,9 @@ async function runReviewGates(opts: {
       `phase-${opts.phaseNumber}-${outputName}-${opts.iteration}-output.md`,
     );
     fs.writeFileSync(outputFilePath, "");
+    const readOnlyArtifactGate =
+      opts.phase.kind !== "code" || opts.phase.auditOnly === true;
+    const sandbox = attempt?.sandbox ?? (readOnlyArtifactGate ? "read-only" : undefined);
     return runSlashCommand({
       inputFilePath: opts.inputFilePath,
       outputFilePath,
@@ -5005,7 +5135,7 @@ async function runReviewGates(opts: {
         command: role.command!,
       },
       gate: true,
-      sandbox: attempt?.sandbox,
+      sandbox,
     });
   };
 
@@ -5028,6 +5158,7 @@ async function runReviewGates(opts: {
       parentWorkspace: parentBeforeGate,
       phaseRef: { phaseNumber: opts.phaseNumber },
       inputFilePath: opts.inputFilePath,
+      allowNonTestPaths: phaseAllowsGateSourceFixes(opts.phase),
     });
     outputs.push(result);
     combined.push(
@@ -5040,7 +5171,9 @@ async function runReviewGates(opts: {
         role,
         result,
         reviewSandboxEnv: process.env.GSTACK_BUILD_CODEX_REVIEW_SANDBOX,
-      })
+      }) &&
+      opts.phase.kind === "code" &&
+      !opts.phase.auditOnly
     ) {
       const retryResult = await runGate(name, role, {
         sandbox: "danger-full-access",
@@ -5054,6 +5187,7 @@ async function runReviewGates(opts: {
         parentWorkspace: parentBeforeGate,
         phaseRef: { phaseNumber: opts.phaseNumber },
         inputFilePath: opts.inputFilePath,
+        allowNonTestPaths: phaseAllowsGateSourceFixes(opts.phase),
       });
       outputs.push(checkedRetryResult);
       combined.push(
@@ -5227,6 +5361,7 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
   label: string;
   dirtyLines: string[];
   globs?: string[];
+  allowNonTestPaths?: boolean;
 }): { committed: boolean; reason: string; nonTestPaths?: string[] } {
   if (parseBooleanEnv(process.env.GSTACK_QA_NO_AUTO_COMMIT)) {
     return { committed: false, reason: "GSTACK_QA_NO_AUTO_COMMIT enabled" };
@@ -5251,6 +5386,16 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
   }
   const nonTest = paths.filter((p) => !isTestOnlyPath(p, globs));
   const testOnly = paths.filter((p) => isTestOnlyPath(p, globs));
+
+  if (nonTest.length > 0 && !opts.allowNonTestPaths) {
+    return {
+      committed: false,
+      reason: `non-test paths present: ${nonTest.slice(0, 3).join(", ")}${
+        nonTest.length > 3 ? ` (+${nonTest.length - 3} more)` : ""
+      }`,
+      nonTestPaths: nonTest,
+    };
+  }
 
   // Mixed diff path: auto-split, gated on GSTACK_QA_NO_AUTO_SPLIT for
   // opt-out. The skill template warns synthesizers off mixed diffs,
@@ -5325,11 +5470,21 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
   // changes from a review/qa role; that would skip the whole point of
   // human review on source code.
   if (nonTest.length > 0) {
+    const prodCommit = commitPathsByList({
+      cwd: opts.cwd,
+      paths: nonTest,
+      message: buildProductionFixesAutoCommitMessage(opts.label, nonTest),
+      stageMode: "addAll",
+    });
+    if (prodCommit.ok) {
+      return {
+        committed: true,
+        reason: `committed ${nonTest.length} production path(s) via fix-on-review`,
+      };
+    }
     return {
       committed: false,
-      reason: `non-test paths present: ${nonTest.slice(0, 3).join(", ")}${
-        nonTest.length > 3 ? ` (+${nonTest.length - 3} more)` : ""
-      }`,
+      reason: prodCommit.error ?? "production commit failed",
       nonTestPaths: nonTest,
     };
   }
@@ -5434,6 +5589,7 @@ function applyGateHygiene(opts: {
    *  When provided, enables the DIFF SCOPE hygiene diagnostic only when
    *  the prompt body actually contains the constraint. */
   inputFilePath?: string;
+  allowNonTestPaths?: boolean;
 }): SubAgentResult {
   if (opts.result.timedOut || opts.result.exitCode !== 0) return opts.result;
   // Review/QA gates run Codex under workspace-write and the subagent writes
@@ -5474,6 +5630,7 @@ function applyGateHygiene(opts: {
         cwd: opts.cwd,
         label: opts.label,
         dirtyLines,
+        allowNonTestPaths: opts.allowNonTestPaths,
       });
       if (auto.committed) {
         console.warn(
@@ -7034,9 +7191,29 @@ async function runPhase(args: {
       // pre-PR1b behavior (skip classification, always cap-hit).
       let classified = false;
       if (process.env.GSTACK_DISABLE_PROVIDER_CLASSIFIER !== "1") {
+        const providerFailureEntries = Object.entries(
+          phaseState.failureRender ?? {},
+        )
+          .map(([role, value]) => ({
+            role,
+            verdict: (value as any)?.providerFailure,
+          }))
+          .filter((entry) => entry.verdict);
+        const latestProviderFailure =
+          providerFailureEntries[providerFailureEntries.length - 1];
+        if (latestProviderFailure) {
+          recordProviderFailureVerdict(
+            state,
+            phaseState.index,
+            latestProviderFailure.role,
+            latestProviderFailure.verdict,
+            helperCtxFor(state),
+          );
+          classified = true;
+        }
         const reviewLogs = phaseState.codexReview?.outputLogPaths ?? [];
         const lastLog = reviewLogs[reviewLogs.length - 1];
-        if (lastLog) {
+        if (!classified && lastLog) {
           let text = "";
           try {
             text = fs.readFileSync(lastLog, "utf8");
@@ -7403,6 +7580,7 @@ async function runPhase(args: {
         );
         const gateRun = await runReviewGates({
           roles: args.roles,
+          phase,
           inputFilePath,
           cwd,
           slug: state.slug,
@@ -10381,6 +10559,45 @@ async function main() {
     process.exit(exitCode);
   }
 
+  if (args.mode === "investigate") {
+    const { runInvestigateMode } = await import("./investigate-mode");
+    const exitCode = await runInvestigateMode({
+      faultId: args.investigateFaultId,
+      runId: args.investigateRunId,
+      statePath: args.investigateStatePath,
+      runDir: args.investigateRunDir,
+      symptoms: args.investigateSymptoms,
+      severityOverride: args.investigateSeverityOverride,
+      noInbox: args.investigateNoInbox,
+    });
+    process.exit(exitCode);
+  }
+
+  if (args.mode === "investigate-finalize") {
+    if (
+      !args.investigateRunId ||
+      !args.investigateFaultId ||
+      !args.investigateReportPath
+    ) {
+      process.stderr.write(
+        "usage: gstack-build investigate-finalize --run-id <id> --fault-id <id> --report <path> [--no-inbox]\n",
+      );
+      process.exit(2);
+    }
+    const { runInvestigateFinalize } = await import("./investigate-mode");
+    const exitCode = await runInvestigateFinalize({
+      runId: args.investigateRunId,
+      faultId: args.investigateFaultId,
+      reportPath: args.investigateReportPath,
+      severity:
+        args.investigateSeverity ?? args.investigateSeverityOverride,
+      source: args.investigateSource,
+      nonce: args.investigateNonce,
+      noInbox: args.investigateNoInbox,
+    });
+    process.exit(exitCode);
+  }
+
   if (
     args.roles.secondaryImpl.model !==
       DEFAULT_ROLE_CONFIGS.secondaryImpl.model &&
@@ -12883,10 +13100,28 @@ async function processMergeBranch(args: {
           );
           return false;
         }
+        // Gate `branch` against the same safe-ref grammar the release-daemon
+        // uses (release-daemon.ts:isAllowedFeatureBranch) before injecting it
+        // into landOnly's privileged kimi prompt. If validation fails, fall
+        // back to undefined so landOnly takes the unscoped legacy prompt path
+        // rather than passing shell-metacharacter or flag-confusable refs
+        // through to the sub-agent.
+        const branchGate = isAllowedFeatureBranch(branch);
+        const safeFeatureBranch = branchGate.ok ? branch : undefined;
+        const safePrNumber = branchGate.ok
+          ? (openPRNumber ?? undefined)
+          : undefined;
+        if (!branchGate.ok) {
+          console.warn(
+            `  ⚠ feature branch ${JSON.stringify(branch)} failed safe-ref gate (${branchGate.reason}) — falling back to unscoped landing prompt`,
+          );
+        }
         result = await landOnly({
           cwd: args.cwd,
           slug: `${args.slug}-${branchSlug}`,
           landRole: args.roles.land,
+          prNumber: safePrNumber,
+          featureBranch: safeFeatureBranch,
         });
       } else {
         result = await shipAndDeploy({

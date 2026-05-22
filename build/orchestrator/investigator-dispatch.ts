@@ -191,8 +191,43 @@ export function parseInvestigationReport(
   if (!Array.isArray(parsed.evidence)) {
     throw new Error("InvestigationReport: evidence must be array");
   }
+  if (parsed.proposedFix !== null && parsed.proposedFix !== undefined) {
+    const pf = parsed.proposedFix;
+    if (typeof pf !== "object" || !Array.isArray(pf.options)) {
+      throw new Error(
+        "InvestigationReport: proposedFix.options must be an array (or proposedFix must be null)",
+      );
+    }
+    for (let i = 0; i < pf.options.length; i++) {
+      const opt = pf.options[i];
+      if (
+        !opt ||
+        typeof opt.label !== "string" ||
+        typeof opt.description !== "string" ||
+        (opt.blast_radius !== "narrow" &&
+          opt.blast_radius !== "medium" &&
+          opt.blast_radius !== "wide")
+      ) {
+        throw new Error(
+          `InvestigationReport: proposedFix.options[${i}] missing label/description/blast_radius`,
+        );
+      }
+    }
+  }
   if (parsed.learnedPatternProposal) {
     const lp = parsed.learnedPatternProposal;
+    if (
+      typeof lp.category !== "string" ||
+      typeof lp.pattern !== "string" ||
+      typeof lp.description !== "string" ||
+      (lp.severity !== "CRITICAL" &&
+        lp.severity !== "HIGH" &&
+        lp.severity !== "MEDIUM")
+    ) {
+      throw new Error(
+        "InvestigationReport: learnedPatternProposal missing category/pattern/description or has invalid severity",
+      );
+    }
     if (!VALID_MATCHER_KINDS.has(lp.matcherKind)) {
       throw new Error(
         `InvestigationReport: invalid matcherKind "${lp.matcherKind}"`,

@@ -135,6 +135,15 @@ export function isAllowedFeatureBranch(
       reason: `featureBranch ${JSON.stringify(branch)} contains characters outside the safe subset [A-Za-z0-9._/-] (or starts with -)`,
     };
   }
+  const refCheck = spawnSync("git", ["check-ref-format", "--branch", branch], {
+    encoding: "utf8",
+  });
+  if (refCheck.status !== 0) {
+    return {
+      ok: false,
+      reason: `featureBranch ${JSON.stringify(branch)} is not a valid git branch name`,
+    };
+  }
   return { ok: true };
 }
 
@@ -687,6 +696,31 @@ function checkoutScratchWorktree(
   resolvedRepoPath: string,
   allowlistPrefixes: string[],
 ): string {
+  const remoteTrackingRef = `refs/remotes/origin/${record.featureBranch}`;
+  const fetchRemoteBranch = (cwd: string): void => {
+    const fetched = spawnSync(
+      "git",
+      [
+        "fetch",
+        "origin",
+        `+refs/heads/${record.featureBranch}:${remoteTrackingRef}`,
+      ],
+      { cwd, encoding: "utf8" },
+    );
+    if (fetched.status !== 0) {
+      throw new Error(fetched.stderr || fetched.stdout || "git fetch failed");
+    }
+  };
+  const resetWorktree = (cwd: string): void => {
+    const reset = spawnSync("git", ["reset", "--hard", remoteTrackingRef], {
+      cwd,
+      encoding: "utf8",
+    });
+    if (reset.status !== 0) {
+      throw new Error(reset.stderr || reset.stdout || "git reset failed");
+    }
+  };
+
   // Codex P2 (round 9) fix: gate record.worktreePath too. A planted
   // queue record can have an allowed repoPath but a worktreePath
   // pointing anywhere on disk (an attacker checkout, /tmp, etc). The
@@ -703,7 +737,21 @@ function checkoutScratchWorktree(
     if (worktreeGate.ok) {
       // Use the realpath-resolved worktree path, not the raw record
       // value — same TOCTOU mitigation as the repoPath gate.
-      return worktreeGate.resolved;
+      const resolvedWorktree = worktreeGate.resolved;
+      const branchCheck = spawnSync(
+        "git",
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        { cwd: resolvedWorktree, encoding: "utf8" },
+      );
+      if (branchCheck.status !== 0) {
+        // Existing fixtures and unusual worktree-like directories can pass
+        // the .git marker gate without being real repos. Keep the legacy
+        // fallback for those, but reset every real worktree below.
+        return resolvedWorktree;
+      }
+      fetchRemoteBranch(resolvedWorktree);
+      resetWorktree(resolvedWorktree);
+      return resolvedWorktree;
     }
     // worktreePath exists but is disallowed — ignore it and create a
     // fresh scratch worktree from the validated repo instead.
@@ -711,17 +759,7 @@ function checkoutScratchWorktree(
   const scratch = scratchWorktreePath(record);
   fs.mkdirSync(path.dirname(scratch), { recursive: true });
   if (!fs.existsSync(scratch)) {
-    const fetched = spawnSync(
-      "git",
-      ["fetch", "origin", record.featureBranch],
-      {
-        cwd: resolvedRepoPath,
-        encoding: "utf8",
-      },
-    );
-    if (fetched.status !== 0) {
-      throw new Error(fetched.stderr || fetched.stdout || "git fetch failed");
-    }
+    fetchRemoteBranch(resolvedRepoPath);
     const added = spawnSync(
       "git",
       [
@@ -729,7 +767,7 @@ function checkoutScratchWorktree(
         "add",
         "--detach",
         scratch,
-        `origin/${record.featureBranch}`,
+        remoteTrackingRef,
       ],
       { cwd: resolvedRepoPath, encoding: "utf8" },
     );
@@ -737,6 +775,16 @@ function checkoutScratchWorktree(
       throw new Error(
         added.stderr || added.stdout || "git worktree add failed",
       );
+    }
+  } else {
+    const branchCheck = spawnSync(
+      "git",
+      ["rev-parse", "--abbrev-ref", "HEAD"],
+      { cwd: scratch, encoding: "utf8" },
+    );
+    if (branchCheck.status === 0) {
+      fetchRemoteBranch(scratch);
+      resetWorktree(scratch);
     }
   }
   return scratch;
@@ -989,6 +1037,8 @@ export async function processReleaseQueueRecord(
       cwd,
       slug: `release-daemon-pr-${record.prNumber}`,
       landRole: opts.roles.land,
+      prNumber: record.prNumber,
+      featureBranch: record.featureBranch,
     });
     if (isInterrupted()) return readCurrentFromDisk(current);
     const lockLost = blockIfLockLost();
@@ -1026,6 +1076,8 @@ export async function processReleaseQueueRecord(
         cwd,
         slug: `release-daemon-pr-${record.prNumber}-retry`,
         landRole: opts.roles.land,
+        prNumber: record.prNumber,
+        featureBranch: record.featureBranch,
       });
       if (isInterrupted()) return readCurrentFromDisk(current);
       const lockLostAfterRetry = blockIfLockLost();

@@ -958,6 +958,19 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     "build/orchestrator/**",
   ],
 
+  // /build investigate subcommand E2E — periodic (non-deterministic LLM
+  // investigation; verifies the four-phase root-cause discipline end-to-end
+  // with a planted halt event and checks machine report + bug report output).
+  "build-investigate-bug-report": [
+    "build/orchestrator/investigate-mode.ts",
+    "build/orchestrator/investigate-context.ts",
+    "build/orchestrator/investigate-report-writer.ts",
+    "build/orchestrator/investigate-lock.ts",
+    "build/orchestrator/investigator-dispatch.ts",
+    "build/SKILL.md.tmpl",
+    "build/SKILL.md",
+  ],
+
   // Build convergence E2E — real Codex verifies round-annotation contract.
   // Layer 4 from the convergence design spec: drives runPlanReviewLoop with
   // a real Codex planReviewer and a stub synth, asserts round 2 reRaises === 0.
@@ -1277,6 +1290,9 @@ export const E2E_TIERS: Record<string, "gate" | "periodic"> = {
   "build-skill-cli-handoff": "periodic",
   "build-step-transition-eval": "periodic",
   "build-fault-investigator-e2e": "periodic",
+  // /build investigate subcommand E2E — periodic (planted halt event; LLM
+  // investigation output is non-deterministic; costs ~$0.50/run).
+  "build-investigate-bug-report": "periodic",
 
   // Build convergence E2E — gate (annotation-contract safety regression).
   // Real Codex must not re-raise resolved objections. Deterministic enough

@@ -6190,12 +6190,7 @@ describe("maybeAutoCommitTestOnlyDirty (Bug 5)", () => {
     expect(lastMsg).toContain("(auto-committed)");
   });
 
-  it("auto-splits mixed test+production diff into two commits (default behavior)", () => {
-    // Failure 3 from the mitosis-oasis incident: a review/qa role
-    // produced a mixed diff. Previously the gate refused entirely and
-    // required manual --mark-phase-committed recovery. The auto-split
-    // path puts test changes in one commit and production fixes in a
-    // second, both attributed to gstack-build (qa auto-commit).
+  it("rejects mixed test+production diff by default", () => {
     fs.mkdirSync(path.join(repoDir, "server", "__tests__"), {
       recursive: true,
     });
@@ -6209,6 +6204,28 @@ describe("maybeAutoCommitTestOnlyDirty (Bug 5)", () => {
       cwd: repoDir,
       label: "Codex review",
       dirtyLines: ["?? server/__tests__/bar.test.ts", "?? server/routes.ts"],
+    });
+
+    expect(result.committed).toBe(false);
+    expect(result.reason).toContain("non-test paths present");
+    expect(result.nonTestPaths).toContain("server/routes.ts");
+  });
+
+  it("fix-on-review opt-in auto-splits mixed test+production diff into two commits", () => {
+    fs.mkdirSync(path.join(repoDir, "server", "__tests__"), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(repoDir, "server", "__tests__", "bar.test.ts"),
+      "// new coverage\n",
+    );
+    fs.writeFileSync(path.join(repoDir, "server", "routes.ts"), "// fix\n");
+
+    const result = maybeAutoCommitTestOnlyDirty({
+      cwd: repoDir,
+      label: "Codex review",
+      dirtyLines: ["?? server/__tests__/bar.test.ts", "?? server/routes.ts"],
+      allowNonTestPaths: true,
     });
 
     expect(result.committed).toBe(true);
@@ -6306,6 +6323,26 @@ describe("maybeAutoCommitTestOnlyDirty (Bug 5)", () => {
     expect(headAfter).toBe(headBefore);
   });
 
+  it("fix-on-review opt-in accepts production-only dirty paths", () => {
+    fs.mkdirSync(path.join(repoDir, "server"), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, "server", "routes.ts"), "// src\n");
+
+    const result = maybeAutoCommitTestOnlyDirty({
+      cwd: repoDir,
+      label: "qa gate",
+      dirtyLines: ["?? server/routes.ts"],
+      allowNonTestPaths: true,
+    });
+
+    expect(result.committed).toBe(true);
+    expect(result.reason).toContain("production path");
+    const lastMsg = spawnSync("git", ["log", "-1", "--pretty=%B"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).stdout;
+    expect(lastMsg).toContain("production fixes from qa gate");
+  });
+
   it("GSTACK_QA_NO_AUTO_COMMIT=1 reverts to old behavior (no auto-commit)", () => {
     const old = process.env.GSTACK_QA_NO_AUTO_COMMIT;
     process.env.GSTACK_QA_NO_AUTO_COMMIT = "1";
@@ -6390,6 +6427,7 @@ describe("maybeAutoCommitTestOnlyDirty (Bug 5)", () => {
       cwd: repoDir,
       label: "qa gate",
       dirtyLines: ["?? src/__tests__/x.test.ts", "?? src/x.ts"],
+      allowNonTestPaths: true,
     });
 
     expect(result.committed).toBe(false);

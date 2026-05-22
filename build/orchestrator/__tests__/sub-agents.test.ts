@@ -38,6 +38,7 @@ import {
   resolveFallbackForConfigured,
   resolveFallbackForRoleTask,
   resolveTimeoutFallback,
+  resolveWatchdogMode,
   checkPhaseScope,
   spawnCaptured,
   type RunConfiguredRoleTaskOpts,
@@ -2978,6 +2979,47 @@ describe("resolveRoleTimeouts", () => {
   });
 });
 
+describe("resolveWatchdogMode", () => {
+  it("defaults to auto and selects cpu when the probe succeeds", () => {
+    expect(resolveWatchdogMode({}, () => true)).toEqual({
+      mode: "cpu",
+      source: "auto",
+    });
+  });
+
+  it("defaults to auto and falls back to stream when the probe fails", () => {
+    const resolved = resolveWatchdogMode({}, () => false);
+    expect(resolved.mode).toBe("stream");
+    expect(resolved.source).toBe("auto");
+    expect(resolved.warning).toContain("auto watchdog selected stream");
+  });
+
+  it("honors explicit stream mode", () => {
+    expect(
+      resolveWatchdogMode({ GSTACK_BUILD_WATCHDOG_MODE: "stream" }, () => true),
+    ).toEqual({ mode: "stream", source: "explicit" });
+  });
+
+  it("honors explicit cpu mode but degrades when unsupported", () => {
+    const resolved = resolveWatchdogMode(
+      { GSTACK_BUILD_WATCHDOG_MODE: "cpu" },
+      () => false,
+    );
+    expect(resolved.mode).toBe("stream");
+    expect(resolved.source).toBe("explicit");
+    expect(resolved.warning).toContain("cpu watchdog requested");
+  });
+
+  it("keeps GSTACK_BUILD_WATCHDOG_CPU as a compatibility alias", () => {
+    expect(
+      resolveWatchdogMode({ GSTACK_BUILD_WATCHDOG_CPU: "1" }, () => true),
+    ).toEqual({ mode: "cpu", source: "legacy" });
+    expect(
+      resolveWatchdogMode({ GSTACK_BUILD_WATCHDOG_CPU: "0" }, () => true),
+    ).toEqual({ mode: "stream", source: "legacy" });
+  });
+});
+
 describe("resolveFallbackForConfigured", () => {
   const baseOpts: RunConfiguredRoleTaskOpts = {
     inputFilePath: "/tmp/in",
@@ -3626,6 +3668,7 @@ describe("spawnCaptured streaming", () => {
       const log = fs.readFileSync(logPath, "utf8");
       // Header at top.
       expect(log).toMatch(/^# command: bash/);
+      expect(log).toMatch(/^# watchdog_mode: (cpu|stream) \((auto|explicit|legacy|invalid)\)$/m);
       // Body contains both channels.
       expect(log).toContain("[OUT] body-line");
       expect(log).toContain("[ERR] body-err");
@@ -3641,6 +3684,37 @@ describe("spawnCaptured streaming", () => {
       expect(log).toMatch(/# stdout_bytes: \d+/);
       expect(log).toMatch(/# stderr_bytes: \d+/);
     } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("kills zero-output child at first-token deadline", async () => {
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "spawncaptured-first-token-"),
+    );
+    const logPath = path.join(tmpDir, "first-token.log");
+    const oldDeadline = process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS;
+    process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS = "50";
+    try {
+      const result = await spawnCaptured({
+        bin: "bash",
+        argv: ["-c", "sleep 10"],
+        cwd: tmpDir,
+        timeoutMs: 5000,
+        logPath,
+        closeStdin: true,
+      });
+      expect(result.timedOut).toBe(true);
+      expect(result.stallKilled).toBe(true);
+      expect(result.killReason).toBe("first_token_timeout");
+      expect(result.stallSilenceMs).toBe(50);
+      const log = fs.readFileSync(logPath, "utf8");
+      expect(log).toContain("# stdout_bytes: 0");
+      expect(log).toContain("# stderr_bytes: 0");
+    } finally {
+      if (oldDeadline === undefined)
+        delete process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS;
+      else process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS = oldDeadline;
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });

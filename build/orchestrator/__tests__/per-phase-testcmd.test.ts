@@ -215,4 +215,32 @@ describe("per-phase testCmd override — mitosis-prototype bug regression", () =
     expect(phaseRunner).toContain("GSTACK_BUILD_RED_MAX_ITER");
     expect(phaseRunner).toContain("testCmd:");
   });
+
+  it("polyglot root-vitest plus Python-pytest override fixture resolves pytest runner", () => {
+    // Regression: a repo whose root autodetects vitest (because of a sibling
+    // JS config) but whose Python phase declares `<!-- testCmd: pytest ... -->`
+    // must resolve to pytest, not vitest, so verify-red uses the pytest parser.
+    withTmp((cwd) => {
+      fs.writeFileSync(
+        path.join(cwd, "pyproject.toml"),
+        "[tool.pytest.ini_options]\ntestpaths = ['tests']\n",
+      );
+      fs.mkdirSync(path.join(cwd, "openclaw"));
+      fs.writeFileSync(path.join(cwd, "openclaw", "vitest.config.ts"), "");
+
+      const plan = `# Plan
+## Feature 1: Python layer
+### Phase 1: Pytest phase
+<!-- testCmd: pytest tests/test_layer.py -->
+- [ ] **Implementation**: emit defaults
+- [ ] **Review**: review
+`;
+      const { phases } = parsePlan(plan);
+      const cmd = resolveTestCmdForPhase(emptyArgs(), cwd, phases[0]);
+      expect(cmd).toBe("pytest tests/test_layer.py");
+      // The runner detected from this command must be pytest, not vitest.
+      expect(cmd).toContain("pytest");
+      expect(cmd).not.toContain("vitest");
+    });
+  });
 });

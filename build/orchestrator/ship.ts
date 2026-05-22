@@ -84,14 +84,32 @@ export async function landOnly(args: {
   cwd: string;
   slug: string;
   landRole: RoleConfig;
+  prNumber?: number;
+  featureBranch?: string;
 }): Promise<SubAgentResult> {
   ensureLogDir(args.slug);
   const landInput = path.join(logDir(args.slug), "land-and-deploy-input.md");
   const landOutput = path.join(logDir(args.slug), "land-and-deploy-output.md");
-  fs.writeFileSync(
-    landInput,
-    `Run ${args.landRole.command || "/gstack-land-and-deploy"} for this repository. Report exactly what happened.`,
-  );
+
+  let prompt: string;
+  if (
+    args.prNumber !== undefined &&
+    args.prNumber !== null &&
+    args.featureBranch
+  ) {
+    prompt = `Run ${args.landRole.command || "/gstack-land-and-deploy"} for this repository.
+
+Hard targeting instructions:
+- land exactly PR #${args.prNumber}.
+- verify branch ${args.featureBranch} (must match origin/${args.featureBranch}).
+- If the current branch does not match ${args.featureBranch}, fail on mismatch and do not land.
+
+Report exactly what happened.`;
+  } else {
+    prompt = `Run ${args.landRole.command || "/gstack-land-and-deploy"} for this repository. Report exactly what happened.`;
+  }
+
+  fs.writeFileSync(landInput, prompt);
   fs.writeFileSync(landOutput, "");
   return runSlashCommand({
     inputFilePath: landInput,

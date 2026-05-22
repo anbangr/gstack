@@ -30,7 +30,11 @@ import {
   parseCoveragePercent,
   extractCoverageTarget,
 } from "./sub-agents";
-import { renderRoleStepFailureMessage } from "./halt-event-helpers";
+import {
+  classifyProviderFailure,
+  renderRoleStepFailure,
+  renderRoleStepFailureMessage,
+} from "./halt-event-helpers";
 import { BUILD_DEFAULTS, envNumberOrDefault } from "./build-config";
 import { extractTestCount } from "./test-runner-introspect";
 
@@ -560,12 +564,14 @@ export function applyResult(
     if (result.timedOut) {
       next.status = "failed";
       next.error = `Gemini timed out (after ${result.retries} retry${result.retries === 1 ? "" : "es"})`;
+      persistFailureRender(next, "primary-impl", result);
       return next;
     }
     if (result.exitCode !== 0) {
       next.status = "failed";
       next.error = geminiExitError("Gemini", result);
       next.gemini.error = next.error;
+      persistFailureRender(next, "primary-impl", result);
       return next;
     }
     next.status = "impl_done";
@@ -601,6 +607,7 @@ export function applyResult(
       next.codexReview.finalVerdict = "TIMEOUT";
       next.status = "failed";
       next.error = `[timeout] Codex review timed out after ${result.retries} retry${result.retries === 1 ? "" : "es"}`;
+      persistFailureRender(next, "review", result);
       return next;
     }
     if (result.exitCode !== 0) {
@@ -608,6 +615,7 @@ export function applyResult(
       const retriedOnce = (result.retries ?? 0) > 0;
       const prefix = retriedOnce ? "[transient: retried once] " : "[other] ";
       next.error = `${prefix}Codex exited ${result.exitCode}; see ${result.logPath}`;
+      persistFailureRender(next, "review", result);
       return next;
     }
     const verdict: Verdict = parseVerdict(result.stdout);
@@ -654,6 +662,7 @@ export function applyResult(
     if (result.timedOut) {
       next.status = "failed";
       next.error = `Gemini re-run (from review feedback) timed out`;
+      persistFailureRender(next, "primary-impl-rerun", result);
       return next;
     }
     if (result.exitCode !== 0) {
@@ -662,6 +671,7 @@ export function applyResult(
         "Gemini re-run (from review feedback)",
         result,
       );
+      persistFailureRender(next, "primary-impl-rerun", result);
       return next;
     }
     next.status = "impl_done";
@@ -681,6 +691,7 @@ export function applyResult(
     if (result.timedOut || result.exitCode !== 0) {
       next.status = "failed";
       next.error = renderRoleStepFailureMessage("test-spec writer", result);
+      persistFailureRender(next, "test-writer", result);
       return next;
     }
     next.status = "test_spec_done";
@@ -693,17 +704,24 @@ export function applyResult(
       next.error = "Test verification timed out";
       return next;
     }
+    const runner = detectRunnerFromTestCmd(extra?.testCmd);
+    const testCount = extractTestCount(
+      { stdout: result.stdout, stderr: result.stderr },
+      runner,
+    );
     if (result.exitCode !== 0) {
       // Tests fail as expected → Red phase confirmed. Proceed to implementation.
       next.redSpecAttempts = 0;
       next.status = "tests_red";
       return next;
     }
-    const runner = detectRunnerFromTestCmd(extra?.testCmd);
-    const testCount = extractTestCount(
-      { stdout: result.stdout, stderr: result.stderr },
-      runner,
-    );
+    if (testCount.failed > 0) {
+      // Some wrapper commands suppress the test runner's non-zero exit status.
+      // Treat explicit failure output as a valid red state.
+      next.redSpecAttempts = 0;
+      next.status = "tests_red";
+      return next;
+    }
     const suppressed = hasSuppressionAnnotation(
       extra?.phaseBody,
       phaseState.kind ?? extra?.phaseKind,
@@ -775,6 +793,7 @@ export function applyResult(
     if (result.timedOut || result.exitCode !== 0) {
       next.status = "failed";
       next.error = renderRoleStepFailureMessage("test-fixer", result);
+      persistFailureRender(next, "test-fixer", result);
       return next;
     }
     // After a successful fix, re-run tests (route back through impl_done → RUN_TESTS).
@@ -786,6 +805,7 @@ export function applyResult(
     if (result.timedOut || result.exitCode !== 0) {
       next.status = "failed";
       next.error = renderRoleStepFailureMessage("dual implementation", result);
+      persistFailureRender(next, "dual-impl", result);
       return next;
     }
     if (!extra?.dualImplInit) {
@@ -899,6 +919,7 @@ export function applyResult(
     if (result.timedOut || result.exitCode !== 0) {
       next.status = "failed";
       next.error = renderRoleStepFailureMessage("dual-impl judge", result);
+      persistFailureRender(next, "judge", result);
       return next;
     }
     const verdict = extra?.judgeVerdict;
@@ -933,6 +954,27 @@ export function applyResult(
 
   // No-op for terminal/transitional actions; driver handles them.
   return next;
+}
+
+function persistFailureRender(
+  phaseState: PhaseState,
+  role: string,
+  result: SubAgentResult,
+): void {
+  const text = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  const providerFailure = classifyProviderFailure({
+    text,
+    stallKilled: result.stallKilled,
+    timedOut: result.timedOut,
+  });
+  phaseState.failureRender = {
+    ...(phaseState.failureRender ?? {}),
+    [role]: {
+      ...renderRoleStepFailure(role, result),
+      logPath: result.logPath,
+      ...(providerFailure ? { providerFailure } : {}),
+    },
+  };
 }
 
 /**

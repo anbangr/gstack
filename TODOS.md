@@ -98,6 +98,48 @@ partial. On finish(), flush any residuals with a final prefix.
 **Priority:** P3
 **Depends on:** streaming-log fix landed
 
+### /build investigate follow-ups (T-INV)
+
+**What:** Codex adversarial review of `worktree-feat-build-investigate-subcommand`
+landed at v1.44.0.0. Four critical findings (lock ownership nonce, lock leak
+on throw, severity/source threading, shallow report validation) were fixed
+before ship. Five less-critical findings are deferred to v1.44.1.0:
+
+- F1: `--run-id` and `--run-dir` flags are accepted by parseArgs but
+  `resolveInvestigationContext` ignores them. With no `--fault-id`, the
+  resolver always picks the most recent active run via auto-detect even
+  when `--run-id <other-run>` is explicit. Operators can investigate the
+  wrong fault silently. Fix: wire `args.runId` through the resolver to
+  scope auto-detect to the named run, and accept `--run-dir` as an
+  alternate context anchor.
+- F2: auto-detect picks the most recent active run first, then looks for
+  a pending halt only for THAT run. If the newest active run has no
+  pending fault but older active runs do, the resolver returns null.
+  Test name says "most recent active run with a pending halt event" but
+  the implementation does not iterate. Fix: iterate active runs in
+  recency order, return the first one with a pending halt event.
+- F3: faultIds contain `:` (e.g., `PHASE_FAILED:p3:a4f2b1c8`) which is
+  invalid on Windows filesystems. Lock and report filenames break on
+  Windows. Acceptable for now since CLAUDE.md states the binaries are
+  "Mach-O arm64 only", but should be addressed before any Windows port.
+  Fix: encode `:` as `_` for filesystem paths while preserving the
+  user-facing faultId string.
+- F4: `--report` validation uses `statSync` + `readFileSync`. A symlink
+  pointing at `/dev/null` passes `isFile()` (it's a regular file via
+  follow), gets read as empty, JSON.parse fails with a clear error.
+  Not exploitable but worth a `lstat` check for symlink safety in
+  defense-in-depth.
+- F5: SKILL.md.tmpl tells Claude to call `gstack-build investigate-finalize`
+  but doesn't tell Claude to `cd` to the worktree path first. If Claude's
+  cwd has drifted, the bug report lands in `<cwd>/inbox` instead of the
+  intended project root. The `GSTACK_INBOX_DIR` env var works around this
+  for tests, but production users may hit it. Fix: have the briefing
+  emit an absolute inbox path that finalize uses via `--inbox-dir`, or
+  add a `cd <worktreePath>` line to the SKILL.md template.
+
+**Effort:** M cumulative (F1+F2 are the most impactful, ~half-day each)
+**Priority:** P2
+
 ### Adversarial review follow-ups (T-ADV)
 
 **What:** Adversarial review of `fix/spawn-captured-streaming-and-cleanup`

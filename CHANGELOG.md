@@ -1,5 +1,59 @@
 # Changelog
 
+## [1.44.0.0] - 2026-05-22
+
+## **`/build investigate` — run the four-phase root-cause discipline against a build halt without waiting for the auto pipeline.**
+## **Manual trigger, current-session investigator, dual-artifact output: a machine report next to the auto-investigation log and a curated `inbox/BUGREPORT-*.md` for HIGH/CRITICAL faults.**
+
+When a build halts, you have two paths now. The auto pipeline (`drain-faults` → `investigator-dispatch`) still works as before, unchanged. Or you can invoke `gstack-build investigate` in the same Claude session and get a richer pass: the CLI resolves context (auto-detect the latest active run, or take an explicit `--fault-id`/`--state`/`--symptoms`), emits a structured JSON briefing block to stdout, and the running Claude session does the four-phase investigation against the briefing's file pointers. A sister `investigate-finalize` subcommand validates the report JSON via the existing `parseInvestigationReport` and writes both artifacts.
+
+The new flow puts a human-readable bug report into `inbox/BUGREPORT-<date>-<slug>.md` for HIGH/CRITICAL faults, slotting into the existing inbox triage pattern. Re-running on the same fault overwrites the machine report and appends a numeric suffix to the bug report — prior investigations aren't clobbered. The lock primitive uses `O_EXCL` atomic creation so two concurrent investigations of the same fault can't both succeed.
+
+### The numbers that matter
+
+Source: 50 free unit + integration tests across 11 new files, plus one paid E2E in the periodic tier.
+
+| Surface | Before | After |
+|---|---|---|
+| Manual investigation trigger | none — wait for `drain-faults` | `gstack-build investigate [<faultId>]` with auto-detect, `--state`, `--run-id`, `--symptoms` |
+| Investigator session | codex subprocess via `investigator-dispatch` | current Claude session via stdout briefing block (no subprocess, no model flag) |
+| Methodology | inline four-phase prompt | full `/investigate` skill discipline with file-pointer access |
+| Bug report format | machine-only JSON report | machine markdown + human `BUGREPORT-*.md` (HIGH/CRITICAL only) |
+| Concurrency | none — last writer wins | `O_EXCL` atomic lock + 1-hour stale reclamation |
+| Test coverage (new modules) | n/a | 50 free tests + 1 paid E2E (`build-investigate-bug-report`, periodic) |
+
+### What this means for build operators
+
+When a halt event hits the queue, you can keep waiting for the auto pipeline (still works, still fires on every halt). Or you can run `/build investigate` from your Claude session and read a real bug report after. The bug report uses the same `inbox/BUGREPORT-*` format as existing hand-filed reports, so it lands in normal triage. The methodology is the full four-phase `/investigate` discipline — Investigate → Analyze → Hypothesize → Implement — with the briefing carrying file pointers (state, stdout tail, living plan, worktree path) so the Claude session can trace candidate code paths without re-discovering them.
+
+### Itemized changes
+
+#### Added
+
+- `gstack-build investigate [<faultId>] [flags]` — new subcommand. Resolves context from explicit `--state`, `--run-id`, positional `<faultId>`, `--symptoms`, or auto-detect via `active-runs.ts`. Emits a `<<<GSTACK_INVESTIGATE_BRIEFING>>>` JSON block to stdout, then the Claude session runs the four-phase methodology.
+- `gstack-build investigate-finalize --run-id <id> --fault-id <id> --report <path>` — internal subcommand the Claude session calls after writing its `InvestigationReport` JSON. Validates the report via `parseInvestigationReport`, writes both artifacts, releases the lock.
+- Four new orchestrator modules: `investigate-mode.ts`, `investigate-context.ts`, `investigate-report-writer.ts`, `investigate-lock.ts`.
+- Investigation methodology section in `build/SKILL.md` (regenerated from `SKILL.md.tmpl`) documenting the four-phase flow for any Claude session reading the briefing.
+- `GSTACK_INBOX_DIR` env var to override the default `process.cwd() + "/inbox"` path for bug-report writes — useful for E2E tests in isolated dirs.
+
+#### Changed
+
+- Build orchestrator CLI now recognizes two new modes (`investigate`, `investigate-finalize`).
+- `FaultLockHandle` shape uses `O_EXCL` (the `wx` open flag) for atomic creation; removed unused `acquiredAt` from the handle (kept on `FaultLockPayload` which is the on-disk shape).
+- The lock now carries a 16-byte nonce embedded in the briefing block. `investigate-finalize` requires `--nonce <hex>` and refuses to delete the lock if the on-disk nonce doesn't match. Prevents one investigation's finalize from clobbering another investigation's lock when both raced through stale-reclaim.
+- `investigate-finalize` now requires `--severity <S>` and `--source <X>` from the briefing so bug-report severity gating (symptoms-only skip, MEDIUM skip) fires correctly. Without these flags, every finalize previously defaulted to HIGH and bypassed the skip logic.
+- `parseInvestigationReport` now validates nested shapes: `proposedFix.options` must be an array; each option must have label, description, and a valid `blast_radius`; `learnedPatternProposal` must have category, pattern, description, and a valid severity. Malformed reports exit 2 cleanly instead of crashing the writer.
+- `investigate-finalize` caps the `--report` file size at 1 MiB and refuses non-regular files (defense against `/dev/zero` or FIFO paths).
+- `tailStdoutLog` caps its read at 4 MiB instead of loading the full stdout log (which can be gigabytes on long-running builds).
+
+#### For contributors
+
+- 11 new test files under `build/orchestrator/__tests__/investigate-*.test.ts` covering the lock primitive (8, including a nonce-mismatch refuse test), stdout tail extraction (4), context resolution (10), machine + bug report writers (12), exit codes (7), JSON validation (7), and three integration tests (end-to-end, auto-detect, no-context fallback). 51 tests, 122 expect() calls.
+- One paid E2E test (`test/skill-e2e-build-investigate.test.ts`) added to the periodic tier under registry key `build-investigate-bug-report`.
+- Five test fixtures under `test/fixtures/investigate/`: a realistic halt event, build state with `recentErrors`, a 2000-line stdout log with planted error sections at lines 750/825/895/896, and two canned `InvestigationReport` fixtures (success + bad-faultId for rejection tests).
+- `coverage-matrix.test.ts` registry updated with the four new modules.
+- Spec at [docs/superpowers/specs/2026-05-22-build-investigate-subcommand-design.md](docs/superpowers/specs/2026-05-22-build-investigate-subcommand-design.md); plan at [docs/superpowers/plans/2026-05-22-build-investigate-subcommand.md](docs/superpowers/plans/2026-05-22-build-investigate-subcommand.md).
+
 ## [1.43.0.0] - 2026-05-20
 
 ## **iOS QA on a real iPhone — no XCTest, no WebDriverAgent, no simulators.**
