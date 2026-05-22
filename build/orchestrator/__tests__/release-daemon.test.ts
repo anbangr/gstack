@@ -2428,6 +2428,120 @@ describe("processReleaseQueueRecord worktree branch correction", () => {
     expect(resetCalls.length).toBeGreaterThan(0);
   });
 
+  it("resets an existing fallback scratch worktree before landing", async () => {
+    const runId = "wt-existing-scratch";
+    const prNumber = 53;
+    const scratch = path.join(
+      os.tmpdir(),
+      "gstack-release-daemon",
+      `${runId}-pr-${prNumber}`,
+    );
+    fs.rmSync(scratch, { recursive: true, force: true });
+    fs.mkdirSync(path.join(scratch, ".git"), { recursive: true });
+
+    const item = writeReleaseQueueRecord(queueDir, {
+      runId,
+      repoPath: repo,
+      repoIdentity: "github.com/acme/wt",
+      baseBranch: "main",
+      featureBranch: "feat/scratch",
+      prNumber,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: path.join(os.tmpdir(), "missing-worktree"),
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+
+    const spawnCalls: [string, string[], string | undefined][] = [];
+    const spawnSpy = spyOn(childRegistry, "spawnSync").mockImplementation(
+      (cmd: string, args: readonly string[], opts?: { cwd?: string }) => {
+        spawnCalls.push([cmd, [...args], opts?.cwd]);
+        return {
+          status: 0,
+          stdout: "",
+          stderr: "",
+          pid: 1,
+          output: [],
+          signal: null,
+        } as any;
+      },
+    );
+
+    let observedCwd = "";
+    try {
+      const result = await processReleaseQueueRecord(item, {
+        queueDir,
+        roles: DEFAULT_ROLE_CONFIGS,
+        allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+        heartbeatIntervalMs: 60_000,
+        verifyQueued: () => ({ ok: true }),
+        verifyMerged: () => ({ merged: true }),
+        acquireLock: () => ({
+          acquired: true,
+          handle: {
+            ref: "refs/gstack/release-locks/wt/main",
+            ownerId: "owner",
+            commit: "c",
+            repoPath: repo,
+            repoIdentity: "github.com/acme/wt",
+            baseBranch: "main",
+          },
+        }),
+        refreshLock: () => ({
+          ok: true,
+          handle: {
+            ref: "refs/gstack/release-locks/wt/main",
+            ownerId: "owner",
+            commit: "c",
+            repoPath: repo,
+            repoIdentity: "github.com/acme/wt",
+            baseBranch: "main",
+          },
+        }),
+        releaseLock: () => ({ ok: true }),
+        land: async ({ cwd }) => {
+          observedCwd = cwd;
+          return {
+            stdout: "",
+            stderr: "",
+            exitCode: 0,
+            timedOut: false,
+            logPath: "/tmp/log",
+            durationMs: 1,
+            retries: 0,
+          };
+        },
+      });
+
+      expect(result.status).toBe("landed");
+      expect(observedCwd).toBe(scratch);
+      expect(
+        spawnCalls.some(
+          ([cmd, args, cwd]) =>
+            cmd === "git" &&
+            cwd === scratch &&
+            args[0] === "fetch" &&
+            args.includes(
+              "+refs/heads/feat/scratch:refs/remotes/origin/feat/scratch",
+            ),
+        ),
+      ).toBe(true);
+      expect(
+        spawnCalls.some(
+          ([cmd, args, cwd]) =>
+            cmd === "git" &&
+            cwd === scratch &&
+            args[0] === "reset" &&
+            args.includes("refs/remotes/origin/feat/scratch"),
+        ),
+      ).toBe(true);
+    } finally {
+      spawnSpy.mockRestore();
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("blocks when remote featureBranch was deleted", async () => {
     const item = writeReleaseQueueRecord(queueDir, {
       runId: "wt-deleted-run",

@@ -696,6 +696,31 @@ function checkoutScratchWorktree(
   resolvedRepoPath: string,
   allowlistPrefixes: string[],
 ): string {
+  const remoteTrackingRef = `refs/remotes/origin/${record.featureBranch}`;
+  const fetchRemoteBranch = (cwd: string): void => {
+    const fetched = spawnSync(
+      "git",
+      [
+        "fetch",
+        "origin",
+        `+refs/heads/${record.featureBranch}:${remoteTrackingRef}`,
+      ],
+      { cwd, encoding: "utf8" },
+    );
+    if (fetched.status !== 0) {
+      throw new Error(fetched.stderr || fetched.stdout || "git fetch failed");
+    }
+  };
+  const resetWorktree = (cwd: string): void => {
+    const reset = spawnSync("git", ["reset", "--hard", remoteTrackingRef], {
+      cwd,
+      encoding: "utf8",
+    });
+    if (reset.status !== 0) {
+      throw new Error(reset.stderr || reset.stdout || "git reset failed");
+    }
+  };
+
   // Codex P2 (round 9) fix: gate record.worktreePath too. A planted
   // queue record can have an allowed repoPath but a worktreePath
   // pointing anywhere on disk (an attacker checkout, /tmp, etc). The
@@ -724,27 +749,8 @@ function checkoutScratchWorktree(
         // fallback for those, but reset every real worktree below.
         return resolvedWorktree;
       }
-      const remoteTrackingRef = `refs/remotes/origin/${record.featureBranch}`;
-      const fetched = spawnSync(
-        "git",
-        [
-          "fetch",
-          "origin",
-          `+refs/heads/${record.featureBranch}:${remoteTrackingRef}`,
-        ],
-        { cwd: resolvedWorktree, encoding: "utf8" },
-      );
-      if (fetched.status !== 0) {
-        throw new Error(fetched.stderr || fetched.stdout || "git fetch failed");
-      }
-      const reset = spawnSync(
-        "git",
-        ["reset", "--hard", remoteTrackingRef],
-        { cwd: resolvedWorktree, encoding: "utf8" },
-      );
-      if (reset.status !== 0) {
-        throw new Error(reset.stderr || reset.stdout || "git reset failed");
-      }
+      fetchRemoteBranch(resolvedWorktree);
+      resetWorktree(resolvedWorktree);
       return resolvedWorktree;
     }
     // worktreePath exists but is disallowed — ignore it and create a
@@ -753,17 +759,7 @@ function checkoutScratchWorktree(
   const scratch = scratchWorktreePath(record);
   fs.mkdirSync(path.dirname(scratch), { recursive: true });
   if (!fs.existsSync(scratch)) {
-    const fetched = spawnSync(
-      "git",
-      ["fetch", "origin", record.featureBranch],
-      {
-        cwd: resolvedRepoPath,
-        encoding: "utf8",
-      },
-    );
-    if (fetched.status !== 0) {
-      throw new Error(fetched.stderr || fetched.stdout || "git fetch failed");
-    }
+    fetchRemoteBranch(resolvedRepoPath);
     const added = spawnSync(
       "git",
       [
@@ -771,7 +767,7 @@ function checkoutScratchWorktree(
         "add",
         "--detach",
         scratch,
-        `origin/${record.featureBranch}`,
+        remoteTrackingRef,
       ],
       { cwd: resolvedRepoPath, encoding: "utf8" },
     );
@@ -779,6 +775,16 @@ function checkoutScratchWorktree(
       throw new Error(
         added.stderr || added.stdout || "git worktree add failed",
       );
+    }
+  } else {
+    const branchCheck = spawnSync(
+      "git",
+      ["rev-parse", "--abbrev-ref", "HEAD"],
+      { cwd: scratch, encoding: "utf8" },
+    );
+    if (branchCheck.status === 0) {
+      fetchRemoteBranch(scratch);
+      resetWorktree(scratch);
     }
   }
   return scratch;
