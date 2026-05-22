@@ -296,6 +296,88 @@ describe("extractTestCount — edge cases", () => {
       source: "stdout-fallback",
     });
   });
+
+  test("edge: malformed JSON output falls back to stdout regex", () => {
+    const stdout =
+      "{not valid json}\n" +
+      JSON.stringify({ numTotalTests: 3, numPassedTests: 3, numFailedTests: 0 });
+    const result = extractTestCount({ stdout }, "vitest");
+    expect(result.source).toBe("json");
+    expect(result.collected).toBe(3);
+  });
+
+  test("edge: vitest with only skipped tests", () => {
+    const stdout = JSON.stringify({
+      numTotalTests: 5,
+      numPassedTests: 0,
+      numFailedTests: 0,
+    });
+    const result = extractTestCount({ stdout }, "vitest");
+    expect(result.collected).toBe(5);
+    expect(result.passed).toBe(0);
+    expect(result.failed).toBe(0);
+  });
+
+  test("edge: jest with only skipped tests", () => {
+    const stdout = JSON.stringify({
+      numTotalTests: 4,
+      numPassedTests: 0,
+      numFailedTests: 0,
+    });
+    const result = extractTestCount({ stdout }, "jest");
+    expect(result.collected).toBe(4);
+    expect(result.passed).toBe(0);
+    expect(result.failed).toBe(0);
+  });
+
+  test("edge: pytest without json-report uses stdout regex", () => {
+    const stdout =
+      "========================= test session starts =========================\n" +
+      "collected 3 items\n" +
+      "1 passed, 2 failed in 0.01s\n";
+    const result = extractTestCount({ stdout }, "pytest");
+    expect(result.source).toBe("stdout-fallback");
+    expect(result.collected).toBe(3);
+    expect(result.passed).toBe(1);
+    expect(result.failed).toBe(2);
+  });
+
+  test("edge: bun coverage-only JSON with zero tests", () => {
+    const coveragePath = path.join(tmp, "bun-coverage-zero.json");
+    fs.writeFileSync(
+      coveragePath,
+      JSON.stringify({
+        results: { numTotalTests: 0, numPassedTests: 0, numFailedTests: 0 },
+      }),
+    );
+    const result = extractTestCount(
+      { stdout: "", coverageJsonPath: coveragePath },
+      "bun",
+    );
+    expect(result.collected).toBe(0);
+    expect(result.passed).toBe(0);
+    expect(result.failed).toBe(0);
+    expect(result.source).toBe("json");
+  });
+
+  test("edge: mixed stdout and stderr for runner summary", () => {
+    const stdout = "bun test v1.3.12\n";
+    const stderr =
+      " 2 pass\n 1 fail\nRan 3 tests across 1 file. [22.00ms]\n";
+    const result = extractTestCount({ stdout, stderr }, "bun");
+    expect(result.source).toBe("stdout-fallback");
+    expect(result.collected).toBe(3);
+    expect(result.passed).toBe(2);
+    expect(result.failed).toBe(1);
+  });
+
+  test("edge: localized mocha stdout does not mis-count", () => {
+    const stdout = "\n  5 passant (42ms)\n  1 \u00e9chouant\n\n";
+    const result = extractTestCount({ stdout }, "mocha");
+    // French localization won't match "passing"/"failing"
+    expect(result.source).toBe("stdout-fallback");
+    expect(result.collected).toBe(0);
+  });
 });
 
 describe("RunnerKind type export", () => {

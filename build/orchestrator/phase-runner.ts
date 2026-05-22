@@ -704,17 +704,24 @@ export function applyResult(
       next.error = "Test verification timed out";
       return next;
     }
+    const runner = detectRunnerFromTestCmd(extra?.testCmd);
+    const testCount = extractTestCount(
+      { stdout: result.stdout, stderr: result.stderr },
+      runner,
+    );
     if (result.exitCode !== 0) {
       // Tests fail as expected → Red phase confirmed. Proceed to implementation.
       next.redSpecAttempts = 0;
       next.status = "tests_red";
       return next;
     }
-    const runner = detectRunnerFromTestCmd(extra?.testCmd);
-    const testCount = extractTestCount(
-      { stdout: result.stdout, stderr: result.stderr },
-      runner,
-    );
+    if (testCount.failed > 0) {
+      // Some wrapper commands suppress the test runner's non-zero exit status.
+      // Treat explicit failure output as a valid red state.
+      next.redSpecAttempts = 0;
+      next.status = "tests_red";
+      return next;
+    }
     const suppressed = hasSuppressionAnnotation(
       extra?.phaseBody,
       phaseState.kind ?? extra?.phaseKind,

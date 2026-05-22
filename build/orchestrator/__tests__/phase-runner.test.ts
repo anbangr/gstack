@@ -2185,3 +2185,354 @@ describe("non-code phase kinds skip test-spec / tests pipeline", () => {
     expect(action.type).toBe("RUN_TESTS");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Red-gate verify-red runner introspection
+// ---------------------------------------------------------------------------
+
+describe("applyResult — VERIFY_RED with runner introspection", () => {
+  function verifyRedResult(stdout: string, exitCode = 0): SubAgentResult {
+    return {
+      stdout,
+      stderr: "",
+      exitCode,
+      timedOut: false,
+      logPath: "/tmp/verify-red.log",
+      durationMs: 500,
+      retries: 0,
+    };
+  }
+
+  function verifyRedState(redSpecAttempts = 0): PhaseState {
+    return basePhase({
+      status: "test_spec_done" as any,
+      redSpecAttempts,
+    });
+  }
+
+  // --- collected=0: one fixture per runner ---
+
+  it("jest zero collected → RED_GATE_ZERO_TESTS_COLLECTED halt", () => {
+    const stdout = JSON.stringify({
+      numTotalTests: 0,
+      numPassedTests: 0,
+      numFailedTests: 0,
+    });
+    const next = applyResult(
+      verifyRedState(),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "jest --json" },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/RED_GATE_ZERO_TESTS_COLLECTED/i);
+  });
+
+  it("pytest zero collected → RED_GATE_ZERO_TESTS_COLLECTED halt", () => {
+    const stdout =
+      "========================= test session starts =========================\n" +
+      "collected 0 items\n";
+    const next = applyResult(
+      verifyRedState(),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "pytest" },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/RED_GATE_ZERO_TESTS_COLLECTED/i);
+  });
+
+  it("bun zero collected → RED_GATE_ZERO_TESTS_COLLECTED halt", () => {
+    const stdout =
+      "bun test v1.3.12\n\n 0 pass\n 0 fail\nRan 0 tests across 0 files. [22.00ms]\n";
+    const next = applyResult(
+      verifyRedState(),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "bun test" },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/RED_GATE_ZERO_TESTS_COLLECTED/i);
+  });
+
+  it("mocha zero collected → RED_GATE_ZERO_TESTS_COLLECTED halt", () => {
+    const stdout = "\n  0 passing (1ms)\n\n";
+    const next = applyResult(
+      verifyRedState(),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "mocha" },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/RED_GATE_ZERO_TESTS_COLLECTED/i);
+  });
+
+  it("go zero collected → RED_GATE_ZERO_TESTS_COLLECTED halt", () => {
+    const stdout = "?       github.com/example/pkg  [no test files]\n";
+    const next = applyResult(
+      verifyRedState(),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "go test ./..." },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/RED_GATE_ZERO_TESTS_COLLECTED/i);
+  });
+
+  // --- passed>0: one fixture per runner → cap becomes 1 ---
+
+  it("vitest passed>0 → retry cap is 1 (fails at attempts=1)", () => {
+    const stdout = JSON.stringify({
+      numTotalTests: 3,
+      numPassedTests: 3,
+      numFailedTests: 0,
+    });
+    const next = applyResult(
+      verifyRedState(0),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "npx vitest run" },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/could not produce failing tests|trivially pass/i);
+  });
+
+  it("jest passed>0 → retry cap is 1", () => {
+    const stdout = JSON.stringify({
+      numTotalTests: 2,
+      numPassedTests: 2,
+      numFailedTests: 0,
+    });
+    const next = applyResult(
+      verifyRedState(0),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "jest --json" },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/could not produce failing tests|trivially pass/i);
+  });
+
+  it("pytest passed>0 → retry cap is 1", () => {
+    const stdout =
+      "========================= test session starts =========================\n" +
+      "collected 2 items\n" +
+      "2 passed in 0.01s\n";
+    const next = applyResult(
+      verifyRedState(0),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "pytest" },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/could not produce failing tests|trivially pass/i);
+  });
+
+  it("bun passed>0 → retry cap is 1", () => {
+    const stdout =
+      "bun test v1.3.12\n\n 5 pass\n 0 fail\nRan 5 tests across 1 file. [22.00ms]\n";
+    const next = applyResult(
+      verifyRedState(0),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "bun test" },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/could not produce failing tests|trivially pass/i);
+  });
+
+  it("mocha passed>0 → retry cap is 1", () => {
+    const stdout = "\n  4 passing (42ms)\n\n";
+    const next = applyResult(
+      verifyRedState(0),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "mocha" },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/could not produce failing tests|trivially pass/i);
+  });
+
+  it("go passed>0 → retry cap is 1", () => {
+    const stdout = "PASS\nok      github.com/example/pkg  0.123s\n";
+    const next = applyResult(
+      verifyRedState(0),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "go test ./..." },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/could not produce failing tests|trivially pass/i);
+  });
+
+  // --- failing tests: one fixture per runner → valid red state ---
+
+  it("vitest failing tests → tests_red (valid red state)", () => {
+    const stdout = JSON.stringify({
+      numTotalTests: 3,
+      numPassedTests: 1,
+      numFailedTests: 2,
+    });
+    const next = applyResult(
+      verifyRedState(),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "npx vitest run" },
+    );
+    expect(next.status).toBe("tests_red");
+    expect(next.error).toBeUndefined();
+  });
+
+  it("jest failing tests → tests_red", () => {
+    const stdout = JSON.stringify({
+      numTotalTests: 2,
+      numPassedTests: 1,
+      numFailedTests: 1,
+    });
+    const next = applyResult(
+      verifyRedState(),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "jest --json" },
+    );
+    expect(next.status).toBe("tests_red");
+    expect(next.error).toBeUndefined();
+  });
+
+  it("pytest failing tests → tests_red", () => {
+    const stdout =
+      "========================= test session starts =========================\n" +
+      "collected 3 items\n" +
+      "1 passed, 2 failed in 0.01s\n";
+    const next = applyResult(
+      verifyRedState(),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "pytest" },
+    );
+    expect(next.status).toBe("tests_red");
+    expect(next.error).toBeUndefined();
+  });
+
+  it("bun failing tests → tests_red", () => {
+    const stdout =
+      "bun test v1.3.12\n\n 3 pass\n 2 fail\nRan 5 tests across 1 file. [22.00ms]\n";
+    const next = applyResult(
+      verifyRedState(),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "bun test" },
+    );
+    expect(next.status).toBe("tests_red");
+    expect(next.error).toBeUndefined();
+  });
+
+  it("mocha failing tests → tests_red", () => {
+    const stdout = "\n  2 passing (42ms)\n  1 failing\n\n";
+    const next = applyResult(
+      verifyRedState(),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "mocha" },
+    );
+    expect(next.status).toBe("tests_red");
+    expect(next.error).toBeUndefined();
+  });
+
+  it("go failing tests → tests_red", () => {
+    const stdout =
+      "--- FAIL: TestFoo (0.01s)\n" +
+      "FAIL    github.com/example/pkg  0.123s\n";
+    const next = applyResult(
+      verifyRedState(),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "go test ./..." },
+    );
+    expect(next.status).toBe("tests_red");
+    expect(next.error).toBeUndefined();
+  });
+
+  // --- polyglot override ---
+
+  it("polyglot override: phase with pytest testCmd uses pytest parser, not vitest", () => {
+    const stdout =
+      "========================= test session starts =========================\n" +
+      "collected 0 items\n";
+    const next = applyResult(
+      verifyRedState(),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "pytest tests/test_layer.py" },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/RED_GATE_ZERO_TESTS_COLLECTED/i);
+    expect(next.error).toMatch(/pytest tests\/test_layer\.py/);
+  });
+
+  // --- edge cases ---
+
+  it("mixed stdout/stderr runner summary is parsed", () => {
+    const stdout = "bun test v1.3.12\n";
+    const stderr =
+      " 0 pass\n 0 fail\nRan 0 tests across 0 files. [22.00ms]\n";
+    const next = applyResult(
+      verifyRedState(),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      { ...verifyRedResult(stdout, 0), stderr },
+      { testCmd: "bun test" },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/RED_GATE_ZERO_TESTS_COLLECTED/i);
+  });
+
+  it("skipped-only suite has collected>0 and hits cap=1", () => {
+    const stdout = JSON.stringify({
+      numTotalTests: 3,
+      numPassedTests: 0,
+      numFailedTests: 0,
+    });
+    const next = applyResult(
+      verifyRedState(0),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "npx vitest run" },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/could not produce failing tests|trivially pass/i);
+  });
+
+  it("malformed JSON stdout falls back to stdout regex", () => {
+    const stdout = "{not valid json}\ncollected 0 items\n";
+    const next = applyResult(
+      verifyRedState(),
+      { type: "VERIFY_RED", phaseIndex: 0 } as any,
+      verifyRedResult(stdout, 0),
+      { testCmd: "pytest" },
+    );
+    expect(next.status).toBe("failed");
+    expect(next.error).toMatch(/RED_GATE_ZERO_TESTS_COLLECTED/i);
+  });
+
+  it("legacy cap env GSTACK_BUILD_RED_LEGACY_CAP=3 prevents cap-1 fail", () => {
+    const prev = process.env.GSTACK_BUILD_RED_LEGACY_CAP;
+    process.env.GSTACK_BUILD_RED_LEGACY_CAP = "3";
+    try {
+      const stdout = JSON.stringify({
+        numTotalTests: 2,
+        numPassedTests: 2,
+        numFailedTests: 0,
+      });
+      const next = applyResult(
+        verifyRedState(1),
+        { type: "VERIFY_RED", phaseIndex: 0 } as any,
+        verifyRedResult(stdout, 0),
+        { testCmd: "npx vitest run" },
+      );
+      expect(next.status).toBe("test_spec_running");
+    } finally {
+      if (prev === undefined) delete process.env.GSTACK_BUILD_RED_LEGACY_CAP;
+      else process.env.GSTACK_BUILD_RED_LEGACY_CAP = prev;
+    }
+  });
+});
