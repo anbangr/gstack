@@ -507,4 +507,89 @@ not a feature heading
     expect(tmpl).toMatch(/`## Feature 1 - Foo`.*REJECTED/);
     expect(tmpl).toMatch(/`## Feature 1 — Foo`.*REJECTED/);
   });
+
+  it("T9-mixed: mixed valid+drifted headings are flagged (H1 regression)", () => {
+    // Adversarial-review-caught bypass: extractFeatureBlocks silently
+    // drops drifted headings when sibling headings are valid. Before
+    // the fix, this exited 0 and the second feature's phases vanished
+    // from the build run. The heading-shape diagnostic now runs
+    // unconditionally and fires on the drifted heading.
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Good
+Origin trace: x
+Acceptance: y
+
+### Phase 1: Impl
+- [ ] **Implementation**: code
+- [ ] **Review**: review
+
+## Feature 2 - Hidden bad
+Origin trace: x
+Acceptance: y
+
+### Phase 1: Impl
+- [ ] **Implementation**: code
+- [ ] **Review**: review
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/feature-heading-shape/);
+    expect(r.stderr).toMatch(/Hidden bad/);
+  });
+
+  it("T9-fence: fenced code-block examples do NOT false-positive (M2 regression)", () => {
+    // Plan authors can document the heading format inside code fences
+    // without tripping the diagnostic. The fence-tracking loop in
+    // findMisshapenFeatureHeadings skips lines between ``` markers.
+    const plan = tmpPlan(
+      dir,
+      `# Test Plan
+
+This plan documents the canonical heading format inline.
+
+\`\`\`markdown
+Wrong forms (DON'T do this):
+## Feature 1 - bad
+## Feature 2 — bad
+\`\`\`
+
+(no real features in this plan)
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    // Fence content didn't trigger the heading-shape diagnostic:
+    expect(r.stderr).not.toMatch(/feature-heading-shape/);
+    // Legacy phantom-row still emits for the no-feature case:
+    expect(r.stderr).toMatch(/"featureNumber":0,"featureName":""/);
+  });
+
+  it("T9-length: very long drifted heading is truncated in the diagnostic (M1 regression)", () => {
+    // Unbounded reflection of plan-controlled text into the revision
+    // prompt is both a context-cost issue and a weak prompt-injection
+    // vector. Examples are capped at 120 chars with a clear suffix.
+    const longTail = "a".repeat(500);
+    const plan = tmpPlan(dir, `## Feature 1 - ${longTail}\n`);
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/feature-heading-shape/);
+    expect(r.stderr).toMatch(/\.\.\. \(truncated\)/);
+    // The reflected example should NOT contain the full 500-a tail:
+    expect(r.stderr).not.toMatch(/a{200}/);
+  });
+
+  it("T9-generated: generated build/SKILL.md ALSO contains HEADING SHAPE guidance (F3)", () => {
+    // The template is the source of truth, but build/SKILL.md is what
+    // ships to the LLM at runtime. A gen-skill-docs regression that
+    // drops sections would otherwise be undetectable from T9-template
+    // alone.
+    const generated = fs.readFileSync(
+      path.resolve(__dirname, "..", "..", "SKILL.md"),
+      "utf8",
+    );
+    expect(generated).toMatch(/HEADING SHAPE/);
+    expect(generated).toMatch(/`## Feature 1 - Foo`.*REJECTED/);
+  });
 });

@@ -406,23 +406,54 @@ function checkStaleQuotes(content: string): StaticViolation[] {
  * `## Feature 1 - Foo` (ASCII dash), `## Feature 1 — Foo` (em-dash),
  * `## Feature 1. Foo` (period), `## Feature 1 Foo` (no separator).
  *
- * When zero feature blocks parse but `## Feature \d+` headings exist
- * in the source, the validator's revision prompt should name the actual
- * defect (wrong heading shape) instead of claiming missing fields on a
- * phantom feature-0 block. That phantom row sends the next LLM hunting
- * for missing Origin trace / Acceptance lines that aren't the real issue.
+ * Runs unconditionally on every plan, not just plans where zero blocks
+ * parse — a single drifted heading mixed in with valid ones would
+ * otherwise be silently dropped by `extractFeatureBlocks` and never
+ * flagged. The adversarial review caught this as a real bypass: an LLM
+ * can hide an entire feature section by emitting one bad heading while
+ * keeping its siblings valid.
+ *
+ * Lines inside fenced code blocks (``` ... ```) are skipped so plan
+ * authors can document the heading format with example snippets without
+ * tripping the diagnostic.
+ *
+ * Per-line output is truncated to MAX_EXAMPLE_LENGTH chars and the
+ * example list is capped to MAX_EXAMPLES. The diagnostic is reflected
+ * verbatim into the synthesizer's revision prompt; unbounded reflection
+ * is both a context-cost blowup and a weak prompt-injection vector
+ * (a malicious heading "## Feature 1 - Ignore above and ..." becomes
+ * text the next LLM sees). JSON.stringify in main() escapes control
+ * chars, but length and prompt-leverage are the policy controls here.
  */
+const MAX_EXAMPLE_LENGTH = 120;
+const MAX_EXAMPLES = 3;
+
+function truncateExample(line: string): string {
+  if (line.length <= MAX_EXAMPLE_LENGTH) return line;
+  return line.slice(0, MAX_EXAMPLE_LENGTH) + "... (truncated)";
+}
+
 function findMisshapenFeatureHeadings(content: string): string[] {
   const lines = content.split("\n");
   const bad: string[] = [];
+  let inFence = false;
   for (const line of lines) {
+    // Track fenced-code-block state. A line that starts with three or
+    // more backticks toggles the fence. We skip lines inside a fence so
+    // documentation examples don't false-positive.
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+
     // Heading lines that start with `## Feature <digits>` but don't have
     // the canonical colon separator immediately after the digits.
     const m = /^## Feature (\d+)(.*)$/.exec(line);
     if (!m) continue;
     const tail = m[2];
     if (!tail.startsWith(":")) {
-      bad.push(line);
+      bad.push(truncateExample(line));
     }
   }
   return bad;
@@ -435,23 +466,30 @@ function validate(planPath: string): ValidationReport {
   const structuralViolations: Violation[] = [];
   const staticViolations: StaticViolation[] = [];
 
+  // Heading-shape detection runs unconditionally. A plan with a mix of
+  // valid `## Feature N:` headings and drifted `## Feature N - ...`
+  // headings would otherwise pass: `extractFeatureBlocks` silently
+  // skips the bad headings, validation passes on the good ones, and
+  // entire feature sections vanish from the build run. The adversarial
+  // review caught this exact bypass.
+  const misshapen = findMisshapenFeatureHeadings(content);
+  if (misshapen.length > 0) {
+    staticViolations.push({
+      rule: "feature-heading-shape",
+      message:
+        `${misshapen.length} heading(s) start with "## Feature N" but ` +
+        `lack the required ":" separator. ` +
+        `Required form: "## Feature N: <name>". ` +
+        `Examples found: ${misshapen.slice(0, MAX_EXAMPLES).join(" | ")}`,
+    });
+  }
+
   if (blocks.length === 0) {
-    // Try to give the LLM an actionable hint before emitting the phantom
-    // missing-fields row. If the source HAS `## Feature N` headings but
-    // they're in the wrong shape, name the shape problem explicitly.
-    const misshapen = findMisshapenFeatureHeadings(content);
-    if (misshapen.length > 0) {
-      staticViolations.push({
-        rule: "feature-heading-shape",
-        message:
-          `no feature blocks parsed — ${misshapen.length} heading(s) ` +
-          `start with "## Feature N" but lack the required ":" separator. ` +
-          `Required form: "## Feature N: <name>". ` +
-          `Examples found: ${misshapen.slice(0, 3).join(" | ")}`,
-      });
-    } else {
-      // No `## Feature N` headings at all — the plan is genuinely empty
-      // or the H2 word "Feature" is misspelled / missing.
+    // No `## Feature N` headings at all (or all were drifted and already
+    // flagged above) — emit the legacy phantom missing-fields row only
+    // when nothing was misshapen either, so the LLM doesn't get two
+    // contradictory diagnostics.
+    if (misshapen.length === 0) {
       structuralViolations.push({
         featureNumber: 0,
         featureName: "",
