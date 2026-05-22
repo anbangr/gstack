@@ -426,7 +426,216 @@ const x = 1;
     const tmpl = fs.readFileSync(TEMPLATE, "utf8");
     expect(tmpl).toMatch(/staticViolations/);
     expect(tmpl).toMatch(/Imported identifiers are used in the same phase/);
-    expect(tmpl).toMatch(/Acceptance file paths exist, are exempt, or are planned/);
+    expect(tmpl).toMatch(
+      /Acceptance file paths exist, are exempt, or are planned/,
+    );
     expect(tmpl).toMatch(/Quoted file:line snippets still match/);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // T9 — feature heading shape: dash form must be flagged with an
+  //      actionable diagnostic, not a phantom missing-fields row.
+  //      Regression for the silent-failure mode where LLM synthesizer
+  //      drift to `## Feature N - name` (dash) was reported as missing
+  //      Origin trace / Acceptance on a phantom feature-0 block.
+  // ─────────────────────────────────────────────────────────────────────────
+  it("T9: ASCII-dash heading form emits feature-heading-shape diagnostic", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1 - Some Name
+Origin trace: test
+Acceptance: passes validation
+
+### Phase 1: Implementation
+- [ ] **Implementation**: write code
+- [ ] **Review**: review
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    // The actionable diagnostic names the real defect (output is
+    // JSON-escaped, so colons inside the message string are escaped):
+    expect(r.stderr).toMatch(/feature-heading-shape/);
+    expect(r.stderr).toMatch(/lack the required.*separator/);
+    expect(r.stderr).toMatch(/## Feature 1 - Some Name/);
+    // The phantom missing-fields row must NOT be emitted in this case:
+    expect(r.stderr).not.toMatch(/"featureNumber":0,"featureName":""/);
+  });
+
+  it("T9-em-dash: em-dash heading form also flagged", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1 — Some Name
+Origin trace: test
+Acceptance: passes
+
+### Phase 1: Implementation
+- [ ] **Implementation**: code
+- [ ] **Review**: review
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/feature-heading-shape/);
+  });
+
+  it("T9-empty: truly empty plan (no ## Feature N headings) still emits the legacy missing-fields row", () => {
+    // This case has no `## Feature N` headings at all, so heading-shape
+    // detection has nothing to flag. The legacy phantom row remains the
+    // right diagnostic shape here.
+    const plan = tmpPlan(
+      dir,
+      `# Just a header
+
+Some prose without any feature blocks.
+
+## Random Other Heading
+not a feature heading
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/"featureNumber":0,"featureName":""/);
+    expect(r.stderr).not.toMatch(/feature-heading-shape/);
+  });
+
+  it("T9-template: SKILL.md.tmpl tells the synthesizer to verify heading shape", () => {
+    // Pins the self-check addition so a template rewrite can't silently
+    // drop the new HEADING SHAPE guidance.
+    const tmpl = fs.readFileSync(TEMPLATE, "utf8");
+    expect(tmpl).toMatch(/HEADING SHAPE/);
+    expect(tmpl).toMatch(/`## Feature 1 - Foo`.*REJECTED/);
+    expect(tmpl).toMatch(/`## Feature 1 — Foo`.*REJECTED/);
+  });
+
+  it("T9-mixed: mixed valid+drifted headings are flagged (H1 regression)", () => {
+    // Adversarial-review-caught bypass: extractFeatureBlocks silently
+    // drops drifted headings when sibling headings are valid. Before
+    // the fix, this exited 0 and the second feature's phases vanished
+    // from the build run. The heading-shape diagnostic now runs
+    // unconditionally and fires on the drifted heading.
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Good
+Origin trace: x
+Acceptance: y
+
+### Phase 1: Impl
+- [ ] **Implementation**: code
+- [ ] **Review**: review
+
+## Feature 2 - Hidden bad
+Origin trace: x
+Acceptance: y
+
+### Phase 1: Impl
+- [ ] **Implementation**: code
+- [ ] **Review**: review
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/feature-heading-shape/);
+    expect(r.stderr).toMatch(/Hidden bad/);
+  });
+
+  it("T9-fence: fenced code-block examples do NOT false-positive (M2 regression)", () => {
+    // Plan authors can document the heading format inside code fences
+    // without tripping the diagnostic. The fence-tracking loop in
+    // findMisshapenFeatureHeadings skips lines between ``` markers.
+    const plan = tmpPlan(
+      dir,
+      `# Test Plan
+
+This plan documents the canonical heading format inline.
+
+\`\`\`markdown
+Wrong forms (DON'T do this):
+## Feature 1 - bad
+## Feature 2 — bad
+\`\`\`
+
+(no real features in this plan)
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    // Fence content didn't trigger the heading-shape diagnostic:
+    expect(r.stderr).not.toMatch(/feature-heading-shape/);
+    // Legacy phantom-row still emits for the no-feature case:
+    expect(r.stderr).toMatch(/"featureNumber":0,"featureName":""/);
+  });
+
+  it("T9-length: very long drifted heading is truncated in the diagnostic (M1 regression)", () => {
+    // Unbounded reflection of plan-controlled text into the revision
+    // prompt is both a context-cost issue and a weak prompt-injection
+    // vector. Examples are capped at 120 chars with a clear suffix.
+    const longTail = "a".repeat(500);
+    const plan = tmpPlan(dir, `## Feature 1 - ${longTail}\n`);
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/feature-heading-shape/);
+    expect(r.stderr).toMatch(/\.\.\. \(truncated\)/);
+    // The reflected example should NOT contain the full 500-a tail:
+    expect(r.stderr).not.toMatch(/a{200}/);
+  });
+
+  it("T9-generated: generated build/SKILL.md ALSO contains HEADING SHAPE guidance (F3)", () => {
+    // The template is the source of truth, but build/SKILL.md is what
+    // ships to the LLM at runtime. A gen-skill-docs regression that
+    // drops sections would otherwise be undetectable from T9-template
+    // alone.
+    const generated = fs.readFileSync(
+      path.resolve(__dirname, "..", "..", "SKILL.md"),
+      "utf8",
+    );
+    expect(generated).toMatch(/HEADING SHAPE/);
+    expect(generated).toMatch(/`## Feature 1 - Foo`.*REJECTED/);
+  });
+
+  it("T9-nested-fence: 4-backtick fence with embedded 3-backtick stays closed (N1 regression)", () => {
+    // CommonMark fences: an opening run of N chars can only be closed
+    // by a bare run of >= N of the same char. Without length-aware
+    // tracking, the inner 3-backtick line would close the outer 4-tick
+    // fence and silently unmask later "## Feature" lines as scannable.
+    const plan = tmpPlan(
+      dir,
+      "# Plan\n\n" +
+        "Documentation:\n\n" +
+        "````markdown\n" +
+        "Example of WRONG heading:\n" +
+        "```\n" +
+        "## Feature 1 - inside-nested-fence\n" +
+        "```\n" +
+        "````\n\n" +
+        "## Feature 2 - real-outside-fence\n",
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/feature-heading-shape/);
+    // Real heading flagged:
+    expect(r.stderr).toMatch(/real-outside-fence/);
+    // Heading inside the nested fence NOT flagged:
+    expect(r.stderr).not.toMatch(/inside-nested-fence/);
+  });
+
+  it("T9-tilde-fence: tilde-fenced examples are also skipped (N2 regression)", () => {
+    // CommonMark allows ~~~ fences alongside backticks. Plan authors
+    // may use them to nest backtick examples without escaping.
+    const plan = tmpPlan(
+      dir,
+      "# Plan\n\n" +
+        "Example:\n\n" +
+        "~~~markdown\n" +
+        "## Feature 1 - tilde-fenced-example\n" +
+        "~~~\n\n" +
+        "(no real features)\n",
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    // Tilde-fenced content does NOT trigger the diagnostic:
+    expect(r.stderr).not.toMatch(/feature-heading-shape/);
+    // Legacy phantom-row emits since plan has no real features:
+    expect(r.stderr).toMatch(/"featureNumber":0,"featureName":""/);
   });
 });

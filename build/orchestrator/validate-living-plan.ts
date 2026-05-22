@@ -400,17 +400,148 @@ function checkStaleQuotes(content: string): StaticViolation[] {
 // Main validation
 // ---------------------------------------------------------------------------
 
+/**
+ * Detect H2 headings that LOOK like feature headings but don't match the
+ * strict `^## Feature N:` regex the parser requires. Common LLM drift:
+ * `## Feature 1 - Foo` (ASCII dash), `## Feature 1 — Foo` (em-dash),
+ * `## Feature 1. Foo` (period), `## Feature 1 Foo` (no separator).
+ *
+ * Runs unconditionally on every plan, not just plans where zero blocks
+ * parse — a single drifted heading mixed in with valid ones would
+ * otherwise be silently dropped by `extractFeatureBlocks` and never
+ * flagged. The adversarial review caught this as a real bypass: an LLM
+ * can hide an entire feature section by emitting one bad heading while
+ * keeping its siblings valid.
+ *
+ * Lines inside fenced code blocks (``` ... ```) are skipped so plan
+ * authors can document the heading format with example snippets without
+ * tripping the diagnostic.
+ *
+ * Per-line output is truncated to MAX_EXAMPLE_LENGTH chars and the
+ * example list is capped to MAX_EXAMPLES. The diagnostic is reflected
+ * verbatim into the synthesizer's revision prompt; unbounded reflection
+ * is both a context-cost blowup and a weak prompt-injection vector
+ * (a malicious heading "## Feature 1 - Ignore above and ..." becomes
+ * text the next LLM sees). JSON.stringify in main() escapes control
+ * chars, but length and prompt-leverage are the policy controls here.
+ */
+const MAX_EXAMPLE_LENGTH = 120;
+const MAX_EXAMPLES = 3;
+
+function truncateExample(line: string): string {
+  if (line.length <= MAX_EXAMPLE_LENGTH) return line;
+  return line.slice(0, MAX_EXAMPLE_LENGTH) + "... (truncated)";
+}
+
+/**
+ * Match a fenced-code-block delimiter per CommonMark rules:
+ *   - 3 or more backticks OR 3 or more tildes (matching the opening char)
+ *   - Optional leading whitespace (up to 3 spaces before counts as fence;
+ *     4+ would be an indented code block per CommonMark, but we accept
+ *     them here too — plan files rarely deep-indent fences and the cost
+ *     of being permissive is lower than the cost of missing a fence)
+ *   - Optional info string after the open fence; closing fence is a bare
+ *     run of fence chars with optional trailing whitespace only.
+ *
+ * A fence opened with N chars can only be closed by ≥ N of the SAME
+ * char on a line by itself. This matters because plan authors who
+ * document the format may use longer outer fences to embed shorter
+ * inner fences in their examples:
+ *
+ *     ```` markdown            <- outer (4 backticks)
+ *     Example of a wrong heading inside a code block:
+ *     ```                       <- inner; must NOT close outer
+ *     ## Feature 1 - wrong
+ *     ```
+ *     ````                      <- closes outer
+ *
+ * Without length tracking, the inner 3-backtick line would close the
+ * outer prematurely and unmask later headings as scannable lines.
+ */
+function parseFenceOpen(
+  line: string,
+): { char: "`" | "~"; length: number } | null {
+  const m = /^\s{0,3}(`{3,}|~{3,})/.exec(line);
+  if (!m) return null;
+  return { char: m[1][0] as "`" | "~", length: m[1].length };
+}
+
+function isFenceClose(
+  line: string,
+  open: { char: "`" | "~"; length: number },
+): boolean {
+  // Closing fence: same char, ≥ open length, optional trailing whitespace
+  // only (no info string allowed on the close).
+  const pattern = new RegExp(`^\\s{0,3}\\${open.char}{${open.length},}\\s*$`);
+  return pattern.test(line);
+}
+
+function findMisshapenFeatureHeadings(content: string): string[] {
+  const lines = content.split("\n");
+  const bad: string[] = [];
+  let openFence: { char: "`" | "~"; length: number } | null = null;
+  for (const line of lines) {
+    if (openFence) {
+      if (isFenceClose(line, openFence)) {
+        openFence = null;
+      }
+      continue;
+    }
+    const fence = parseFenceOpen(line);
+    if (fence) {
+      openFence = fence;
+      continue;
+    }
+
+    // Heading lines that start with `## Feature <digits>` but don't have
+    // the canonical colon separator immediately after the digits.
+    const m = /^## Feature (\d+)(.*)$/.exec(line);
+    if (!m) continue;
+    const tail = m[2];
+    if (!tail.startsWith(":")) {
+      bad.push(truncateExample(line));
+    }
+  }
+  return bad;
+}
+
 function validate(planPath: string): ValidationReport {
   const content = fs.readFileSync(planPath, "utf8");
   const blocks = extractFeatureBlocks(content);
 
   const structuralViolations: Violation[] = [];
-  if (blocks.length === 0) {
-    structuralViolations.push({
-      featureNumber: 0,
-      featureName: "",
-      missing: ["originTrace", "acceptance"],
+  const staticViolations: StaticViolation[] = [];
+
+  // Heading-shape detection runs unconditionally. A plan with a mix of
+  // valid `## Feature N:` headings and drifted `## Feature N - ...`
+  // headings would otherwise pass: `extractFeatureBlocks` silently
+  // skips the bad headings, validation passes on the good ones, and
+  // entire feature sections vanish from the build run. The adversarial
+  // review caught this exact bypass.
+  const misshapen = findMisshapenFeatureHeadings(content);
+  if (misshapen.length > 0) {
+    staticViolations.push({
+      rule: "feature-heading-shape",
+      message:
+        `${misshapen.length} heading(s) start with "## Feature N" but ` +
+        `lack the required ":" separator. ` +
+        `Required form: "## Feature N: <name>". ` +
+        `Examples found: ${misshapen.slice(0, MAX_EXAMPLES).join(" | ")}`,
     });
+  }
+
+  if (blocks.length === 0) {
+    // No `## Feature N` headings at all (or all were drifted and already
+    // flagged above) — emit the legacy phantom missing-fields row only
+    // when nothing was misshapen either, so the LLM doesn't get two
+    // contradictory diagnostics.
+    if (misshapen.length === 0) {
+      structuralViolations.push({
+        featureNumber: 0,
+        featureName: "",
+        missing: ["originTrace", "acceptance"],
+      });
+    }
   } else {
     for (const block of blocks) {
       const missing: Array<"originTrace" | "acceptance"> = [];
@@ -425,8 +556,6 @@ function validate(planPath: string): ValidationReport {
       }
     }
   }
-
-  const staticViolations: StaticViolation[] = [];
 
   // T1 — unused imports (per-phase)
   for (const block of blocks) {

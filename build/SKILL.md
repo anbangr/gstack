@@ -1413,10 +1413,27 @@ prior commit.
    `~`, `$HOME`, or `${HOME}`.
 
    Before writing the synthesis output summary, run a STRUCTURAL SELF-CHECK
-   over every living plan file you produced. For each `## Feature N:`
-   heading, verify two line-anchored conditions in the lines BETWEEN the
-   heading and the next `### Phase` (or next `## ` heading), whichever
-   comes first:
+   over every living plan file you produced. First, verify the HEADING SHAPE
+   of every feature section, then verify the REQUIRED FIELDS inside each one.
+
+   HEADING SHAPE — every feature section MUST start with a heading that
+   matches the literal pattern `## Feature N: <name>` (H2, the word
+   `Feature`, an integer, a COLON, then the feature name). The validator's
+   regex (`^## Feature (\d+):\s*(.*)$`) accepts NOTHING else.
+   - `## Feature 1: Foo` — accepted.
+   - `## Feature 1 - Foo` — REJECTED (dash form). Common LLM drift; rewrite.
+   - `## Feature 1 — Foo` — REJECTED (em-dash form). Rewrite.
+   - `## Feature 1. Foo` — REJECTED. Rewrite.
+   - `## Feature 1 Foo` — REJECTED (no separator). Rewrite.
+   Even ONE drifted heading rejects the plan: the validator surfaces a
+   `feature-heading-shape` static violation that names each bad line. The
+   validator runs this check even when some sibling headings are correct,
+   so don't assume a partially-good plan slides through. Fix every
+   drifted heading before continuing.
+
+   REQUIRED FIELDS — for each `## Feature N:` heading, verify two
+   line-anchored conditions in the lines BETWEEN the heading and the next
+   `### Phase` (or next `## ` heading), whichever comes first:
    - a line that STARTS with `Origin trace:` exists.
    - a line that STARTS with `Acceptance:` exists.
    If either is missing or is collapsed into run-on prose on the same line
