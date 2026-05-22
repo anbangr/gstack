@@ -624,6 +624,8 @@ ship.ts         configurable /ship + /land-and-deploy delegation
 mark-shipped.ts operator escape hatch — write canonical terminal state shape
 pr-info.ts      gh pr lookup helpers (findMergedPRForBranch, readMergedPRInfo)
 child-registry.ts drop-in spawn wrappers + signal handlers (reap detached children)
+stall-watchdog.ts liveness watchdog: stream/mtime/cpu modes + tool-aware windowing + progress-gap arm
+subagent-progress-parser.ts per-provider stdout parser (Gemini/Codex/Claude/Kimi) → ProgressEvent | null
 plan-reviewer.ts single-round review: parsing, reconciliation, annotation read/write, prompts
 plan-review-loop.ts multi-round orchestration, triage gates, adaptive cap, history JSONL
 drain-faults.ts skill-fault drain consumer; short-circuits audit events (investigate:false)

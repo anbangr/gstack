@@ -35,6 +35,7 @@
 
 import * as fs from "node:fs";
 import { spawnSync, type ChildProcess } from "./child-registry";
+import type { ProgressEvent } from "./subagent-progress-parser";
 
 export type Provider = "claude" | "gemini" | "codex" | "kimi" | "shell";
 
@@ -93,6 +94,35 @@ export interface StallWatchdogOptions {
    * shell-out implemented in `sampleProcessTreeCpuMs`.
    */
   sampleCpuFn?: (pid: number | undefined) => Map<number, number> | null;
+
+  /**
+   * Optional progress-line parser. When provided, the watchdog feeds
+   * each stdout/stderr line to this function. Non-null ProgressEvents
+   * update internal state:
+   *   - TOOL_START sets currentToolBucket and lastClassifiedActivityAt.
+   *   - TOOL_END clears currentToolBucket; lastClassifiedActivityAt updates.
+   * The effective stall window per tick depends on currentToolBucket:
+   *   - "slow" → toolStallMs.slow
+   *   - "fast" → toolStallMs.fast
+   *   - null   → legacy stallMs (today's behavior)
+   * Required pair: toolStallMs and progressGapMs must also be set when
+   * parseProgress is provided.
+   */
+  parseProgress?: (
+    line: string,
+    now: number,
+  ) => import("./subagent-progress-parser").ProgressEvent | null;
+
+  /** Tool-aware window thresholds. Required when parseProgress is set. */
+  toolStallMs?: { fast: number; slow: number };
+
+  /**
+   * Max ms the watchdog tolerates noisy stdout with no parsed events
+   * before firing SIGTERM with killReason="progress_gap". Required when
+   * parseProgress is set. Gated on having seen at least one parsed
+   * event in this run — see implementation.
+   */
+  progressGapMs?: number;
 }
 
 export interface StallWatchdogController {
@@ -109,8 +139,27 @@ export interface StallWatchdogController {
    * that's actually busy producing output would be misread as silent.
    */
   notifyActivity: () => void;
-  /** If the watchdog killed for an auth prompt, returns "auth_required". */
+  /**
+   * Why the watchdog killed. Returns:
+   *   - "auth_required" — auth-prompt fast-kill (pre-existing).
+   *   - "stall"         — legacy silence-based stall (pre-existing).
+   *   - "silence"       — tool-aware silence kill (new, when parseProgress set).
+   *   - "progress_gap"  — noisy stdout without classified progress (new).
+   *   - undefined       — watchdog has not killed.
+   */
   killReason: () => string | undefined;
+
+  /**
+   * Last classified tool name at kill time, or null if never
+   * classified. Set when parseProgress is wired and at least one
+   * ProgressEvent was emitted.
+   */
+  lastTool: () => string | null;
+
+  /**
+   * Last classified bucket at kill time, or null. Mirrors lastTool.
+   */
+  lastBucket: () => "fast" | "slow" | null;
 }
 
 /**
@@ -342,6 +391,19 @@ export function attachStallWatchdog(
   let stopped = false;
   let killed = false;
   let killReason: string | undefined = undefined;
+
+  // Tool-aware state. All null when parseProgress is not provided —
+  // the legacy branches below treat null exactly as today's behavior.
+  const parseProgress = opts.parseProgress;
+  const toolStallMs = opts.toolStallMs;
+  const progressGapMs = opts.progressGapMs;
+  let currentToolBucket: "fast" | "slow" | null = null;
+  let lastClassifiedActivityAt: number | null = null;
+  let lastClassifiedTool: string | null = null;
+  // Sticky bucket — represents the bucket at the most recent classified
+  // event, preserved past TOOL_END. Task 14 wires the controller getter.
+  let lastClassifiedBucket: "fast" | "slow" | null = null;
+
   let pollHandle: unknown = null;
   let killTimerHandle: unknown = null;
 
@@ -380,6 +442,35 @@ export function attachStallWatchdog(
     // Regex test is a single short-circuit pass; the prior split-and-loop
     // allocated a string array per chunk just to discover the same answer.
     if (/\S/.test(text)) recordActivity();
+
+    // Tool-aware progress parsing. Lines are split on \n inside this
+    // chunk; each non-empty line goes to the parser. Errors swallowed —
+    // a throwing parser falls through to legacy behavior, which is
+    // exactly today's degradation.
+    if (parseProgress && !killed) {
+      for (const rawLine of text.split(/\r?\n/)) {
+        if (!rawLine) continue;
+        let evt: ProgressEvent | null = null;
+        try {
+          evt = parseProgress(rawLine, clock.now());
+        } catch {
+          // Parser threw. Treat this line as if it returned null.
+          evt = null;
+        }
+        if (evt === null) continue;
+        lastClassifiedActivityAt = clock.now();
+        lastClassifiedTool = evt.tool;
+        lastClassifiedBucket = evt.bucket;
+        if (evt.event === "TOOL_START") {
+          currentToolBucket = evt.bucket;
+        } else {
+          // TOOL_END clears the bucket (the next tick uses the legacy
+          // stallMs window until a new TOOL_START arrives). We do NOT
+          // clear lastClassifiedBucket — it's sticky for halt-event quoting.
+          currentToolBucket = null;
+        }
+      }
+    }
 
     // Auth-prompt fast-kill: if the child is asking for interactive auth,
     // kill immediately rather than waiting for the stall window.
@@ -465,9 +556,28 @@ export function attachStallWatchdog(
     }
 
     const silence = clock.now() - lastActivityAt;
-    if (silence >= stallMs) {
+    // Effective stall window:
+    //   - "slow" → toolStallMs.slow
+    //   - "fast" → toolStallMs.fast
+    //   - null   → legacy stallMs
+    // The legacy path is preserved EXACTLY when parseProgress is absent
+    // or when no TOOL_START has been observed yet.
+    let effectiveStallMs = stallMs;
+    if (currentToolBucket !== null && toolStallMs) {
+      effectiveStallMs =
+        currentToolBucket === "slow" ? toolStallMs.slow : toolStallMs.fast;
+    }
+    if (silence >= effectiveStallMs) {
       killed = true;
-      killReason = killReason ?? "stall";
+      // "silence" when the tool-aware path is active (parseProgress set,
+      // we have seen at least one classified event). "stall" for
+      // the legacy path so existing consumers / tests see the same string.
+      if (killReason === undefined) {
+        killReason =
+          parseProgress && lastClassifiedActivityAt !== null
+            ? "silence"
+            : "stall";
+      }
       try {
         opts.onStallKill?.(silence);
       } catch {
@@ -499,6 +609,48 @@ export function attachStallWatchdog(
         // and does its own kill + grace timer. The watchdog just signals
         // via onStallKill and stops polling.
         stop();
+      }
+    }
+
+    // Progress-gap arm. Gated on:
+    //   - parseProgress is wired,
+    //   - we've seen at least one classified event in this run,
+    //   - the gap since the last classified event exceeds progressGapMs.
+    // Independent of lastActivityAt — that's the whole point. A subagent
+    // that's babbling but not making classifiable progress should be
+    // killed even if stdout is fresh.
+    if (
+      !killed &&
+      parseProgress &&
+      progressGapMs !== undefined &&
+      lastClassifiedActivityAt !== null
+    ) {
+      const gap = clock.now() - lastClassifiedActivityAt;
+      if (gap >= progressGapMs) {
+        killed = true;
+        killReason = "progress_gap";
+        try {
+          opts.onStallKill?.(gap);
+        } catch {
+          // Callback errors are swallowed.
+        }
+        if (source.mode === "stream" || source.mode === "cpu") {
+          const pid = source.child.pid;
+          if (typeof pid === "number") {
+            killProcessAndGroup(pid, "SIGTERM");
+            killTimerHandle = clock.setTimeout(() => {
+              killProcessAndGroup(pid, "SIGKILL");
+            }, gracePeriodMs);
+          }
+          if (pollHandle !== null) {
+            clock.clearInterval(pollHandle);
+            pollHandle = null;
+          }
+          source.child.stdout?.off("data", onLine);
+          source.child.stderr?.off("data", onLine);
+        } else {
+          stop();
+        }
       }
     }
   };
@@ -537,5 +689,7 @@ export function attachStallWatchdog(
       if (!stopped && !killed) recordActivity();
     },
     killReason: () => killReason,
+    lastTool: () => lastClassifiedTool,
+    lastBucket: () => lastClassifiedBucket,
   };
 }

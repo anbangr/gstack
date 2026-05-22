@@ -1,0 +1,8 @@
+{
+  "comment": "Kimi --print --final-message-only is silent. All lines parse to null. CPU-mode watchdog covers liveness.",
+  "rows": [
+    { "lineIndex": 0, "expected": null },
+    { "lineIndex": 1, "expected": null },
+    { "lineIndex": 2, "expected": null }
+  ]
+}

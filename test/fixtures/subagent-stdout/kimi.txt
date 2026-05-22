@@ -1,0 +1,3 @@
+[OUT] /tmp/example/output.md
+[ERR]
+[ERR] To resume this session: kimi -r abc-123

@@ -389,3 +389,49 @@ export function warnOnLargeStallWindows(
 export function _resetWarnOnLargeStallWindowsForTest(): void {
   warnOnLargeStallWindowsCalled = false;
 }
+
+/**
+ * Tool-aware stall windows. Used by the watchdog when a subagent's stdout
+ * line is classified into a known tool bucket. See
+ * docs/superpowers/specs/2026-05-21-subagent-progress-watchdog-design.md.
+ *
+ * Plain module constants — not part of BUILD_DEFAULTS — because they are
+ * code defaults, not operator-tunable JSON config. Tuning at v1 happens
+ * via the GSTACK_TOOL_AWARE_WATCHDOG=0 kill switch, not per-bucket env
+ * vars.
+ */
+export const TOOL_AWARE_STALL_MS = {
+  fast: 90_000, // 90s — Edit, Read, Write, Grep, Glob, default Bash
+  slow: 600_000, // 10min — WebFetch, codex_review, kimi_print, long Bash
+} as const;
+
+/**
+ * Max milliseconds of "noisy stdout but no classified progress event"
+ * before the watchdog fires progress_gap. Gated on having seen at least
+ * one classified event in this run — see stall-watchdog.ts.
+ */
+export const PROGRESS_GAP_MS = 300_000; // 5min
+
+export type ToolBucket = "fast" | "slow";
+
+/**
+ * Tool-name → bucket map. Unknown tool names are intentionally absent
+ * (the parser returns null for them, routing through legacy stallMs).
+ * Adding a new tool is a one-line change here.
+ */
+export const TOOL_BUCKET: Readonly<Record<string, ToolBucket>> = {
+  // Filesystem / search / shell — fast
+  Edit: "fast",
+  Read: "fast",
+  Write: "fast",
+  Grep: "fast",
+  Glob: "fast",
+  Bash: "fast", // most bashes; long bashes have their own watchdog timeout
+  apply_patch: "fast", // Codex edit primitive
+
+  // Network / LLM-driven — slow
+  WebFetch: "slow",
+  WebSearch: "slow",
+  codex_review: "slow",
+  kimi_print: "slow",
+};

@@ -27,7 +27,19 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { logDir, ensureLogDir, deriveGeminiTmpKey } from "./state";
 import type { RoleConfig, RoleProvider, RoleReasoning } from "./role-config";
-import { BUILD_DEFAULTS, envNumberOrDefault } from "./build-config";
+import {
+  BUILD_DEFAULTS,
+  envNumberOrDefault,
+  TOOL_AWARE_STALL_MS,
+  PROGRESS_GAP_MS,
+} from "./build-config";
+import {
+  parseGeminiLine,
+  parseCodexLine,
+  parseKimiLine,
+  parseClaudeLine,
+  type ProgressEvent,
+} from "./subagent-progress-parser";
 import type { DualImplCandidateKey } from "./types";
 import { attachStallWatchdog, type Provider } from "./stall-watchdog";
 import { computeFaultId, emitHaltEventResolved } from "./halt-events";
@@ -403,6 +415,18 @@ export interface SubAgentResult {
    * same reason as stallSilenceMs.
    */
   exitSignal?: string | null;
+  /**
+   * Why the stall watchdog killed, when stallKilled is true. Absent
+   * otherwise. See stall-watchdog.ts killReason() for the union.
+   */
+  killReason?: string;
+  /**
+   * Last classified tool at kill time. Null when never classified or
+   * tool-aware path inactive.
+   */
+  lastTool?: string | null;
+  /** Last classified bucket at kill time. */
+  lastBucket?: "fast" | "slow" | null;
   /** Absolute path to the log file written for this invocation. */
   logPath: string;
   /** Wall-clock duration in ms. */
@@ -433,6 +457,31 @@ function pickProviderForBin(bin: string): Provider {
   if (bin === geminiBin()) return "gemini";
   if (bin === process.env.GEMINI_BIN) return "gemini";
   return "shell";
+}
+
+/**
+ * Pick the parser for a provider, or `null` to disable tool-aware
+ * windowing for this subagent. Null is returned when the env-var kill
+ * switch is set OR the provider has no useful parser (shell etc.).
+ *
+ * Exported for tests in __tests__/sub-agents-parser-pick.test.ts.
+ */
+export function pickParserForProvider(
+  provider: Provider,
+): ((line: string, now: number) => ProgressEvent | null) | null {
+  if (process.env.GSTACK_TOOL_AWARE_WATCHDOG === "0") return null;
+  switch (provider) {
+    case "gemini":
+      return parseGeminiLine;
+    case "codex":
+      return parseCodexLine;
+    case "kimi":
+      return parseKimiLine;
+    case "claude":
+      return parseClaudeLine;
+    default:
+      return null;
+  }
 }
 
 /**
@@ -704,15 +753,24 @@ export function spawnCaptured(args: {
         "gstack-build: GSTACK_BUILD_WATCHDOG_CPU=1 ignored — `ps` not available on this platform; using stream-mode watchdog instead.\n",
       );
     }
+    const provider = pickProviderForBin(args.bin);
+    const parseProgress = pickParserForProvider(provider);
     const watchdog = attachStallWatchdog(
       useCpuWatchdog ? { mode: "cpu", child } : { mode: "stream", child },
       {
         stallMs: args.timeoutMs,
-        provider: pickProviderForBin(args.bin),
+        provider,
         onStallKill: (silenceMs) => {
           stallKilled = true;
           stallSilenceMs = silenceMs;
         },
+        ...(parseProgress
+          ? {
+              parseProgress,
+              toolStallMs: TOOL_AWARE_STALL_MS,
+              progressGapMs: PROGRESS_GAP_MS,
+            }
+          : {}),
       },
     );
 
@@ -841,6 +899,9 @@ export function spawnCaptured(args: {
           stallKilled,
           stallSilenceMs,
           exitSignal,
+          killReason: watchdog.killReason(),
+          lastTool: watchdog.lastTool(),
+          lastBucket: watchdog.lastBucket(),
           logPath: args.logPath,
           durationMs: Date.now() - startedAt,
           retries: 0,
