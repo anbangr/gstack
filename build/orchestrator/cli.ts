@@ -4413,6 +4413,10 @@ export function buildCodexReviewBody(
   );
 }
 
+function phaseAllowsGateSourceFixes(phase: Phase): boolean {
+  return phase.kind === "code" && /fix-on-review/i.test(phase.body);
+}
+
 export function buildOriginVerificationBody(args: {
   feature: FeatureState;
   featureDef?: Feature;
@@ -4925,6 +4929,7 @@ async function runJudgeRole(opts: {
 
 async function runReviewGates(opts: {
   roles: RoleConfigs;
+  phase: Phase;
   inputFilePath: string;
   cwd: string;
   slug: string;
@@ -4990,6 +4995,9 @@ async function runReviewGates(opts: {
       `phase-${opts.phaseNumber}-${outputName}-${opts.iteration}-output.md`,
     );
     fs.writeFileSync(outputFilePath, "");
+    const readOnlyArtifactGate =
+      opts.phase.kind !== "code" || opts.phase.auditOnly === true;
+    const sandbox = attempt?.sandbox ?? (readOnlyArtifactGate ? "read-only" : undefined);
     return runSlashCommand({
       inputFilePath: opts.inputFilePath,
       outputFilePath,
@@ -5005,7 +5013,7 @@ async function runReviewGates(opts: {
         command: role.command!,
       },
       gate: true,
-      sandbox: attempt?.sandbox,
+      sandbox,
     });
   };
 
@@ -5028,6 +5036,7 @@ async function runReviewGates(opts: {
       parentWorkspace: parentBeforeGate,
       phaseRef: { phaseNumber: opts.phaseNumber },
       inputFilePath: opts.inputFilePath,
+      allowNonTestPaths: phaseAllowsGateSourceFixes(opts.phase),
     });
     outputs.push(result);
     combined.push(
@@ -5040,7 +5049,9 @@ async function runReviewGates(opts: {
         role,
         result,
         reviewSandboxEnv: process.env.GSTACK_BUILD_CODEX_REVIEW_SANDBOX,
-      })
+      }) &&
+      opts.phase.kind === "code" &&
+      !opts.phase.auditOnly
     ) {
       const retryResult = await runGate(name, role, {
         sandbox: "danger-full-access",
@@ -5054,6 +5065,7 @@ async function runReviewGates(opts: {
         parentWorkspace: parentBeforeGate,
         phaseRef: { phaseNumber: opts.phaseNumber },
         inputFilePath: opts.inputFilePath,
+        allowNonTestPaths: phaseAllowsGateSourceFixes(opts.phase),
       });
       outputs.push(checkedRetryResult);
       combined.push(
@@ -5227,6 +5239,7 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
   label: string;
   dirtyLines: string[];
   globs?: string[];
+  allowNonTestPaths?: boolean;
 }): { committed: boolean; reason: string; nonTestPaths?: string[] } {
   if (parseBooleanEnv(process.env.GSTACK_QA_NO_AUTO_COMMIT)) {
     return { committed: false, reason: "GSTACK_QA_NO_AUTO_COMMIT enabled" };
@@ -5251,6 +5264,16 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
   }
   const nonTest = paths.filter((p) => !isTestOnlyPath(p, globs));
   const testOnly = paths.filter((p) => isTestOnlyPath(p, globs));
+
+  if (nonTest.length > 0 && !opts.allowNonTestPaths) {
+    return {
+      committed: false,
+      reason: `non-test paths present: ${nonTest.slice(0, 3).join(", ")}${
+        nonTest.length > 3 ? ` (+${nonTest.length - 3} more)` : ""
+      }`,
+      nonTestPaths: nonTest,
+    };
+  }
 
   // Mixed diff path: auto-split, gated on GSTACK_QA_NO_AUTO_SPLIT for
   // opt-out. The skill template warns synthesizers off mixed diffs,
@@ -5325,11 +5348,21 @@ export function maybeAutoCommitTestOnlyDirty(opts: {
   // changes from a review/qa role; that would skip the whole point of
   // human review on source code.
   if (nonTest.length > 0) {
+    const prodCommit = commitPathsByList({
+      cwd: opts.cwd,
+      paths: nonTest,
+      message: buildProductionFixesAutoCommitMessage(opts.label, nonTest),
+      stageMode: "addAll",
+    });
+    if (prodCommit.ok) {
+      return {
+        committed: true,
+        reason: `committed ${nonTest.length} production path(s) via fix-on-review`,
+      };
+    }
     return {
       committed: false,
-      reason: `non-test paths present: ${nonTest.slice(0, 3).join(", ")}${
-        nonTest.length > 3 ? ` (+${nonTest.length - 3} more)` : ""
-      }`,
+      reason: prodCommit.error ?? "production commit failed",
       nonTestPaths: nonTest,
     };
   }
@@ -5434,6 +5467,7 @@ function applyGateHygiene(opts: {
    *  When provided, enables the DIFF SCOPE hygiene diagnostic only when
    *  the prompt body actually contains the constraint. */
   inputFilePath?: string;
+  allowNonTestPaths?: boolean;
 }): SubAgentResult {
   if (opts.result.timedOut || opts.result.exitCode !== 0) return opts.result;
   // Review/QA gates run Codex under workspace-write and the subagent writes
@@ -5474,6 +5508,7 @@ function applyGateHygiene(opts: {
         cwd: opts.cwd,
         label: opts.label,
         dirtyLines,
+        allowNonTestPaths: opts.allowNonTestPaths,
       });
       if (auto.committed) {
         console.warn(
@@ -7423,6 +7458,7 @@ async function runPhase(args: {
         );
         const gateRun = await runReviewGates({
           roles: args.roles,
+          phase,
           inputFilePath,
           cwd,
           slug: state.slug,
