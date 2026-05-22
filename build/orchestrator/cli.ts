@@ -930,7 +930,6 @@ export interface Args {
   investigateSymptoms?: string;
   investigateSeverityOverride?: "CRITICAL" | "HIGH" | "MEDIUM";
   investigateNoInbox?: boolean;
-  investigateEmitJson?: boolean;
   investigateReportPath?: string;
 }
 
@@ -1717,7 +1716,6 @@ export function parseArgs(argv: string[]): Args {
     args.mode = "investigate";
     args.investigateFaultId = args.investigateFaultId ?? positional[1];
     args.investigateRunId = args.investigateRunId ?? args.runId;
-    args.investigateEmitJson = args.investigateEmitJson ?? args.planStatusJson;
   } else if (positional[0] === "investigate-finalize") {
     args.mode = "investigate-finalize";
     args.investigateRunId = args.investigateRunId ?? args.runId;
@@ -10527,7 +10525,6 @@ async function main() {
       symptoms: args.investigateSymptoms,
       severityOverride: args.investigateSeverityOverride,
       noInbox: args.investigateNoInbox,
-      emitJson: args.investigateEmitJson,
     });
     process.exit(exitCode);
   }

@@ -24,7 +24,6 @@ export interface InvestigateModeArgs {
   symptoms?: string;
   severityOverride?: "CRITICAL" | "HIGH" | "MEDIUM";
   noInbox?: boolean;
-  emitJson?: boolean;
   faultsDir?: string;
   activeRunsRegistryDir?: string;
 }
