@@ -2929,12 +2929,12 @@ When the user invokes `/build investigate` (with or without a fault id), follow 
 
 3. **Write your report as JSON** to a tmp path. The schema is the `InvestigationReport` from `build/orchestrator/investigator-dispatch.ts:24-56`. The `faultId` field MUST equal the briefing's faultId.
 
-4. **Call investigate-finalize** with that tmp path. The CLI prints the same `finalizeHint` string back to you in the briefing — use it verbatim:
+4. **Call investigate-finalize** with that tmp path. The CLI prints the exact `finalizeHint` string back to you in the briefing — use it verbatim. The hint embeds the lock nonce, severity, and source from the briefing so finalize can verify lock ownership and apply correct severity gating:
 
    ```bash
-   gstack-build investigate-finalize --run-id <id> --fault-id <id> --report <tmp-path>
+   gstack-build investigate-finalize --run-id <id> --fault-id <id> --nonce <hex> --severity <S> --source <X> --report <tmp-path>
    ```
 
-   `investigate-finalize` validates the report, writes `~/.gstack/skill-faults/<runId>/<faultId>.md` (machine report) and — for HIGH/CRITICAL only — `inbox/BUGREPORT-<date>-<slug>.md` (human bug report). It returns exit 0 on success, 1 when the outcome is `needs-human` or `no-context`, and 2 on validation failure.
+   `investigate-finalize` validates the report, writes `~/.gstack/skill-faults/<runId>/<faultId>.md` (machine report) and — for HIGH/CRITICAL only, and only when `source` is not `symptoms` — `inbox/BUGREPORT-<date>-<slug>.md` (human bug report). It returns exit 0 on success, 1 when the outcome is `needs-human` or `no-context`, and 2 on validation failure.
 
 5. **Surface the paths to the user.** Print the machine report path and (if written) the bug report path. If the report includes a `learnedPatternProposal`, tell the user to run `gstack-build learn-fault-patterns` to absorb it.

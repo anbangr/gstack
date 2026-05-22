@@ -113,4 +113,83 @@ describe("investigate-finalize JSON validation", () => {
     expect(code).toBe(1);
     expect(fs.existsSync(path.join(faultsDir, "run-Z", "CAT:p0:abc.md"))).toBe(true);
   });
+
+  test("malformed proposedFix (object without options array) → exit 2", async () => {
+    const reportPath = path.join(tmpRoot, "bad-fix-shape.json");
+    fs.writeFileSync(
+      reportPath,
+      JSON.stringify({
+        faultId: "CAT:p0:abc",
+        outcome: "root-cause-identified",
+        rootCause: "x",
+        evidence: [],
+        proposedFix: {}, // missing options array — used to pass parser then crash writer
+        learnedPatternProposal: null,
+      }),
+    );
+    const code = await runInvestigateFinalize({
+      runId: "run-Z",
+      faultId: "CAT:p0:abc",
+      reportPath,
+      faultsDir,
+      inboxDir,
+    });
+    expect(code).toBe(2);
+    expect(stderrBuf).toContain("proposedFix.options");
+  });
+
+  test("malformed proposedFix option (missing blast_radius) → exit 2", async () => {
+    const reportPath = path.join(tmpRoot, "bad-option.json");
+    fs.writeFileSync(
+      reportPath,
+      JSON.stringify({
+        faultId: "CAT:p0:abc",
+        outcome: "root-cause-identified",
+        rootCause: "x",
+        evidence: [],
+        proposedFix: {
+          options: [{ label: "fix", description: "do it" }], // missing blast_radius
+        },
+        learnedPatternProposal: null,
+      }),
+    );
+    const code = await runInvestigateFinalize({
+      runId: "run-Z",
+      faultId: "CAT:p0:abc",
+      reportPath,
+      faultsDir,
+      inboxDir,
+    });
+    expect(code).toBe(2);
+    expect(stderrBuf).toMatch(/label|description|blast_radius/);
+  });
+
+  test("malformed learnedPatternProposal (missing pattern) → exit 2", async () => {
+    const reportPath = path.join(tmpRoot, "bad-lp.json");
+    fs.writeFileSync(
+      reportPath,
+      JSON.stringify({
+        faultId: "CAT:p0:abc",
+        outcome: "root-cause-identified",
+        rootCause: "x",
+        evidence: [],
+        proposedFix: null,
+        learnedPatternProposal: {
+          category: "FOO",
+          matcherKind: "stdout_contains",
+          // missing pattern, description
+          severity: "HIGH",
+        },
+      }),
+    );
+    const code = await runInvestigateFinalize({
+      runId: "run-Z",
+      faultId: "CAT:p0:abc",
+      reportPath,
+      faultsDir,
+      inboxDir,
+    });
+    expect(code).toBe(2);
+    expect(stderrBuf).toContain("learnedPatternProposal");
+  });
 });

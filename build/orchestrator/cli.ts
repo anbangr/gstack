@@ -931,6 +931,15 @@ export interface Args {
   investigateSeverityOverride?: "CRITICAL" | "HIGH" | "MEDIUM";
   investigateNoInbox?: boolean;
   investigateReportPath?: string;
+  investigateNonce?: string;
+  investigateSeverity?: "CRITICAL" | "HIGH" | "MEDIUM";
+  investigateSource?:
+    | "auto-detect"
+    | "explicit-fault-id"
+    | "explicit-state"
+    | "explicit-run-id"
+    | "symptoms"
+    | "user-picked";
 }
 
 /**
@@ -1496,6 +1505,38 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.investigateReportPath = next;
+    } else if (a === "--nonce") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--nonce requires a value");
+        process.exit(2);
+      }
+      args.investigateNonce = next;
+    } else if (a === "--severity") {
+      const next = argv[++i];
+      if (next === "CRITICAL" || next === "HIGH" || next === "MEDIUM") {
+        args.investigateSeverity = next;
+      } else {
+        console.error("--severity expects CRITICAL, HIGH, or MEDIUM");
+        process.exit(2);
+      }
+    } else if (a === "--source") {
+      const next = argv[++i];
+      if (
+        next === "auto-detect" ||
+        next === "explicit-fault-id" ||
+        next === "explicit-state" ||
+        next === "explicit-run-id" ||
+        next === "symptoms" ||
+        next === "user-picked"
+      ) {
+        args.investigateSource = next;
+      } else {
+        console.error(
+          "--source expects auto-detect, explicit-fault-id, explicit-state, explicit-run-id, symptoms, or user-picked",
+        );
+        process.exit(2);
+      }
     } else if (a === "--help" || a === "-h") {
       printHelp();
       process.exit(0);
@@ -2969,11 +3010,14 @@ Modes:
                         /investigate methodology in the current Claude session.
                         Auto-detects the latest active run when no args given.
                         Flags: --run-id, --state, --run-dir, --symptoms,
-                        --severity-override, --no-inbox, --json.
-  investigate-finalize --run-id <id> --fault-id <id> --report <path> [--no-inbox]
+                        --severity-override, --no-inbox.
+  investigate-finalize --run-id <id> --fault-id <id> --report <path>
+                       [--nonce <hex>] [--severity <S>] [--source <X>] [--no-inbox]
                         Validate the report file written by the Claude session
                         and persist both the machine report and (for HIGH/CRITICAL)
-                        the human bug report. Called by the Claude session.
+                        the human bug report. Called by the Claude session via
+                        the briefing's finalizeHint; the nonce, severity, and
+                        source flags are echoed verbatim from the briefing.
 
 Flags:
   --print-only         Parse and show phase table; exit.
@@ -10545,7 +10589,10 @@ async function main() {
       runId: args.investigateRunId,
       faultId: args.investigateFaultId,
       reportPath: args.investigateReportPath,
-      severity: args.investigateSeverityOverride,
+      severity:
+        args.investigateSeverity ?? args.investigateSeverityOverride,
+      source: args.investigateSource,
+      nonce: args.investigateNonce,
       noInbox: args.investigateNoInbox,
     });
     process.exit(exitCode);
