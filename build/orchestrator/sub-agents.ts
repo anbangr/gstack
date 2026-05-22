@@ -234,6 +234,56 @@ function psAvailableForWatchdog(): boolean {
   return _psProbeResult;
 }
 
+export type ResolvedWatchdogMode = {
+  mode: "stream" | "cpu";
+  source: "explicit" | "legacy" | "auto" | "invalid";
+  warning?: string;
+};
+
+export function resolveWatchdogMode(
+  env: Record<string, string | undefined> = process.env,
+  cpuProbe: () => boolean = psAvailableForWatchdog,
+): ResolvedWatchdogMode {
+  const explicit = env.GSTACK_BUILD_WATCHDOG_MODE?.trim().toLowerCase();
+  const legacy =
+    explicit === undefined && env.GSTACK_BUILD_WATCHDOG_CPU === "1"
+      ? "cpu"
+      : explicit === undefined && env.GSTACK_BUILD_WATCHDOG_CPU === "0"
+        ? "stream"
+        : undefined;
+  const requested = explicit ?? legacy ?? "auto";
+  const source = explicit
+    ? "explicit"
+    : legacy
+      ? "legacy"
+      : ("auto" as const);
+
+  if (requested === "stream") return { mode: "stream", source };
+  if (requested === "cpu" || requested === "auto") {
+    if (cpuProbe()) return { mode: "cpu", source };
+    return {
+      mode: "stream",
+      source,
+      warning:
+        requested === "cpu"
+          ? "cpu watchdog requested but `ps` probe failed; using stream"
+          : "auto watchdog selected stream; `ps` probe failed",
+    };
+  }
+  if (cpuProbe()) {
+    return {
+      mode: "cpu",
+      source: "invalid",
+      warning: `invalid GSTACK_BUILD_WATCHDOG_MODE=${requested}; using auto/cpu`,
+    };
+  }
+  return {
+    mode: "stream",
+    source: "invalid",
+    warning: `invalid GSTACK_BUILD_WATCHDOG_MODE=${requested}; using auto/stream`,
+  };
+}
+
 function kimiBin(): string {
   return process.env.KIMI_BIN || KIMI_BIN;
 }
@@ -770,36 +820,21 @@ export function spawnCaptured(args: {
       writeChannel("ERR", text);
     });
 
-    // Watchdog mode: env-var opt-in for CPU-time liveness probing. Stream
-    // mode is the default; cpu mode adds a `ps -o pid=,cputime= -g <pgid>`
-    // probe on every poll tick (kernel-truthful activity signal for
-    // sub-agents that run silently by design, e.g. kimi --print
-    // --final-message-only, codex exec without --json). Stdout activity
-    // still resets the timer in cpu mode — CPU is the canonical signal,
-    // stdout is the safety net.
-    //
-    // Rollout sunset: this env-var is the canary path. The plan is to
-    // observe cpu-mode behavior across kimi + codex runs without false-
-    // positive kills, then flip the default to cpu mode and treat
-    // `GSTACK_BUILD_WATCHDOG_CPU=0` as the explicit opt-out. When that
-    // flip lands, this branch goes away entirely.
-    //
-    // Platform guard: cpu mode shells out to `ps`. macOS + Linux ship it
-    // by default; Windows + minimal containers (alpine without procps)
-    // do not. We probe at attach time and silently degrade to stream
-    // mode with a one-line stderr notice — otherwise the user's opt-in
-    // would silently kill every silent sub-agent at stallMs.
-    const cpuModeRequested = process.env.GSTACK_BUILD_WATCHDOG_CPU === "1";
-    const useCpuWatchdog = cpuModeRequested && psAvailableForWatchdog();
-    if (cpuModeRequested && !useCpuWatchdog) {
-      process.stderr.write(
-        "gstack-build: GSTACK_BUILD_WATCHDOG_CPU=1 ignored — `ps` not available on this platform; using stream-mode watchdog instead.\n",
-      );
+    // Watchdog mode: default auto selects CPU liveness when the platform
+    // supports process-group CPU sampling, otherwise stream liveness.
+    const watchdogMode = resolveWatchdogMode();
+    if (watchdogMode.warning) {
+      process.stderr.write(`gstack-build: ${watchdogMode.warning}\n`);
     }
+    ws?.write(
+      `# watchdog_mode: ${watchdogMode.mode} (${watchdogMode.source})\n`,
+    );
     const provider = pickProviderForBin(args.bin);
     const parseProgress = pickParserForProvider(provider);
     const watchdog = attachStallWatchdog(
-      useCpuWatchdog ? { mode: "cpu", child } : { mode: "stream", child },
+      watchdogMode.mode === "cpu"
+        ? { mode: "cpu", child }
+        : { mode: "stream", child },
       {
         stallMs: args.timeoutMs,
         provider,
