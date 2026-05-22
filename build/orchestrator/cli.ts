@@ -2074,6 +2074,88 @@ export function contentHashDelta(
  *  remaining error precisely instead of substring-sniffing free-form prose. */
 const NO_NEW_COMMIT_ERROR_SUFFIX = " did not create a new commit";
 
+/**
+ * Capture HEAD sha for each sibling repo. Used by `validatePostAgentHygiene`
+ * to accept a phase whose deliverable landed in a sibling (e.g.
+ * `agnt2-gstack/implemented/<doc>.md` for a `[research]` phase whose
+ * project root is `agnt2-prototype`).
+ *
+ * Returns a map of `repoPath -> HEAD sha at capture time`. `null` HEAD
+ * means the rev-parse failed (corrupt repo, detached, empty); callers
+ * treat those entries as "unknown baseline" and conservatively do NOT
+ * accept the no-commit gate against them.
+ *
+ * Cheap: one `git rev-parse` per sibling. Safe to call before every
+ * phase if siblings might rotate.
+ */
+export function captureSiblingRepoBaselines(
+  repos: readonly string[],
+): Map<string, string | null> {
+  const out = new Map<string, string | null>();
+  for (const repo of repos) {
+    const r = spawnSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    });
+    out.set(repo, r.status === 0 ? r.stdout.trim() || null : null);
+  }
+  return out;
+}
+
+/**
+ * Find a gstack-mirror sibling repo for `projectRoot` whose tree contains
+ * the plan file. Returns the absolute path, or null if no such sibling
+ * exists.
+ *
+ * Motivating workspace layout (the NetX Foundation family — agnt2,
+ * mitosis, netx, agentcity, etc.):
+ *
+ *   workspace/
+ *     <project>-prototype/        ← projectRoot (code lives here)
+ *     <project>-gstack/           ← gstack mirror (design docs, plans)
+ *
+ * `[research]` and `[writing]` phases routinely produce deliverables in
+ * the mirror (per the `feedback_gstack_outputs_mirror.md` convention).
+ * The mirror is its own git repo. Without this helper, the hygiene gate
+ * watches only `projectRoot` and reports "no commit" even when the
+ * implementor correctly committed the deliverable in the mirror.
+ */
+export function findGstackMirrorSibling(
+  projectRoot: string,
+  planFile: string,
+): string | null {
+  // Both paths must be normalised through realpathSync so the sibling
+  // comparison survives macOS's `/tmp` -> `/private/tmp` symlink (and
+  // similar) — git rev-parse returns canonical paths, but path.resolve
+  // does not follow symlinks, so a naive string compare silently misses
+  // valid siblings under temp dirs.
+  const planDir = path.dirname(path.resolve(planFile));
+  const planRoot = gitRootFor(planDir);
+  if (!planRoot) return null;
+  let resolvedProject: string;
+  try {
+    resolvedProject = fs.realpathSync(path.resolve(projectRoot));
+  } catch {
+    return null;
+  }
+  let canonicalPlanRoot: string;
+  try {
+    canonicalPlanRoot = fs.realpathSync(planRoot);
+  } catch {
+    return null;
+  }
+  // The mirror is a SIBLING of the project root, not the project root
+  // itself. If the plan happens to live INSIDE projectRoot, there's
+  // nothing sibling-shaped to add.
+  if (canonicalPlanRoot === resolvedProject) return null;
+  if (!isGstackMirrorRoot(canonicalPlanRoot)) return null;
+  // Sanity: ensure the project root and the mirror are siblings (same
+  // parent directory). Avoids matching a `~/.gstack-artifacts-worktree`
+  // shared mirror that lives outside the workspace.
+  if (path.dirname(canonicalPlanRoot) !== path.dirname(resolvedProject))
+    return null;
+  return canonicalPlanRoot;
+}
+
 export function validatePostAgentHygiene(opts: {
   cwd: string;
   before: GitSnapshot;
@@ -2081,6 +2163,17 @@ export function validatePostAgentHygiene(opts: {
   requireNonEmptyOutput?: boolean;
   requireNewCommit?: boolean;
   label: string;
+  /**
+   * Optional baseline HEAD shas for sibling repos (e.g. the workspace's
+   * gstack-mirror). When `requireNewCommit` would otherwise fail because
+   * `opts.cwd`'s HEAD is unchanged, the gate checks each sibling; if ANY
+   * has advanced past its baseline sha, the no-commit error is
+   * suppressed.
+   *
+   * Captured via `captureSiblingRepoBaselines` at the same moment as
+   * `before`.
+   */
+  siblingRepoBaselines?: Map<string, string | null>;
   /**
    * When true, tolerate Codex CLI scratch directories that the review
    * subagent writes under workspace-write sandbox. Specifically `.codex/`,
@@ -2119,7 +2212,28 @@ export function validatePostAgentHygiene(opts: {
   }
 
   if (opts.requireNewCommit && after.head === opts.before.head) {
-    errors.push(`${opts.label}${NO_NEW_COMMIT_ERROR_SUFFIX}`);
+    // Before reporting "no commit", check sibling repos. `[research]` and
+    // `[writing]` phases routinely commit their deliverable in the
+    // workspace's gstack mirror (e.g. `agnt2-gstack/implemented/<doc>.md`)
+    // rather than the project root. A new commit in any sibling counts
+    // as the implementor having done its job.
+    let siblingAdvanced = false;
+    if (opts.siblingRepoBaselines) {
+      for (const [repo, baseline] of opts.siblingRepoBaselines) {
+        if (!baseline) continue; // unknown baseline → conservative skip
+        const r = spawnSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        });
+        const head = r.status === 0 ? r.stdout.trim() || null : null;
+        if (head && head !== baseline) {
+          siblingAdvanced = true;
+          break;
+        }
+      }
+    }
+    if (!siblingAdvanced) {
+      errors.push(`${opts.label}${NO_NEW_COMMIT_ERROR_SUFFIX}`);
+    }
   }
 
   // D5: filter using contentHashDelta so pre-existing dirty + idempotent
@@ -2150,7 +2264,10 @@ export function validatePostAgentHygiene(opts: {
         let promptHadConstraint = false;
         if (opts.reviewGatePromptPath) {
           try {
-            const promptBody = fs.readFileSync(opts.reviewGatePromptPath, "utf8");
+            const promptBody = fs.readFileSync(
+              opts.reviewGatePromptPath,
+              "utf8",
+            );
             promptHadConstraint = promptBody.includes("DIFF SCOPE:");
           } catch {
             // Prompt unreadable — conservatively treat as constraint absent.
@@ -3595,11 +3712,10 @@ export function quarantineMalformedRefs(cwd: string): {
     return { quarantined: 0, skipped: true };
   }
 
-  const gitDirResult = spawnSync(
-    "git",
-    ["-C", cwd, "rev-parse", "--git-dir"],
-    { cwd, encoding: "utf8" },
-  );
+  const gitDirResult = spawnSync("git", ["-C", cwd, "rev-parse", "--git-dir"], {
+    cwd,
+    encoding: "utf8",
+  });
   if (gitDirResult.status !== 0) {
     return { quarantined: 0 };
   }
@@ -3700,7 +3816,8 @@ export function quarantineMalformedRefs(cwd: string): {
 
     const sourceRefPath = path.join(commonDir, "refs", refRelPath);
 
-    const effectiveSha = originalSha ?? "0000000000000000000000000000000000000000";
+    const effectiveSha =
+      originalSha ?? "0000000000000000000000000000000000000000";
     const isNullSha = /^0{40}$/i.test(effectiveSha);
     const quotedRef = ref.replace(/'/g, "'\\''");
     // git update-ref refuses bad ref names, so add a filesystem fallback that
@@ -3768,7 +3885,13 @@ export function syncLandedBase(cwd: string): {
 export function syncFeatureBranchWithBase(
   cwd: string,
   branch: string,
-): { ok: boolean; baseRef?: string; conflicts?: string[]; error?: string; haltKind?: string } {
+): {
+  ok: boolean;
+  baseRef?: string;
+  conflicts?: string[];
+  error?: string;
+  haltKind?: string;
+} {
   const q = quarantineMalformedRefs(cwd);
   if (q.quarantined > 0) {
     console.log(`[sync] quarantined ${q.quarantined} malformed ref(s)`);
@@ -5001,7 +5124,8 @@ async function runReviewGates(opts: {
     fs.writeFileSync(outputFilePath, "");
     const readOnlyArtifactGate =
       opts.phase.kind !== "code" || opts.phase.auditOnly === true;
-    const sandbox = attempt?.sandbox ?? (readOnlyArtifactGate ? "read-only" : undefined);
+    const sandbox =
+      attempt?.sandbox ?? (readOnlyArtifactGate ? "read-only" : undefined);
     return runSlashCommand({
       inputFilePath: opts.inputFilePath,
       outputFilePath,
@@ -5607,6 +5731,12 @@ export async function applyMutableAgentHygiene(opts: {
    *  Opt-in per call site; the first RUN_GEMINI pass and the test-fixer keep the
    *  strict default. */
   allowNoChangesSentinel?: boolean;
+  /** Baseline HEAD shas for workspace sibling repos (typically the
+   *  gstack mirror), captured at the same moment as `before`. When the
+   *  no-commit gate would otherwise fail, a new commit in ANY sibling
+   *  counts as the implementor having delivered. See
+   *  `captureSiblingRepoBaselines` + `findGstackMirrorSibling`. */
+  siblingRepoBaselines?: Map<string, string | null>;
 }): Promise<SubAgentResult> {
   if (!opts.before) {
     return opts.result;
@@ -5671,6 +5801,7 @@ export async function applyMutableAgentHygiene(opts: {
       requireNonEmptyOutput: opts.requireNonEmptyOutput,
       requireNewCommit: opts.requireNewCommit,
       label: opts.label,
+      siblingRepoBaselines: opts.siblingRepoBaselines,
     }),
     validateParentWorkspaceUnchanged({
       before: opts.parentWorkspace?.snapshot ?? null,
@@ -6450,14 +6581,10 @@ async function runFeatureReviewIteration(args: {
   // Effective reasoning used for THIS spawn (T9 may override role default
   // to "medium" on cycle 1). Initialized to the role default; updated at
   // the spawn-dispatch site so analytics reflects what actually ran.
-  let _metricsEffectiveReasoning: string =
-    args.roles.featureReview.reasoning;
+  let _metricsEffectiveReasoning: string = args.roles.featureReview.reasoning;
   let _metricsPassEvidenceTimeout = false;
-  let _metricsEndedBy:
-    | "exit0"
-    | "watchdog"
-    | "signal"
-    | "exit-nonzero" = "exit-nonzero";
+  let _metricsEndedBy: "exit0" | "watchdog" | "signal" | "exit-nonzero" =
+    "exit-nonzero";
   const inputFilePath = path.join(
     logDir(slug),
     `feature-${args.feature.number}-review-${args.iteration}-input.md`,
@@ -6549,354 +6676,354 @@ async function runFeatureReviewIteration(args: {
   }
 
   try {
+    // Containment-checked prior report (F2 trust-boundary defense).
+    const priorRaw = args.featureState.featureReview?.outputFilePaths?.at(-1);
+    const priorReportPath = priorRaw
+      ? (validateLogPathInScope(priorRaw, slug) ?? undefined)
+      : undefined;
 
-  // Containment-checked prior report (F2 trust-boundary defense).
-  const priorRaw = args.featureState.featureReview?.outputFilePaths?.at(-1);
-  const priorReportPath = priorRaw
-    ? (validateLogPathInScope(priorRaw, slug) ?? undefined)
-    : undefined;
-
-  // Compute feature commits + diff. Best-effort — if either git call
-  // fails (no commits yet, detached HEAD, etc) we pass an empty string
-  // and the prompt builder embeds a `(no commits captured)` note.
-  //
-  // Resolve the actual fork point via `git merge-base origin/<base> HEAD`.
-  // The legacy `branch^{tree}` pattern silently produced empty diffs when
-  // the branch hadn't moved the tree away from main, hiding real changes
-  // from the reviewer (cross-model adversarial review surfaced this).
-  // Fall back to the legacy pattern only when base detection fails (e.g.
-  // no origin/main, no origin/master) so a repo without a canonical base
-  // still gets a non-crashing review.
-  const branchPoint =
-    resolveFeatureBaseRef({ cwd: args.cwd }) ??
-    (args.featureState.branch
-      ? `${args.featureState.branch}^{tree}`
-      : "HEAD~10");
-  const commitsR = spawnSync(
-    "git",
-    ["log", `${branchPoint}..HEAD`, "--oneline", "--no-decorate"],
-    { cwd: args.cwd, encoding: "utf8" },
-  );
-  const featureCommitsOneline =
-    commitsR.status === 0 ? (commitsR.stdout || "").trim() : "";
-  const diffR = spawnSync("git", ["diff", `${branchPoint}..HEAD`], {
-    cwd: args.cwd,
-    encoding: "utf8",
-  });
-  // Cap to ~30KB to bound reviewer input. The header explains the
-  // truncation so the reviewer knows the diff is partial.
-  let featureDiff = diffR.status === 0 ? diffR.stdout || "" : "";
-  const DIFF_CAP = 30_000;
-  if (featureDiff.length > DIFF_CAP) {
-    featureDiff =
-      `[diff truncated — first ${DIFF_CAP} of ${featureDiff.length} chars shown]\n` +
-      featureDiff.slice(0, DIFF_CAP);
-  }
-
-  // T8: per-phase diffs. Map phase.number → git diff <prev>..<this> (10KB
-  // cap each). Only populated when consecutive phase commits resolve via
-  // committedSha (set by T7 at every commit; cleared on REDO). When any
-  // step fails (missing sha, rev-parse fail), that phase is skipped and the
-  // reviewer falls back to the mega-diff for that delta.
-  const PHASE_DIFF_CAP = 10_000;
-  const phaseDiffs = new Map<string, string>();
-  // First phase's base is the feature's branch point (best-effort resolve).
-  // Subsequent phases' base is the previous phase's committedSha.
-  const baseR = spawnSync(
-    "git",
-    ["rev-parse", branchPoint],
-    { cwd: args.cwd, encoding: "utf8" },
-  );
-  let prevSha: string | null =
-    baseR.status === 0 ? (baseR.stdout || "").trim() || null : null;
-  for (const phaseIdx of args.feature.phaseIndexes) {
-    const ps = args.state.phases[phaseIdx];
-    const thisSha = ps?.committedSha;
-    if (!prevSha || !thisSha) {
-      // Skip — reviewer will see the unified mega-diff (fall-through path
-      // in the prompt builder when phaseDiffs ends up empty).
-      continue;
-    }
-    const phaseDiffR = spawnSync(
+    // Compute feature commits + diff. Best-effort — if either git call
+    // fails (no commits yet, detached HEAD, etc) we pass an empty string
+    // and the prompt builder embeds a `(no commits captured)` note.
+    //
+    // Resolve the actual fork point via `git merge-base origin/<base> HEAD`.
+    // The legacy `branch^{tree}` pattern silently produced empty diffs when
+    // the branch hadn't moved the tree away from main, hiding real changes
+    // from the reviewer (cross-model adversarial review surfaced this).
+    // Fall back to the legacy pattern only when base detection fails (e.g.
+    // no origin/main, no origin/master) so a repo without a canonical base
+    // still gets a non-crashing review.
+    const branchPoint =
+      resolveFeatureBaseRef({ cwd: args.cwd }) ??
+      (args.featureState.branch
+        ? `${args.featureState.branch}^{tree}`
+        : "HEAD~10");
+    const commitsR = spawnSync(
       "git",
-      ["diff", `${prevSha}..${thisSha}`],
+      ["log", `${branchPoint}..HEAD`, "--oneline", "--no-decorate"],
       { cwd: args.cwd, encoding: "utf8" },
     );
-    if (phaseDiffR.status === 0 && phaseDiffR.stdout) {
-      let body = phaseDiffR.stdout;
-      if (body.length > PHASE_DIFF_CAP) {
-        body =
-          `[per-phase diff truncated — first ${PHASE_DIFF_CAP} of ${body.length} chars shown]\n` +
-          body.slice(0, PHASE_DIFF_CAP);
-      }
-      phaseDiffs.set(ps.number, body);
-    }
-    prevSha = thisSha;
-  }
-
-  // Cross-phase summary (git diff --stat). Always cheap, useful even when
-  // per-phase didn't resolve. Cap at ~2KB defensively.
-  let featureDiffSummary = "";
-  const SUMMARY_CAP = 2_000;
-  const statR = spawnSync(
-    "git",
-    ["diff", "--stat", `${branchPoint}..HEAD`],
-    { cwd: args.cwd, encoding: "utf8" },
-  );
-  if (statR.status === 0) {
-    featureDiffSummary = statR.stdout || "";
-    if (featureDiffSummary.length > SUMMARY_CAP) {
-      featureDiffSummary =
-        `[summary truncated — first ${SUMMARY_CAP} of ${featureDiffSummary.length} chars shown]\n` +
-        featureDiffSummary.slice(0, SUMMARY_CAP);
-    }
-  }
-
-  const promptBody = buildFeatureReviewPrompt({
-    feature: args.feature,
-    featureState: args.featureState,
-    phases: args.phases,
-    phaseStates: args.state.phases,
-    planFile: args.planFile,
-    branch: args.state.branch,
-    iteration: args.iteration,
-    priorReportPath,
-    featureCommitsOneline,
-    featureDiff,
-    phaseDiffs,
-    featureDiffSummary,
-    outputFilePath,
-  });
-  fs.writeFileSync(inputFilePath, promptBody);
-  fs.writeFileSync(outputFilePath, "");
-  _metricsPromptBytes = Buffer.byteLength(promptBody, "utf8");
-  if (!args.dryRun) {
-    _metricsFirstWriteWatcher = watchFirstWrite(
-      outputFilePath,
-      _metricsSpawnStart,
-    );
-  }
-
-  const before = args.dryRun ? null : captureGitSnapshot(args.cwd);
-  let parentBeforeRole: {
-    workspaceRoot: string | null;
-    snapshot: GitSnapshot | null;
-  };
-  let result: SubAgentResult;
-  if (args.dryRun) {
-    // Default dry-run verdict: PASS so the orchestrator walks the happy
-    // path. Tests can opt into other verdicts by writing the file.
-    fs.writeFileSync(
-      outputFilePath,
-      "## VERDICT\nFEATURE_PASS\n\n## Findings\n- [dry-run] no real review performed\n",
-    );
-    parentBeforeRole = refreshParentWorkspaceSnapshot(
-      args.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
-    );
-    result = mockResult({
-      exitCode: 0,
-      stdout: "## VERDICT\nFEATURE_PASS\n",
-      logPath: inputFilePath,
+    const featureCommitsOneline =
+      commitsR.status === 0 ? (commitsR.stdout || "").trim() : "";
+    const diffR = spawnSync("git", ["diff", `${branchPoint}..HEAD`], {
+      cwd: args.cwd,
+      encoding: "utf8",
     });
-  } else {
-    parentBeforeRole = refreshParentWorkspaceSnapshot(
-      args.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
-    );
-    // Codex provider routes through runCodexFeatureReview — implementor's
-    // workspace-write sandbox and "files changed / tests run" prompt template
-    // were producing TIMEOUT-rebranded UNCLEAR verdicts and tripping the
-    // post-agent hygiene gate when the reviewer mutated audit files. The
-    // dedicated reviewer path uses a read-only sandbox and a verdict-sentinel
-    // prompt. Other providers still go through runRoleTask for now —
-    // follow-up commits will give gemini/kimi/claude the same treatment.
-    if (args.roles.featureReview.provider === "codex") {
-      const resolved = resolveRoleTimeouts(args.roles.featureReview);
-      // Cycle 1 uses reasoning=medium; cycle 2+ uses the configured reasoning
-      // (typically high). If cycle 1 returns UNCLEAR, the retry runs with
-      // the configured reasoning. Cuts p50 latency on the happy path while
-      // preserving full-depth review on contested cases.
-      const effectiveReasoning =
-        args.iteration === 1 ? "medium" : args.roles.featureReview.reasoning;
-      _metricsEffectiveReasoning = effectiveReasoning;
-      result = await runCodexFeatureReview({
-        inputFilePath,
-        outputFilePath,
-        cwd: args.cwd,
-        slug,
-        phaseNumber: `feature-${args.feature.number}`,
-        iteration: args.iteration,
-        reasoning: effectiveReasoning,
-        model: args.roles.featureReview.model,
-        timeoutMs: resolved.primaryMs,
-      });
-    } else {
-      result = await runRoleTask({
-        role: args.roles.featureReview,
-        inputFilePath,
-        outputFilePath,
-        cwd: args.cwd,
-        slug,
-        phaseNumber: `feature-${args.feature.number}`,
-        iteration: args.iteration,
-        logPrefix: "feature-review",
-      });
+    // Cap to ~30KB to bound reviewer input. The header explains the
+    // truncation so the reviewer knows the diff is partial.
+    let featureDiff = diffR.status === 0 ? diffR.stdout || "" : "";
+    const DIFF_CAP = 30_000;
+    if (featureDiff.length > DIFF_CAP) {
+      featureDiff =
+        `[diff truncated — first ${DIFF_CAP} of ${featureDiff.length} chars shown]\n` +
+        featureDiff.slice(0, DIFF_CAP);
     }
-  }
-  result = await applyMutableAgentHygiene({
-    result,
-    before,
-    cwd: args.cwd,
-    label: "feature review",
-    parentWorkspace: parentBeforeRole,
-  });
-  if (result.timedOut) {
-    _metricsEndedBy = "watchdog";
-  } else if (result.exitCode === 0) {
-    _metricsEndedBy = "exit0";
-  } else if (result.exitCode === null) {
-    _metricsEndedBy = "signal";
-  } else {
-    _metricsEndedBy = "exit-nonzero";
-  }
 
-  // Persist iteration onto featureState.featureReview.
-  if (!args.featureState.featureReview) {
-    args.featureState.featureReview = {
-      iterations: 0,
-      outputLogPaths: [],
-      outputFilePaths: [],
-    };
-  }
-  const fr = args.featureState.featureReview;
-  fr.iterations += 1;
-  fr.outputLogPaths.push(result.logPath);
-  fr.outputFilePaths!.push(outputFilePath);
-  delete fr.timeoutEvidence;
-
-  // Read the artifact (mergeOutputFile populated result.stdout from
-  // outputFilePath, but the file itself is the canonical source for
-  // future iterations to read back).
-  let artifactRaw = "";
-  try {
-    artifactRaw = fs.readFileSync(outputFilePath, "utf8");
-  } catch {
-    artifactRaw = result.stdout || "";
-  }
-  let verdict = parseFeatureReviewVerdict(artifactRaw);
-  _metricsFinalVerdict = verdict.verdict;
-  // Initial finalVerdict. UNCLEAR (no `## VERDICT` sentinel) is MISSING_VERDICT
-  // not TIMEOUT — the old code collapsed every non-PASS shape onto TIMEOUT,
-  // which hid the prompt-contract violation behind a generic timeout label.
-  // The classifyFeatureReviewResult helper produces the right discriminator.
-  fr.finalVerdict =
-    verdict.verdict === "UNCLEAR"
-      ? "MISSING_VERDICT"
-      : (verdict.verdict as any);
-
-  let timedOutWithStructuredVerdict = false;
-  if (result.timedOut) {
-    const timeoutClassification = classifyFeatureReviewTimeout(artifactRaw);
-    verdict = timeoutClassification.verdict;
-    _metricsFinalVerdict = verdict.verdict;
-    if (timeoutClassification.kind === "pass-evidence-timeout") {
-      _metricsPassEvidenceTimeout = true;
-    }
-    if (timeoutClassification.kind === "structured-verdict") {
-      fr.finalVerdict = verdict.verdict as any;
-      timedOutWithStructuredVerdict = true;
-    } else {
-      fr.finalVerdict = "TIMEOUT";
-      if (timeoutClassification.kind === "pass-evidence-timeout") {
-        fr.timeoutEvidence = "pass";
+    // T8: per-phase diffs. Map phase.number → git diff <prev>..<this> (10KB
+    // cap each). Only populated when consecutive phase commits resolve via
+    // committedSha (set by T7 at every commit; cleared on REDO). When any
+    // step fails (missing sha, rev-parse fail), that phase is skipped and the
+    // reviewer falls back to the mega-diff for that delta.
+    const PHASE_DIFF_CAP = 10_000;
+    const phaseDiffs = new Map<string, string>();
+    // First phase's base is the feature's branch point (best-effort resolve).
+    // Subsequent phases' base is the previous phase's committedSha.
+    const baseR = spawnSync("git", ["rev-parse", branchPoint], {
+      cwd: args.cwd,
+      encoding: "utf8",
+    });
+    let prevSha: string | null =
+      baseR.status === 0 ? (baseR.stdout || "").trim() || null : null;
+    for (const phaseIdx of args.feature.phaseIndexes) {
+      const ps = args.state.phases[phaseIdx];
+      const thisSha = ps?.committedSha;
+      if (!prevSha || !thisSha) {
+        // Skip — reviewer will see the unified mega-diff (fall-through path
+        // in the prompt builder when phaseDiffs ends up empty).
+        continue;
       }
-      updateFeatureReviewFailureShape(fr, "TIMEOUT", result.logPath);
-      return { verdict, action: "unclear", outputFilePath };
-    }
-  }
-
-  if (!timedOutWithStructuredVerdict && result.exitCode !== 0) {
-    // Non-zero exit, watchdog didn't fire. Two shapes (see
-    // classifyFeatureReviewResult for the full taxonomy):
-    //   - hygieneFailure: applyMutableAgentHygiene caught a worktree mutation.
-    //     Distinct fix path — same-shape repeats here are a signal to halt
-    //     rather than retry.
-    //   - everything else: transport, quota, crash. Generic retry-or-bail.
-    const failureState = result.hygieneFailure ? "HYGIENE_FAULT" : "EXEC_ERROR";
-    fr.finalVerdict = failureState;
-    updateFeatureReviewFailureShape(fr, failureState, result.logPath);
-    return { verdict, action: "unclear", outputFilePath };
-  }
-
-  // Exit 0 (or timed-out-with-structured-verdict). If the parsed verdict is
-  // still UNCLEAR at this point, mark MISSING_VERDICT and track its shape.
-  // The successful verdict branches below clear the shape on PASS / REDO /
-  // NEEDS_PHASES.
-  if (verdict.verdict === "UNCLEAR" && !timedOutWithStructuredVerdict) {
-    fr.finalVerdict = "MISSING_VERDICT";
-    updateFeatureReviewFailureShape(fr, "MISSING_VERDICT", result.logPath);
-  } else {
-    clearFeatureReviewFailureShape(fr);
-  }
-
-  if (verdict.verdict === "FEATURE_PASS") {
-    // T14: persist PASS to the disk cache so a future /build run with
-    // identical inputs (feature content + phase shas + plan + reviewer)
-    // can skip the spawn. Empty _cacheKey (missing committedSha or
-    // dryRun) skips the write — storeCache also no-ops on empty keys.
-    if (_cacheKey && !args.dryRun) {
-      storeCache(_cacheKey, slug, {
-        verdict: "FEATURE_PASS",
-        iteration: args.iteration,
-        outputFilePath,
-        cachedAt: new Date().toISOString(),
-        originalSlug: slug,
+      const phaseDiffR = spawnSync("git", ["diff", `${prevSha}..${thisSha}`], {
+        cwd: args.cwd,
+        encoding: "utf8",
       });
+      if (phaseDiffR.status === 0 && phaseDiffR.stdout) {
+        let body = phaseDiffR.stdout;
+        if (body.length > PHASE_DIFF_CAP) {
+          body =
+            `[per-phase diff truncated — first ${PHASE_DIFF_CAP} of ${body.length} chars shown]\n` +
+            body.slice(0, PHASE_DIFF_CAP);
+        }
+        phaseDiffs.set(ps.number, body);
+      }
+      prevSha = thisSha;
     }
-    return { verdict, action: "ship", outputFilePath };
-  }
 
-  if (verdict.verdict === "FEATURE_REDO") {
-    // Map phase numbers (strings, matching plan headings) to indexes
-    // within THIS feature only. Reviewer-supplied phase numbers that
-    // don't belong to this feature are silently ignored — the prompt
-    // tells the reviewer to scope to its feature, but if a stray
-    // number sneaks through we don't reach into other features.
-    const featurePhases = args.feature.phaseIndexes.map((i) => args.phases[i]);
-    const targets: number[] = [];
-    for (const num of verdict.phasesToRedo) {
-      const phase = featurePhases.find((p) => p?.number === num);
-      if (phase) targets.push(phase.index);
+    // Cross-phase summary (git diff --stat). Always cheap, useful even when
+    // per-phase didn't resolve. Cap at ~2KB defensively.
+    let featureDiffSummary = "";
+    const SUMMARY_CAP = 2_000;
+    const statR = spawnSync("git", ["diff", "--stat", `${branchPoint}..HEAD`], {
+      cwd: args.cwd,
+      encoding: "utf8",
+    });
+    if (statR.status === 0) {
+      featureDiffSummary = statR.stdout || "";
+      if (featureDiffSummary.length > SUMMARY_CAP) {
+        featureDiffSummary =
+          `[summary truncated — first ${SUMMARY_CAP} of ${featureDiffSummary.length} chars shown]\n` +
+          featureDiffSummary.slice(0, SUMMARY_CAP);
+      }
     }
-    if (targets.length === 0) {
-      // Reviewer said REDO but named no valid phase in this feature.
-      // Treat as UNCLEAR — caller will decide.
-      return { verdict, action: "unclear", outputFilePath };
-    }
-    for (const i of targets) {
-      resetPhaseStateForRedo(args.state, i);
-    }
-    fr.phasesReset = targets;
-    saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
-    return { verdict, action: "redo", outputFilePath };
-  }
 
-  if (verdict.verdict === "FEATURE_NEEDS_PHASES") {
-    if (!verdict.additionalPhasesMd) {
-      // Verdict claims new phases needed but supplied no markdown body.
-      // Caller will treat as UNCLEAR.
-      return { verdict, action: "unclear", outputFilePath };
-    }
-    appendFeaturePhases({
+    const promptBody = buildFeatureReviewPrompt({
+      feature: args.feature,
+      featureState: args.featureState,
+      phases: args.phases,
+      phaseStates: args.state.phases,
       planFile: args.planFile,
-      featureNumber: args.feature.number,
-      phasesMd: verdict.additionalPhasesMd,
+      branch: args.state.branch,
+      iteration: args.iteration,
+      priorReportPath,
+      featureCommitsOneline,
+      featureDiff,
+      phaseDiffs,
+      featureDiffSummary,
+      outputFilePath,
     });
-    fr.phasesAdded = (fr.phasesAdded ?? 0) + 1;
-    saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
-    return { verdict, action: "phases_added", outputFilePath };
-  }
+    fs.writeFileSync(inputFilePath, promptBody);
+    fs.writeFileSync(outputFilePath, "");
+    _metricsPromptBytes = Buffer.byteLength(promptBody, "utf8");
+    if (!args.dryRun) {
+      _metricsFirstWriteWatcher = watchFirstWrite(
+        outputFilePath,
+        _metricsSpawnStart,
+      );
+    }
 
-  return { verdict, action: "unclear", outputFilePath };
+    const before = args.dryRun ? null : captureGitSnapshot(args.cwd);
+    let parentBeforeRole: {
+      workspaceRoot: string | null;
+      snapshot: GitSnapshot | null;
+    };
+    let result: SubAgentResult;
+    if (args.dryRun) {
+      // Default dry-run verdict: PASS so the orchestrator walks the happy
+      // path. Tests can opt into other verdicts by writing the file.
+      fs.writeFileSync(
+        outputFilePath,
+        "## VERDICT\nFEATURE_PASS\n\n## Findings\n- [dry-run] no real review performed\n",
+      );
+      parentBeforeRole = refreshParentWorkspaceSnapshot(
+        args.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
+      );
+      result = mockResult({
+        exitCode: 0,
+        stdout: "## VERDICT\nFEATURE_PASS\n",
+        logPath: inputFilePath,
+      });
+    } else {
+      parentBeforeRole = refreshParentWorkspaceSnapshot(
+        args.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
+      );
+      // Codex provider routes through runCodexFeatureReview — implementor's
+      // workspace-write sandbox and "files changed / tests run" prompt template
+      // were producing TIMEOUT-rebranded UNCLEAR verdicts and tripping the
+      // post-agent hygiene gate when the reviewer mutated audit files. The
+      // dedicated reviewer path uses a read-only sandbox and a verdict-sentinel
+      // prompt. Other providers still go through runRoleTask for now —
+      // follow-up commits will give gemini/kimi/claude the same treatment.
+      if (args.roles.featureReview.provider === "codex") {
+        const resolved = resolveRoleTimeouts(args.roles.featureReview);
+        // Cycle 1 uses reasoning=medium; cycle 2+ uses the configured reasoning
+        // (typically high). If cycle 1 returns UNCLEAR, the retry runs with
+        // the configured reasoning. Cuts p50 latency on the happy path while
+        // preserving full-depth review on contested cases.
+        const effectiveReasoning =
+          args.iteration === 1 ? "medium" : args.roles.featureReview.reasoning;
+        _metricsEffectiveReasoning = effectiveReasoning;
+        result = await runCodexFeatureReview({
+          inputFilePath,
+          outputFilePath,
+          cwd: args.cwd,
+          slug,
+          phaseNumber: `feature-${args.feature.number}`,
+          iteration: args.iteration,
+          reasoning: effectiveReasoning,
+          model: args.roles.featureReview.model,
+          timeoutMs: resolved.primaryMs,
+        });
+      } else {
+        result = await runRoleTask({
+          role: args.roles.featureReview,
+          inputFilePath,
+          outputFilePath,
+          cwd: args.cwd,
+          slug,
+          phaseNumber: `feature-${args.feature.number}`,
+          iteration: args.iteration,
+          logPrefix: "feature-review",
+        });
+      }
+    }
+    result = await applyMutableAgentHygiene({
+      result,
+      before,
+      cwd: args.cwd,
+      label: "feature review",
+      parentWorkspace: parentBeforeRole,
+    });
+    if (result.timedOut) {
+      _metricsEndedBy = "watchdog";
+    } else if (result.exitCode === 0) {
+      _metricsEndedBy = "exit0";
+    } else if (result.exitCode === null) {
+      _metricsEndedBy = "signal";
+    } else {
+      _metricsEndedBy = "exit-nonzero";
+    }
+
+    // Persist iteration onto featureState.featureReview.
+    if (!args.featureState.featureReview) {
+      args.featureState.featureReview = {
+        iterations: 0,
+        outputLogPaths: [],
+        outputFilePaths: [],
+      };
+    }
+    const fr = args.featureState.featureReview;
+    fr.iterations += 1;
+    fr.outputLogPaths.push(result.logPath);
+    fr.outputFilePaths!.push(outputFilePath);
+    delete fr.timeoutEvidence;
+
+    // Read the artifact (mergeOutputFile populated result.stdout from
+    // outputFilePath, but the file itself is the canonical source for
+    // future iterations to read back).
+    let artifactRaw = "";
+    try {
+      artifactRaw = fs.readFileSync(outputFilePath, "utf8");
+    } catch {
+      artifactRaw = result.stdout || "";
+    }
+    let verdict = parseFeatureReviewVerdict(artifactRaw);
+    _metricsFinalVerdict = verdict.verdict;
+    // Initial finalVerdict. UNCLEAR (no `## VERDICT` sentinel) is MISSING_VERDICT
+    // not TIMEOUT — the old code collapsed every non-PASS shape onto TIMEOUT,
+    // which hid the prompt-contract violation behind a generic timeout label.
+    // The classifyFeatureReviewResult helper produces the right discriminator.
+    fr.finalVerdict =
+      verdict.verdict === "UNCLEAR"
+        ? "MISSING_VERDICT"
+        : (verdict.verdict as any);
+
+    let timedOutWithStructuredVerdict = false;
+    if (result.timedOut) {
+      const timeoutClassification = classifyFeatureReviewTimeout(artifactRaw);
+      verdict = timeoutClassification.verdict;
+      _metricsFinalVerdict = verdict.verdict;
+      if (timeoutClassification.kind === "pass-evidence-timeout") {
+        _metricsPassEvidenceTimeout = true;
+      }
+      if (timeoutClassification.kind === "structured-verdict") {
+        fr.finalVerdict = verdict.verdict as any;
+        timedOutWithStructuredVerdict = true;
+      } else {
+        fr.finalVerdict = "TIMEOUT";
+        if (timeoutClassification.kind === "pass-evidence-timeout") {
+          fr.timeoutEvidence = "pass";
+        }
+        updateFeatureReviewFailureShape(fr, "TIMEOUT", result.logPath);
+        return { verdict, action: "unclear", outputFilePath };
+      }
+    }
+
+    if (!timedOutWithStructuredVerdict && result.exitCode !== 0) {
+      // Non-zero exit, watchdog didn't fire. Two shapes (see
+      // classifyFeatureReviewResult for the full taxonomy):
+      //   - hygieneFailure: applyMutableAgentHygiene caught a worktree mutation.
+      //     Distinct fix path — same-shape repeats here are a signal to halt
+      //     rather than retry.
+      //   - everything else: transport, quota, crash. Generic retry-or-bail.
+      const failureState = result.hygieneFailure
+        ? "HYGIENE_FAULT"
+        : "EXEC_ERROR";
+      fr.finalVerdict = failureState;
+      updateFeatureReviewFailureShape(fr, failureState, result.logPath);
+      return { verdict, action: "unclear", outputFilePath };
+    }
+
+    // Exit 0 (or timed-out-with-structured-verdict). If the parsed verdict is
+    // still UNCLEAR at this point, mark MISSING_VERDICT and track its shape.
+    // The successful verdict branches below clear the shape on PASS / REDO /
+    // NEEDS_PHASES.
+    if (verdict.verdict === "UNCLEAR" && !timedOutWithStructuredVerdict) {
+      fr.finalVerdict = "MISSING_VERDICT";
+      updateFeatureReviewFailureShape(fr, "MISSING_VERDICT", result.logPath);
+    } else {
+      clearFeatureReviewFailureShape(fr);
+    }
+
+    if (verdict.verdict === "FEATURE_PASS") {
+      // T14: persist PASS to the disk cache so a future /build run with
+      // identical inputs (feature content + phase shas + plan + reviewer)
+      // can skip the spawn. Empty _cacheKey (missing committedSha or
+      // dryRun) skips the write — storeCache also no-ops on empty keys.
+      if (_cacheKey && !args.dryRun) {
+        storeCache(_cacheKey, slug, {
+          verdict: "FEATURE_PASS",
+          iteration: args.iteration,
+          outputFilePath,
+          cachedAt: new Date().toISOString(),
+          originalSlug: slug,
+        });
+      }
+      return { verdict, action: "ship", outputFilePath };
+    }
+
+    if (verdict.verdict === "FEATURE_REDO") {
+      // Map phase numbers (strings, matching plan headings) to indexes
+      // within THIS feature only. Reviewer-supplied phase numbers that
+      // don't belong to this feature are silently ignored — the prompt
+      // tells the reviewer to scope to its feature, but if a stray
+      // number sneaks through we don't reach into other features.
+      const featurePhases = args.feature.phaseIndexes.map(
+        (i) => args.phases[i],
+      );
+      const targets: number[] = [];
+      for (const num of verdict.phasesToRedo) {
+        const phase = featurePhases.find((p) => p?.number === num);
+        if (phase) targets.push(phase.index);
+      }
+      if (targets.length === 0) {
+        // Reviewer said REDO but named no valid phase in this feature.
+        // Treat as UNCLEAR — caller will decide.
+        return { verdict, action: "unclear", outputFilePath };
+      }
+      for (const i of targets) {
+        resetPhaseStateForRedo(args.state, i);
+      }
+      fr.phasesReset = targets;
+      saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
+      return { verdict, action: "redo", outputFilePath };
+    }
+
+    if (verdict.verdict === "FEATURE_NEEDS_PHASES") {
+      if (!verdict.additionalPhasesMd) {
+        // Verdict claims new phases needed but supplied no markdown body.
+        // Caller will treat as UNCLEAR.
+        return { verdict, action: "unclear", outputFilePath };
+      }
+      appendFeaturePhases({
+        planFile: args.planFile,
+        featureNumber: args.feature.number,
+        phasesMd: verdict.additionalPhasesMd,
+      });
+      fr.phasesAdded = (fr.phasesAdded ?? 0) + 1;
+      saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
+      return { verdict, action: "phases_added", outputFilePath };
+    }
+
+    return { verdict, action: "unclear", outputFilePath };
   } finally {
     _metricsFirstWriteWatcher?.stop();
     if (!args.dryRun) {
@@ -6943,9 +7070,15 @@ async function runPhase(args: {
     workspaceRoot: string | null;
     snapshot: GitSnapshot | null;
   };
+  /** Workspace sibling repos to watch for hygiene-gate commits (typically
+   *  the gstack mirror). `[research]` / `[writing]` phases routinely land
+   *  their deliverable in the mirror; the no-commit hygiene check
+   *  accepts a new commit in any of these as proof of work. */
+  siblingRepos?: string[];
 }): Promise<"done" | "failed"> {
   const { state, phase, cwd, noGbrain, dryRun, maxCodexIter, parentWorkspace } =
     args;
+  const siblingRepos = args.siblingRepos ?? [];
   let phaseState = state.phases[phase.index];
 
   while (true) {
@@ -7118,8 +7251,7 @@ async function runPhase(args: {
         }
       }
       if (action.reason.startsWith("RED_GATE_ZERO_TESTS_COLLECTED")) {
-        const testCmd =
-          resolveTestCmdForPhase(args, cwd, phase) ?? "unknown";
+        const testCmd = resolveTestCmdForPhase(args, cwd, phase) ?? "unknown";
         recordRedGateZeroTestsCollected(
           state,
           phaseState.index,
@@ -7199,6 +7331,10 @@ async function runPhase(args: {
         `phase-${phase.number}-gemini-${action.iteration}-output.md`,
       );
       const before = dryRun ? null : captureGitSnapshot(cwd);
+      const siblingBaselines =
+        dryRun || siblingRepos.length === 0
+          ? undefined
+          : captureSiblingRepoBaselines(siblingRepos);
       let parentBeforeRole: {
         workspaceRoot: string | null;
         snapshot: GitSnapshot | null;
@@ -7276,6 +7412,7 @@ async function runPhase(args: {
         requireNewCommit: !phase.auditOnly,
         allowSubmoduleRecovery: args.allowSubmoduleRecovery,
         parentWorkspace: parentBeforeRole,
+        siblingRepoBaselines: siblingBaselines,
       });
       phaseState = applyResult(phaseState, action, result, { outputFilePath });
       state.phases[phase.index] = phaseState;
@@ -7292,6 +7429,10 @@ async function runPhase(args: {
         `phase-${phase.number}-gemini-rerun-${action.iteration}-output.md`,
       );
       const before = dryRun ? null : captureGitSnapshot(cwd);
+      const siblingBaselines =
+        dryRun || siblingRepos.length === 0
+          ? undefined
+          : captureSiblingRepoBaselines(siblingRepos);
       let parentBeforeRole: {
         workspaceRoot: string | null;
         snapshot: GitSnapshot | null;
@@ -7400,6 +7541,7 @@ async function runPhase(args: {
         allowNoChangesSentinel: true,
         allowSubmoduleRecovery: args.allowSubmoduleRecovery,
         parentWorkspace: parentBeforeRole,
+        siblingRepoBaselines: siblingBaselines,
       });
       phaseState = applyResult(phaseState, action, result, { outputFilePath });
       state.phases[phase.index] = phaseState;
@@ -10857,6 +10999,24 @@ async function main() {
       // Drive the loop.
       const cwd = projectRoot;
 
+      // Sibling repos whose new commits count toward the hygiene gate's
+      // "did not create a new commit" check. The dominant case is the
+      // gstack mirror (e.g. `agnt2-gstack/` sibling of `agnt2-prototype/`):
+      // `[research]` and `[writing]` phases routinely land their
+      // deliverable there per the workspace's design-doc convention.
+      // One-shot computation at startup: siblings don't rotate during a
+      // build.
+      const hygieneSiblingRepos: string[] = [];
+      {
+        const mirror = findGstackMirrorSibling(projectRoot, args.planFile);
+        if (mirror) {
+          hygieneSiblingRepos.push(mirror);
+          console.log(
+            `Hygiene siblings: a new commit in ${path.basename(mirror)} also satisfies the no-commit gate.`,
+          );
+        }
+      }
+
       // Plan review: second-opinion pass before Phase 1 of Feature 1.
       // Skipped in dry-run, when --no-plan-review is set, or on resume (already reviewed).
       // Resume re-runs the loop when prior session left a pending status:
@@ -11246,6 +11406,7 @@ async function main() {
                 roles: args.roles,
                 allowSubmoduleRecovery: args.allowSubmoduleRecovery,
                 parentWorkspace,
+                siblingRepos: hygieneSiblingRepos,
               });
 
               if (outcome === "failed") {
@@ -11318,11 +11479,10 @@ async function main() {
                 .map((l) => l.trim())
                 .filter((l) => l.length > 0);
             }
-            const _diffR = spawnSync(
-              "git",
-              ["diff", `${_bp}..HEAD`],
-              { cwd, encoding: "utf8" },
-            );
+            const _diffR = spawnSync("git", ["diff", `${_bp}..HEAD`], {
+              cwd,
+              encoding: "utf8",
+            });
             if (_diffR.status === 0) {
               _skipDiffBytes = Buffer.byteLength(_diffR.stdout || "", "utf8");
             }
@@ -11730,10 +11890,7 @@ async function main() {
             // UNCLEAR verdicts (e.g. base-branch undetectable, subprocess
             // failed, output missing sentinel) are best-effort: warn and
             // proceed — verifier is a quality gate, not a hard prerequisite.
-            if (
-              !args.skipPreMergeVerify &&
-              args.roles.featureVerifier
-            ) {
+            if (!args.skipPreMergeVerify && args.roles.featureVerifier) {
               console.log(
                 `\n▶ Feature ${featureState.number} pre-merge verify (${roleLabel(args.roles.featureVerifier)})`,
               );
