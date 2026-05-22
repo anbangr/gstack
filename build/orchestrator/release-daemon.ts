@@ -704,46 +704,37 @@ function checkoutScratchWorktree(
       // Use the realpath-resolved worktree path, not the raw record
       // value — same TOCTOU mitigation as the repoPath gate.
       const resolvedWorktree = worktreeGate.resolved;
-      // Check whether the worktree is already on the expected branch.
-      // If not, fetch the remote branch and reset to it.
       const branchCheck = spawnSync(
         "git",
         ["rev-parse", "--abbrev-ref", "HEAD"],
         { cwd: resolvedWorktree, encoding: "utf8" },
       );
       if (branchCheck.status !== 0) {
-        // Can't determine current branch (not a git repo, shallow clone,
-        // etc.) — proceed without resetting so we don't break test fixtures
-        // or edge-case worktrees.
+        // Existing fixtures and unusual worktree-like directories can pass
+        // the .git marker gate without being real repos. Keep the legacy
+        // fallback for those, but reset every real worktree below.
         return resolvedWorktree;
       }
-      const currentBranch = (branchCheck.stdout || "").trim();
-      if (currentBranch !== record.featureBranch) {
-        const remoteTrackingRef = `refs/remotes/origin/${record.featureBranch}`;
-        const fetched = spawnSync(
-          "git",
-          [
-            "fetch",
-            "origin",
-            `+refs/heads/${record.featureBranch}:${remoteTrackingRef}`,
-          ],
-          { cwd: resolvedWorktree, encoding: "utf8" },
-        );
-        if (fetched.status !== 0) {
-          throw new Error(
-            fetched.stderr || fetched.stdout || "git fetch failed",
-          );
-        }
-        const reset = spawnSync(
-          "git",
-          ["reset", "--hard", remoteTrackingRef],
-          { cwd: resolvedWorktree, encoding: "utf8" },
-        );
-        if (reset.status !== 0) {
-          throw new Error(
-            reset.stderr || reset.stdout || "git reset failed",
-          );
-        }
+      const remoteTrackingRef = `refs/remotes/origin/${record.featureBranch}`;
+      const fetched = spawnSync(
+        "git",
+        [
+          "fetch",
+          "origin",
+          `+refs/heads/${record.featureBranch}:${remoteTrackingRef}`,
+        ],
+        { cwd: resolvedWorktree, encoding: "utf8" },
+      );
+      if (fetched.status !== 0) {
+        throw new Error(fetched.stderr || fetched.stdout || "git fetch failed");
+      }
+      const reset = spawnSync(
+        "git",
+        ["reset", "--hard", remoteTrackingRef],
+        { cwd: resolvedWorktree, encoding: "utf8" },
+      );
+      if (reset.status !== 0) {
+        throw new Error(reset.stderr || reset.stdout || "git reset failed");
       }
       return resolvedWorktree;
     }

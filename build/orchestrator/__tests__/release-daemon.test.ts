@@ -2305,7 +2305,7 @@ describe("processReleaseQueueRecord worktree branch correction", () => {
     expect(resetCalls.length).toBeGreaterThan(0);
   });
 
-  it("skips reset when worktree is already on the correct branch", async () => {
+  it("resets even when worktree is already on the correct branch", async () => {
     const item = writeReleaseQueueRecord(queueDir, {
       runId: "wt-correct-run",
       repoPath: repo,
@@ -2395,16 +2395,23 @@ describe("processReleaseQueueRecord worktree branch correction", () => {
 
     expect(result.status).toBe("landed");
 
-    // No fetch or reset should fire when already on correct branch
     const fetchCalls = spawnCalls.filter(
-      ([cmd, args]) => cmd === "git" && args[0] === "fetch",
+      ([cmd, args]) =>
+        cmd === "git" &&
+        args[0] === "fetch" &&
+        args.includes(
+          "+refs/heads/feat/correct:refs/remotes/origin/feat/correct",
+        ),
     );
     const resetCalls = spawnCalls.filter(
-      ([cmd, args]) => cmd === "git" && args[0] === "reset",
+      ([cmd, args]) =>
+        cmd === "git" &&
+        args[0] === "reset" &&
+        args.includes("refs/remotes/origin/feat/correct"),
     );
 
-    expect(fetchCalls.length).toBe(0);
-    expect(resetCalls.length).toBe(0);
+    expect(fetchCalls.length).toBeGreaterThan(0);
+    expect(resetCalls.length).toBeGreaterThan(0);
   });
 
   it("blocks when remote featureBranch was deleted", async () => {
