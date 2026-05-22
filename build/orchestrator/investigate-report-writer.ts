@@ -115,7 +115,10 @@ export function writeBugReport(args: {
   noInbox?: boolean;
   dateOverride?: string;
 }): WriteBugReportResult {
-  const inboxDir = args.inboxDir ?? path.resolve(process.cwd(), "inbox");
+  const inboxDir =
+    args.inboxDir ??
+    process.env.GSTACK_INBOX_DIR ??
+    path.resolve(process.cwd(), "inbox");
   if (args.noInbox) {
     return { skipped: true, path: null, reason: "noInbox=true" };
   }
