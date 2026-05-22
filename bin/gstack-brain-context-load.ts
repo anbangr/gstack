@@ -68,7 +68,14 @@ interface QueryResult {
 
 const HOME = homedir();
 const GSTACK_HOME = process.env.GSTACK_HOME || join(HOME, ".gstack");
-const MCP_TIMEOUT_MS = 500;
+function mcpTimeoutMs(): number {
+  const raw = process.env.GSTACK_BRAIN_CONTEXT_TIMEOUT_MS;
+  if (!raw) return 500;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 500;
+}
+
+const MCP_TIMEOUT_MS = mcpTimeoutMs();
 const PAGE_SIZE_CAP = 10 * 1024; // 10KB per query result before truncation
 
 // ── CLI ────────────────────────────────────────────────────────────────────
