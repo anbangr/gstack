@@ -703,7 +703,44 @@ function checkoutScratchWorktree(
     if (worktreeGate.ok) {
       // Use the realpath-resolved worktree path, not the raw record
       // value — same TOCTOU mitigation as the repoPath gate.
-      return worktreeGate.resolved;
+      const resolvedWorktree = worktreeGate.resolved;
+      // Check whether the worktree is already on the expected branch.
+      // If not, fetch the remote branch and reset to it.
+      const branchCheck = spawnSync(
+        "git",
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        { cwd: resolvedWorktree, encoding: "utf8" },
+      );
+      if (branchCheck.status !== 0) {
+        // Can't determine current branch (not a git repo, shallow clone,
+        // etc.) — proceed without resetting so we don't break test fixtures
+        // or edge-case worktrees.
+        return resolvedWorktree;
+      }
+      const currentBranch = (branchCheck.stdout || "").trim();
+      if (currentBranch !== record.featureBranch) {
+        const fetched = spawnSync(
+          "git",
+          ["fetch", "origin", record.featureBranch],
+          { cwd: resolvedWorktree, encoding: "utf8" },
+        );
+        if (fetched.status !== 0) {
+          throw new Error(
+            fetched.stderr || fetched.stdout || "git fetch failed",
+          );
+        }
+        const reset = spawnSync(
+          "git",
+          ["reset", "--hard", `origin/${record.featureBranch}`],
+          { cwd: resolvedWorktree, encoding: "utf8" },
+        );
+        if (reset.status !== 0) {
+          throw new Error(
+            reset.stderr || reset.stdout || "git reset failed",
+          );
+        }
+      }
+      return resolvedWorktree;
     }
     // worktreePath exists but is disallowed — ignore it and create a
     // fresh scratch worktree from the validated repo instead.
@@ -989,6 +1026,8 @@ export async function processReleaseQueueRecord(
       cwd,
       slug: `release-daemon-pr-${record.prNumber}`,
       landRole: opts.roles.land,
+      prNumber: record.prNumber,
+      featureBranch: record.featureBranch,
     });
     if (isInterrupted()) return readCurrentFromDisk(current);
     const lockLost = blockIfLockLost();
@@ -1026,6 +1065,8 @@ export async function processReleaseQueueRecord(
         cwd,
         slug: `release-daemon-pr-${record.prNumber}-retry`,
         landRole: opts.roles.land,
+        prNumber: record.prNumber,
+        featureBranch: record.featureBranch,
       });
       if (isInterrupted()) return readCurrentFromDisk(current);
       const lockLostAfterRetry = blockIfLockLost();
