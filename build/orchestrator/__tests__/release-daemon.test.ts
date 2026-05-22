@@ -1048,6 +1048,20 @@ describe("isAllowedFeatureBranch (refspec injection gate)", () => {
     const result = isAllowedFeatureBranch("--upload-pack=bad");
     expect(result.ok).toBe(false);
   });
+
+  it("rejects git-invalid ref names even when characters are allowlisted", () => {
+    for (const branch of [
+      "../main",
+      "foo/../main",
+      "foo//bar",
+      "foo.lock",
+      "foo/",
+    ]) {
+      const result = isAllowedFeatureBranch(branch);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toContain("valid git branch");
+    }
+  });
 });
 
 describe("getRepoAllowlistPrefixes — env override is additive (C8)", () => {

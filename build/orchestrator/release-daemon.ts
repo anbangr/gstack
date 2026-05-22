@@ -135,6 +135,15 @@ export function isAllowedFeatureBranch(
       reason: `featureBranch ${JSON.stringify(branch)} contains characters outside the safe subset [A-Za-z0-9._/-] (or starts with -)`,
     };
   }
+  const refCheck = spawnSync("git", ["check-ref-format", "--branch", branch], {
+    encoding: "utf8",
+  });
+  if (refCheck.status !== 0) {
+    return {
+      ok: false,
+      reason: `featureBranch ${JSON.stringify(branch)} is not a valid git branch name`,
+    };
+  }
   return { ok: true };
 }
 
