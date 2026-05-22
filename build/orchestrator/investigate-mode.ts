@@ -43,9 +43,36 @@ function defaultFaultsDir(): string {
   return path.join(home, "skill-faults");
 }
 
+// Defense-in-depth: faultId and runId are used in path.join and embedded into
+// the finalizeHint shell command. Internal sources (computeFaultId,
+// synthesizeManualFaultId, halt-event filenames) already produce safe values,
+// but external CLI paths (--fault-id, --run-id) reach this code unvalidated.
+// Rejecting shell metacharacters and path separators closes both vectors.
+const SAFE_ID_RE = /^[A-Za-z0-9._:\-]+$/;
+
+function assertSafeId(label: string, value: string): void {
+  if (!SAFE_ID_RE.test(value)) {
+    throw new Error(
+      `invalid ${label}: ${JSON.stringify(value)} — must match ${SAFE_ID_RE}`,
+    );
+  }
+}
+
 export async function runInvestigateMode(
   args: InvestigateModeArgs,
 ): Promise<number> {
+  // Validate caller-supplied IDs BEFORE any filesystem lookup. Defense in
+  // depth: faultId and runId reach path.join and finalizeHint, and the
+  // happy-path "fault not found" path is not the right place to silently
+  // shield against a malicious ID.
+  try {
+    if (args.faultId) assertSafeId("faultId", args.faultId);
+    if (args.runId) assertSafeId("runId", args.runId);
+  } catch (err) {
+    process.stderr.write(`error: ${(err as Error).message}\n`);
+    return 2;
+  }
+
   let ctx: InvestigationContext | null;
   try {
     ctx = await resolveInvestigationContext({
@@ -73,6 +100,14 @@ export async function runInvestigateMode(
       "error: no context auto-detected and stdin is not a TTY. Pass --state, --run-id, --fault-id, or --symptoms explicitly.\n",
     );
     return 3;
+  }
+
+  try {
+    assertSafeId("runId", ctx.runId);
+    assertSafeId("faultId", ctx.faultId);
+  } catch (err) {
+    process.stderr.write(`error: ${(err as Error).message}\n`);
+    return 2;
   }
 
   const lock = acquireFaultLock({
@@ -134,82 +169,94 @@ export async function runInvestigateMode(
 export async function runInvestigateFinalize(
   args: InvestigateFinalizeArgs,
 ): Promise<number> {
+  try {
+    assertSafeId("runId", args.runId);
+    assertSafeId("faultId", args.faultId);
+  } catch (err) {
+    process.stderr.write(`error: ${(err as Error).message}\n`);
+    return 2;
+  }
+
   if (!fs.existsSync(args.reportPath)) {
     process.stderr.write(`error: report file not found: ${args.reportPath}\n`);
     return 2;
   }
 
-  let raw: string;
+  // Lock is held on disk from runInvestigateMode. ALWAYS release it before
+  // returning, even on unexpected throws — otherwise the user is stuck for
+  // the full 1-hour stale-reclaim window.
   try {
-    raw = fs.readFileSync(args.reportPath, "utf8");
-  } catch (err) {
-    process.stderr.write(
-      `error: cannot read report file: ${(err as Error).message}\n`,
-    );
-    return 2;
-  }
+    let raw: string;
+    try {
+      raw = fs.readFileSync(args.reportPath, "utf8");
+    } catch (err) {
+      process.stderr.write(
+        `error: cannot read report file: ${(err as Error).message}\n`,
+      );
+      return 2;
+    }
 
-  let report: ReturnType<typeof parseInvestigationReport>;
-  try {
-    report = parseInvestigationReport(raw, args.faultId);
-  } catch (err) {
-    process.stderr.write(`error: ${(err as Error).message}\n`);
-    releaseLockByPath(args);
-    return 2;
-  }
+    let report: ReturnType<typeof parseInvestigationReport>;
+    try {
+      report = parseInvestigationReport(raw, args.faultId);
+    } catch (err) {
+      process.stderr.write(`error: ${(err as Error).message}\n`);
+      return 2;
+    }
 
-  const ctx: InvestigationContext = {
-    runId: args.runId,
-    faultId: args.faultId,
-    severity: args.severity ?? "HIGH",
-    source: "auto-detect",
-    haltEvent: null,
-    statePath: null,
-    stdoutLogPath: null,
-    livingPlanPath: null,
-    worktreePath: null,
-    symptoms: null,
-  };
+    const ctx: InvestigationContext = {
+      runId: args.runId,
+      faultId: args.faultId,
+      severity: args.severity ?? "HIGH",
+      source: "auto-detect",
+      haltEvent: null,
+      statePath: null,
+      stdoutLogPath: null,
+      livingPlanPath: null,
+      worktreePath: null,
+      symptoms: null,
+    };
 
-  const machinePath = writeMachineReport({
-    report,
-    ctx,
-    faultsDir: args.faultsDir,
-  });
-
-  let bugPath: string | null = null;
-  try {
-    const bugResult = writeBugReport({
+    const machinePath = writeMachineReport({
       report,
       ctx,
-      inboxDir: args.inboxDir,
-      noInbox: args.noInbox,
+      faultsDir: args.faultsDir,
     });
-    if (!bugResult.skipped) bugPath = bugResult.path;
-  } catch (err) {
-    process.stderr.write(
-      `warning: bug report write failed: ${(err as Error).message}\n`,
-    );
-  }
 
-  releaseLockByPath(args);
+    let bugPath: string | null = null;
+    try {
+      const bugResult = writeBugReport({
+        report,
+        ctx,
+        inboxDir: args.inboxDir,
+        noInbox: args.noInbox,
+      });
+      if (!bugResult.skipped) bugPath = bugResult.path;
+    } catch (err) {
+      process.stderr.write(
+        `warning: bug report write failed: ${(err as Error).message}\n`,
+      );
+    }
 
-  const lines = [
-    `investigation finalized for ${args.faultId} (${report.outcome})`,
-    `  machine report: ${machinePath}`,
-  ];
-  if (bugPath) lines.push(`  bug report:     ${bugPath}`);
-  if (report.learnedPatternProposal) {
-    lines.push(
-      `  pattern proposal present — run \`gstack-build learn-fault-patterns\` to absorb it`,
-    );
-  }
-  process.stdout.write(lines.join("\n") + "\n");
+    const lines = [
+      `investigation finalized for ${args.faultId} (${report.outcome})`,
+      `  machine report: ${machinePath}`,
+    ];
+    if (bugPath) lines.push(`  bug report:     ${bugPath}`);
+    if (report.learnedPatternProposal) {
+      lines.push(
+        `  pattern proposal present — run \`gstack-build learn-fault-patterns\` to absorb it`,
+      );
+    }
+    process.stdout.write(lines.join("\n") + "\n");
 
-  if (report.outcome === "needs-human" || report.outcome === "no-context") {
-    return 1;
+    if (report.outcome === "needs-human" || report.outcome === "no-context") {
+      return 1;
+    }
+    return 0;
+  } finally {
+    releaseLockByPath(args);
   }
-  return 0;
 }
 
 function releaseLockByPath(args: InvestigateFinalizeArgs): void {

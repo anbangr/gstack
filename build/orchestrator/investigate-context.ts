@@ -21,10 +21,16 @@ export interface TailStdoutLogArgs {
   windowLines: number;
 }
 
+// Hard cap on bytes read from stdout log. A long-running build can produce
+// gigabytes of stdout; loading the full file just to slice the last 500 lines
+// would OOM. 4 MiB is ~40k lines of typical orchestrator output — well above
+// the 500-line tail + window-around-error budget.
+const STDOUT_READ_CAP_BYTES = 4 * 1024 * 1024;
+
 export function tailStdoutLog(args: TailStdoutLogArgs): string {
   const { stdoutPath, recentErrors, tailLines, windowLines } = args;
   if (!fs.existsSync(stdoutPath)) return "";
-  const content = fs.readFileSync(stdoutPath, "utf8");
+  const content = readLastBytes(stdoutPath, STDOUT_READ_CAP_BYTES);
   const lines = content.split("\n");
   if (lines.length > 0 && lines[lines.length - 1] === "") {
     lines.pop();
@@ -65,6 +71,25 @@ function parseLineTimestamp(line: string): number | null {
   if (!match) return null;
   const ms = Date.parse(match[1]);
   return Number.isNaN(ms) ? null : ms;
+}
+
+function readLastBytes(filePath: string, maxBytes: number): string {
+  const stat = fs.statSync(filePath);
+  if (stat.size <= maxBytes) {
+    return fs.readFileSync(filePath, "utf8");
+  }
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const buf = Buffer.alloc(maxBytes);
+    fs.readSync(fd, buf, 0, maxBytes, stat.size - maxBytes);
+    const raw = buf.toString("utf8");
+    // First "line" is likely truncated mid-line. Drop everything before the
+    // first newline so we only return complete lines.
+    const firstNewline = raw.indexOf("\n");
+    return firstNewline >= 0 ? raw.slice(firstNewline + 1) : raw;
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 export type ContextSource =
