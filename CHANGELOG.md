@@ -40,10 +40,15 @@ When a halt event hits the queue, you can keep waiting for the auto pipeline (st
 
 - Build orchestrator CLI now recognizes two new modes (`investigate`, `investigate-finalize`).
 - `FaultLockHandle` shape uses `O_EXCL` (the `wx` open flag) for atomic creation; removed unused `acquiredAt` from the handle (kept on `FaultLockPayload` which is the on-disk shape).
+- The lock now carries a 16-byte nonce embedded in the briefing block. `investigate-finalize` requires `--nonce <hex>` and refuses to delete the lock if the on-disk nonce doesn't match. Prevents one investigation's finalize from clobbering another investigation's lock when both raced through stale-reclaim.
+- `investigate-finalize` now requires `--severity <S>` and `--source <X>` from the briefing so bug-report severity gating (symptoms-only skip, MEDIUM skip) fires correctly. Without these flags, every finalize previously defaulted to HIGH and bypassed the skip logic.
+- `parseInvestigationReport` now validates nested shapes: `proposedFix.options` must be an array; each option must have label, description, and a valid `blast_radius`; `learnedPatternProposal` must have category, pattern, description, and a valid severity. Malformed reports exit 2 cleanly instead of crashing the writer.
+- `investigate-finalize` caps the `--report` file size at 1 MiB and refuses non-regular files (defense against `/dev/zero` or FIFO paths).
+- `tailStdoutLog` caps its read at 4 MiB instead of loading the full stdout log (which can be gigabytes on long-running builds).
 
 #### For contributors
 
-- 11 new test files under `build/orchestrator/__tests__/investigate-*.test.ts` covering the lock primitive (7), stdout tail extraction (4), context resolution (10), machine + bug report writers (12), exit codes (7), JSON validation (4), and three integration tests (end-to-end, auto-detect, no-context fallback). 50 tests, 111 expect() calls.
+- 11 new test files under `build/orchestrator/__tests__/investigate-*.test.ts` covering the lock primitive (8, including a nonce-mismatch refuse test), stdout tail extraction (4), context resolution (10), machine + bug report writers (12), exit codes (7), JSON validation (7), and three integration tests (end-to-end, auto-detect, no-context fallback). 51 tests, 122 expect() calls.
 - One paid E2E test (`test/skill-e2e-build-investigate.test.ts`) added to the periodic tier under registry key `build-investigate-bug-report`.
 - Five test fixtures under `test/fixtures/investigate/`: a realistic halt event, build state with `recentErrors`, a 2000-line stdout log with planted error sections at lines 750/825/895/896, and two canned `InvestigationReport` fixtures (success + bad-faultId for rejection tests).
 - `coverage-matrix.test.ts` registry updated with the four new modules.
