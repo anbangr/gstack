@@ -744,7 +744,9 @@ export interface Args {
     | "doctor"
     | "drain-faults"
     | "mark-shipped"
-    | "learn-fault-patterns";
+    | "learn-fault-patterns"
+    | "investigate"
+    | "investigate-finalize";
   /** learn-fault-patterns: dry-run only — print diff against learned-patterns.json. */
   learnFaultPatternsDryRun?: boolean;
   /** learn-fault-patterns: comma-separated faultIds to promote. */
@@ -921,6 +923,15 @@ export interface Args {
   markShippedPr?: number;
   /** Merge SHA override for mark-shipped (otherwise read from gh pr view). */
   markShippedMergeSha?: string;
+  investigateFaultId?: string;
+  investigateRunId?: string;
+  investigateStatePath?: string;
+  investigateRunDir?: string;
+  investigateSymptoms?: string;
+  investigateSeverityOverride?: "CRITICAL" | "HIGH" | "MEDIUM";
+  investigateNoInbox?: boolean;
+  investigateEmitJson?: boolean;
+  investigateReportPath?: string;
 }
 
 /**
@@ -1439,6 +1450,53 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.markShippedMergeSha = next;
+    } else if (a === "--state") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--state requires a value");
+        process.exit(2);
+      }
+      args.investigateStatePath = next;
+    } else if (a === "--run-dir") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--run-dir requires a value");
+        process.exit(2);
+      }
+      args.investigateRunDir = next;
+    } else if (a === "--symptoms") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--symptoms requires a value");
+        process.exit(2);
+      }
+      args.investigateSymptoms = next;
+    } else if (a === "--severity-override") {
+      const next = argv[++i];
+      if (next === "CRITICAL" || next === "HIGH" || next === "MEDIUM") {
+        args.investigateSeverityOverride = next;
+      } else {
+        console.error(
+          "--severity-override expects CRITICAL, HIGH, or MEDIUM",
+        );
+        process.exit(2);
+      }
+    } else if (a === "--no-inbox") {
+      args.investigateNoInbox = true;
+    } else if (a === "--fault-id") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--fault-id requires a value");
+        process.exit(2);
+      }
+      args.investigateFaultId = next;
+    } else if (a === "--report") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--report requires a value");
+        process.exit(2);
+      }
+      args.investigateReportPath = next;
     } else if (a === "--help" || a === "-h") {
       printHelp();
       process.exit(0);
@@ -1655,6 +1713,14 @@ export function parseArgs(argv: string[]): Args {
     ) {
       args.dryRun = true;
     }
+  } else if (positional[0] === "investigate") {
+    args.mode = "investigate";
+    args.investigateFaultId = args.investigateFaultId ?? positional[1];
+    args.investigateRunId = args.investigateRunId ?? args.runId;
+    args.investigateEmitJson = args.investigateEmitJson ?? args.planStatusJson;
+  } else if (positional[0] === "investigate-finalize") {
+    args.mode = "investigate-finalize";
+    args.investigateRunId = args.investigateRunId ?? args.runId;
   } else if (positional.length === 1) {
     args.planFile = path.resolve(positional[0]);
     if (
@@ -1672,7 +1738,7 @@ export function parseArgs(argv: string[]): Args {
     }
   } else {
     console.error(
-      "usage: gstack-build <plan-file> [flags]\n       gstack-build merge [flags]\n       gstack-build monitor --manifest <path> [--once|--watch]\n       gstack-build plan-status --gstack-repo <path> [--project-root <path>] [--json]\n       gstack-build learn-fault-patterns [--dry-run | --promote <ids> | --auto-promote]   (-h for help)",
+      "usage: gstack-build <plan-file> [flags]\n       gstack-build merge [flags]\n       gstack-build monitor --manifest <path> [--once|--watch]\n       gstack-build plan-status --gstack-repo <path> [--project-root <path>] [--json]\n       gstack-build learn-fault-patterns [--dry-run | --promote <ids> | --auto-promote]\n       gstack-build investigate [<faultId>] [flags]\n       gstack-build investigate-finalize --run-id <id> --fault-id <id> --report <path>   (-h for help)",
     );
     process.exit(2);
   }
@@ -2900,6 +2966,16 @@ Modes:
                         codexReview from on-disk review/qa artifacts.
   doctor                Read-only audit: flag state/plan/artifact drift.
                         Suggests the right reconcile invocation.
+  investigate [<faultId>] [flags]
+                        Manually investigate a build fault using the four-phase
+                        /investigate methodology in the current Claude session.
+                        Auto-detects the latest active run when no args given.
+                        Flags: --run-id, --state, --run-dir, --symptoms,
+                        --severity-override, --no-inbox, --json.
+  investigate-finalize --run-id <id> --fault-id <id> --report <path> [--no-inbox]
+                        Validate the report file written by the Claude session
+                        and persist both the machine report and (for HIGH/CRITICAL)
+                        the human bug report. Called by the Claude session.
 
 Flags:
   --print-only         Parse and show phase table; exit.
@@ -10438,6 +10514,44 @@ async function main() {
 
   if (args.mode === "learn-fault-patterns") {
     const exitCode = await runLearnFaultPatternsMode(args);
+    process.exit(exitCode);
+  }
+
+  if (args.mode === "investigate") {
+    const { runInvestigateMode } = await import("./investigate-mode");
+    const exitCode = await runInvestigateMode({
+      faultId: args.investigateFaultId,
+      runId: args.investigateRunId,
+      statePath: args.investigateStatePath,
+      runDir: args.investigateRunDir,
+      symptoms: args.investigateSymptoms,
+      severityOverride: args.investigateSeverityOverride,
+      noInbox: args.investigateNoInbox,
+      emitJson: args.investigateEmitJson,
+      ttyAvailable: Boolean(process.stdin.isTTY),
+    });
+    process.exit(exitCode);
+  }
+
+  if (args.mode === "investigate-finalize") {
+    if (
+      !args.investigateRunId ||
+      !args.investigateFaultId ||
+      !args.investigateReportPath
+    ) {
+      process.stderr.write(
+        "usage: gstack-build investigate-finalize --run-id <id> --fault-id <id> --report <path> [--no-inbox]\n",
+      );
+      process.exit(2);
+    }
+    const { runInvestigateFinalize } = await import("./investigate-mode");
+    const exitCode = await runInvestigateFinalize({
+      runId: args.investigateRunId,
+      faultId: args.investigateFaultId,
+      reportPath: args.investigateReportPath,
+      severity: args.investigateSeverityOverride,
+      noInbox: args.investigateNoInbox,
+    });
     process.exit(exitCode);
   }
 
