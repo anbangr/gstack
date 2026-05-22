@@ -400,17 +400,64 @@ function checkStaleQuotes(content: string): StaticViolation[] {
 // Main validation
 // ---------------------------------------------------------------------------
 
+/**
+ * Detect H2 headings that LOOK like feature headings but don't match the
+ * strict `^## Feature N:` regex the parser requires. Common LLM drift:
+ * `## Feature 1 - Foo` (ASCII dash), `## Feature 1 — Foo` (em-dash),
+ * `## Feature 1. Foo` (period), `## Feature 1 Foo` (no separator).
+ *
+ * When zero feature blocks parse but `## Feature \d+` headings exist
+ * in the source, the validator's revision prompt should name the actual
+ * defect (wrong heading shape) instead of claiming missing fields on a
+ * phantom feature-0 block. That phantom row sends the next LLM hunting
+ * for missing Origin trace / Acceptance lines that aren't the real issue.
+ */
+function findMisshapenFeatureHeadings(content: string): string[] {
+  const lines = content.split("\n");
+  const bad: string[] = [];
+  for (const line of lines) {
+    // Heading lines that start with `## Feature <digits>` but don't have
+    // the canonical colon separator immediately after the digits.
+    const m = /^## Feature (\d+)(.*)$/.exec(line);
+    if (!m) continue;
+    const tail = m[2];
+    if (!tail.startsWith(":")) {
+      bad.push(line);
+    }
+  }
+  return bad;
+}
+
 function validate(planPath: string): ValidationReport {
   const content = fs.readFileSync(planPath, "utf8");
   const blocks = extractFeatureBlocks(content);
 
   const structuralViolations: Violation[] = [];
+  const staticViolations: StaticViolation[] = [];
+
   if (blocks.length === 0) {
-    structuralViolations.push({
-      featureNumber: 0,
-      featureName: "",
-      missing: ["originTrace", "acceptance"],
-    });
+    // Try to give the LLM an actionable hint before emitting the phantom
+    // missing-fields row. If the source HAS `## Feature N` headings but
+    // they're in the wrong shape, name the shape problem explicitly.
+    const misshapen = findMisshapenFeatureHeadings(content);
+    if (misshapen.length > 0) {
+      staticViolations.push({
+        rule: "feature-heading-shape",
+        message:
+          `no feature blocks parsed — ${misshapen.length} heading(s) ` +
+          `start with "## Feature N" but lack the required ":" separator. ` +
+          `Required form: "## Feature N: <name>". ` +
+          `Examples found: ${misshapen.slice(0, 3).join(" | ")}`,
+      });
+    } else {
+      // No `## Feature N` headings at all — the plan is genuinely empty
+      // or the H2 word "Feature" is misspelled / missing.
+      structuralViolations.push({
+        featureNumber: 0,
+        featureName: "",
+        missing: ["originTrace", "acceptance"],
+      });
+    }
   } else {
     for (const block of blocks) {
       const missing: Array<"originTrace" | "acceptance"> = [];
@@ -425,8 +472,6 @@ function validate(planPath: string): ValidationReport {
       }
     }
   }
-
-  const staticViolations: StaticViolation[] = [];
 
   // T1 — unused imports (per-phase)
   for (const block of blocks) {
