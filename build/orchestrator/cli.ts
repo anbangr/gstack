@@ -7034,9 +7034,29 @@ async function runPhase(args: {
       // pre-PR1b behavior (skip classification, always cap-hit).
       let classified = false;
       if (process.env.GSTACK_DISABLE_PROVIDER_CLASSIFIER !== "1") {
+        const providerFailureEntries = Object.entries(
+          phaseState.failureRender ?? {},
+        )
+          .map(([role, value]) => ({
+            role,
+            verdict: (value as any)?.providerFailure,
+          }))
+          .filter((entry) => entry.verdict);
+        const latestProviderFailure =
+          providerFailureEntries[providerFailureEntries.length - 1];
+        if (latestProviderFailure) {
+          recordProviderFailureVerdict(
+            state,
+            phaseState.index,
+            latestProviderFailure.role,
+            latestProviderFailure.verdict,
+            helperCtxFor(state),
+          );
+          classified = true;
+        }
         const reviewLogs = phaseState.codexReview?.outputLogPaths ?? [];
         const lastLog = reviewLogs[reviewLogs.length - 1];
-        if (lastLog) {
+        if (!classified && lastLog) {
           let text = "";
           try {
             text = fs.readFileSync(lastLog, "utf8");

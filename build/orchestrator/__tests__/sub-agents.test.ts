@@ -3645,6 +3645,37 @@ describe("spawnCaptured streaming", () => {
     }
   });
 
+  it("kills zero-output child at first-token deadline", async () => {
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "spawncaptured-first-token-"),
+    );
+    const logPath = path.join(tmpDir, "first-token.log");
+    const oldDeadline = process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS;
+    process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS = "50";
+    try {
+      const result = await spawnCaptured({
+        bin: "bash",
+        argv: ["-c", "sleep 10"],
+        cwd: tmpDir,
+        timeoutMs: 5000,
+        logPath,
+        closeStdin: true,
+      });
+      expect(result.timedOut).toBe(true);
+      expect(result.stallKilled).toBe(true);
+      expect(result.killReason).toBe("first_token_timeout");
+      expect(result.stallSilenceMs).toBe(50);
+      const log = fs.readFileSync(logPath, "utf8");
+      expect(log).toContain("# stdout_bytes: 0");
+      expect(log).toContain("# stderr_bytes: 0");
+    } finally {
+      if (oldDeadline === undefined)
+        delete process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS;
+      else process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS = oldDeadline;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("writer error is logged via console.warn but does not throw (A-T4)", async () => {
     // Construct a logPath whose parent does not exist. createWriteStream
     // returns a stream that emits 'error' on first write (ENOENT). This

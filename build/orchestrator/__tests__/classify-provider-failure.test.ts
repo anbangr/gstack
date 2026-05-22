@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   classifyProviderFailure,
+  parseRoleLogFailureEvidence,
   recordProviderFailureVerdict,
 } from "../halt-event-helpers";
 import { loadPendingInvestigations } from "../halt-events";
@@ -73,6 +74,37 @@ describe("classifyProviderFailure (PR1b)", () => {
       text: "",
       timedOut: true,
     });
+    expect(v?.kind).toBe("stall");
+  });
+
+  test("role log footer — stall_killed exit 0 still classifies as stall", () => {
+    const log = [
+      "# ---- result ----",
+      "# timed_out: true",
+      "# stall_killed: true",
+      "# stall_silence_ms: 120000",
+      "# exit: 0",
+      "# stdout_bytes: 0",
+      "# stderr_bytes: 0",
+    ].join("\n");
+    const evidence = parseRoleLogFailureEvidence(log);
+    expect(evidence.stallKilled).toBe(true);
+    expect(evidence.exit).toBe("0");
+    const v = classifyProviderFailure({ text: log });
+    expect(v?.kind).toBe("stall");
+  });
+
+  test("role log footer — timed_out true without banner classifies as stall", () => {
+    const log = [
+      "# ---- result ----",
+      "# timed_out: true",
+      "# stall_killed: false",
+      "# stall_silence_ms: 0",
+      "# exit: SIGTERM",
+      "# stdout_bytes: 0",
+      "# stderr_bytes: 0",
+    ].join("\n");
+    const v = classifyProviderFailure({ text: log });
     expect(v?.kind).toBe("stall");
   });
 
