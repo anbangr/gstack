@@ -217,10 +217,14 @@ function parseBunStdout(stdout: string): TestCountResult {
   // e.g. "ran 8 tests across 2 files"
   const m = stdout.match(/ran\s+(\d+)\s+tests?\s+across/i);
   const collected = m ? parseInt(m[1], 10) : 0;
+  const passedMatch = stdout.match(/(\d+)\s+pass(?:es)?\b/i);
+  const failedMatch = stdout.match(/(\d+)\s+fail(?:s)?\b/i);
+  const passed = passedMatch ? parseInt(passedMatch[1], 10) : collected;
+  const failed = failedMatch ? parseInt(failedMatch[1], 10) : 0;
   return {
     collected,
-    passed: collected,
-    failed: 0,
+    passed,
+    failed,
     source: "stdout-fallback",
   };
 }

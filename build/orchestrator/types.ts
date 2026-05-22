@@ -352,6 +352,12 @@ export interface PhaseState {
    */
   committedSha?: string;
   error?: string;
+  /**
+   * Structured failure evidence by role name. Populated when a role subprocess
+   * fails so the final FAIL handler can classify provider/auth/quota/stall
+   * failures for any role, not only Codex review.
+   */
+  failureRender?: Record<string, Record<string, unknown>>;
 }
 
 /**

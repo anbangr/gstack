@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, afterEach } from "bun:test";
+import { describe, expect, it, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -22,6 +22,7 @@ import {
 import { DEFAULT_ROLE_CONFIGS } from "../role-config";
 import type { ReleaseLockHandle } from "../release-lock";
 import type { SubAgentResult } from "../sub-agents";
+import * as childRegistry from "../child-registry";
 
 describe("release daemon queue loop", () => {
   let dir: string;
@@ -1046,6 +1047,20 @@ describe("isAllowedFeatureBranch (refspec injection gate)", () => {
     // Reject defensively.
     const result = isAllowedFeatureBranch("--upload-pack=bad");
     expect(result.ok).toBe(false);
+  });
+
+  it("rejects git-invalid ref names even when characters are allowlisted", () => {
+    for (const branch of [
+      "../main",
+      "foo/../main",
+      "foo//bar",
+      "foo.lock",
+      "foo/",
+    ]) {
+      const result = isAllowedFeatureBranch(branch);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toContain("valid git branch");
+    }
   });
 });
 
@@ -2160,5 +2175,844 @@ describe("verifyPrMerged + post-land GitHub ground-truth (Codex-15 / false-posit
       // parser rejected a valid input.
       expect(r.reason ?? "").not.toContain("could not parse");
     }
+  });
+});
+
+
+describe("processReleaseQueueRecord worktree branch correction", () => {
+  let queueDir: string;
+  let repo: string;
+  let worktree: string;
+
+  beforeEach(() => {
+    queueDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-rd-wt-branch-"),
+    );
+    repo = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-wt-repo-"));
+    worktree = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-rd-wt-worktree-"),
+    );
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.mkdirSync(path.join(worktree, ".git"));
+    _resetReleaseDaemonForTests();
+  });
+
+  afterEach(() => {
+    _resetReleaseDaemonForTests();
+    fs.rmSync(queueDir, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(worktree, { recursive: true, force: true });
+  });
+
+  it("resets existing worktree to origin/featureBranch when on wrong branch", async () => {
+    const item = writeReleaseQueueRecord(queueDir, {
+      runId: "wt-branch-run",
+      repoPath: repo,
+      repoIdentity: "github.com/acme/wt",
+      baseBranch: "main",
+      featureBranch: "feat/target",
+      prNumber: 50,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: worktree,
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+
+    const spawnCalls: [string, string[]][] = [];
+    const spawnSpy = spyOn(childRegistry, "spawnSync").mockImplementation(
+      (cmd: string, args: readonly string[]) => {
+        spawnCalls.push([cmd, [...args]]);
+        if (
+          cmd === "git" &&
+          args[0] === "rev-parse" &&
+          args[1] === "--abbrev-ref" &&
+          args[2] === "HEAD"
+        ) {
+          return {
+            status: 0,
+            stdout: "wrong-branch\n",
+            stderr: "",
+            pid: 1,
+            output: [],
+            signal: null,
+          } as any;
+        }
+        return {
+          status: 0,
+          stdout: "",
+          stderr: "",
+          pid: 1,
+          output: [],
+          signal: null,
+        } as any;
+      },
+    );
+
+    let observedCwd = "";
+    const result = await processReleaseQueueRecord(item, {
+      queueDir,
+      roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      heartbeatIntervalMs: 60_000,
+      verifyQueued: () => ({ ok: true }),
+      verifyMerged: () => ({ merged: true }),
+      acquireLock: () => ({
+        acquired: true,
+        handle: {
+          ref: "refs/gstack/release-locks/wt/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/wt",
+          baseBranch: "main",
+        },
+      }),
+      refreshLock: () => ({
+        ok: true,
+        handle: {
+          ref: "refs/gstack/release-locks/wt/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/wt",
+          baseBranch: "main",
+        },
+      }),
+      releaseLock: () => ({ ok: true }),
+      land: async ({ cwd }) => {
+        observedCwd = cwd;
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          logPath: "/tmp/log",
+          durationMs: 1,
+          retries: 0,
+        };
+      },
+    });
+
+    spawnSpy.mockRestore();
+
+    expect(result.status).toBe("landed");
+    expect(observedCwd).toBe(fs.realpathSync(worktree));
+
+    // Verify git commands were issued to reset the worktree
+    const fetchCalls = spawnCalls.filter(
+      ([cmd, args]) =>
+        cmd === "git" &&
+        args[0] === "fetch" &&
+        args.includes(
+          "+refs/heads/feat/target:refs/remotes/origin/feat/target",
+        ),
+    );
+    const resetCalls = spawnCalls.filter(
+      ([cmd, args]) =>
+        cmd === "git" &&
+        args[0] === "reset" &&
+        args.includes("refs/remotes/origin/feat/target"),
+    );
+
+    expect(fetchCalls.length).toBeGreaterThan(0);
+    expect(resetCalls.length).toBeGreaterThan(0);
+  });
+
+  it("resets even when worktree is already on the correct branch", async () => {
+    const item = writeReleaseQueueRecord(queueDir, {
+      runId: "wt-correct-run",
+      repoPath: repo,
+      repoIdentity: "github.com/acme/wt",
+      baseBranch: "main",
+      featureBranch: "feat/correct",
+      prNumber: 51,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: worktree,
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+
+    const spawnCalls: [string, string[]][] = [];
+    const spawnSpy = spyOn(childRegistry, "spawnSync").mockImplementation(
+      (cmd: string, args: readonly string[]) => {
+        spawnCalls.push([cmd, [...args]]);
+        if (
+          cmd === "git" &&
+          args[0] === "rev-parse" &&
+          args[1] === "--abbrev-ref" &&
+          args[2] === "HEAD"
+        ) {
+          return {
+            status: 0,
+            stdout: "feat/correct\n",
+            stderr: "",
+            pid: 1,
+            output: [],
+            signal: null,
+          } as any;
+        }
+        return {
+          status: 0,
+          stdout: "",
+          stderr: "",
+          pid: 1,
+          output: [],
+          signal: null,
+        } as any;
+      },
+    );
+
+    const result = await processReleaseQueueRecord(item, {
+      queueDir,
+      roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      heartbeatIntervalMs: 60_000,
+      verifyQueued: () => ({ ok: true }),
+      verifyMerged: () => ({ merged: true }),
+      acquireLock: () => ({
+        acquired: true,
+        handle: {
+          ref: "refs/gstack/release-locks/wt/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/wt",
+          baseBranch: "main",
+        },
+      }),
+      refreshLock: () => ({
+        ok: true,
+        handle: {
+          ref: "refs/gstack/release-locks/wt/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/wt",
+          baseBranch: "main",
+        },
+      }),
+      releaseLock: () => ({ ok: true }),
+      land: async () => ({
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+        timedOut: false,
+        logPath: "/tmp/log",
+        durationMs: 1,
+        retries: 0,
+      }),
+    });
+
+    spawnSpy.mockRestore();
+
+    expect(result.status).toBe("landed");
+
+    const fetchCalls = spawnCalls.filter(
+      ([cmd, args]) =>
+        cmd === "git" &&
+        args[0] === "fetch" &&
+        args.includes(
+          "+refs/heads/feat/correct:refs/remotes/origin/feat/correct",
+        ),
+    );
+    const resetCalls = spawnCalls.filter(
+      ([cmd, args]) =>
+        cmd === "git" &&
+        args[0] === "reset" &&
+        args.includes("refs/remotes/origin/feat/correct"),
+    );
+
+    expect(fetchCalls.length).toBeGreaterThan(0);
+    expect(resetCalls.length).toBeGreaterThan(0);
+  });
+
+  it("resets an existing fallback scratch worktree before landing", async () => {
+    const runId = "wt-existing-scratch";
+    const prNumber = 53;
+    const scratch = path.join(
+      os.tmpdir(),
+      "gstack-release-daemon",
+      `${runId}-pr-${prNumber}`,
+    );
+    fs.rmSync(scratch, { recursive: true, force: true });
+    fs.mkdirSync(path.join(scratch, ".git"), { recursive: true });
+
+    const item = writeReleaseQueueRecord(queueDir, {
+      runId,
+      repoPath: repo,
+      repoIdentity: "github.com/acme/wt",
+      baseBranch: "main",
+      featureBranch: "feat/scratch",
+      prNumber,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: path.join(os.tmpdir(), "missing-worktree"),
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+
+    const spawnCalls: [string, string[], string | undefined][] = [];
+    const spawnSpy = spyOn(childRegistry, "spawnSync").mockImplementation(
+      (cmd: string, args: readonly string[], opts?: { cwd?: string }) => {
+        spawnCalls.push([cmd, [...args], opts?.cwd]);
+        return {
+          status: 0,
+          stdout: "",
+          stderr: "",
+          pid: 1,
+          output: [],
+          signal: null,
+        } as any;
+      },
+    );
+
+    let observedCwd = "";
+    try {
+      const result = await processReleaseQueueRecord(item, {
+        queueDir,
+        roles: DEFAULT_ROLE_CONFIGS,
+        allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+        heartbeatIntervalMs: 60_000,
+        verifyQueued: () => ({ ok: true }),
+        verifyMerged: () => ({ merged: true }),
+        acquireLock: () => ({
+          acquired: true,
+          handle: {
+            ref: "refs/gstack/release-locks/wt/main",
+            ownerId: "owner",
+            commit: "c",
+            repoPath: repo,
+            repoIdentity: "github.com/acme/wt",
+            baseBranch: "main",
+          },
+        }),
+        refreshLock: () => ({
+          ok: true,
+          handle: {
+            ref: "refs/gstack/release-locks/wt/main",
+            ownerId: "owner",
+            commit: "c",
+            repoPath: repo,
+            repoIdentity: "github.com/acme/wt",
+            baseBranch: "main",
+          },
+        }),
+        releaseLock: () => ({ ok: true }),
+        land: async ({ cwd }) => {
+          observedCwd = cwd;
+          return {
+            stdout: "",
+            stderr: "",
+            exitCode: 0,
+            timedOut: false,
+            logPath: "/tmp/log",
+            durationMs: 1,
+            retries: 0,
+          };
+        },
+      });
+
+      expect(result.status).toBe("landed");
+      expect(observedCwd).toBe(scratch);
+      expect(
+        spawnCalls.some(
+          ([cmd, args, cwd]) =>
+            cmd === "git" &&
+            cwd === scratch &&
+            args[0] === "fetch" &&
+            args.includes(
+              "+refs/heads/feat/scratch:refs/remotes/origin/feat/scratch",
+            ),
+        ),
+      ).toBe(true);
+      expect(
+        spawnCalls.some(
+          ([cmd, args, cwd]) =>
+            cmd === "git" &&
+            cwd === scratch &&
+            args[0] === "reset" &&
+            args.includes("refs/remotes/origin/feat/scratch"),
+        ),
+      ).toBe(true);
+    } finally {
+      spawnSpy.mockRestore();
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks when remote featureBranch was deleted", async () => {
+    const item = writeReleaseQueueRecord(queueDir, {
+      runId: "wt-deleted-run",
+      repoPath: repo,
+      repoIdentity: "github.com/acme/wt",
+      baseBranch: "main",
+      featureBranch: "feat/deleted",
+      prNumber: 52,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: worktree,
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+
+    const spawnSpy = spyOn(childRegistry, "spawnSync").mockImplementation(
+      (cmd: string, args: readonly string[]) => {
+        if (
+          cmd === "git" &&
+          args[0] === "rev-parse" &&
+          args[1] === "--abbrev-ref" &&
+          args[2] === "HEAD"
+        ) {
+          return {
+            status: 0,
+            stdout: "wrong-branch\n",
+            stderr: "",
+            pid: 1,
+            output: [],
+            signal: null,
+          } as any;
+        }
+        if (cmd === "git" && args[0] === "fetch") {
+          return {
+            status: 128,
+            stdout: "",
+            stderr: "fatal: couldn't find remote ref feat/deleted",
+            pid: 1,
+            output: [],
+            signal: null,
+          } as any;
+        }
+        return {
+          status: 0,
+          stdout: "",
+          stderr: "",
+          pid: 1,
+          output: [],
+          signal: null,
+        } as any;
+      },
+    );
+
+    const result = await processReleaseQueueRecord(item, {
+      queueDir,
+      roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      heartbeatIntervalMs: 60_000,
+      verifyQueued: () => ({ ok: true }),
+      verifyMerged: () => ({ merged: true }),
+      acquireLock: () => ({
+        acquired: true,
+        handle: {
+          ref: "refs/gstack/release-locks/wt/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/wt",
+          baseBranch: "main",
+        },
+      }),
+      refreshLock: () => ({
+        ok: true,
+        handle: {
+          ref: "refs/gstack/release-locks/wt/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/wt",
+          baseBranch: "main",
+        },
+      }),
+      releaseLock: () => ({ ok: true }),
+      land: async () => ({
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+        timedOut: false,
+        logPath: "/tmp/log",
+        durationMs: 1,
+        retries: 0,
+      }),
+    });
+
+    spawnSpy.mockRestore();
+
+    expect(result.status).toBe("blocked");
+    expect(result.lastError).toContain("feat/deleted");
+  });
+});
+
+describe("processReleaseQueueRecord landOnly argument propagation", () => {
+  let queueDir: string;
+  let repo: string;
+
+  beforeEach(() => {
+    queueDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-rd-propagate-"),
+    );
+    repo = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-propagate-repo-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    _resetReleaseDaemonForTests();
+  });
+
+  afterEach(() => {
+    _resetReleaseDaemonForTests();
+    fs.rmSync(queueDir, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("passes prNumber and featureBranch to land on normal path", async () => {
+    const item = writeReleaseQueueRecord(queueDir, {
+      runId: "propagate-normal",
+      repoPath: repo,
+      repoIdentity: "github.com/acme/prop",
+      baseBranch: "main",
+      featureBranch: "feat/normal",
+      prNumber: 70,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: repo,
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+
+    let capturedArgs: any = null;
+    const result = await processReleaseQueueRecord(item, {
+      queueDir,
+      roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      heartbeatIntervalMs: 60_000,
+      verifyQueued: () => ({ ok: true }),
+      verifyMerged: () => ({ merged: true }),
+      acquireLock: () => ({
+        acquired: true,
+        handle: {
+          ref: "refs/gstack/release-locks/prop/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/prop",
+          baseBranch: "main",
+        },
+      }),
+      refreshLock: () => ({
+        ok: true,
+        handle: {
+          ref: "refs/gstack/release-locks/prop/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/prop",
+          baseBranch: "main",
+        },
+      }),
+      releaseLock: () => ({ ok: true }),
+      land: async (args) => {
+        capturedArgs = args;
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          logPath: "/tmp/log",
+          durationMs: 1,
+          retries: 0,
+        };
+      },
+    });
+
+    expect(result.status).toBe("landed");
+    expect(capturedArgs).not.toBeNull();
+    expect(capturedArgs.prNumber).toBe(70);
+    expect(capturedArgs.featureBranch).toBe("feat/normal");
+  });
+
+  it("passes prNumber and featureBranch to land on retry path after drift repair", async () => {
+    const item = writeReleaseQueueRecord(queueDir, {
+      runId: "propagate-retry",
+      repoPath: repo,
+      repoIdentity: "github.com/acme/prop",
+      baseBranch: "main",
+      featureBranch: "feat/retry",
+      prNumber: 71,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: repo,
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+
+    const landCalls: any[] = [];
+    const result = await processReleaseQueueRecord(item, {
+      queueDir,
+      roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      heartbeatIntervalMs: 60_000,
+      verifyQueued: () => ({ ok: true }),
+      verifyMerged: () => ({ merged: true }),
+      acquireLock: () => ({
+        acquired: true,
+        handle: {
+          ref: "refs/gstack/release-locks/prop/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/prop",
+          baseBranch: "main",
+        },
+      }),
+      refreshLock: () => ({
+        ok: true,
+        handle: {
+          ref: "refs/gstack/release-locks/prop/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/prop",
+          baseBranch: "main",
+        },
+      }),
+      releaseLock: () => ({ ok: true }),
+      land: async (args) => {
+        landCalls.push(args);
+        if (landCalls.length === 1) {
+          // First call simulates drift failure
+          return {
+            stdout: "",
+            stderr: "VERSION drift detected",
+            exitCode: 1,
+            timedOut: false,
+            logPath: "/tmp/log",
+            durationMs: 1,
+            retries: 0,
+          };
+        }
+        // Retry call succeeds
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          logPath: "/tmp/log",
+          durationMs: 1,
+          retries: 0,
+        };
+      },
+      ship: async () => ({
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+        timedOut: false,
+        logPath: "/tmp/log",
+        durationMs: 1,
+        retries: 0,
+      }),
+    });
+
+    expect(result.status).toBe("landed");
+    expect(landCalls.length).toBe(2);
+
+    // Both normal and retry calls must propagate prNumber and featureBranch
+    for (const call of landCalls) {
+      expect(call.prNumber).toBe(71);
+      expect(call.featureBranch).toBe("feat/retry");
+    }
+  });
+});
+
+describe("processReleaseQueueRecord PR already merged edge cases", () => {
+  let queueDir: string;
+  let repo: string;
+
+  beforeEach(() => {
+    queueDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-rd-merged-edge-"),
+    );
+    repo = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-merged-repo-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    _resetReleaseDaemonForTests();
+  });
+
+  afterEach(() => {
+    _resetReleaseDaemonForTests();
+    fs.rmSync(queueDir, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("marks landed when PR was merged externally before retry", async () => {
+    // The first land fails with drift. While drift repair runs, a human
+    // merges the PR on GitHub. The retry land succeeds, and verifyMerged
+    // confirms the PR is merged.
+    const item = writeReleaseQueueRecord(queueDir, {
+      runId: "merged-externally",
+      repoPath: repo,
+      repoIdentity: "github.com/acme/merged",
+      baseBranch: "main",
+      featureBranch: "feat/merged",
+      prNumber: 80,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: repo,
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+
+    let landCalls = 0;
+    const result = await processReleaseQueueRecord(item, {
+      queueDir,
+      roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      heartbeatIntervalMs: 60_000,
+      verifyQueued: () => ({ ok: true }),
+      verifyMerged: () => ({ merged: true }),
+      acquireLock: () => ({
+        acquired: true,
+        handle: {
+          ref: "refs/gstack/release-locks/merged/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/merged",
+          baseBranch: "main",
+        },
+      }),
+      refreshLock: () => ({
+        ok: true,
+        handle: {
+          ref: "refs/gstack/release-locks/merged/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/merged",
+          baseBranch: "main",
+        },
+      }),
+      releaseLock: () => ({ ok: true }),
+      land: async () => {
+        landCalls++;
+        if (landCalls === 1) {
+          return {
+            stdout: "",
+            stderr: "VERSION drift detected",
+            exitCode: 1,
+            timedOut: false,
+            logPath: "/tmp/log",
+            durationMs: 1,
+            retries: 0,
+          };
+        }
+        // Retry succeeds
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          logPath: "/tmp/log",
+          durationMs: 1,
+          retries: 0,
+        };
+      },
+      ship: async () => ({
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+        timedOut: false,
+        logPath: "/tmp/log",
+        durationMs: 1,
+        retries: 0,
+      }),
+    });
+
+    expect(result.status).toBe("landed");
+  });
+
+  it("blocks when verifyMerged fails on retry path", async () => {
+    const item = writeReleaseQueueRecord(queueDir, {
+      runId: "verify-fail-retry",
+      repoPath: repo,
+      repoIdentity: "github.com/acme/verify",
+      baseBranch: "main",
+      featureBranch: "feat/verify",
+      prNumber: 81,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: repo,
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "queued",
+    });
+
+    let landCalls = 0;
+    const result = await processReleaseQueueRecord(item, {
+      queueDir,
+      roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      heartbeatIntervalMs: 60_000,
+      verifyQueued: () => ({ ok: true }),
+      verifyMerged: () => ({
+        merged: false,
+        reason: "PR #81 state is OPEN on GitHub",
+      }),
+      acquireLock: () => ({
+        acquired: true,
+        handle: {
+          ref: "refs/gstack/release-locks/verify/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/verify",
+          baseBranch: "main",
+        },
+      }),
+      refreshLock: () => ({
+        ok: true,
+        handle: {
+          ref: "refs/gstack/release-locks/verify/main",
+          ownerId: "owner",
+          commit: "c",
+          repoPath: repo,
+          repoIdentity: "github.com/acme/verify",
+          baseBranch: "main",
+        },
+      }),
+      releaseLock: () => ({ ok: true }),
+      land: async () => {
+        landCalls++;
+        if (landCalls === 1) {
+          return {
+            stdout: "",
+            stderr: "VERSION drift detected",
+            exitCode: 1,
+            timedOut: false,
+            logPath: "/tmp/log",
+            durationMs: 1,
+            retries: 0,
+          };
+        }
+        // Retry succeeds but verifyMerged will block
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          logPath: "/tmp/log",
+          durationMs: 1,
+          retries: 0,
+        };
+      },
+      ship: async () => ({
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+        timedOut: false,
+        logPath: "/tmp/log",
+        durationMs: 1,
+        retries: 0,
+      }),
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.lastError).toContain("GitHub disagrees");
+    expect(result.lastError).toContain("PR #81 state is OPEN");
   });
 });
