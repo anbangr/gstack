@@ -283,6 +283,19 @@ describe("extractTestCount — edge cases", () => {
       source: "stdout-fallback",
     });
   });
+
+  test("edge: bun test summary on stderr is counted", () => {
+    const stdout = "bun test v1.3.12 (700fc117)\n";
+    const stderr =
+      " 299 pass\n 0 fail\n 909 expect() calls\nRan 299 tests across 4 files. [20.57s]\n";
+    const result = extractTestCount({ stdout, stderr }, "bun");
+    expect(result).toEqual({
+      collected: 299,
+      passed: 299,
+      failed: 0,
+      source: "stdout-fallback",
+    });
+  });
 });
 
 describe("RunnerKind type export", () => {

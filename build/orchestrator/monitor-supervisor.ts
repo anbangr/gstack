@@ -45,6 +45,7 @@ export interface MonitorAgentRunnerOptions {
   logPrefix: string;
   role: RoleConfig;
   timeoutMs: number;
+  gate?: boolean;
 }
 
 export type MonitorAgentRunner = (
@@ -283,6 +284,7 @@ export async function buildMonitorAgentEscalation(opts: {
       logPrefix: "monitor-agent",
       role: opts.role,
       timeoutMs: opts.timeoutMs ?? MONITOR_AGENT_TIMEOUT_MS,
+      gate: false,
     });
   } catch (err) {
     result = {
