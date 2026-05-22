@@ -426,7 +426,85 @@ const x = 1;
     const tmpl = fs.readFileSync(TEMPLATE, "utf8");
     expect(tmpl).toMatch(/staticViolations/);
     expect(tmpl).toMatch(/Imported identifiers are used in the same phase/);
-    expect(tmpl).toMatch(/Acceptance file paths exist, are exempt, or are planned/);
+    expect(tmpl).toMatch(
+      /Acceptance file paths exist, are exempt, or are planned/,
+    );
     expect(tmpl).toMatch(/Quoted file:line snippets still match/);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // T9 — feature heading shape: dash form must be flagged with an
+  //      actionable diagnostic, not a phantom missing-fields row.
+  //      Regression for the silent-failure mode where LLM synthesizer
+  //      drift to `## Feature N - name` (dash) was reported as missing
+  //      Origin trace / Acceptance on a phantom feature-0 block.
+  // ─────────────────────────────────────────────────────────────────────────
+  it("T9: ASCII-dash heading form emits feature-heading-shape diagnostic", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1 - Some Name
+Origin trace: test
+Acceptance: passes validation
+
+### Phase 1: Implementation
+- [ ] **Implementation**: write code
+- [ ] **Review**: review
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    // The actionable diagnostic names the real defect (output is
+    // JSON-escaped, so colons inside the message string are escaped):
+    expect(r.stderr).toMatch(/feature-heading-shape/);
+    expect(r.stderr).toMatch(/lack the required.*separator/);
+    expect(r.stderr).toMatch(/## Feature 1 - Some Name/);
+    // The phantom missing-fields row must NOT be emitted in this case:
+    expect(r.stderr).not.toMatch(/"featureNumber":0,"featureName":""/);
+  });
+
+  it("T9-em-dash: em-dash heading form also flagged", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1 — Some Name
+Origin trace: test
+Acceptance: passes
+
+### Phase 1: Implementation
+- [ ] **Implementation**: code
+- [ ] **Review**: review
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/feature-heading-shape/);
+  });
+
+  it("T9-empty: truly empty plan (no ## Feature N headings) still emits the legacy missing-fields row", () => {
+    // This case has no `## Feature N` headings at all, so heading-shape
+    // detection has nothing to flag. The legacy phantom row remains the
+    // right diagnostic shape here.
+    const plan = tmpPlan(
+      dir,
+      `# Just a header
+
+Some prose without any feature blocks.
+
+## Random Other Heading
+not a feature heading
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/"featureNumber":0,"featureName":""/);
+    expect(r.stderr).not.toMatch(/feature-heading-shape/);
+  });
+
+  it("T9-template: SKILL.md.tmpl tells the synthesizer to verify heading shape", () => {
+    // Pins the self-check addition so a template rewrite can't silently
+    // drop the new HEADING SHAPE guidance.
+    const tmpl = fs.readFileSync(TEMPLATE, "utf8");
+    expect(tmpl).toMatch(/HEADING SHAPE/);
+    expect(tmpl).toMatch(/`## Feature 1 - Foo`.*REJECTED/);
+    expect(tmpl).toMatch(/`## Feature 1 — Foo`.*REJECTED/);
   });
 });
