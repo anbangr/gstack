@@ -18,6 +18,7 @@ import {
   readReleaseQueueRecords,
   updateReleaseQueueRecord,
   verifyPrQueued,
+  writeReleaseQueueRecord,
   type ReleaseQueueRecord,
 } from "./release-queue";
 import { landOnly, shipOnly } from "./ship";
@@ -608,6 +609,7 @@ function isDriftFailure(text: string): boolean {
  */
 export interface PrMergeStatus {
   merged: boolean;
+  state?: string;
   /** Free-text for the queue record's lastError when not merged. */
   reason?: string;
 }
@@ -676,11 +678,70 @@ export function verifyPrMerged(
     };
   }
   const state = (result.stdout || "").trim();
-  if (state === "MERGED") return { merged: true };
+  if (state === "MERGED") return { merged: true, state };
   return {
     merged: false,
+    state: state || "unknown",
     reason: `PR #${prNumber} state is ${state || "unknown"} on GitHub (sub-agent reported success but PR was not merged)`,
   };
+}
+
+const MERGED_RECONCILE_MIN_INTERVAL_MS = 10 * 60 * 1000;
+
+function shouldReconcileBlockedRecord(
+  record: ReleaseQueueRecord,
+  now: Date,
+): boolean {
+  if (record.status !== "blocked") return false;
+  if (!record.lastGithubCheckedAt) return true;
+  const last = Date.parse(record.lastGithubCheckedAt);
+  if (!Number.isFinite(last)) return true;
+  return now.getTime() - last >= MERGED_RECONCILE_MIN_INTERVAL_MS;
+}
+
+export function reconcileBlockedRecordWithGithub(
+  record: ReleaseQueueRecord,
+  opts: Pick<
+    ReleaseDaemonOptions,
+    "allowlistPrefixes" | "now" | "repoPath" | "verifyMerged" | "log"
+  > & { queueDir?: string },
+): ReleaseQueueRecord {
+  const now = opts.now?.() ?? new Date();
+  if (!shouldReconcileBlockedRecord(record, now)) return record;
+  const prefixes =
+    opts.allowlistPrefixes ?? buildAllowlistWithRoot(opts.repoPath);
+  const gate = isAllowedRepoPath(record.repoPath, prefixes);
+  if (!gate.ok) {
+    opts.log?.(
+      `warning: skipping blocked PR #${record.prNumber} reconciliation: ${gate.reason}`,
+    );
+    return record;
+  }
+  const verifyMerged = opts.verifyMerged ?? verifyPrMerged;
+  const mergeStatus = verifyMerged(
+    record.prNumber,
+    record.repoIdentity,
+    gate.resolved,
+  );
+  const checkedAt = now.toISOString();
+  if (mergeStatus.merged) {
+    return writeReleaseQueueRecord(opts.queueDir ?? defaultReleaseQueueDir(), {
+      ...record,
+      status: "landed",
+      lastError: undefined,
+      lastGithubCheckedAt: checkedAt,
+      lastGithubState: mergeStatus.state ?? "MERGED",
+      reconciledAt: checkedAt,
+    });
+  }
+  return updateReleaseQueueRecord(
+    opts.queueDir ?? defaultReleaseQueueDir(),
+    record,
+    {
+      lastGithubCheckedAt: checkedAt,
+      lastGithubState: mergeStatus.state ?? "unknown",
+    },
+  );
 }
 
 function scratchWorktreePath(record: ReleaseQueueRecord): string {
@@ -1156,7 +1217,9 @@ function discoverQueuedRecords(
   queueDir: string,
   opts: ReleaseDaemonOptions,
 ): DiscoveryResult {
-  const local = readReleaseQueueRecords(queueDir);
+  const local = readReleaseQueueRecords(queueDir).map((record) =>
+    reconcileBlockedRecordWithGithub(record, { ...opts, queueDir }),
+  );
   const byId = new Map<string, ReleaseQueueRecord>();
   let preBlocked = 0;
   // Codex P1 (round 11) fix: when no test seam bypasses the

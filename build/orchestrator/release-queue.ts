@@ -35,6 +35,9 @@ export interface ReleaseQueueRecord {
   status: ReleaseQueueStatus;
   lastError?: string;
   lastUpdatedAt?: string;
+  lastGithubCheckedAt?: string;
+  lastGithubState?: string;
+  reconciledAt?: string;
   retries?: number;
 }
 

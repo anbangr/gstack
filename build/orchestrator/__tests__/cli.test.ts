@@ -71,6 +71,7 @@ import {
   buildReleaseDaemonDoctorReport,
   renderReleaseDaemonDoctorReport,
   runRoleTask,
+  runMergeMode,
   buildKindInstructions,
   chooseMergePath,
   extractCoverageTarget,
@@ -986,6 +987,72 @@ describe("merge subcommand wiring", () => {
     expect(HELP_TEXT).toContain(
       "Review/fix/ship/land unmerged feat/* branches",
     );
+  });
+
+  it("continues after a worktree-locked branch and reports later branch failures", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-merge-sweep-"));
+    const bare = path.join(tmpDir, "origin.git");
+    const repo = path.join(tmpDir, "repo");
+    const lockedWorktree = path.join(tmpDir, "locked");
+    const git = (cwd: string, args: string[]) => {
+      const r = spawnSync("git", args, { cwd, encoding: "utf8" });
+      if (r.status !== 0) {
+        throw new Error(`git ${args.join(" ")} failed: ${r.stderr || r.stdout}`);
+      }
+      return r.stdout.trim();
+    };
+    fs.mkdirSync(bare, { recursive: true });
+    git(bare, ["init", "--bare", "--initial-branch=main"]);
+    git(tmpDir, ["clone", bare, repo]);
+    git(repo, ["config", "user.email", "test@example.com"]);
+    git(repo, ["config", "user.name", "Test User"]);
+    fs.writeFileSync(path.join(repo, "README.md"), "main\n");
+    git(repo, ["add", "README.md"]);
+    git(repo, ["commit", "-m", "initial"]);
+    git(repo, ["push", "-u", "origin", "main"]);
+    git(repo, ["remote", "set-head", "origin", "-a"]);
+
+    for (const branch of ["feat/a-locked", "feat/z-normal"]) {
+      git(repo, ["checkout", "-b", branch, "main"]);
+      fs.writeFileSync(
+        path.join(repo, `${branch.replace(/[/-]/g, "_")}.txt`),
+        `${branch}\n`,
+      );
+      git(repo, ["add", "."]);
+      git(repo, ["commit", "-m", branch]);
+      git(repo, ["push", "-u", "origin", branch]);
+      git(repo, ["checkout", "main"]);
+    }
+    git(repo, ["worktree", "add", lockedWorktree, "feat/a-locked"]);
+
+    const args = parseArgs([
+      "merge",
+      "--project-root",
+      repo,
+      "--skip-clean-check",
+    ]);
+    args.maxCodexIter = 0;
+    const logs: string[] = [];
+    const origLog = console.log;
+    const origWarn = console.warn;
+    const origError = console.error;
+    console.log = (...parts: unknown[]) => logs.push(parts.join(" "));
+    console.warn = (...parts: unknown[]) => logs.push(parts.join(" "));
+    console.error = (...parts: unknown[]) => logs.push(parts.join(" "));
+    try {
+      const code = await runMergeMode(args);
+      const output = logs.join("\n");
+      expect(code).toBe(1);
+      expect(output).toContain("merge branch feat/a-locked");
+      expect(output).toContain("merge branch feat/z-normal");
+      expect(output).toContain("Merge summary: 0 merged, 1 deferred, 1 failed.");
+      expect(output).toContain("deferred: feat/a-locked");
+      expect(output).toContain("failed: feat/z-normal");
+    } finally {
+      console.log = origLog;
+      console.warn = origWarn;
+      console.error = origError;
+    }
   });
 });
 

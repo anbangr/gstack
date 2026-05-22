@@ -10,6 +10,7 @@ import {
   isAllowedFeatureBranch,
   isAllowedRepoPath,
   processReleaseQueueRecord,
+  reconcileBlockedRecordWithGithub,
   reviveActiveRecordsForSignal,
   runReleaseDaemon,
   verifyPrMerged,
@@ -3014,5 +3015,97 @@ describe("processReleaseQueueRecord PR already merged edge cases", () => {
     expect(result.status).toBe("blocked");
     expect(result.lastError).toContain("GitHub disagrees");
     expect(result.lastError).toContain("PR #81 state is OPEN");
+  });
+});
+
+describe("blocked release queue reconciliation", () => {
+  let queueDir4: string;
+  let repo: string;
+
+  beforeEach(() => {
+    queueDir4 = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-rd-reconcile-"),
+    );
+    repo = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-rd-reconcile-repo-"),
+    );
+    fs.mkdirSync(path.join(repo, ".git"));
+    _resetReleaseDaemonForTests();
+  });
+
+  afterEach(() => {
+    _resetReleaseDaemonForTests();
+    fs.rmSync(queueDir4, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  function blockedRecord(): ReleaseQueueRecord {
+    return {
+      runId: "reconcile-run",
+      repoPath: repo,
+      repoIdentity: "github.com/acme/reconcile",
+      baseBranch: "main",
+      featureBranch: "feat/reconcile",
+      prNumber: 1001,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: repo,
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "blocked",
+      lastError:
+        "land-and-deploy reported success but GitHub disagrees: PR #1001 state is OPEN",
+    };
+  }
+
+  it("marks a stale blocked record landed when GitHub now says MERGED", () => {
+    const item = writeReleaseQueueRecord(queueDir4, blockedRecord());
+    const result = reconcileBlockedRecordWithGithub(item, {
+      queueDir: queueDir4,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      now: () => new Date("2026-05-22T00:00:00.000Z"),
+      verifyMerged: () => ({ merged: true, state: "MERGED" }),
+    });
+
+    expect(result.status).toBe("landed");
+    expect(result.lastError).toBeUndefined();
+    expect(result.reconciledAt).toBe("2026-05-22T00:00:00.000Z");
+    expect(result.lastGithubState).toBe("MERGED");
+    expect(readReleaseQueueRecords(queueDir4)[0].status).toBe("landed");
+  });
+
+  it("keeps a blocked record blocked when GitHub still says OPEN", () => {
+    const item = writeReleaseQueueRecord(queueDir4, blockedRecord());
+    const result = reconcileBlockedRecordWithGithub(item, {
+      queueDir: queueDir4,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      now: () => new Date("2026-05-22T00:00:00.000Z"),
+      verifyMerged: () => ({
+        merged: false,
+        state: "OPEN",
+        reason: "PR #1001 state is OPEN",
+      }),
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.lastError).toContain("GitHub disagrees");
+    expect(result.lastGithubCheckedAt).toBe("2026-05-22T00:00:00.000Z");
+    expect(result.lastGithubState).toBe("OPEN");
+  });
+
+  it("does not dispatch reconciled landed records from the daemon loop", async () => {
+    writeReleaseQueueRecord(queueDir4, blockedRecord());
+    const code = await runReleaseDaemon({
+      queueDir: queueDir4,
+      once: true,
+      roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      verifyMerged: () => ({ merged: true, state: "MERGED" }),
+      processor: async () => {
+        throw new Error("processor should not receive reconciled records");
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(readReleaseQueueRecords(queueDir4)[0].status).toBe("landed");
   });
 });
