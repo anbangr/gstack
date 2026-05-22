@@ -957,8 +957,9 @@ describe("monitor agent supervisor", () => {
       evaluation,
       role: monitorAgent,
       now: new Date("2026-05-08T01:00:00.000Z"),
-      runner: async ({ outputFilePath, cwd }) => {
+      runner: async ({ outputFilePath, cwd, gate }) => {
         agentCwd = cwd;
+        expect(gate).toBe(false);
         const body = {
           verdict: "host_action_required",
           summary: "tests failed after implementation",

@@ -700,7 +700,10 @@ export function applyResult(
       return next;
     }
     const runner = detectRunnerFromTestCmd(extra?.testCmd);
-    const testCount = extractTestCount({ stdout: result.stdout }, runner);
+    const testCount = extractTestCount(
+      { stdout: result.stdout, stderr: result.stderr },
+      runner,
+    );
     const suppressed = hasSuppressionAnnotation(
       extra?.phaseBody,
       phaseState.kind ?? extra?.phaseKind,

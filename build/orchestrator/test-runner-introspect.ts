@@ -17,10 +17,15 @@ export interface TestCountResult {
 
 export interface RunnerResult {
   stdout: string;
+  stderr?: string;
   /** pytest --json-report-file path */
   jsonReportPath?: string;
   /** bun --coverage JSON output path */
   coverageJsonPath?: string;
+}
+
+function combinedOutput(result: RunnerResult): string {
+  return [result.stdout, result.stderr].filter(Boolean).join("\n");
 }
 
 function safeParseJson(text: string): unknown {
@@ -257,11 +262,12 @@ export function extractTestCount(
   runnerResult: RunnerResult,
   runner: RunnerKind | string,
 ): TestCountResult {
+  const output = combinedOutput(runnerResult);
   switch (runner) {
     case "vitest": {
-      const json = parseVitestJson(runnerResult.stdout);
+      const json = parseVitestJson(output);
       if (json) return json;
-      return parseVitestStdout(runnerResult.stdout);
+      return parseVitestStdout(output);
     }
     case "pytest": {
       if (runnerResult.jsonReportPath) {
@@ -272,25 +278,25 @@ export function extractTestCount(
           fs.rmSync(runnerResult.jsonReportPath, { force: true });
         }
       }
-      return parsePytestStdout(runnerResult.stdout);
+      return parsePytestStdout(output);
     }
     case "jest": {
-      const json = parseJestJson(runnerResult.stdout);
+      const json = parseJestJson(output);
       if (json) return json;
-      return parseJestStdout(runnerResult.stdout);
+      return parseJestStdout(output);
     }
     case "bun": {
       if (runnerResult.coverageJsonPath) {
         const json = parseBunCoverageJson(runnerResult.coverageJsonPath);
         if (json) return json;
       }
-      return parseBunStdout(runnerResult.stdout);
+      return parseBunStdout(output);
     }
     case "mocha": {
-      return parseMochaStdout(runnerResult.stdout);
+      return parseMochaStdout(output);
     }
     case "go": {
-      return parseGoStdout(runnerResult.stdout);
+      return parseGoStdout(output);
     }
     default: {
       console.warn(
