@@ -103,7 +103,7 @@ describe("resolveInvestigationContext", () => {
     const ctx = await resolveInvestigationContext({
       statePath: stateFile,
       faultsDir, activeRunsRegistryDir: activeRunsDir,
-      ttyAvailable: false,
+
     });
     expect(ctx).not.toBeNull();
     expect(ctx!.runId).toBe("run-explicit");
@@ -115,7 +115,7 @@ describe("resolveInvestigationContext", () => {
     const ctx = await resolveInvestigationContext({
       faultId: "CAT:p2:fff",
       faultsDir, activeRunsRegistryDir: activeRunsDir,
-      ttyAvailable: false,
+
     });
     expect(ctx).not.toBeNull();
     expect(ctx!.runId).toBe("run-FF");
@@ -127,7 +127,7 @@ describe("resolveInvestigationContext", () => {
     const ctx = await resolveInvestigationContext({
       symptoms: "build halts on phase 3 codex review every time",
       faultsDir, activeRunsRegistryDir: activeRunsDir,
-      ttyAvailable: false,
+
     });
     expect(ctx).not.toBeNull();
     expect(ctx!.runId).toMatch(/^manual-/);
@@ -141,7 +141,7 @@ describe("resolveInvestigationContext", () => {
     writeHaltEvent("pending-investigations", "run-auto", "CAT:p0:aaa");
     const ctx = await resolveInvestigationContext({
       faultsDir, activeRunsRegistryDir: activeRunsDir,
-      ttyAvailable: false,
+
     });
     expect(ctx).not.toBeNull();
     expect(ctx!.runId).toBe("run-auto");
@@ -152,7 +152,7 @@ describe("resolveInvestigationContext", () => {
   test("returns null context when nothing found and non-TTY", async () => {
     const ctx = await resolveInvestigationContext({
       faultsDir, activeRunsRegistryDir: activeRunsDir,
-      ttyAvailable: false,
+
     });
     expect(ctx).toBeNull();
   });

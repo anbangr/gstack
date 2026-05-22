@@ -71,7 +71,6 @@ test("auto-detect picks most recent active run with a pending halt event", async
 
   const code = await runInvestigateMode({
     faultsDir, activeRunsRegistryDir: activeRunsDir,
-    ttyAvailable: false,
   });
   expect(code).toBe(0);
   const briefing = JSON.parse(

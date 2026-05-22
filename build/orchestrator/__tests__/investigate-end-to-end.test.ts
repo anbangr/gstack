@@ -51,7 +51,6 @@ describe("end-to-end /build investigate flow", () => {
       faultId: event.faultId,
       faultsDir,
       activeRunsRegistryDir: path.join(tmpRoot, "active-runs-empty"),
-      ttyAvailable: false,
     });
     expect(code1).toBe(0);
     expect(stdoutBuf).toContain("<<<GSTACK_INVESTIGATE_BRIEFING>>>");

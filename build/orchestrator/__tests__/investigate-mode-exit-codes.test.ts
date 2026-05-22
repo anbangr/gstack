@@ -46,7 +46,7 @@ describe("runInvestigateMode exit codes", () => {
     const args: InvestigateModeArgs = {
       statePath: "/nonexistent/state.json",
       faultsDir, activeRunsRegistryDir: activeRunsDir,
-      ttyAvailable: false,
+
     };
     const code = await runInvestigateMode(args);
     expect(code).toBe(2);
@@ -57,7 +57,7 @@ describe("runInvestigateMode exit codes", () => {
     const args: InvestigateModeArgs = {
       faultId: "MISSING:p0:notthere",
       faultsDir, activeRunsRegistryDir: activeRunsDir,
-      ttyAvailable: false,
+
     };
     const code = await runInvestigateMode(args);
     expect(code).toBe(2);
@@ -67,7 +67,7 @@ describe("runInvestigateMode exit codes", () => {
   test("exit 3 when nothing auto-detects and non-TTY", async () => {
     const args: InvestigateModeArgs = {
       faultsDir, activeRunsRegistryDir: activeRunsDir,
-      ttyAvailable: false,
+
     };
     const code = await runInvestigateMode(args);
     expect(code).toBe(3);
@@ -78,7 +78,7 @@ describe("runInvestigateMode exit codes", () => {
     const args: InvestigateModeArgs = {
       symptoms: "build halts on phase 3 every time",
       faultsDir, activeRunsRegistryDir: activeRunsDir,
-      ttyAvailable: false,
+
     };
     const code = await runInvestigateMode(args);
     expect(code).toBe(0);

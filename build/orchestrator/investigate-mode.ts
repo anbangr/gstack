@@ -27,7 +27,6 @@ export interface InvestigateModeArgs {
   emitJson?: boolean;
   faultsDir?: string;
   activeRunsRegistryDir?: string;
-  ttyAvailable: boolean;
 }
 
 export interface InvestigateFinalizeArgs {
@@ -59,7 +58,6 @@ export async function runInvestigateMode(
       severityOverride: args.severityOverride,
       faultsDir: args.faultsDir,
       activeRunsRegistryDir: args.activeRunsRegistryDir,
-      ttyAvailable: args.ttyAvailable,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

@@ -29,7 +29,6 @@ afterEach(() => {
 test("no context, non-TTY → exit 3 with stderr explanation", async () => {
   const code = await runInvestigateMode({
     faultsDir, activeRunsRegistryDir: activeRunsDir,
-    ttyAvailable: false,
   });
   expect(code).toBe(3);
   expect(stderrBuf).toContain("no context auto-detected");

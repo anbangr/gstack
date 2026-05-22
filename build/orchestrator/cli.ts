@@ -10528,7 +10528,6 @@ async function main() {
       severityOverride: args.investigateSeverityOverride,
       noInbox: args.investigateNoInbox,
       emitJson: args.investigateEmitJson,
-      ttyAvailable: Boolean(process.stdin.isTTY),
     });
     process.exit(exitCode);
   }

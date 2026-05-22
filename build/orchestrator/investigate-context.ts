@@ -156,7 +156,6 @@ export interface ResolveContextArgs {
   severityOverride?: "CRITICAL" | "HIGH" | "MEDIUM";
   faultsDir?: string;
   activeRunsRegistryDir?: string;
-  ttyAvailable: boolean;
 }
 
 export async function resolveInvestigationContext(

@@ -146,7 +146,7 @@ export function writeBugReport(args: {
 
   const content = renderBugReportMarkdown(args.report, args.ctx, date);
   const tmpPath = `${candidatePath}.tmp.${process.pid}`;
-  fs.writeFileSync(tmpPath, content, { mode: 0o600 });
+  fs.writeFileSync(tmpPath, content);
   fs.renameSync(tmpPath, candidatePath);
   return { skipped: false, path: candidatePath };
 }
