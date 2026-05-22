@@ -35,6 +35,26 @@ const MODULE_TEST_OWNERS: Record<string, string[]> = {
   "gbrain.ts": ["gbrain.test.ts"],
   "halt-event-helpers.ts": ["halt-event-helpers.test.ts"],
   "halt-events.ts": ["halt-events.test.ts"],
+  "investigate-context.ts": [
+    "investigate-context.test.ts",
+    "investigate-context-tail.test.ts",
+    "investigate-auto-detect.test.ts",
+    "investigate-end-to-end.test.ts",
+    "investigate-no-context-fallback.test.ts",
+  ],
+  "investigate-lock.ts": ["investigate-lock.test.ts"],
+  "investigate-mode.ts": [
+    "investigate-mode-exit-codes.test.ts",
+    "investigate-finalize-validation.test.ts",
+    "investigate-end-to-end.test.ts",
+    "investigate-auto-detect.test.ts",
+    "investigate-no-context-fallback.test.ts",
+  ],
+  "investigate-report-writer.ts": [
+    "investigate-report-writer.test.ts",
+    "investigate-report-writer-severity.test.ts",
+    "investigate-end-to-end.test.ts",
+  ],
   "investigator-dispatch.ts": ["investigator-dispatch.test.ts"],
   "learn-fault-patterns.ts": ["learn-fault-patterns.test.ts"],
   "monitor-supervisor.ts": [
