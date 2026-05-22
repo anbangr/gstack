@@ -12943,6 +12943,8 @@ async function processMergeBranch(args: {
           cwd: args.cwd,
           slug: `${args.slug}-${branchSlug}`,
           landRole: args.roles.land,
+          prNumber: openPRNumber ?? undefined,
+          featureBranch: branch,
         });
       } else {
         result = await shipAndDeploy({
