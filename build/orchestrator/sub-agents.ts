@@ -1896,6 +1896,13 @@ export interface RunConfiguredRoleTaskOpts {
    * default helperCtxFor uses.
    */
   runId?: string;
+  /**
+   * Optional tool allowlist forwarded to the Claude provider only.
+   * Gemini, Kimi, and Codex branches ignore this field. Used to grant the
+   * inner /ship session access to the Task/Agent subagent-dispatch tool
+   * so /ship Step 18 can run /document-release.
+   */
+  allowedTools?: readonly string[];
 }
 
 /**
@@ -2023,6 +2030,7 @@ export async function runConfiguredRoleTask(
       reasoning: opts.role.reasoning,
       gate: opts.gate,
       timeoutMs: effectiveTimeoutMs,
+      allowedTools: opts.allowedTools,
     });
   } else if (opts.role.provider === "gemini") {
     result = await runRoleTask({
