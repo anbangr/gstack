@@ -87,12 +87,16 @@ function geminiBin(): string {
 let _geminiAuthPromise:
   | Promise<{ ok: boolean; reason?: string; skipped?: boolean }>
   | undefined;
-let _geminiAuthCache: { ok: boolean; reason?: string; skipped?: boolean } | undefined;
+let _geminiAuthCache:
+  | { ok: boolean; reason?: string; skipped?: boolean }
+  | undefined;
 
 let _codexAuthPromise:
   | Promise<{ ok: boolean; reason?: string; skipped?: boolean }>
   | undefined;
-let _codexAuthCache: { ok: boolean; reason?: string; skipped?: boolean } | undefined;
+let _codexAuthCache:
+  | { ok: boolean; reason?: string; skipped?: boolean }
+  | undefined;
 
 function resolveBinInPath(bin: string): string {
   if (path.isAbsolute(bin)) return bin;
@@ -121,10 +125,8 @@ function probeAuthSync(
       timeout: timeoutMs,
     });
     if (result.status === 0) return { ok: true };
-    const stdout =
-      typeof result.stdout === "string" ? result.stdout : "";
-    const stderr =
-      typeof result.stderr === "string" ? result.stderr : "";
+    const stdout = typeof result.stdout === "string" ? result.stdout : "";
+    const stderr = typeof result.stderr === "string" ? result.stderr : "";
     return {
       ok: false,
       reason: stdout.trim() || stderr.trim() || `exit ${result.status}`,
@@ -252,11 +254,7 @@ export function resolveWatchdogMode(
         ? "stream"
         : undefined;
   const requested = explicit ?? legacy ?? "auto";
-  const source = explicit
-    ? "explicit"
-    : legacy
-      ? "legacy"
-      : ("auto" as const);
+  const source = explicit ? "explicit" : legacy ? "legacy" : ("auto" as const);
 
   if (requested === "stream") return { mode: "stream", source };
   if (requested === "cpu" || requested === "auto") {
@@ -1581,6 +1579,7 @@ export function buildClaudeTaskArgv(opts: {
   model?: string;
   reasoning?: RoleReasoning;
   gate?: boolean;
+  allowedTools?: readonly string[];
 }): string[] {
   const commandLine = opts.command
     ? `Run ${opts.command}.`
@@ -1600,7 +1599,14 @@ export function buildClaudeTaskArgv(opts: {
   ]
     .filter(Boolean)
     .join(" ");
-  return [...(opts.model ? ["--model", opts.model] : []), "-p", prompt];
+  return [
+    ...(opts.model ? ["--model", opts.model] : []),
+    "-p",
+    prompt,
+    ...(opts.allowedTools && opts.allowedTools.length > 0
+      ? ["--allowedTools", ...opts.allowedTools]
+      : []),
+  ];
 }
 
 /**
@@ -1719,6 +1725,7 @@ export async function runClaudeTask(opts: {
   reasoning?: RoleReasoning;
   gate?: boolean;
   timeoutMs?: number;
+  allowedTools?: readonly string[];
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
   const argv = buildClaudeTaskArgv(opts);
@@ -1790,6 +1797,13 @@ export async function runShip(opts: {
     // runConfiguredRoleTask via resolveRoleTimeouts; caller default stays SHIP_TIMEOUT_MS.
     timeoutMs: opts.ship.timeoutMs ?? SHIP_TIMEOUT_MS,
     gate: false,
+    // Grant the inner /ship session access to the Task/Agent subagent-dispatch
+    // tool so /ship Step 18 can run /document-release in a fresh-context
+    // subagent. Both names listed for Claude Code version-skew resilience;
+    // the CLI silently ignores unknown allowlist entries. Land call below
+    // intentionally does NOT get this — /land-and-deploy never dispatches
+    // a subagent.
+    allowedTools: ["Task", "Agent"],
   });
 
   // Bail out before /land-and-deploy if /ship failed.
@@ -1860,6 +1874,7 @@ export async function runSlashCommand(opts: {
   timeoutMs?: number;
   gate?: boolean;
   sandbox?: CodexSandbox;
+  allowedTools?: readonly string[];
 }): Promise<SubAgentResult> {
   return runConfiguredRoleTask({
     ...opts,
@@ -1889,6 +1904,13 @@ export interface RunConfiguredRoleTaskOpts {
    * default helperCtxFor uses.
    */
   runId?: string;
+  /**
+   * Optional tool allowlist forwarded to the Claude provider only.
+   * Gemini, Kimi, and Codex branches ignore this field. Used to grant the
+   * inner /ship session access to the Task/Agent subagent-dispatch tool
+   * so /ship Step 18 can run /document-release.
+   */
+  allowedTools?: readonly string[];
 }
 
 /**
@@ -2016,6 +2038,7 @@ export async function runConfiguredRoleTask(
       reasoning: opts.role.reasoning,
       gate: opts.gate,
       timeoutMs: effectiveTimeoutMs,
+      allowedTools: opts.allowedTools,
     });
   } else if (opts.role.provider === "gemini") {
     result = await runRoleTask({

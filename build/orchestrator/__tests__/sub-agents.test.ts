@@ -6,6 +6,7 @@ import {
   afterEach,
   beforeAll,
   afterAll,
+  spyOn,
 } from "bun:test";
 import {
   parseVerdict,
@@ -30,6 +31,7 @@ import {
   runCodexReview,
   runConfiguredRoleTask,
   runTests,
+  runClaudeTask,
   runShip,
   runSlashCommand,
   mergeOutputFile,
@@ -1270,6 +1272,59 @@ describe("buildClaudeTaskArgv (claude role invocation shape)", () => {
     });
     const prompt = argv[argv.indexOf("-p") + 1];
     expect(prompt).toContain("/codex review");
+  });
+
+  it("emits no --allowedTools flag when allowedTools is omitted", () => {
+    const argv = buildClaudeTaskArgv({
+      inputFilePath: "/tmp/ship-in.md",
+      outputFilePath: "/tmp/ship-out.md",
+      command: "/gstack-ship",
+      model: "role-model-under-test",
+      reasoning: "high",
+    });
+    expect(argv).not.toContain("--allowedTools");
+  });
+
+  it("emits --allowedTools followed by each tool name when allowedTools is non-empty", () => {
+    const argv = buildClaudeTaskArgv({
+      inputFilePath: "/tmp/ship-in.md",
+      outputFilePath: "/tmp/ship-out.md",
+      command: "/gstack-ship",
+      model: "role-model-under-test",
+      reasoning: "high",
+      allowedTools: ["Task", "Agent"],
+    });
+    const idx = argv.indexOf("--allowedTools");
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(argv[idx + 1]).toBe("Task");
+    expect(argv[idx + 2]).toBe("Agent");
+  });
+
+  it("omits --allowedTools when allowedTools is the empty array", () => {
+    const argv = buildClaudeTaskArgv({
+      inputFilePath: "/tmp/ship-in.md",
+      outputFilePath: "/tmp/ship-out.md",
+      command: "/gstack-ship",
+      model: "role-model-under-test",
+      reasoning: "high",
+      allowedTools: [],
+    });
+    expect(argv).not.toContain("--allowedTools");
+  });
+
+  it("preserves --allowedTools position after -p prompt", () => {
+    const argv = buildClaudeTaskArgv({
+      inputFilePath: "/tmp/ship-in.md",
+      outputFilePath: "/tmp/ship-out.md",
+      command: "/gstack-ship",
+      model: "role-model-under-test",
+      reasoning: "high",
+      allowedTools: ["Task", "Agent"],
+    });
+    const pIdx = argv.indexOf("-p");
+    const allowedIdx = argv.indexOf("--allowedTools");
+    expect(pIdx).toBeGreaterThanOrEqual(0);
+    expect(allowedIdx).toBeGreaterThan(pIdx + 1);
   });
 });
 
@@ -3668,7 +3723,9 @@ describe("spawnCaptured streaming", () => {
       const log = fs.readFileSync(logPath, "utf8");
       // Header at top.
       expect(log).toMatch(/^# command: bash/);
-      expect(log).toMatch(/^# watchdog_mode: (cpu|stream) \((auto|explicit|legacy|invalid)\)$/m);
+      expect(log).toMatch(
+        /^# watchdog_mode: (cpu|stream) \((auto|explicit|legacy|invalid)\)$/m,
+      );
       // Body contains both channels.
       expect(log).toContain("[OUT] body-line");
       expect(log).toContain("[ERR] body-err");
@@ -3865,5 +3922,77 @@ describe("spawnCaptured streaming", () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("runShip allowlist propagation", () => {
+  it("passes allowedTools to the ship call but not to land-and-deploy", async () => {
+    const calls: Array<{
+      logPrefix: string;
+      allowedTools: readonly string[] | undefined;
+    }> = [];
+
+    const subAgents = await import("../sub-agents");
+    const spy = spyOn(subAgents, "runClaudeTask").mockImplementation(
+      async (opts: Parameters<typeof subAgents.runClaudeTask>[0]) => {
+        calls.push({
+          logPrefix: opts.logPrefix,
+          allowedTools: opts.allowedTools,
+        });
+        fs.writeFileSync(opts.outputFilePath, "ok\n");
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          stallKilled: false,
+          logPath: "",
+          durationMs: 0,
+          retries: 0,
+        };
+      },
+    );
+
+    try {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-runship-"));
+      await subAgents.runShip({
+        cwd: tmp,
+        slug: "test-slug",
+        ship: {
+          provider: "claude",
+          model: "test-model",
+          reasoning: "high",
+          command: "/gstack-ship",
+        },
+        land: {
+          provider: "claude",
+          model: "test-model",
+          reasoning: "high",
+          command: "/land-and-deploy",
+        },
+      });
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(calls.length).toBe(2);
+    const shipCall = calls.find((c) => c.logPrefix === "ship");
+    const landCall = calls.find((c) => c.logPrefix === "land-and-deploy");
+    expect(shipCall).toBeDefined();
+    expect(landCall).toBeDefined();
+    expect(shipCall!.allowedTools).toEqual(["Task", "Agent"]);
+    expect(landCall!.allowedTools).toBeUndefined();
+  });
+
+  it("allowlists the Task subagent tool by literal name in runShip body (static-grep invariant)", () => {
+    const source = fs.readFileSync(
+      path.join(import.meta.dir, "..", "sub-agents.ts"),
+      "utf8",
+    );
+    const runShipMatch = source.match(
+      /export async function runShip\([\s\S]*?\n\}\n/,
+    );
+    expect(runShipMatch).not.toBeNull();
+    expect(runShipMatch![0]).toContain('allowedTools: ["Task", "Agent"]');
   });
 });
