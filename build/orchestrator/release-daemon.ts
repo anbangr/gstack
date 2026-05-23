@@ -657,6 +657,11 @@ export function verifyPrMerged(
     }
     repoArg = ["--repo", match[1]];
   }
+  // Hard timeout. A hung `gh pr view` (offline, expired auth keychain
+  // prompt, DNS, rate-limit) otherwise blocks daemon discovery for all
+  // queued records — every poll cycle waits on the first stale blocked
+  // record before any queued PR is processed.
+  const VERIFY_TIMEOUT_MS = 30_000;
   const result = spawnSync(
     "gh",
     [
@@ -669,8 +674,14 @@ export function verifyPrMerged(
       "-q",
       ".state",
     ],
-    { cwd, encoding: "utf8" },
+    { cwd, encoding: "utf8", timeout: VERIFY_TIMEOUT_MS },
   );
+  if (result.signal === "SIGTERM" || result.error?.code === "ETIMEDOUT") {
+    return {
+      merged: false,
+      reason: `gh pr view timed out after ${VERIFY_TIMEOUT_MS}ms`,
+    };
+  }
   if (result.status !== 0) {
     return {
       merged: false,
@@ -708,6 +719,20 @@ export function reconcileBlockedRecordWithGithub(
 ): ReleaseQueueRecord {
   const now = opts.now?.() ?? new Date();
   if (!shouldReconcileBlockedRecord(record, now)) return record;
+  // Trust-boundary: refuse to reconcile legacy records without
+  // repoIdentity. Without it, downstream calls (releaseQueueRecordId →
+  // canonicalRepoIdentity) spawn git in record.repoPath BEFORE the
+  // allowlist gate resolves the path. A planted record could symlink-
+  // flip between the gate check and the git spawn (the documented
+  // queued-path TOCTOU). Legacy blocked records must be requeued
+  // through the normal path to gain a repoIdentity before they're
+  // reconcile-eligible.
+  if (!record.repoIdentity) {
+    opts.log?.(
+      `warning: skipping blocked PR #${record.prNumber} reconciliation: record lacks repoIdentity (legacy record — requeue manually)`,
+    );
+    return record;
+  }
   const prefixes =
     opts.allowlistPrefixes ?? buildAllowlistWithRoot(opts.repoPath);
   const gate = isAllowedRepoPath(record.repoPath, prefixes);
@@ -728,14 +753,22 @@ export function reconcileBlockedRecordWithGithub(
   );
   const checkedAt = now.toISOString();
   if (mergeStatus.merged) {
-    return writeReleaseQueueRecord(opts.queueDir ?? defaultReleaseQueueDir(), {
-      ...record,
-      status: "landed",
-      lastError: undefined,
-      lastGithubCheckedAt: checkedAt,
-      lastGithubState: mergeStatus.state ?? "MERGED",
-      reconciledAt: checkedAt,
-    });
+    // Route through updateReleaseQueueRecord so assertReleaseQueueTransition
+    // enforces the blocked→landed transition. If the record drifted to a
+    // status that doesn't allow landed (concurrent daemon race, manual
+    // edit), the transition guard throws and we don't silently overwrite
+    // mid-flight state with landed.
+    return updateReleaseQueueRecord(
+      opts.queueDir ?? defaultReleaseQueueDir(),
+      record,
+      {
+        status: "landed",
+        lastError: undefined,
+        lastGithubCheckedAt: checkedAt,
+        lastGithubState: mergeStatus.state ?? "MERGED",
+        reconciledAt: checkedAt,
+      },
+    );
   }
   return updateReleaseQueueRecord(
     opts.queueDir ?? defaultReleaseQueueDir(),

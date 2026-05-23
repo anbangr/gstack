@@ -997,7 +997,9 @@ describe("merge subcommand wiring", () => {
     const git = (cwd: string, args: string[]) => {
       const r = spawnSync("git", args, { cwd, encoding: "utf8" });
       if (r.status !== 0) {
-        throw new Error(`git ${args.join(" ")} failed: ${r.stderr || r.stdout}`);
+        throw new Error(
+          `git ${args.join(" ")} failed: ${r.stderr || r.stdout}`,
+        );
       }
       return r.stdout.trim();
     };
@@ -1045,9 +1047,85 @@ describe("merge subcommand wiring", () => {
       expect(code).toBe(1);
       expect(output).toContain("merge branch feat/a-locked");
       expect(output).toContain("merge branch feat/z-normal");
-      expect(output).toContain("Merge summary: 0 merged, 1 deferred, 1 failed.");
+      expect(output).toContain(
+        "Merge summary: 0 merged, 1 deferred, 1 failed.",
+      );
       expect(output).toContain("deferred: feat/a-locked");
       expect(output).toContain("failed: feat/z-normal");
+    } finally {
+      console.log = origLog;
+      console.warn = origWarn;
+      console.error = origError;
+    }
+  });
+
+  it("refuses to process the next candidate if the worktree is dirty (cross-branch contamination guard)", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-merge-dirty-"));
+    const bare = path.join(tmpDir, "origin.git");
+    const repo = path.join(tmpDir, "repo");
+    const git = (cwd: string, args: string[]) => {
+      const r = spawnSync("git", args, { cwd, encoding: "utf8" });
+      if (r.status !== 0) {
+        throw new Error(
+          `git ${args.join(" ")} failed: ${r.stderr || r.stdout}`,
+        );
+      }
+      return r.stdout.trim();
+    };
+    fs.mkdirSync(bare, { recursive: true });
+    git(bare, ["init", "--bare", "--initial-branch=main"]);
+    git(tmpDir, ["clone", bare, repo]);
+    git(repo, ["config", "user.email", "test@example.com"]);
+    git(repo, ["config", "user.name", "Test User"]);
+    fs.writeFileSync(path.join(repo, "README.md"), "main\n");
+    git(repo, ["add", "README.md"]);
+    git(repo, ["commit", "-m", "initial"]);
+    git(repo, ["push", "-u", "origin", "main"]);
+    git(repo, ["remote", "set-head", "origin", "-a"]);
+    // Two normal feat/* branches.
+    for (const branch of ["feat/a-first", "feat/b-second"]) {
+      git(repo, ["checkout", "-b", branch, "main"]);
+      fs.writeFileSync(
+        path.join(repo, `${branch.replace(/[/-]/g, "_")}.txt`),
+        `${branch}\n`,
+      );
+      git(repo, ["add", "."]);
+      git(repo, ["commit", "-m", branch]);
+      git(repo, ["push", "-u", "origin", branch]);
+      git(repo, ["checkout", "main"]);
+    }
+    // Plant an UNCOMMITTED edit BEFORE invoking the sweeper. The first
+    // candidate processing will see the dirty state and refuse — without
+    // the guard, it would proceed and `git checkout feat/b-second` would
+    // carry the edit across branches.
+    fs.writeFileSync(path.join(repo, "dirty.txt"), "planted\n");
+
+    const args = parseArgs([
+      "merge",
+      "--project-root",
+      repo,
+      "--skip-clean-check",
+    ]);
+    args.maxCodexIter = 0;
+    const logs: string[] = [];
+    const origLog = console.log;
+    const origWarn = console.warn;
+    const origError = console.error;
+    console.log = (...parts: unknown[]) => logs.push(parts.join(" "));
+    console.warn = (...parts: unknown[]) => logs.push(parts.join(" "));
+    console.error = (...parts: unknown[]) => logs.push(parts.join(" "));
+    try {
+      const code = await runMergeMode(args);
+      const output = logs.join("\n");
+      expect(code).toBe(1);
+      // The dirty-state guard must fail the first candidate without
+      // ever calling git checkout — and stop the sweep.
+      expect(output).toContain("failed: feat/a-first");
+      expect(output).toContain("worktree is dirty");
+      // The second candidate must NOT have been processed. The summary
+      // should NOT show feat/b-second as merged/deferred/failed.
+      expect(output).not.toContain("merge branch feat/b-second");
+      expect(output).not.toContain("failed: feat/b-second");
     } finally {
       console.log = origLog;
       console.warn = origWarn;
@@ -4090,7 +4168,9 @@ describe("ensureFeatureBranch", () => {
   });
 
   it("quarantines malformed refs before fetching to create a feature branch", () => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-feature-quarantine-"));
+    tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "gstack-feature-quarantine-"),
+    );
     const bare = path.join(tmpDir, "origin.git");
     const repo = path.join(tmpDir, "repo");
     expect(spawnSync("git", ["init", "--bare", bare]).status).toBe(0);

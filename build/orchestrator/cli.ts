@@ -1485,9 +1485,7 @@ export function parseArgs(argv: string[]): Args {
       if (next === "CRITICAL" || next === "HIGH" || next === "MEDIUM") {
         args.investigateSeverityOverride = next;
       } else {
-        console.error(
-          "--severity-override expects CRITICAL, HIGH, or MEDIUM",
-        );
+        console.error("--severity-override expects CRITICAL, HIGH, or MEDIUM");
         process.exit(2);
       }
     } else if (a === "--no-inbox") {
@@ -10732,8 +10730,7 @@ async function main() {
       runId: args.investigateRunId,
       faultId: args.investigateFaultId,
       reportPath: args.investigateReportPath,
-      severity:
-        args.investigateSeverity ?? args.investigateSeverityOverride,
+      severity: args.investigateSeverity ?? args.investigateSeverityOverride,
       source: args.investigateSource,
       nonce: args.investigateNonce,
       noInbox: args.investigateNoInbox,
@@ -13189,6 +13186,34 @@ export async function runMergeMode(args: Args): Promise<number> {
 
     const results: MergeBranchResult[] = [];
     for (const candidate of candidates) {
+      // Cross-branch contamination guard. If the previous iteration
+      // failed mid-flight (fixer crash, ship-and-land error after a
+      // partial commit, etc.) the worktree may have uncommitted edits
+      // that `git checkout` would carry into the next candidate's
+      // branch — and `shipAndDeploy` could then commit them under the
+      // wrong PR. Before each candidate, refuse to proceed when the
+      // worktree is dirty; surface as a "failed" result with a clear
+      // reason so the operator can clean up. This is intentionally
+      // conservative: hard-reset would discard the user's WIP if they
+      // were investigating the previous failure.
+      const dirtyCheck = spawnSync(
+        "git",
+        ["-C", projectRoot, "status", "--porcelain"],
+        { encoding: "utf8" },
+      );
+      if (
+        dirtyCheck.status === 0 &&
+        (dirtyCheck.stdout || "").trim().length > 0
+      ) {
+        results.push({
+          status: "failed",
+          branch: candidate.name,
+          reason: `worktree is dirty before checkout (prior candidate left uncommitted edits) — run 'git status' at ${projectRoot} and clean up, then re-run gstack-build merge`,
+        });
+        // Stop the sweep on dirty state. Continuing would risk
+        // carrying edits across branches.
+        break;
+      }
       const result = await processMergeBranch({
         cwd: projectRoot,
         candidate,
@@ -13392,9 +13417,10 @@ function checkoutMergeBranch(
     return {
       ok: false,
       reason,
-      deferred: /already checked out|is already used by worktree|worktree/i.test(
-        reason,
-      ),
+      deferred:
+        /already checked out|is already used by worktree|worktree/i.test(
+          reason,
+        ),
     };
   }
   if (candidate.hasLocal && candidate.hasRemote) {

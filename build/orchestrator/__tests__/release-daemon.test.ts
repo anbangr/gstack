@@ -3241,4 +3241,44 @@ describe("blocked release queue reconciliation", () => {
       ),
     ).toBe(true);
   });
+
+  it("trust boundary: refuses to reconcile a record without repoIdentity", () => {
+    // Legacy records (written before repoIdentity was added) lack the
+    // canonical identity field. The reconciler must refuse them BEFORE
+    // the allowlist gate runs git in record.repoPath — otherwise an
+    // attacker who can write a malicious repoPath into a queue file
+    // could trigger git execution there.
+    const record = blockedRecord();
+    delete (record as { repoIdentity?: string }).repoIdentity;
+    const item = writeReleaseQueueRecord(queueDir4, record);
+
+    let verifyMergedCalled = false;
+    const logs: string[] = [];
+    const result = reconcileBlockedRecordWithGithub(item, {
+      queueDir: queueDir4,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      now: () => new Date("2026-05-22T00:00:00.000Z"),
+      verifyMerged: () => {
+        verifyMergedCalled = true;
+        return { merged: true, state: "MERGED" };
+      },
+      log: (m) => logs.push(m),
+    });
+
+    // verifyMerged must NEVER be called — that would mean the early
+    // refusal failed to trip and reconcile reached the GitHub probe.
+    expect(verifyMergedCalled).toBe(false);
+    // Record returned unchanged.
+    expect(result.status).toBe("blocked");
+    expect(result.reconciledAt).toBeUndefined();
+    // Warning names the PR, the missing field, and the requeue guidance.
+    expect(
+      logs.some(
+        (m) =>
+          m.includes(`PR #${item.prNumber}`) &&
+          m.includes("repoIdentity") &&
+          m.includes("requeue"),
+      ),
+    ).toBe(true);
+  });
 });
