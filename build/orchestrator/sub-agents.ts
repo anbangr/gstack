@@ -1725,6 +1725,7 @@ export async function runClaudeTask(opts: {
   reasoning?: RoleReasoning;
   gate?: boolean;
   timeoutMs?: number;
+  allowedTools?: readonly string[];
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
   const argv = buildClaudeTaskArgv(opts);
