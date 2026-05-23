@@ -1271,6 +1271,59 @@ describe("buildClaudeTaskArgv (claude role invocation shape)", () => {
     const prompt = argv[argv.indexOf("-p") + 1];
     expect(prompt).toContain("/codex review");
   });
+
+  it("emits no --allowedTools flag when allowedTools is omitted", () => {
+    const argv = buildClaudeTaskArgv({
+      inputFilePath: "/tmp/ship-in.md",
+      outputFilePath: "/tmp/ship-out.md",
+      command: "/gstack-ship",
+      model: "role-model-under-test",
+      reasoning: "high",
+    });
+    expect(argv).not.toContain("--allowedTools");
+  });
+
+  it("emits --allowedTools followed by each tool name when allowedTools is non-empty", () => {
+    const argv = buildClaudeTaskArgv({
+      inputFilePath: "/tmp/ship-in.md",
+      outputFilePath: "/tmp/ship-out.md",
+      command: "/gstack-ship",
+      model: "role-model-under-test",
+      reasoning: "high",
+      allowedTools: ["Task", "Agent"],
+    });
+    const idx = argv.indexOf("--allowedTools");
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(argv[idx + 1]).toBe("Task");
+    expect(argv[idx + 2]).toBe("Agent");
+  });
+
+  it("omits --allowedTools when allowedTools is the empty array", () => {
+    const argv = buildClaudeTaskArgv({
+      inputFilePath: "/tmp/ship-in.md",
+      outputFilePath: "/tmp/ship-out.md",
+      command: "/gstack-ship",
+      model: "role-model-under-test",
+      reasoning: "high",
+      allowedTools: [],
+    });
+    expect(argv).not.toContain("--allowedTools");
+  });
+
+  it("preserves --allowedTools position after -p prompt", () => {
+    const argv = buildClaudeTaskArgv({
+      inputFilePath: "/tmp/ship-in.md",
+      outputFilePath: "/tmp/ship-out.md",
+      command: "/gstack-ship",
+      model: "role-model-under-test",
+      reasoning: "high",
+      allowedTools: ["Task", "Agent"],
+    });
+    const pIdx = argv.indexOf("-p");
+    const allowedIdx = argv.indexOf("--allowedTools");
+    expect(pIdx).toBeGreaterThanOrEqual(0);
+    expect(allowedIdx).toBeGreaterThan(pIdx + 1);
+  });
 });
 
 describe("buildRoleTaskArgv", () => {
@@ -3668,7 +3721,9 @@ describe("spawnCaptured streaming", () => {
       const log = fs.readFileSync(logPath, "utf8");
       // Header at top.
       expect(log).toMatch(/^# command: bash/);
-      expect(log).toMatch(/^# watchdog_mode: (cpu|stream) \((auto|explicit|legacy|invalid)\)$/m);
+      expect(log).toMatch(
+        /^# watchdog_mode: (cpu|stream) \((auto|explicit|legacy|invalid)\)$/m,
+      );
       // Body contains both channels.
       expect(log).toContain("[OUT] body-line");
       expect(log).toContain("[ERR] body-err");

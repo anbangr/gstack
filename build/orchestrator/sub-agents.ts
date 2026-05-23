@@ -87,12 +87,16 @@ function geminiBin(): string {
 let _geminiAuthPromise:
   | Promise<{ ok: boolean; reason?: string; skipped?: boolean }>
   | undefined;
-let _geminiAuthCache: { ok: boolean; reason?: string; skipped?: boolean } | undefined;
+let _geminiAuthCache:
+  | { ok: boolean; reason?: string; skipped?: boolean }
+  | undefined;
 
 let _codexAuthPromise:
   | Promise<{ ok: boolean; reason?: string; skipped?: boolean }>
   | undefined;
-let _codexAuthCache: { ok: boolean; reason?: string; skipped?: boolean } | undefined;
+let _codexAuthCache:
+  | { ok: boolean; reason?: string; skipped?: boolean }
+  | undefined;
 
 function resolveBinInPath(bin: string): string {
   if (path.isAbsolute(bin)) return bin;
@@ -121,10 +125,8 @@ function probeAuthSync(
       timeout: timeoutMs,
     });
     if (result.status === 0) return { ok: true };
-    const stdout =
-      typeof result.stdout === "string" ? result.stdout : "";
-    const stderr =
-      typeof result.stderr === "string" ? result.stderr : "";
+    const stdout = typeof result.stdout === "string" ? result.stdout : "";
+    const stderr = typeof result.stderr === "string" ? result.stderr : "";
     return {
       ok: false,
       reason: stdout.trim() || stderr.trim() || `exit ${result.status}`,
@@ -252,11 +254,7 @@ export function resolveWatchdogMode(
         ? "stream"
         : undefined;
   const requested = explicit ?? legacy ?? "auto";
-  const source = explicit
-    ? "explicit"
-    : legacy
-      ? "legacy"
-      : ("auto" as const);
+  const source = explicit ? "explicit" : legacy ? "legacy" : ("auto" as const);
 
   if (requested === "stream") return { mode: "stream", source };
   if (requested === "cpu" || requested === "auto") {
@@ -1581,6 +1579,7 @@ export function buildClaudeTaskArgv(opts: {
   model?: string;
   reasoning?: RoleReasoning;
   gate?: boolean;
+  allowedTools?: readonly string[];
 }): string[] {
   const commandLine = opts.command
     ? `Run ${opts.command}.`
@@ -1600,7 +1599,14 @@ export function buildClaudeTaskArgv(opts: {
   ]
     .filter(Boolean)
     .join(" ");
-  return [...(opts.model ? ["--model", opts.model] : []), "-p", prompt];
+  return [
+    ...(opts.model ? ["--model", opts.model] : []),
+    "-p",
+    prompt,
+    ...(opts.allowedTools && opts.allowedTools.length > 0
+      ? ["--allowedTools", ...opts.allowedTools]
+      : []),
+  ];
 }
 
 /**
