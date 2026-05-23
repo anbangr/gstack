@@ -35,6 +35,9 @@ export interface ReleaseQueueRecord {
   status: ReleaseQueueStatus;
   lastError?: string;
   lastUpdatedAt?: string;
+  lastGithubCheckedAt?: string;
+  lastGithubState?: string;
+  reconciledAt?: string;
   retries?: number;
 }
 
@@ -50,7 +53,10 @@ const ALLOWED_TRANSITIONS: Record<ReleaseQueueStatus, ReleaseQueueStatus[]> = {
   landing: ["drift_repairing", "landed", "blocked", "queued"],
   drift_repairing: ["landing", "blocked", "queued"],
   landed: [],
-  blocked: ["queued", "abandoned"],
+  // blocked → landed is the reconcile path: when GitHub shows the PR is
+  // already merged, the local record skips the requeue dance and goes
+  // straight to the terminal landed state.
+  blocked: ["queued", "abandoned", "landed"],
   abandoned: [],
 };
 

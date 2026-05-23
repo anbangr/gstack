@@ -18,6 +18,7 @@ import {
   readReleaseQueueRecords,
   updateReleaseQueueRecord,
   verifyPrQueued,
+  writeReleaseQueueRecord,
   type ReleaseQueueRecord,
 } from "./release-queue";
 import { landOnly, shipOnly } from "./ship";
@@ -608,6 +609,7 @@ function isDriftFailure(text: string): boolean {
  */
 export interface PrMergeStatus {
   merged: boolean;
+  state?: string;
   /** Free-text for the queue record's lastError when not merged. */
   reason?: string;
 }
@@ -655,6 +657,11 @@ export function verifyPrMerged(
     }
     repoArg = ["--repo", match[1]];
   }
+  // Hard timeout. A hung `gh pr view` (offline, expired auth keychain
+  // prompt, DNS, rate-limit) otherwise blocks daemon discovery for all
+  // queued records — every poll cycle waits on the first stale blocked
+  // record before any queued PR is processed.
+  const VERIFY_TIMEOUT_MS = 30_000;
   const result = spawnSync(
     "gh",
     [
@@ -667,8 +674,14 @@ export function verifyPrMerged(
       "-q",
       ".state",
     ],
-    { cwd, encoding: "utf8" },
+    { cwd, encoding: "utf8", timeout: VERIFY_TIMEOUT_MS },
   );
+  if (result.signal === "SIGTERM" || result.error?.code === "ETIMEDOUT") {
+    return {
+      merged: false,
+      reason: `gh pr view timed out after ${VERIFY_TIMEOUT_MS}ms`,
+    };
+  }
   if (result.status !== 0) {
     return {
       merged: false,
@@ -676,11 +689,95 @@ export function verifyPrMerged(
     };
   }
   const state = (result.stdout || "").trim();
-  if (state === "MERGED") return { merged: true };
+  if (state === "MERGED") return { merged: true, state };
   return {
     merged: false,
+    state: state || "unknown",
     reason: `PR #${prNumber} state is ${state || "unknown"} on GitHub (sub-agent reported success but PR was not merged)`,
   };
+}
+
+const MERGED_RECONCILE_MIN_INTERVAL_MS = 10 * 60 * 1000;
+
+function shouldReconcileBlockedRecord(
+  record: ReleaseQueueRecord,
+  now: Date,
+): boolean {
+  if (record.status !== "blocked") return false;
+  if (!record.lastGithubCheckedAt) return true;
+  const last = Date.parse(record.lastGithubCheckedAt);
+  if (!Number.isFinite(last)) return true;
+  return now.getTime() - last >= MERGED_RECONCILE_MIN_INTERVAL_MS;
+}
+
+export function reconcileBlockedRecordWithGithub(
+  record: ReleaseQueueRecord,
+  opts: Pick<
+    ReleaseDaemonOptions,
+    "allowlistPrefixes" | "now" | "repoPath" | "verifyMerged" | "log"
+  > & { queueDir?: string },
+): ReleaseQueueRecord {
+  const now = opts.now?.() ?? new Date();
+  if (!shouldReconcileBlockedRecord(record, now)) return record;
+  // Trust-boundary: refuse to reconcile legacy records without
+  // repoIdentity. Without it, downstream calls (releaseQueueRecordId →
+  // canonicalRepoIdentity) spawn git in record.repoPath BEFORE the
+  // allowlist gate resolves the path. A planted record could symlink-
+  // flip between the gate check and the git spawn (the documented
+  // queued-path TOCTOU). Legacy blocked records must be requeued
+  // through the normal path to gain a repoIdentity before they're
+  // reconcile-eligible.
+  if (!record.repoIdentity) {
+    opts.log?.(
+      `warning: skipping blocked PR #${record.prNumber} reconciliation: record lacks repoIdentity (legacy record — requeue manually)`,
+    );
+    return record;
+  }
+  const prefixes =
+    opts.allowlistPrefixes ?? buildAllowlistWithRoot(opts.repoPath);
+  const gate = isAllowedRepoPath(record.repoPath, prefixes);
+  if (!gate.ok) {
+    // Don't leak the rejected repoPath into the daemon log on every poll
+    // cycle. The allowlist mechanism is the same one already documented
+    // via GSTACK_DAEMON_REPO_ALLOWLIST — operators know where to look.
+    opts.log?.(
+      `warning: skipping blocked PR #${record.prNumber} reconciliation: repo not in daemon allowlist`,
+    );
+    return record;
+  }
+  const verifyMerged = opts.verifyMerged ?? verifyPrMerged;
+  const mergeStatus = verifyMerged(
+    record.prNumber,
+    record.repoIdentity,
+    gate.resolved,
+  );
+  const checkedAt = now.toISOString();
+  if (mergeStatus.merged) {
+    // Route through updateReleaseQueueRecord so assertReleaseQueueTransition
+    // enforces the blocked→landed transition. If the record drifted to a
+    // status that doesn't allow landed (concurrent daemon race, manual
+    // edit), the transition guard throws and we don't silently overwrite
+    // mid-flight state with landed.
+    return updateReleaseQueueRecord(
+      opts.queueDir ?? defaultReleaseQueueDir(),
+      record,
+      {
+        status: "landed",
+        lastError: undefined,
+        lastGithubCheckedAt: checkedAt,
+        lastGithubState: mergeStatus.state ?? "MERGED",
+        reconciledAt: checkedAt,
+      },
+    );
+  }
+  return updateReleaseQueueRecord(
+    opts.queueDir ?? defaultReleaseQueueDir(),
+    record,
+    {
+      lastGithubCheckedAt: checkedAt,
+      lastGithubState: mergeStatus.state ?? "unknown",
+    },
+  );
 }
 
 function scratchWorktreePath(record: ReleaseQueueRecord): string {
@@ -762,13 +859,7 @@ function checkoutScratchWorktree(
     fetchRemoteBranch(resolvedRepoPath);
     const added = spawnSync(
       "git",
-      [
-        "worktree",
-        "add",
-        "--detach",
-        scratch,
-        remoteTrackingRef,
-      ],
+      ["worktree", "add", "--detach", scratch, remoteTrackingRef],
       { cwd: resolvedRepoPath, encoding: "utf8" },
     );
     if (added.status !== 0) {
@@ -1156,7 +1247,9 @@ function discoverQueuedRecords(
   queueDir: string,
   opts: ReleaseDaemonOptions,
 ): DiscoveryResult {
-  const local = readReleaseQueueRecords(queueDir);
+  const local = readReleaseQueueRecords(queueDir).map((record) =>
+    reconcileBlockedRecordWithGithub(record, { ...opts, queueDir }),
+  );
   const byId = new Map<string, ReleaseQueueRecord>();
   let preBlocked = 0;
   // Codex P1 (round 11) fix: when no test seam bypasses the

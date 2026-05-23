@@ -128,23 +128,23 @@ pending → running → phases_done → feature_review_pending → feature_revie
 
 ### 2.1 FeatureStatus exhaustive list
 
-| Status                   | Set by                             | Meaning                                                                              |
-| ------------------------ | ---------------------------------- | ------------------------------------------------------------------------------------ |
-| `pending`                | initial                            | Feature hasn't been touched.                                                         |
-| `running`                | main loop on first phase action    | At least one phase is in flight or done.                                             |
-| `phases_done`            | main loop after last phase commits | All phases committed; feature review hasn't started.                                 |
-| `feature_review_pending` | main loop                          | Feature review queued.                                                               |
-| `feature_review_running` | feature review dispatch            | Feature reviewer in flight.                                                          |
-| `feature_redo_pending`   | FEATURE_REDO verdict               | Reviewer asked to redo named phases; reset queued.                                   |
-| `feature_blocked`        | FEATURE_BLOCKED verdict            | Reviewer blocked the feature; manual recovery needed.                                |
-| `paused`                 | hygiene / manual intervention      | Operator halted progress; feature owns this state.                                   |
-| `failed`                 | non-recoverable error path         | Feature itself failed (vs a single phase). Treated as no-opinion by projection (§4). |
-| `shipping`               | main loop after review PASS        | /ship workflow in progress.                                                          |
-| `release_queued`         | main loop after ship               | PR queued for release daemon.                                                        |
-| `landed`                 | release daemon                     | PR merged, deploy not yet verified.                                                  |
-| `origin_verifying`       | release daemon                     | Post-deploy canary running.                                                          |
-| `origin_verified`        | release daemon                     | Canary passed.                                                                       |
-| `committed`              | release daemon final               | Feature fully shipped and verified.                                                  |
+| Status                   | Set by                             | Meaning                                                                                                          |
+| ------------------------ | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `pending`                | initial                            | Feature hasn't been touched.                                                                                     |
+| `running`                | main loop on first phase action    | At least one phase is in flight or done.                                                                         |
+| `phases_done`            | main loop after last phase commits | All phases committed; feature review hasn't started.                                                             |
+| `feature_review_pending` | main loop                          | Feature review queued.                                                                                           |
+| `feature_review_running` | feature review dispatch            | Feature reviewer in flight.                                                                                      |
+| `feature_redo_pending`   | FEATURE_REDO verdict               | Reviewer asked to redo named phases; reset queued.                                                               |
+| `feature_blocked`        | FEATURE_BLOCKED verdict            | Reviewer blocked the feature; manual recovery needed.                                                            |
+| `paused`                 | hygiene / manual intervention      | Operator halted progress; feature owns this state.                                                               |
+| `failed`                 | non-recoverable error path         | Feature itself failed (vs a single phase). Treated as no-opinion by projection (§4).                             |
+| `shipping`               | main loop after review PASS        | /ship workflow in progress.                                                                                      |
+| `release_queued`         | main loop after ship               | PR queued for release daemon.                                                                                    |
+| `landed`                 | release daemon                     | PR merged, deploy not yet verified. Also reachable from `blocked` via the GitHub-probe reconcile path (see §10). |
+| `origin_verifying`       | release daemon                     | Post-deploy canary running.                                                                                      |
+| `origin_verified`        | release daemon                     | Canary passed.                                                                                                   |
+| `committed`              | release daemon final               | Feature fully shipped and verified.                                                                              |
 
 ---
 
@@ -320,7 +320,7 @@ loop then re-issued `FEATURE_NEEDS_PHASES` until
 `--feature-review-max-iter` was hit. See CHANGELOG v1.40.2.0.
 
 **Asymmetry with feature drops:** the helper fails closed on dropped
-*phases* (data loss is severe) but silently empties
+_phases_ (data loss is severe) but silently empties
 `featureState.phaseIndexes` when the matching `Feature` is missing
 from `reparsedFeatures`. A future PR may tighten this when the
 `FEATURE_REDO` path lands.
@@ -329,12 +329,11 @@ from `reparsedFeatures`. A future PR may tighten this when the
 `FEATURE_NEEDS_PHASES` prompt now lists every phase number already in
 use under the feature inline (`K MUST NOT collide with phase numbers
 already in use under this feature: \`1\`, \`1.review-1\`, ...`). Without
-this feedback loop, the reviewer model picked `K` blind across review
-cycles, occasionally re-emitting an existing `Phase N.review-K` heading
+this feedback loop, the reviewer model picked `K`blind across review
+cycles, occasionally re-emitting an existing`Phase N.review-K`heading
 that the v1.40.3.0 reconciler dedup would then reject. Better to
 prevent the collision at prompt-build time than to recover from it at
-the reconciler. See `buildPhaseNumberHistory` in
-`build/orchestrator/feature-review.ts`.
+the reconciler. See`buildPhaseNumberHistory`in`build/orchestrator/feature-review.ts`.
 
 ---
 
@@ -462,7 +461,73 @@ supply it. Surfaces as `--commit-dirty` / `--force-dirty` CLI flags.
 
 ---
 
-## 9. Glossary of source pointers
+## 9. Release-queue reconcile contract (v1.44.1.0)
+
+The release daemon owns a second healing path on top of the canonical
+`release_queued → landed` transition: `blocked → landed` via GitHub probe.
+A `blocked` record means the local `gstack-build land-and-deploy` exited
+non-zero but GitHub may still have completed the merge (CI flake, post-merge
+hook failure, race). `reconcileBlockedRecordWithGithub` (`release-daemon.ts`)
+runs before every queue read and probes `gh pr view <prNumber>`; if GitHub
+says `MERGED`, the record moves to `landed`.
+
+Invariants enforced by the reconcile path:
+
+- **Identity-first gate.** `reconcileBlockedRecordWithGithub` refuses any
+  record without `repoIdentity` BEFORE consulting the allowlist. The
+  allowlist gate calls `canonicalRepoIdentity`, which spawns git in
+  `record.repoPath` — a record-supplied path. Refusing identity-less
+  records up-front prevents a crafted queue file from triggering git
+  execution in its claimed path.
+
+- **10-min throttle (`MERGED_RECONCILE_MIN_INTERVAL_MS`).** Records with
+  a `lastGithubCheckedAt` newer than 10 minutes ago are skipped without
+  a `gh pr view` call. Unparseable timestamps (`Date.parse` returns NaN)
+  are treated as "never checked" and proceed, so a corrupted record can't
+  be quietly silenced forever.
+
+- **30s probe timeout (`VERIFY_TIMEOUT_MS`).** `verifyPrMerged` spawns
+  `gh pr view` with a 30-second timeout. SIGTERM and ETIMEDOUT are
+  mapped to a structured "GitHub probe timed out" reason. Without this
+  timeout, a wedged `gh` subprocess would stall the entire daemon loop.
+
+- **Transition-guarded write.** When GitHub reports `MERGED`, the
+  reconcile path writes through `updateReleaseQueueRecord`, not the
+  direct `writeReleaseQueueRecord`. `ALLOWED_TRANSITIONS`
+  (`release-queue.ts`) permits `blocked → landed` so the guard accepts
+  this heal path; other illegal transitions still error.
+
+Surfaces in `release-daemon.test.ts` "blocked release queue reconciliation"
+describe block — throttle / allowlist / trust-boundary / merge-state tests
+pin all four invariants.
+
+---
+
+## 10. Merge-sweep dirty-tree guard (v1.44.1.0)
+
+`runMergeMode` in `cli.ts` walks a list of merge candidates and processes
+each one in the shared `projectRoot` worktree. A candidate whose
+auto-fixer raised an exception mid-edit can leave uncommitted changes
+behind. Before v1.44.1.0 the next candidate would silently inherit those
+edits and carry them across branches at checkout time — cross-branch
+contamination with no error surface.
+
+The sweep now runs `git status --porcelain` between every two
+candidates. A non-empty output produces a `failed` result for the
+upcoming candidate with reason `worktree is dirty before checkout
+(prior candidate left uncommitted edits) — run 'git status' at
+<projectRoot> and clean up, then re-run gstack-build merge`, and the
+sweep stops at that point. The exit code reflects the failure, but the
+operator gets a clear pointer to the dirty path instead of debugging a
+branch with unexpected diff a day later.
+
+This is the merge-sweep equivalent of the §8 dirty-tree guard on
+`markPhaseCommittedAfterManualRecovery`: in both cases, a dirty tree
+indicates the operator must intervene before the orchestrator continues.
+
+---
+
+## 11. Glossary of source pointers
 
 For each contract above, the canonical implementation lives at:
 

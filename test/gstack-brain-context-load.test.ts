@@ -242,7 +242,10 @@ describe("gstack-brain-context-load — graceful gbrain absence", () => {
     writeFakeGbrain(binDir);
 
     try {
-      const r = runScript(["--repo", "test-repo", "--explain"], prependPath(binDir));
+      const r = runScript(["--repo", "test-repo", "--explain"], {
+        ...prependPath(binDir),
+        GSTACK_BRAIN_CONTEXT_TIMEOUT_MS: "5000",
+      });
       expect(r.exitCode).toBe(0);
       expect(r.stderr).toContain("OK");
       expect(r.stderr).not.toContain("gbrain CLI missing");

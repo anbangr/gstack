@@ -10,6 +10,7 @@ import {
   isAllowedFeatureBranch,
   isAllowedRepoPath,
   processReleaseQueueRecord,
+  reconcileBlockedRecordWithGithub,
   reviveActiveRecordsForSignal,
   runReleaseDaemon,
   verifyPrMerged,
@@ -2178,20 +2179,15 @@ describe("verifyPrMerged + post-land GitHub ground-truth (Codex-15 / false-posit
   });
 });
 
-
 describe("processReleaseQueueRecord worktree branch correction", () => {
   let queueDir: string;
   let repo: string;
   let worktree: string;
 
   beforeEach(() => {
-    queueDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), "gstack-rd-wt-branch-"),
-    );
+    queueDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-wt-branch-"));
     repo = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-wt-repo-"));
-    worktree = fs.mkdtempSync(
-      path.join(os.tmpdir(), "gstack-rd-wt-worktree-"),
-    );
+    worktree = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-wt-worktree-"));
     fs.mkdirSync(path.join(repo, ".git"));
     fs.mkdirSync(path.join(worktree, ".git"));
     _resetReleaseDaemonForTests();
@@ -2648,9 +2644,7 @@ describe("processReleaseQueueRecord landOnly argument propagation", () => {
   let repo: string;
 
   beforeEach(() => {
-    queueDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), "gstack-rd-propagate-"),
-    );
+    queueDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-propagate-"));
     repo = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-propagate-repo-"));
     fs.mkdirSync(path.join(repo, ".git"));
     _resetReleaseDaemonForTests();
@@ -2826,9 +2820,7 @@ describe("processReleaseQueueRecord PR already merged edge cases", () => {
   let repo: string;
 
   beforeEach(() => {
-    queueDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), "gstack-rd-merged-edge-"),
-    );
+    queueDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-merged-edge-"));
     repo = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-merged-repo-"));
     fs.mkdirSync(path.join(repo, ".git"));
     _resetReleaseDaemonForTests();
@@ -3014,5 +3006,279 @@ describe("processReleaseQueueRecord PR already merged edge cases", () => {
     expect(result.status).toBe("blocked");
     expect(result.lastError).toContain("GitHub disagrees");
     expect(result.lastError).toContain("PR #81 state is OPEN");
+  });
+});
+
+describe("blocked release queue reconciliation", () => {
+  let queueDir4: string;
+  let repo: string;
+
+  beforeEach(() => {
+    queueDir4 = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-reconcile-"));
+    repo = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-rd-reconcile-repo-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    _resetReleaseDaemonForTests();
+  });
+
+  afterEach(() => {
+    _resetReleaseDaemonForTests();
+    fs.rmSync(queueDir4, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  function blockedRecord(): ReleaseQueueRecord {
+    return {
+      runId: "reconcile-run",
+      repoPath: repo,
+      repoIdentity: "github.com/acme/reconcile",
+      baseBranch: "main",
+      featureBranch: "feat/reconcile",
+      prNumber: 1001,
+      version: "1.0.0.0",
+      livingPlanPath: "/plan",
+      worktreePath: repo,
+      queuedAt: "2026-05-09T00:00:00.000Z",
+      status: "blocked",
+      lastError:
+        "land-and-deploy reported success but GitHub disagrees: PR #1001 state is OPEN",
+    };
+  }
+
+  it("marks a stale blocked record landed when GitHub now says MERGED", () => {
+    const item = writeReleaseQueueRecord(queueDir4, blockedRecord());
+    const result = reconcileBlockedRecordWithGithub(item, {
+      queueDir: queueDir4,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      now: () => new Date("2026-05-22T00:00:00.000Z"),
+      verifyMerged: () => ({ merged: true, state: "MERGED" }),
+    });
+
+    expect(result.status).toBe("landed");
+    expect(result.lastError).toBeUndefined();
+    expect(result.reconciledAt).toBe("2026-05-22T00:00:00.000Z");
+    expect(result.lastGithubState).toBe("MERGED");
+    expect(readReleaseQueueRecords(queueDir4)[0].status).toBe("landed");
+  });
+
+  it("keeps a blocked record blocked when GitHub still says OPEN", () => {
+    const item = writeReleaseQueueRecord(queueDir4, blockedRecord());
+    const result = reconcileBlockedRecordWithGithub(item, {
+      queueDir: queueDir4,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      now: () => new Date("2026-05-22T00:00:00.000Z"),
+      verifyMerged: () => ({
+        merged: false,
+        state: "OPEN",
+        reason: "PR #1001 state is OPEN",
+      }),
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.lastError).toContain("GitHub disagrees");
+    expect(result.lastGithubCheckedAt).toBe("2026-05-22T00:00:00.000Z");
+    expect(result.lastGithubState).toBe("OPEN");
+  });
+
+  it("does not dispatch reconciled landed records from the daemon loop", async () => {
+    writeReleaseQueueRecord(queueDir4, blockedRecord());
+    const code = await runReleaseDaemon({
+      queueDir: queueDir4,
+      once: true,
+      roles: DEFAULT_ROLE_CONFIGS,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      verifyMerged: () => ({ merged: true, state: "MERGED" }),
+      processor: async () => {
+        throw new Error("processor should not receive reconciled records");
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(readReleaseQueueRecords(queueDir4)[0].status).toBe("landed");
+  });
+
+  // --- Throttle tests (gaps 1-3) ---
+
+  it("throttle: skips reconcile when lastGithubCheckedAt is 5 minutes ago (too recent)", () => {
+    // MERGED_RECONCILE_MIN_INTERVAL_MS = 10 minutes. A check 5 minutes ago
+    // is too recent — reconcile must be skipped (no verifyMerged call, no
+    // status change, record returned unchanged).
+    const now = new Date("2026-05-22T12:00:00.000Z");
+    const fiveMinutesAgo = new Date(
+      now.getTime() - 5 * 60 * 1000,
+    ).toISOString();
+    const item = writeReleaseQueueRecord(queueDir4, {
+      ...blockedRecord(),
+      runId: "throttle-recent",
+      lastGithubCheckedAt: fiveMinutesAgo,
+    });
+
+    let verifyMergedCalled = false;
+    const result = reconcileBlockedRecordWithGithub(item, {
+      queueDir: queueDir4,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      now: () => now,
+      verifyMerged: () => {
+        verifyMergedCalled = true;
+        return { merged: true, state: "MERGED" };
+      },
+    });
+
+    // No GitHub call should have been made.
+    expect(verifyMergedCalled).toBe(false);
+    // Record returned unchanged — status still blocked, no reconciledAt.
+    expect(result.status).toBe("blocked");
+    expect(result.reconciledAt).toBeUndefined();
+    // On-disk record also unchanged.
+    const onDisk = readReleaseQueueRecords(queueDir4).find(
+      (r) => r.runId === "throttle-recent",
+    );
+    expect(onDisk?.status).toBe("blocked");
+    expect(onDisk?.reconciledAt).toBeUndefined();
+  });
+
+  it("throttle: allows reconcile when lastGithubCheckedAt is 15 minutes ago (stale)", () => {
+    // 15 minutes > MERGED_RECONCILE_MIN_INTERVAL_MS (10 min). Reconcile
+    // should proceed and update lastGithubCheckedAt.
+    const now = new Date("2026-05-22T12:00:00.000Z");
+    const fifteenMinutesAgo = new Date(
+      now.getTime() - 15 * 60 * 1000,
+    ).toISOString();
+    const item = writeReleaseQueueRecord(queueDir4, {
+      ...blockedRecord(),
+      runId: "throttle-stale",
+      lastGithubCheckedAt: fifteenMinutesAgo,
+    });
+
+    let verifyMergedCalled = false;
+    const result = reconcileBlockedRecordWithGithub(item, {
+      queueDir: queueDir4,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      now: () => now,
+      verifyMerged: () => {
+        verifyMergedCalled = true;
+        return { merged: false, state: "OPEN", reason: "still OPEN" };
+      },
+    });
+
+    // GitHub WAS called because the check was stale.
+    expect(verifyMergedCalled).toBe(true);
+    // lastGithubCheckedAt updated to now.
+    expect(result.lastGithubCheckedAt).toBe(now.toISOString());
+  });
+
+  it("throttle: allows reconcile when lastGithubCheckedAt is a garbage string (defensive)", () => {
+    // An unparseable date string should be treated as "never checked" —
+    // Date.parse returns NaN, !Number.isFinite(NaN) is true, so reconcile
+    // should proceed rather than silently skipping the record forever.
+    const now = new Date("2026-05-22T12:00:00.000Z");
+    const item = writeReleaseQueueRecord(queueDir4, {
+      ...blockedRecord(),
+      runId: "throttle-garbage",
+      lastGithubCheckedAt: "not-a-date-!!!", // garbage
+    });
+
+    let verifyMergedCalled = false;
+    const result = reconcileBlockedRecordWithGithub(item, {
+      queueDir: queueDir4,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      now: () => now,
+      verifyMerged: () => {
+        verifyMergedCalled = true;
+        return { merged: false, state: "OPEN", reason: "still OPEN" };
+      },
+    });
+
+    // Garbage date → treat as stale → GitHub call proceeds.
+    expect(verifyMergedCalled).toBe(true);
+    // Timestamp updated to now.
+    expect(result.lastGithubCheckedAt).toBe(now.toISOString());
+  });
+
+  // --- Allowlist rejection test (gap 4) ---
+
+  it("allowlist gate: skips reconcile and logs warning when repoPath is outside allowlist", () => {
+    // A blocked record whose repoPath is NOT in allowlistPrefixes must
+    // produce a warning log and be returned unchanged — no verifyMerged
+    // call, no status mutation, no reconciledAt written.
+    const OUTSIDE_ALLOWLIST = "/tmp/outside-allowlist-" + Date.now();
+    const item: ReleaseQueueRecord = {
+      ...blockedRecord(),
+      runId: "allowlist-rejected",
+      // Use a path that won't pass the allowlist gate. We don't create
+      // this dir, so isAllowedRepoPath rejects it with "does not exist".
+      repoPath: OUTSIDE_ALLOWLIST,
+    };
+
+    const logs: string[] = [];
+    let verifyMergedCalled = false;
+    const result = reconcileBlockedRecordWithGithub(item, {
+      // No queueDir provided — defaultReleaseQueueDir() won't be used
+      // because the gate fires before any disk write.
+      queueDir: queueDir4,
+      // Only allow tmpdir-under paths; OUTSIDE_ALLOWLIST doesn't exist
+      // and also points to a non-standard location.
+      allowlistPrefixes: ["/Users/safe-only/"],
+      now: () => new Date("2026-05-22T00:00:00.000Z"),
+      log: (msg) => logs.push(msg),
+      verifyMerged: () => {
+        verifyMergedCalled = true;
+        return { merged: true, state: "MERGED" };
+      },
+    });
+
+    // Gate fired: no GitHub call.
+    expect(verifyMergedCalled).toBe(false);
+    // Record returned unchanged — status still blocked, no reconciledAt.
+    expect(result.status).toBe("blocked");
+    expect(result.reconciledAt).toBeUndefined();
+    // A warning was logged naming the PR and the gate reason.
+    expect(
+      logs.some(
+        (m) =>
+          m.includes("warning") &&
+          m.includes(`PR #${item.prNumber}`) &&
+          m.includes("reconciliation"),
+      ),
+    ).toBe(true);
+  });
+
+  it("trust boundary: refuses to reconcile a record without repoIdentity", () => {
+    // Legacy records (written before repoIdentity was added) lack the
+    // canonical identity field. The reconciler must refuse them BEFORE
+    // the allowlist gate runs git in record.repoPath — otherwise an
+    // attacker who can write a malicious repoPath into a queue file
+    // could trigger git execution there.
+    const record = blockedRecord();
+    delete (record as { repoIdentity?: string }).repoIdentity;
+    const item = writeReleaseQueueRecord(queueDir4, record);
+
+    let verifyMergedCalled = false;
+    const logs: string[] = [];
+    const result = reconcileBlockedRecordWithGithub(item, {
+      queueDir: queueDir4,
+      allowlistPrefixes: [fs.realpathSync(os.tmpdir()) + path.sep],
+      now: () => new Date("2026-05-22T00:00:00.000Z"),
+      verifyMerged: () => {
+        verifyMergedCalled = true;
+        return { merged: true, state: "MERGED" };
+      },
+      log: (m) => logs.push(m),
+    });
+
+    // verifyMerged must NEVER be called — that would mean the early
+    // refusal failed to trip and reconcile reached the GitHub probe.
+    expect(verifyMergedCalled).toBe(false);
+    // Record returned unchanged.
+    expect(result.status).toBe("blocked");
+    expect(result.reconciledAt).toBeUndefined();
+    // Warning names the PR, the missing field, and the requeue guidance.
+    expect(
+      logs.some(
+        (m) =>
+          m.includes(`PR #${item.prNumber}`) &&
+          m.includes("repoIdentity") &&
+          m.includes("requeue"),
+      ),
+    ).toBe(true);
   });
 });

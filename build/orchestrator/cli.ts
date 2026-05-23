@@ -140,6 +140,7 @@ import { runPlanReview, SYNTH_REVISION_PROMPT } from "./plan-reviewer";
 import { runPlanReviewLoop } from "./plan-review-loop";
 import { shipAndDeploy, shipOnly } from "./ship";
 import {
+  reconcileBlockedRecordWithGithub,
   runReleaseDaemon,
   retryReleaseQueueRecord,
   isAllowedFeatureBranch,
@@ -1484,9 +1485,7 @@ export function parseArgs(argv: string[]): Args {
       if (next === "CRITICAL" || next === "HIGH" || next === "MEDIUM") {
         args.investigateSeverityOverride = next;
       } else {
-        console.error(
-          "--severity-override expects CRITICAL, HIGH, or MEDIUM",
-        );
+        console.error("--severity-override expects CRITICAL, HIGH, or MEDIUM");
         process.exit(2);
       }
     } else if (a === "--no-inbox") {
@@ -10731,8 +10730,7 @@ async function main() {
       runId: args.investigateRunId,
       faultId: args.investigateFaultId,
       reportPath: args.investigateReportPath,
-      severity:
-        args.investigateSeverity ?? args.investigateSeverityOverride,
+      severity: args.investigateSeverity ?? args.investigateSeverityOverride,
       source: args.investigateSource,
       nonce: args.investigateNonce,
       noInbox: args.investigateNoInbox,
@@ -12999,6 +12997,22 @@ export function chooseMergePath(
   return openPRNumber !== null ? "land-only" : "ship-and-deploy";
 }
 
+type MergeBranchStatus = "merged" | "failed" | "deferred";
+
+interface MergeBranchResult {
+  branch: string;
+  status: MergeBranchStatus;
+  reason?: string;
+}
+
+function mergeBranchResult(
+  branch: string,
+  status: MergeBranchStatus,
+  reason?: string,
+): MergeBranchResult {
+  return { branch, status, ...(reason ? { reason } : {}) };
+}
+
 export function detectRemoteBaseRef(cwd: string): string {
   const originHead = spawnSync(
     "git",
@@ -13103,7 +13117,7 @@ function resolveMergeProjectRoot(args: Args): string {
   return currentRoot;
 }
 
-async function runMergeMode(args: Args): Promise<number> {
+export async function runMergeMode(args: Args): Promise<number> {
   let projectRoot: string;
   try {
     projectRoot = validateProjectRootSelection(
@@ -13170,8 +13184,37 @@ async function runMergeMode(args: Args): Promise<number> {
       return 0;
     }
 
+    const results: MergeBranchResult[] = [];
     for (const candidate of candidates) {
-      const ok = await processMergeBranch({
+      // Cross-branch contamination guard. If the previous iteration
+      // failed mid-flight (fixer crash, ship-and-land error after a
+      // partial commit, etc.) the worktree may have uncommitted edits
+      // that `git checkout` would carry into the next candidate's
+      // branch — and `shipAndDeploy` could then commit them under the
+      // wrong PR. Before each candidate, refuse to proceed when the
+      // worktree is dirty; surface as a "failed" result with a clear
+      // reason so the operator can clean up. This is intentionally
+      // conservative: hard-reset would discard the user's WIP if they
+      // were investigating the previous failure.
+      const dirtyCheck = spawnSync(
+        "git",
+        ["-C", projectRoot, "status", "--porcelain"],
+        { encoding: "utf8" },
+      );
+      if (
+        dirtyCheck.status === 0 &&
+        (dirtyCheck.stdout || "").trim().length > 0
+      ) {
+        results.push({
+          status: "failed",
+          branch: candidate.name,
+          reason: `worktree is dirty before checkout (prior candidate left uncommitted edits) — run 'git status' at ${projectRoot} and clean up, then re-run gstack-build merge`,
+        });
+        // Stop the sweep on dirty state. Continuing would risk
+        // carrying edits across branches.
+        break;
+      }
+      const result = await processMergeBranch({
         cwd: projectRoot,
         candidate,
         slug,
@@ -13180,7 +13223,19 @@ async function runMergeMode(args: Args): Promise<number> {
         dryRun: false,
         allowSubmoduleRecovery: args.allowSubmoduleRecovery,
       });
-      if (!ok) return 1;
+      results.push(result);
+    }
+
+    const merged = results.filter((r) => r.status === "merged");
+    const deferred = results.filter((r) => r.status === "deferred");
+    const failed = results.filter((r) => r.status === "failed");
+    console.log(
+      `Merge summary: ${merged.length} merged, ${deferred.length} deferred, ${failed.length} failed.`,
+    );
+    for (const result of [...deferred, ...failed]) {
+      console.log(
+        `  ${result.status}: ${result.branch}${result.reason ? ` — ${result.reason}` : ""}`,
+      );
     }
 
     const remaining = findMergeCandidateBranches(projectRoot, startingBranch, {
@@ -13196,6 +13251,7 @@ async function runMergeMode(args: Args): Promise<number> {
       );
       return 1;
     }
+    if (deferred.length > 0 || failed.length > 0) return 1;
     console.log("All unmerged feat/* branches have been processed.");
     return 0;
   } finally {
@@ -13220,10 +13276,17 @@ async function processMergeBranch(args: {
   maxReviewIterations: number;
   dryRun: boolean;
   allowSubmoduleRecovery: string[];
-}): Promise<boolean> {
+}): Promise<MergeBranchResult> {
   const branch = args.candidate.name;
   console.log(`\n▶ merge branch ${branch}`);
-  if (!checkoutMergeBranch(args.cwd, args.candidate)) return false;
+  const checkout = checkoutMergeBranch(args.cwd, args.candidate);
+  if (!checkout.ok) {
+    return mergeBranchResult(
+      branch,
+      checkout.deferred ? "deferred" : "failed",
+      checkout.reason,
+    );
+  }
 
   const branchSlug = branch.replace(/[^a-z0-9-]/gi, "-").toLowerCase();
   const openPRNumber = findOpenPRForBranch(args.cwd, branch);
@@ -13252,10 +13315,11 @@ async function processMergeBranch(args: {
           timeout: 60_000,
         });
         if (pushR.status !== 0) {
+          const reason = `git push failed: ${(pushR.stderr || pushR.stdout || "").trim()}`;
           console.error(
             `  ✗ git push failed for ${branch}: ${pushR.stderr || pushR.stdout}`,
           );
-          return false;
+          return mergeBranchResult(branch, "failed", reason);
         }
         // Gate `branch` against the same safe-ref grammar the release-daemon
         // uses (release-daemon.ts:isAllowedFeatureBranch) before injecting it
@@ -13294,10 +13358,14 @@ async function processMergeBranch(args: {
         console.error(
           `  ✗ ${deployLabel} failed for ${branch} (exit ${result.exitCode})`,
         );
-        return false;
+        return mergeBranchResult(
+          branch,
+          "failed",
+          `${deployLabel} failed (exit ${result.exitCode}, timed_out=${result.timedOut})`,
+        );
       }
       cleanupLocalMergedBranch(args.cwd, branch);
-      return true;
+      return mergeBranchResult(branch, "merged");
     }
 
     console.warn(
@@ -13312,19 +13380,25 @@ async function processMergeBranch(args: {
       reviewReportPath: lastReviewReportPath,
       allowSubmoduleRecovery: args.allowSubmoduleRecovery,
     });
-    if (!fixed) return false;
+    if (!fixed) {
+      return mergeBranchResult(branch, "failed", "merge fixer failed");
+    }
   }
 
   console.error(
     `  ✗ review did not pass for ${branch} after ${args.maxReviewIterations} iterations`,
   );
-  return false;
+  return mergeBranchResult(
+    branch,
+    "failed",
+    `review did not pass after ${args.maxReviewIterations} iterations`,
+  );
 }
 
 function checkoutMergeBranch(
   cwd: string,
   candidate: MergeCandidateBranch,
-): boolean {
+): { ok: true } | { ok: false; reason: string; deferred: boolean } {
   const branch = candidate.name;
   const co = candidate.hasRemote
     ? spawnSync(
@@ -13339,7 +13413,15 @@ function checkoutMergeBranch(
     console.error(
       `  ✗ checkout failed for ${branch}: ${co.stderr || co.stdout}`,
     );
-    return false;
+    const reason = (co.stderr || co.stdout || "checkout failed").trim();
+    return {
+      ok: false,
+      reason,
+      deferred:
+        /already checked out|is already used by worktree|worktree/i.test(
+          reason,
+        ),
+    };
   }
   if (candidate.hasLocal && candidate.hasRemote) {
     const ff = spawnSync("git", ["merge", "--ff-only", `origin/${branch}`], {
@@ -13350,10 +13432,14 @@ function checkoutMergeBranch(
       console.error(
         `  ✗ could not fast-forward ${branch} from origin/${branch}: ${ff.stderr || ff.stdout}`,
       );
-      return false;
+      return {
+        ok: false,
+        reason: (ff.stderr || ff.stdout || "fast-forward failed").trim(),
+        deferred: false,
+      };
     }
   }
-  return true;
+  return { ok: true };
 }
 
 async function runMergeReview(args: {
