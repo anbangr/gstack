@@ -2,13 +2,34 @@
 
 ## [1.44.1.0] - 2026-05-23
 
-## **Merge sweeper keeps moving past worktree-locked branches, and the release daemon stops treating already-landed PRs as blocked work.**
+**Merge sweeper keeps moving past worktree-locked branches, and the release daemon stops treating already-landed PRs as blocked work.**
 
-## **Two stuck-state fixes that surfaced as `gstack-build merge` halting on the first locked branch and the release queue showing PRs as blocked long after they merged on GitHub.**
+**Two stuck-state fixes plus four adversarial-review hardenings on the same reconcile + merge paths.**
 
 `gstack-build merge` previously halted on the first branch it couldn't take a lock on, even when later candidates in the sweep were ready to review and land. After this fix the sweeper defers the locked branch, keeps walking the queue, and emits a merged/deferred/failed summary at the end. The exit code still goes non-zero when anything is unresolved, so CI doesn't silently pass on a stuck branch, but the run actually makes progress instead of bailing at branch one.
 
 The release daemon now reconciles `blocked` queue records against GitHub before reading queue state for status output or daemon candidate selection. If GitHub says the PR is already merged, the local record moves to `landed` immediately. This stops the case where you fix a CI flake, the PR lands, and the queue keeps reporting it as blocked work for hours because nothing reconciled the state.
+
+Adversarial review against the new code paths turned up four findings that all shipped fixed in the same release: a cross-branch contamination window in the merge sweep, a missing trust-boundary check before the allowlist gate ran git in record-supplied paths, a wedge risk on slow `gh pr view` calls, and a guard bypass on the landed-write path.
+
+### The numbers that matter
+
+Source: 373 free tests across the cli + release-daemon + release-queue suites (`bun test build/orchestrator/__tests__/cli.test.ts build/orchestrator/__tests__/release-daemon.test.ts build/orchestrator/__tests__/release-queue.test.ts`), plus the test files added in this release.
+
+| Behavior                                    | Before                                                  | After                                                                                      |
+| ------------------------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `merge` sweep with one worktree-locked      | halt at branch one                                      | defer locked, keep sweeping, summary at end                                                |
+| Stuck `blocked` queue records               | manual cleanup forever                                  | auto-reconciled against GitHub, 10-min throttle between probes                             |
+| `gh pr view` wedge risk in daemon           | unbounded — wedges the loop                             | 30s timeout, structured "GitHub probe timed out" reason                                    |
+| Legacy queue records lacking `repoIdentity` | reached allowlist gate, ran git in record-supplied path | refused before any git spawn, warning names PR + requeue guidance                          |
+| Landed-write path                           | direct write bypassed transition guard                  | routed through `updateReleaseQueueRecord` with `blocked → landed` in `ALLOWED_TRANSITIONS` |
+| Merge sweep after failed candidate          | next candidate inherited dirty edits silently           | fail-fast with "worktree is dirty before checkout" reason                                  |
+
+The trust-boundary fix is the largest correctness gain: a malicious or corrupted queue file with a crafted `repoPath` previously got past the allowlist gate before identity was checked. Now identity-first ordering means a record without `repoIdentity` can never trigger git execution in its own claimed path.
+
+### What this means for build operators
+
+The release daemon now self-heals instead of staying stuck. If a PR lands while a `blocked` record sits in the queue, the next daemon tick reconciles it without operator intervention, and the 10-min throttle keeps the GitHub probe rate sane even with many blocked records. The merge sweep no longer wedges on the first locked branch in a multi-branch run, so a queue with one stuck worktree doesn't block landing the other ready PRs. Two new fail-fast paths surface contamination immediately: dirty worktrees between merge candidates fail with an actionable reason, and slow `gh pr view` calls time out at 30s instead of stalling the daemon loop. Re-run `gstack-build merge` after the next push — locked branches will be deferred, ready ones will land.
 
 ### Itemized changes
 
@@ -16,11 +37,19 @@ The release daemon now reconciles `blocked` queue records against GitHub before 
 
 - `gstack-build merge` keeps sweeping after a branch-level failure. Worktree-locked branches are deferred, later candidates are still reviewed and landed, and the command prints a merged/deferred/failed summary before returning a failing exit code when anything remains unresolved.
 - Release daemon queue records now reconcile stale `blocked` PRs against GitHub before status reporting or daemon candidate selection. If GitHub says the PR is already merged, the local queue record moves to `landed` instead of staying visible as blocked work.
+- 10-minute throttle (`MERGED_RECONCILE_MIN_INTERVAL_MS`) on the GitHub merge probe so a wedged record can't burn `gh pr view` calls in a tight loop.
+- 30-second timeout on `verifyPrMerged` so a slow `gh pr view` no longer wedges the entire release-daemon loop; mapped to a structured "GitHub probe timed out" reason on SIGTERM / ETIMEDOUT.
+- Trust-boundary fix: `reconcileBlockedRecordWithGithub` refuses records missing `repoIdentity` before consulting the allowlist (identity-first gate). Previously the allowlist gate spawned git in record-supplied `repoPath` before identity was checked.
+- Landed write now routes through the transition-guarded `updateReleaseQueueRecord` instead of the direct `writeReleaseQueueRecord` write; `ALLOWED_TRANSITIONS` extended with `blocked → landed` so the guard accepts the heal path.
+- `runMergeMode` fails fast with `worktree is dirty before checkout` when a prior candidate left uncommitted edits behind, instead of silently inheriting them into the next candidate's branch.
 
 #### Added
 
 - Regression coverage for merge sweeps with a worktree-locked branch followed by another candidate.
 - Release-queue reconciliation coverage for `MERGED`, still-`OPEN`, and daemon-loop skip behavior.
+- Throttle coverage (recent / stale / garbage `lastGithubCheckedAt`) and allowlist-rejection coverage on the reconcile path.
+- Trust-boundary test: refuses to reconcile a record without `repoIdentity` (asserts `verifyMerged` is never called).
+- Cross-branch contamination test: refuses to process the next candidate if the worktree is dirty.
 - Full-suite test environment isolation fixes so concurrent test files don't share `$HOME`-scoped state.
 
 ## [1.44.0.0] - 2026-05-22
