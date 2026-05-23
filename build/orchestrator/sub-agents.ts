@@ -1797,6 +1797,13 @@ export async function runShip(opts: {
     // runConfiguredRoleTask via resolveRoleTimeouts; caller default stays SHIP_TIMEOUT_MS.
     timeoutMs: opts.ship.timeoutMs ?? SHIP_TIMEOUT_MS,
     gate: false,
+    // Grant the inner /ship session access to the Task/Agent subagent-dispatch
+    // tool so /ship Step 18 can run /document-release in a fresh-context
+    // subagent. Both names listed for Claude Code version-skew resilience;
+    // the CLI silently ignores unknown allowlist entries. Land call below
+    // intentionally does NOT get this — /land-and-deploy never dispatches
+    // a subagent.
+    allowedTools: ["Task", "Agent"],
   });
 
   // Bail out before /land-and-deploy if /ship failed.
