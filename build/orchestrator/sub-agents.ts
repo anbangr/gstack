@@ -1867,6 +1867,7 @@ export async function runSlashCommand(opts: {
   timeoutMs?: number;
   gate?: boolean;
   sandbox?: CodexSandbox;
+  allowedTools?: readonly string[];
 }): Promise<SubAgentResult> {
   return runConfiguredRoleTask({
     ...opts,
