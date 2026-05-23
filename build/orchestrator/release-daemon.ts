@@ -712,8 +712,11 @@ export function reconcileBlockedRecordWithGithub(
     opts.allowlistPrefixes ?? buildAllowlistWithRoot(opts.repoPath);
   const gate = isAllowedRepoPath(record.repoPath, prefixes);
   if (!gate.ok) {
+    // Don't leak the rejected repoPath into the daemon log on every poll
+    // cycle. The allowlist mechanism is the same one already documented
+    // via GSTACK_DAEMON_REPO_ALLOWLIST — operators know where to look.
     opts.log?.(
-      `warning: skipping blocked PR #${record.prNumber} reconciliation: ${gate.reason}`,
+      `warning: skipping blocked PR #${record.prNumber} reconciliation: repo not in daemon allowlist`,
     );
     return record;
   }
@@ -823,13 +826,7 @@ function checkoutScratchWorktree(
     fetchRemoteBranch(resolvedRepoPath);
     const added = spawnSync(
       "git",
-      [
-        "worktree",
-        "add",
-        "--detach",
-        scratch,
-        remoteTrackingRef,
-      ],
+      ["worktree", "add", "--detach", scratch, remoteTrackingRef],
       { cwd: resolvedRepoPath, encoding: "utf8" },
     );
     if (added.status !== 0) {
