@@ -110,6 +110,7 @@ lookup_default() {
     skill_prefix) echo "false" ;;
     checkpoint_mode) echo "explicit" ;;
     checkpoint_push) echo "false" ;;
+    explain_level) echo "default" ;;
     codex_reviews) echo "enabled" ;;
     gstack_contributor) echo "false" ;;
     skip_eng_review) echo "false" ;;
@@ -193,8 +194,9 @@ case "${1:-}" in
     echo ""
     echo "# ─── Active values (including defaults for unset keys) ───"
     for KEY in proactive routing_declined telemetry auto_upgrade update_check \
-               skill_prefix checkpoint_mode checkpoint_push codex_reviews \
-               gstack_contributor skip_eng_review workspace_root fork_repo_path \
+               skill_prefix checkpoint_mode checkpoint_push explain_level \
+               codex_reviews gstack_contributor skip_eng_review workspace_root \
+               fork_repo_path \
                artifacts_sync_mode artifacts_sync_mode_prompted; do
       VALUE=$(grep -E "^${KEY}:" "$CONFIG_FILE" 2>/dev/null | tail -1 \
         | sed 's/^[^:]*:[[:space:]]*//' \
@@ -211,8 +213,9 @@ case "${1:-}" in
   defaults)
     echo "# gstack-config defaults"
     for KEY in proactive routing_declined telemetry auto_upgrade update_check \
-               skill_prefix checkpoint_mode checkpoint_push codex_reviews \
-               gstack_contributor skip_eng_review workspace_root fork_repo_path \
+               skill_prefix checkpoint_mode checkpoint_push explain_level \
+               codex_reviews gstack_contributor skip_eng_review workspace_root \
+               fork_repo_path \
                artifacts_sync_mode artifacts_sync_mode_prompted; do
       printf '  %-24s %s\n' "$KEY:" "$(lookup_default "$KEY")"
     done

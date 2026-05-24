@@ -12,7 +12,15 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync } from "fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  rmSync,
+  mkdirSync,
+  chmodSync,
+} from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -29,15 +37,21 @@ import {
 
 describe("canonicalizeRemote", () => {
   it("strips https scheme and .git suffix", () => {
-    expect(canonicalizeRemote("https://github.com/garrytan/gstack.git")).toBe("github.com/garrytan/gstack");
+    expect(canonicalizeRemote("https://github.com/garrytan/gstack.git")).toBe(
+      "github.com/garrytan/gstack",
+    );
   });
 
   it("normalizes git@host:path scp-style remotes", () => {
-    expect(canonicalizeRemote("git@github.com:garrytan/gstack.git")).toBe("github.com/garrytan/gstack");
+    expect(canonicalizeRemote("git@github.com:garrytan/gstack.git")).toBe(
+      "github.com/garrytan/gstack",
+    );
   });
 
   it("strips ssh:// scheme", () => {
-    expect(canonicalizeRemote("ssh://git@gitlab.com/foo/bar")).toBe("gitlab.com/foo/bar");
+    expect(canonicalizeRemote("ssh://git@gitlab.com/foo/bar")).toBe(
+      "gitlab.com/foo/bar",
+    );
   });
 
   it("returns empty string for null/undefined/empty input", () => {
@@ -47,25 +61,35 @@ describe("canonicalizeRemote", () => {
   });
 
   it("strips surrounding quotes", () => {
-    expect(canonicalizeRemote(`"https://github.com/foo/bar.git"`)).toBe("github.com/foo/bar");
-  });
-
-  it("strips trailing slashes", () => {
-    expect(canonicalizeRemote("https://github.com/foo/bar/")).toBe("github.com/foo/bar");
-  });
-
-  it("lowercases the result", () => {
-    expect(canonicalizeRemote("https://GitHub.com/Foo/Bar.git")).toBe("github.com/foo/bar");
-  });
-
-  it("handles paths with multiple segments", () => {
-    expect(canonicalizeRemote("https://gitlab.example.com/group/subgroup/project.git")).toBe(
-      "gitlab.example.com/group/subgroup/project"
+    expect(canonicalizeRemote(`"https://github.com/foo/bar.git"`)).toBe(
+      "github.com/foo/bar",
     );
   });
 
+  it("strips trailing slashes", () => {
+    expect(canonicalizeRemote("https://github.com/foo/bar/")).toBe(
+      "github.com/foo/bar",
+    );
+  });
+
+  it("lowercases the result", () => {
+    expect(canonicalizeRemote("https://GitHub.com/Foo/Bar.git")).toBe(
+      "github.com/foo/bar",
+    );
+  });
+
+  it("handles paths with multiple segments", () => {
+    expect(
+      canonicalizeRemote(
+        "https://gitlab.example.com/group/subgroup/project.git",
+      ),
+    ).toBe("gitlab.example.com/group/subgroup/project");
+  });
+
   it("collapses redundant slashes", () => {
-    expect(canonicalizeRemote("https://github.com//foo//bar")).toBe("github.com/foo/bar");
+    expect(canonicalizeRemote("https://github.com//foo//bar")).toBe(
+      "github.com/foo/bar",
+    );
   });
 });
 
@@ -95,6 +119,47 @@ describe("secretScanFile", () => {
       expect(result.findings).toEqual([]);
     }
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("probes the gitleaks executable directly before scanning", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gstack-test-"));
+    const binDir = join(dir, "bin");
+    const log = join(dir, "gitleaks-calls.log");
+    const file = join(dir, "clean.txt");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(file, "no secrets here\n");
+    writeFileSync(
+      join(binDir, "gitleaks"),
+      `#!/bin/sh
+printf '%s\\n' "$*" >> "${log}"
+if [ "$1" = "version" ]; then
+  exit 0
+fi
+if [ "$1" = "detect" ]; then
+  echo '[]'
+  exit 0
+fi
+exit 2
+`,
+      "utf-8",
+    );
+    chmodSync(join(binDir, "gitleaks"), 0o755);
+
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${oldPath || ""}`;
+    try {
+      _resetGitleaksAvailabilityCache();
+      const result = secretScanFile(file);
+      expect(result.scanner).toBe("gitleaks");
+      expect(result.findings).toEqual([]);
+      const calls = readFileSync(log, "utf-8").trim().split("\n");
+      expect(calls[0]).toBe("version");
+      expect(calls[1]).toContain("detect --no-git --source");
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -152,7 +217,7 @@ triggers:
 ---
 
 body
-`
+`,
     );
 
     const m = parseSkillManifest(file);
@@ -161,12 +226,18 @@ body
     expect(m!.context_queries).toHaveLength(3);
 
     const ids = m!.context_queries.map((q) => q.id);
-    expect(ids).toEqual(["prior-sessions", "builder-profile", "prior-assignments"]);
+    expect(ids).toEqual([
+      "prior-sessions",
+      "builder-profile",
+      "prior-assignments",
+    ]);
 
     const kinds = m!.context_queries.map((q) => q.kind);
     expect(kinds).toEqual(["vector", "filesystem", "list"]);
 
-    expect(m!.context_queries[0].query).toBe("office-hours sessions for {repo_slug}");
+    expect(m!.context_queries[0].query).toBe(
+      "office-hours sessions for {repo_slug}",
+    );
     expect(m!.context_queries[0].limit).toBe(5);
     expect(m!.context_queries[1].glob).toBe("~/.gstack/builder-profile.jsonl");
     expect(m!.context_queries[1].tail).toBe(1);
@@ -194,7 +265,7 @@ gbrain:
 ---
 
 body
-`
+`,
     );
 
     const m = parseSkillManifest(file);
@@ -223,7 +294,11 @@ describe("withErrorContext", () => {
   });
 
   it("returns the value on success and writes an ok entry", async () => {
-    const result = await withErrorContext("test-op-success", () => 42, "test-caller");
+    const result = await withErrorContext(
+      "test-op-success",
+      () => 42,
+      "test-caller",
+    );
     expect(result).toBe(42);
 
     const log = readFileSync(join(testHome, ".gbrain-errors.jsonl"), "utf-8");
@@ -239,9 +314,13 @@ describe("withErrorContext", () => {
   it("rethrows the error on failure and writes an error entry", async () => {
     let caught: unknown = null;
     try {
-      await withErrorContext("test-op-fail", () => {
-        throw new Error("boom");
-      }, "test-caller");
+      await withErrorContext(
+        "test-op-fail",
+        () => {
+          throw new Error("boom");
+        },
+        "test-caller",
+      );
     } catch (e) {
       caught = e;
     }
@@ -262,7 +341,7 @@ describe("withErrorContext", () => {
         await new Promise((r) => setTimeout(r, 5));
         return "done";
       },
-      "test-caller"
+      "test-caller",
     );
     expect(result).toBe("done");
   });
@@ -335,8 +414,11 @@ describe("detectEngineTier", () => {
     process.env.PATH = "/nonexistent-no-gbrain-here";
     writeFileSync(
       join(testGbrainHome, "config.json"),
-      JSON.stringify({ engine: "postgres", database_url: "postgresql://test/example" }),
-      "utf-8"
+      JSON.stringify({
+        engine: "postgres",
+        database_url: "postgresql://test/example",
+      }),
+      "utf-8",
     );
     const result = detectEngineTier();
     expect(result.engine).toBe("supabase");
@@ -366,13 +448,13 @@ if [ "$1" = "--version" ]; then
 fi
 exit 0
 `,
-      { mode: 0o755 }
+      { mode: 0o755 },
     );
     process.env.PATH = `${binDir}:${process.env.PATH || ""}`;
     writeFileSync(
       join(testGbrainHome, "config.json"),
       JSON.stringify({ engine: "pglite" }),
-      "utf-8"
+      "utf-8",
     );
     const result = detectEngineTier();
     expect(result.engine).toBe("pglite");

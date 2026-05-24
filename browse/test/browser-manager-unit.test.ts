@@ -29,17 +29,20 @@ describe('shouldEnableChromiumSandbox', () => {
   const origPlatform = process.platform;
   const origCI = process.env.CI;
   const origContainer = process.env.CONTAINER;
+  const origNoSandbox = process.env.GSTACK_CHROMIUM_NO_SANDBOX;
   const origGetuid = process.getuid;
 
   beforeEach(() => {
     delete process.env.CI;
     delete process.env.CONTAINER;
+    delete process.env.GSTACK_CHROMIUM_NO_SANDBOX;
   });
 
   afterEach(() => {
     Object.defineProperty(process, 'platform', { value: origPlatform });
     if (origCI === undefined) delete process.env.CI; else process.env.CI = origCI;
     if (origContainer === undefined) delete process.env.CONTAINER; else process.env.CONTAINER = origContainer;
+    if (origNoSandbox === undefined) delete process.env.GSTACK_CHROMIUM_NO_SANDBOX; else process.env.GSTACK_CHROMIUM_NO_SANDBOX = origNoSandbox;
     process.getuid = origGetuid;
   });
 
@@ -89,6 +92,31 @@ describe('shouldEnableChromiumSandbox', () => {
     process.getuid = (() => 0) as typeof process.getuid;
     const { shouldEnableChromiumSandbox } = await import('../src/browser-manager');
     expect(shouldEnableChromiumSandbox()).toBe(false);
+  });
+
+  // #1562 — Ubuntu/AppArmor opt-in override
+  it('linux + GSTACK_CHROMIUM_NO_SANDBOX=1 → false (Ubuntu/AppArmor opt-out)', async () => {
+    setPlatform('linux');
+    process.env.GSTACK_CHROMIUM_NO_SANDBOX = '1';
+    process.getuid = (() => 1000) as typeof process.getuid;
+    const { shouldEnableChromiumSandbox } = await import('../src/browser-manager');
+    expect(shouldEnableChromiumSandbox()).toBe(false);
+  });
+
+  it('darwin + GSTACK_CHROMIUM_NO_SANDBOX=1 → false (env override wins on any platform)', async () => {
+    setPlatform('darwin');
+    process.env.GSTACK_CHROMIUM_NO_SANDBOX = '1';
+    process.getuid = (() => 501) as typeof process.getuid;
+    const { shouldEnableChromiumSandbox } = await import('../src/browser-manager');
+    expect(shouldEnableChromiumSandbox()).toBe(false);
+  });
+
+  it('GSTACK_CHROMIUM_NO_SANDBOX=0 → does NOT trigger override (must be exactly "1")', async () => {
+    setPlatform('linux');
+    process.env.GSTACK_CHROMIUM_NO_SANDBOX = '0';
+    process.getuid = (() => 1000) as typeof process.getuid;
+    const { shouldEnableChromiumSandbox } = await import('../src/browser-manager');
+    expect(shouldEnableChromiumSandbox()).toBe(true);
   });
 });
 
