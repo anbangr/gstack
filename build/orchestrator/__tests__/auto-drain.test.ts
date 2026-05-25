@@ -78,6 +78,59 @@ describe("auto-drain hook contract", () => {
     expect(typeof result.proposalsAppended).toBe("number");
   });
 
+  test("Sink 3 default inbox lives under ${GSTACK_HOME}/skill-faults/inbox/, not <cwd>/inbox", async () => {
+    // Beware: this test must NOT pass inboxDir — the whole point is to
+    // verify the fallback. GSTACK_HOME is set to `tmp` by beforeEach so
+    // the default resolves to ${tmp}/skill-faults/inbox/.
+    const skillFaults = path.join(tmp, "skill-faults");
+    const cwdSandbox = fs.mkdtempSync(path.join(tmp, "cwd-"));
+    const savedCwd = process.cwd();
+    process.chdir(cwdSandbox);
+    try {
+      const faultId = emitHaltEvent(
+        {
+          kind: "PHASE_FAILED",
+          runId: "r-default-inbox",
+          stateSlug: "s-default-inbox",
+          severity: "CRITICAL",
+          message: "verify-default-inbox-path",
+          pointers: {
+            stateFile: "/x",
+            stdoutLog: "/x",
+            livingPlan: "/x",
+            worktreePath: tmp,
+          },
+          snapshot: { stdoutTail: "" },
+        },
+        { queueDir: skillFaults },
+      );
+      const result = await drainFaultsFromHaltEventsQueue({
+        queueDir: skillFaults,
+        max: 10,
+        severityMin: "MEDIUM",
+        // intentionally NO inboxDir
+        mockInvestigator: () => ({
+          faultId,
+          outcome: "root-cause-identified",
+          rootCause: "test",
+          evidence: [],
+          proposedFix: null,
+          learnedPatternProposal: null,
+        }),
+      });
+      expect(result.inboxFiled).toBe(1);
+      // Auto-file landed at GSTACK_HOME path.
+      const expectedInbox = path.join(tmp, "skill-faults", "inbox");
+      const filed = fs.readdirSync(expectedInbox);
+      expect(filed.length).toBe(1);
+      expect(filed[0]).toMatch(/^\d{4}-\d{2}-\d{2}-halt-.+\.md$/);
+      // And NOT at <cwd>/inbox — the regression we're guarding.
+      expect(fs.existsSync(path.join(cwdSandbox, "inbox"))).toBe(false);
+    } finally {
+      process.chdir(savedCwd);
+    }
+  });
+
   test("empty queue: zero counts (hook stays silent)", async () => {
     const skillFaults = path.join(tmp, "skill-faults");
     const result = await drainFaultsFromHaltEventsQueue({
