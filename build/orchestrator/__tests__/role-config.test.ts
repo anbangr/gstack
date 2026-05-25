@@ -222,11 +222,36 @@ describe("role config precedence helpers", () => {
     ).toThrow("GSTACK_BUILD_PRIMARY_IMPL_BACKUP_PROVIDER");
   });
 
-  it("configure.cm sets gemini backup for primaryImpl, testFixer, ship, land", () => {
+  it("configure.cm sets the expected per-role backup providers and models", () => {
+    // Pinned to the configure.cm defaults as of commit 8f604299
+    // ("chore(build): swap testWriter/primaryImpl/testFixer providers in configure.cm").
+    // testFixer + testWriter now use codex/gpt-5.3-codex-spark as backup (not gemini),
+    // so the previous loop-over-roles shape no longer fits — backups are role-specific.
     const defaults = loadBuildDefaults(DEFAULT_BUILD_CONFIG_FILE);
-    for (const role of ["primaryImpl", "testFixer", "ship", "land"] as const) {
-      expect(defaults.roles[role].backupProvider).toBe("gemini");
-      expect(defaults.roles[role].backupModel).toBe("gemini-3.1-pro-preview");
+    const expected: Record<
+      "primaryImpl" | "testFixer" | "testWriter" | "ship" | "land",
+      { backupProvider: "gemini" | "codex"; backupModel: string }
+    > = {
+      primaryImpl: {
+        backupProvider: "gemini",
+        backupModel: "gemini-3.5-flash",
+      },
+      testFixer: {
+        backupProvider: "codex",
+        backupModel: "gpt-5.3-codex-spark",
+      },
+      testWriter: {
+        backupProvider: "codex",
+        backupModel: "gpt-5.3-codex-spark",
+      },
+      ship: { backupProvider: "gemini", backupModel: "gemini-3.5-flash" },
+      land: { backupProvider: "gemini", backupModel: "gemini-3.5-flash" },
+    };
+    for (const [role, want] of Object.entries(expected) as Array<
+      [keyof typeof expected, (typeof expected)[keyof typeof expected]]
+    >) {
+      expect(defaults.roles[role].backupProvider).toBe(want.backupProvider);
+      expect(defaults.roles[role].backupModel).toBe(want.backupModel);
     }
   });
 
