@@ -24,6 +24,7 @@ import {
   spawnSync as registeredSpawnSync,
 } from "./child-registry";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { logDir, ensureLogDir, deriveGeminiTmpKey } from "./state";
 import type { RoleConfig, RoleProvider, RoleReasoning } from "./role-config";
@@ -109,6 +110,76 @@ function resolveStartupHangMs(): number {
 
 function geminiBin(): string {
   return process.env.GEMINI_BIN || "gemini";
+}
+
+/**
+ * Bug T4 (mitosis-control-plane-cp-pod-log-archival 2026-05-25): Gemini's
+ * file editor creates `*.bak` backup files when overwriting files in `--yolo`
+ * mode and does NOT clean them up. The leftover untracked `.bak` poisons the
+ * post-agent hygiene gate and rejects an otherwise-clean implementation
+ * commit (`completed: false` despite a working `git commit`).
+ *
+ * Sweep all `*.bak` files in the cwd whose mtime is newer than the spawn-start
+ * timestamp. Restricting to mtime > sinceMs ensures we don't delete a user's
+ * pre-existing `.bak` files. Uses `find` for portability and speed (avoids
+ * walking a large worktree from Node.js).
+ *
+ * Returns the list of deleted paths. Best-effort: any failure mode (find not
+ * available, sentinel file write fails, individual unlink fails) is swallowed
+ * — the hygiene gate is the safety net behind this sweep.
+ */
+export function sweepBakFilesNewerThan(
+  cwd: string,
+  sinceMs: number,
+): string[] {
+  if (!fs.existsSync(cwd)) return [];
+  const sentinel = path.join(
+    os.tmpdir(),
+    `gstack-bak-sweep-${process.pid}-${Date.now()}.ref`,
+  );
+  try {
+    fs.writeFileSync(sentinel, "");
+    // Anchor `-newer` comparison to sinceMs. fs.utimes accepts seconds (Date).
+    const ref = new Date(sinceMs);
+    fs.utimesSync(sentinel, ref, ref);
+  } catch {
+    try {
+      fs.unlinkSync(sentinel);
+    } catch {}
+    return [];
+  }
+  let stdout = "";
+  try {
+    const r = registeredSpawnSync(
+      "find",
+      [cwd, "-type", "f", "-name", "*.bak", "-newer", sentinel],
+      { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+    );
+    if (r.status === 0 && typeof r.stdout === "string") {
+      stdout = r.stdout;
+    }
+  } catch {
+    // find unavailable, etc.
+  } finally {
+    try {
+      fs.unlinkSync(sentinel);
+    } catch {}
+  }
+  const paths = stdout
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const deleted: string[] = [];
+  for (const p of paths) {
+    try {
+      fs.unlinkSync(p);
+      deleted.push(p);
+    } catch {
+      // Path raced (deleted by something else), permission denied, etc.
+      // Skip silently — hygiene gate will surface anything left.
+    }
+  }
+  return deleted;
 }
 
 // ------------------------------------------------------------------
@@ -1691,6 +1762,7 @@ export async function runRoleTask(opts: {
       : `${opts.logPrefix}.log`,
   );
 
+  const spawnStartedAt = Date.now();
   const result = await spawnCaptured({
     bin: geminiBin(),
     argv,
@@ -1704,6 +1776,12 @@ export async function runRoleTask(opts: {
   });
 
   cleanupStaged();
+  const swept = sweepBakFilesNewerThan(opts.cwd, spawnStartedAt);
+  if (swept.length > 0) {
+    console.warn(
+      `  · gemini cleanup: removed ${swept.length} .bak file(s) left by --yolo (${swept.slice(0, 3).join(", ")}${swept.length > 3 ? "..." : ""})`,
+    );
+  }
   return mergeOutputFile(result, opts.outputFilePath);
 }
 
@@ -2969,6 +3047,7 @@ export async function runGeminiTestSpec(opts: {
     `phase-${opts.phaseNumber}-gemini-testspec-${opts.iteration}.log`,
   );
 
+  const spawnStartedAt = Date.now();
   const result = await spawnCaptured({
     bin: geminiBin(),
     argv,
@@ -2981,6 +3060,12 @@ export async function runGeminiTestSpec(opts: {
   // Stall kills aren't retried under liveness semantics — same stall window
   // would just stall again. Caller can surface this via result.stallKilled.
   cleanupStaged();
+  const swept = sweepBakFilesNewerThan(opts.cwd, spawnStartedAt);
+  if (swept.length > 0) {
+    console.warn(
+      `  · gemini-testspec cleanup: removed ${swept.length} .bak file(s) left by --yolo`,
+    );
+  }
   return mergeOutputFile(result, opts.outputFilePath);
 }
 
