@@ -4678,8 +4678,40 @@ export function buildCodexReviewBody(
   );
 }
 
-function phaseAllowsGateSourceFixes(phase: Phase): boolean {
-  return phase.kind === "code" && /fix-on-review/i.test(phase.body);
+/**
+ * Should the post-agent hygiene gate auto-commit non-test path mutations
+ * left dirty by the review/QA gate?
+ *
+ * Two cases return true:
+ *
+ * 1. `kind: "code"` phases that opt into inline fixes via a `fix-on-review`
+ *    marker in the phase body. The skill template normally constrains Review
+ *    & QA to test paths, but `fix-on-review` is the explicit opt-out for
+ *    phases where a reviewer is allowed to fix the production source it just
+ *    inspected.
+ *
+ * 2. Non-code phase kinds (`research | writing | experiment | manual`) where
+ *    the phase's PRIMARY deliverable IS a non-test artifact: a paper section,
+ *    an audit document, a benchmark log, prepared manual-step files. The
+ *    review gate inspecting those deliverables can legitimately commit them
+ *    via the auto-commit path. Without this, the tidy-haven 2026-05-21 and
+ *    polis-paper-prereqs 2026-05-20 fault classes left agents stuck on the
+ *    hygiene gate even when the dirty file was the agreed deliverable
+ *    (Bug T5).
+ *
+ * Code phases without `fix-on-review` still reject non-test dirt — the
+ * skill template's test-only contract stays the default for code work.
+ */
+export function phaseAllowsGateSourceFixes(phase: Phase): boolean {
+  if (phase.kind === "code") {
+    return /fix-on-review/i.test(phase.body);
+  }
+  return (
+    phase.kind === "research" ||
+    phase.kind === "writing" ||
+    phase.kind === "experiment" ||
+    phase.kind === "manual"
+  );
 }
 
 export function buildOriginVerificationBody(args: {

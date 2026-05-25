@@ -77,6 +77,7 @@ import {
   extractCoverageTarget,
   resolvePhaseBody,
   maybeAutoCommitTestOnlyDirty,
+  phaseAllowsGateSourceFixes,
   runStopRun,
   HELP_TEXT,
 } from "../cli";
@@ -6943,5 +6944,69 @@ describe("B-T1: gate-visibility reconcile ENOENT race", () => {
       // Always clean projection so test isolation holds.
       _setVisiblePlanProjectionForTests(null);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// phaseAllowsGateSourceFixes — Bug T5 (tidy-haven 2026-05-21 +
+// polis-paper-prereqs 2026-05-20: research/paper phase deliverables blocked
+// at hygiene gate)
+// ---------------------------------------------------------------------------
+describe("phaseAllowsGateSourceFixes", () => {
+  function p(overrides: Partial<Phase>): Phase {
+    return {
+      index: 0,
+      number: "1",
+      name: "P",
+      featureIndex: 0,
+      featureNumber: "1",
+      featureName: "F",
+      kind: "code",
+      body: "",
+      implementationDone: false,
+      reviewDone: false,
+      implementationCheckboxLine: -1,
+      reviewCheckboxLine: -1,
+      testSpecCheckboxLine: -1,
+      ...overrides,
+    } as unknown as Phase;
+  }
+
+  it("code phase WITHOUT fix-on-review → false (test-only contract stays default)", () => {
+    expect(phaseAllowsGateSourceFixes(p({ kind: "code", body: "do work" }))).toBe(
+      false,
+    );
+  });
+
+  it("code phase WITH fix-on-review marker → true (existing behavior preserved)", () => {
+    expect(
+      phaseAllowsGateSourceFixes(
+        p({ kind: "code", body: "fix-on-review allowed" }),
+      ),
+    ).toBe(true);
+  });
+
+  it("research phase → true (deliverable is a non-test artifact)", () => {
+    expect(
+      phaseAllowsGateSourceFixes(p({ kind: "research", body: "" })),
+    ).toBe(true);
+  });
+
+  it("writing phase → true (paper sections, drafts)", () => {
+    expect(phaseAllowsGateSourceFixes(p({ kind: "writing", body: "" }))).toBe(
+      true,
+    );
+  });
+
+  it("experiment phase → true (benchmark logs, CSV)", () => {
+    expect(
+      phaseAllowsGateSourceFixes(p({ kind: "experiment", body: "" })),
+    ).toBe(true);
+  });
+
+  it("manual phase → true (prepared files for human step)", () => {
+    expect(phaseAllowsGateSourceFixes(p({ kind: "manual", body: "" }))).toBe(
+      true,
+    );
   });
 });
