@@ -587,7 +587,19 @@ export function attachStallWatchdog(
     //   - null   → legacy stallMs
     // The legacy path is preserved EXACTLY when parseProgress is absent
     // or when no TOOL_START has been observed yet.
-    const startupWindow = opts.startupHangMs ?? 120_000;
+    //
+    // Phase A is clamped to stallMs: the startup window must never extend
+    // past the operator's configured stall window. Otherwise a caller with
+    // a short stallMs (integration tests with stallMs: 1000, drain-faults
+    // with investigatorTimeoutMs: 1000, ad-hoc shorter budgets) would
+    // silently get a 120s startup grace and the configured kill never
+    // fires. The clamp preserves Phase A's "kill genuinely-hung startups
+    // earlier than stallMs would" semantics in the LLM case
+    // (min(120_000, 900_000) = 120_000) while collapsing to stallMs in
+    // short-budget cases.
+    const rawStartupWindow = opts.startupHangMs ?? 120_000;
+    const startupWindow =
+      rawStartupWindow > 0 ? Math.min(rawStartupWindow, stallMs) : 0;
     const inStartupPhase = firstActivityAt === null && startupWindow > 0;
     let effectiveStallMs: number;
     if (inStartupPhase) {

@@ -823,14 +823,9 @@ export function spawnCaptured(args: {
         // GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS keeps its historical name
         // for operator-override continuity. New semantics: Phase A window
         // (CPU + stream both silent). Set to 0 to disable Phase A.
-        //
-        // Clamp to args.timeoutMs so Phase A never extends past the
-        // operator's configured stall window. Without this, short-timeout
-        // callers (integration tests with timeoutMs=2000, ad-hoc shorter
-        // budgets) would silently get a 120s startup grace, breaking the
-        // configured wall-clock semantics. resolveStartupHangMs() returns
-        // 0 when env=0 — preserved through Math.min — disabling Phase A.
-        startupHangMs: Math.min(resolveStartupHangMs(), args.timeoutMs),
+        // The watchdog clamps the effective Phase A window to stallMs
+        // internally so this caller can pass the env-derived value as-is.
+        startupHangMs: resolveStartupHangMs(),
         onStallKill: (silenceMs) => {
           stallKilled = true;
           stallSilenceMs = silenceMs;
