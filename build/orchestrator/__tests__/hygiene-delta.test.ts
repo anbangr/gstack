@@ -21,6 +21,7 @@ import { spawnSync } from "node:child_process";
 import {
   captureGitSnapshot,
   contentHashDelta,
+  EDITOR_ARTIFACT_STATUS,
   validatePostAgentHygiene,
   type GitSnapshot,
 } from "../cli";
@@ -281,5 +282,95 @@ describe("contentHashDelta", () => {
     });
     expect(verdict.ok).toBe(false);
     expect(verdict.errors.join("\n")).toContain("foo.txt");
+  });
+});
+
+describe("EDITOR_ARTIFACT_STATUS regex", () => {
+  // The gstack hygiene gate hits these every time gemini's --yolo backup
+  // implementor runs and leaves behind sed/vim/etc. artifacts. The regex
+  // matches the `?? <path>` porcelain form (untracked only) so a single
+  // .bak doesn't pause the phase.
+  it("matches plain `.bak` at root", () => {
+    expect(EDITOR_ARTIFACT_STATUS.test("?? foo.test.ts.bak")).toBe(true);
+  });
+
+  it("matches `.bak` under a nested path", () => {
+    expect(
+      EDITOR_ARTIFACT_STATUS.test("?? server/__tests__/x.test.ts.bak"),
+    ).toBe(true);
+  });
+
+  it("matches `.tmp`, `.swp`, `.orig`, `.rej`, and `~` suffixes", () => {
+    expect(EDITOR_ARTIFACT_STATUS.test("?? foo.tmp")).toBe(true);
+    expect(EDITOR_ARTIFACT_STATUS.test("?? foo.swp")).toBe(true);
+    expect(EDITOR_ARTIFACT_STATUS.test("?? foo.orig")).toBe(true);
+    expect(EDITOR_ARTIFACT_STATUS.test("?? foo.rej")).toBe(true);
+    expect(EDITOR_ARTIFACT_STATUS.test("?? foo~")).toBe(true);
+  });
+
+  it("does NOT match modified-tracked files with same extensions", () => {
+    // Only `?? <path>` (untracked) form is allowlisted. A modified-tracked
+    // `M foo.bak` represents the user intentionally checking in a backup
+    // and should still flag dirty.
+    expect(EDITOR_ARTIFACT_STATUS.test(" M foo.bak")).toBe(false);
+    expect(EDITOR_ARTIFACT_STATUS.test("M  foo.bak")).toBe(false);
+  });
+
+  it("does NOT match normal source files", () => {
+    expect(EDITOR_ARTIFACT_STATUS.test("?? src/foo.ts")).toBe(false);
+    expect(EDITOR_ARTIFACT_STATUS.test("?? README.md")).toBe(false);
+    expect(EDITOR_ARTIFACT_STATUS.test("?? .gitignore")).toBe(false);
+  });
+
+  it("does NOT match files where the suffix appears mid-name (not at end)", () => {
+    // The regex anchors with `$` so `.bak.json` should NOT match.
+    expect(EDITOR_ARTIFACT_STATUS.test("?? foo.bak.json")).toBe(false);
+    expect(EDITOR_ARTIFACT_STATUS.test("?? swp.ts")).toBe(false);
+  });
+});
+
+describe("validatePostAgentHygiene with editor-artifact filter", () => {
+  // Integration regression: simulates the recurring gstack-build fault where
+  // gemini-backup-implementor leaves a `.bak` file in the worktree. Before
+  // the EDITOR_ARTIFACT_STATUS filter, the post-impl hygiene gate would
+  // mark the phase paused and require manual `rm + --mark-phase-committed`.
+  it("passes when agent leaves a .bak alongside an otherwise-clean tree", () => {
+    initRepo();
+    commit("foo.ts", "tracked\n");
+    const before = captureGitSnapshot(repo);
+
+    // Simulate gemini's --yolo edit-with-backup pattern: agent commits the
+    // real change AND leaves a .bak. The "did not create a new commit"
+    // error doesn't fire here because we're not asserting that; we're
+    // asserting the dirty-tree check tolerates the .bak.
+    fs.writeFileSync(path.join(repo, "foo.ts.bak"), "stale backup\n");
+
+    const verdict = validatePostAgentHygiene({
+      cwd: repo,
+      before,
+      label: "test",
+    });
+    expect(verdict.ok).toBe(true);
+    expect(verdict.errors).toEqual([]);
+  });
+
+  it("still flags dirty when agent leaves a non-artifact file alongside .bak", () => {
+    initRepo();
+    commit("foo.ts", "tracked\n");
+    const before = captureGitSnapshot(repo);
+
+    // .bak is allowed but a real new file is not — must still fail.
+    fs.writeFileSync(path.join(repo, "foo.ts.bak"), "stale backup\n");
+    fs.writeFileSync(path.join(repo, "rogue.ts"), "agent-leak\n");
+
+    const verdict = validatePostAgentHygiene({
+      cwd: repo,
+      before,
+      label: "test",
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.errors.join("\n")).toContain("rogue.ts");
+    // Should NOT mention the .bak in the error.
+    expect(verdict.errors.join("\n")).not.toContain("foo.ts.bak");
   });
 });
