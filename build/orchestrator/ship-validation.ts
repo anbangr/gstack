@@ -32,6 +32,7 @@ export type ShipValidationFailure =
   | "no_pr_reference_in_output"
   | "pr_not_found_on_github"
   | "pr_branch_mismatch"
+  | "pr_repo_mismatch"
   | "pr_not_open"
   | "pr_headref_missing"
   | "invalid_branch"
@@ -77,16 +78,52 @@ const defaultRunCommand: RunCommandFn = (cmd, args, opts) => {
   };
 };
 
-const PR_URL_RE = /https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/(\d+)/i;
+const PR_URL_RE = /https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)/i;
 const PR_NUMBER_RE = /\bPR\s*#(\d+)\b/i;
+
+/**
+ * Parse an `owner/repo` pair out of a `git remote get-url origin` value.
+ * Handles the three URL shapes git emits:
+ *   - https://github.com/<owner>/<repo>(.git)?
+ *   - git@github.com:<owner>/<repo>(.git)?
+ *   - ssh://git@github.com/<owner>/<repo>(.git)?
+ *
+ * Strips the trailing `.git` so the parsed value matches what GitHub's
+ * REST/CLI return (`url` field from `gh repo view --json url` is the
+ * .git-less form).
+ *
+ * Exported for tests.
+ */
+export function parseGithubOwnerRepo(
+  originUrl: string,
+): { owner: string; repo: string } | null {
+  if (!originUrl) return null;
+  const trimmed = originUrl.trim();
+  // https://github.com/<owner>/<repo>(.git)?  OR  http://...
+  let m = trimmed.match(/^https?:\/\/github\.com\/([^/]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
+  if (m) return { owner: m[1], repo: m[2] };
+  // git@github.com:<owner>/<repo>(.git)?
+  m = trimmed.match(/^git@github\.com:([^/]+)\/([^/\s]+?)(?:\.git)?$/i);
+  if (m) return { owner: m[1], repo: m[2] };
+  // ssh://git@github.com/<owner>/<repo>(.git)?
+  m = trimmed.match(/^ssh:\/\/git@github\.com\/([^/]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
+  if (m) return { owner: m[1], repo: m[2] };
+  return null;
+}
 
 /**
  * Extract a PR number from ship-output prose. Accepts the canonical
  * GitHub PR URL or a "PR #N" reference. Returns null if no number found.
+ *
+ * When a URL is parsed, also returns the owner/repo from the URL so the
+ * caller can verify the URL points at the expected repository (defends
+ * against a sub-agent quoting a real PR URL from an unrelated repo).
  */
 export function parsePrReference(outputText: string): {
   prNumber: number | null;
   prUrl: string | null;
+  prOwner: string | null;
+  prRepo: string | null;
 } {
   // PR numbers must be positive integers. Reject 0, negatives, leading-zero
   // junk that parses to 0, and non-finite inputs. `gh pr view 0` returns
@@ -96,18 +133,27 @@ export function parsePrReference(outputText: string): {
   const validPr = (n: number): boolean => Number.isFinite(n) && n > 0;
   const urlMatch = outputText.match(PR_URL_RE);
   if (urlMatch) {
-    const n = Number(urlMatch[1]);
+    const owner = urlMatch[1];
+    const repo = urlMatch[2];
+    const n = Number(urlMatch[3]);
     return {
       prNumber: validPr(n) ? n : null,
       prUrl: validPr(n) ? urlMatch[0] : null,
+      prOwner: validPr(n) ? owner : null,
+      prRepo: validPr(n) ? repo : null,
     };
   }
   const numMatch = outputText.match(PR_NUMBER_RE);
   if (numMatch) {
     const n = Number(numMatch[1]);
-    return { prNumber: validPr(n) ? n : null, prUrl: null };
+    return {
+      prNumber: validPr(n) ? n : null,
+      prUrl: null,
+      prOwner: null,
+      prRepo: null,
+    };
   }
-  return { prNumber: null, prUrl: null };
+  return { prNumber: null, prUrl: null, prOwner: null, prRepo: null };
 }
 
 /**
@@ -219,7 +265,7 @@ export function validateShipCompletion(args: {
     args.outputText.length > OUTPUT_TEXT_CAP_BYTES
       ? args.outputText.slice(-OUTPUT_TEXT_CAP_BYTES)
       : args.outputText;
-  const { prNumber, prUrl } = parsePrReference(capped);
+  const { prNumber, prUrl, prOwner, prRepo } = parsePrReference(capped);
   if (prNumber == null) {
     return {
       ok: false,
@@ -232,6 +278,49 @@ export function validateShipCompletion(args: {
     };
   }
   evidence.push(`output references PR #${prNumber}`);
+
+  // (2.5) PR URL repo-match (T6 /review MEDIUM finding, deferred from
+  // PR #96; addressed here). When the prose quoted a full URL we can
+  // resolve the current repo's expected owner/repo from `git remote get-url
+  // origin` and reject mismatches before paying for a gh round-trip.
+  // Defends against a sub-agent quoting a real PR URL from a sibling repo
+  // (where the headRefName check would only fire if branch names happened
+  // to collide).
+  //
+  // Bare "PR #N" references skip this check (we don't know what repo they
+  // meant) and fall through to (3) where gh pr view + headRefName provide
+  // the remaining defense. Origin lookup is also skipped — saves a
+  // subprocess + keeps existing tests' mock sequences shorter.
+  if (prOwner && prRepo) {
+    const originUrl = run("git", ["remote", "get-url", "origin"], {
+      cwd: args.cwd,
+      timeoutMs: 5_000,
+    });
+    // Soft failure: if we cannot determine the origin repo (detached
+    // checkout, no remote configured) we skip the repo-match check rather
+    // than fail closed — pr_branch_mismatch / pr_headref_missing remain
+    // the primary defenses.
+    const expectedRepo =
+      originUrl.status === 0
+        ? parseGithubOwnerRepo(originUrl.stdout.trim())
+        : null;
+    if (expectedRepo) {
+      const ownerMatch =
+        prOwner.toLowerCase() === expectedRepo.owner.toLowerCase();
+      const repoMatch =
+        prRepo.toLowerCase() === expectedRepo.repo.toLowerCase();
+      if (!ownerMatch || !repoMatch) {
+        return {
+          ok: false,
+          reason: "pr_repo_mismatch",
+          evidence: [
+            ...evidence,
+            `quoted PR URL points at ${prOwner}/${prRepo}, but this repo's origin is ${expectedRepo.owner}/${expectedRepo.repo}`,
+          ],
+        };
+      }
+    }
+  }
 
   // (3) gh pr view must confirm the PR.
   if (args.skipGhVerify) {
