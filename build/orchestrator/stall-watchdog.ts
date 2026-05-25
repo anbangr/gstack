@@ -123,6 +123,23 @@ export interface StallWatchdogOptions {
    * event in this run — see implementation.
    */
   progressGapMs?: number;
+
+  /**
+   * Max ms the watchdog tolerates startup-phase silence before firing
+   * SIGTERM with killReason="startup_hang". Default 120_000. Set to 0 to
+   * disable Phase A entirely (legacy stallMs applies from spawn).
+   *
+   * Phase A is active as long as no activity has ever been recorded
+   * (firstActivityAt === null). In cpu mode this means BOTH zero CPU
+   * delta AND zero stream bytes for the full window. In stream mode it
+   * means zero stream bytes (no CPU signal available). This is the
+   * targeted detector for genuinely hung sub-agents (auth prompts,
+   * frozen TTYs, missing binaries) that the older first-token-stream-only
+   * deadline used to handle in sub-agents.ts. Long-reasoning LLM CLIs
+   * that burn CPU between tokens move out of Phase A on the first
+   * CPU-positive sample and run under the longer legacy stallMs.
+   */
+  startupHangMs?: number;
 }
 
 export interface StallWatchdogController {
@@ -142,9 +159,10 @@ export interface StallWatchdogController {
   /**
    * Why the watchdog killed. Returns:
    *   - "auth_required" — auth-prompt fast-kill (pre-existing).
+   *   - "startup_hang"  — Phase A: silent + zero-CPU during startup window.
    *   - "stall"         — legacy silence-based stall (pre-existing).
-   *   - "silence"       — tool-aware silence kill (new, when parseProgress set).
-   *   - "progress_gap"  — noisy stdout without classified progress (new).
+   *   - "silence"       — tool-aware silence kill (when parseProgress set).
+   *   - "progress_gap"  — noisy stdout without classified progress.
    *   - undefined       — watchdog has not killed.
    */
   killReason: () => string | undefined;
@@ -370,6 +388,14 @@ export function attachStallWatchdog(
   opts: StallWatchdogOptions,
 ): StallWatchdogController {
   const stallMs = opts.stallMs;
+  // Phase A startup-hang window. Hoisted out of the poll loop because both
+  // inputs (opts.startupHangMs, stallMs) are immutable for the watchdog's
+  // lifetime — recomputing per tick reads as if startupHangMs could change.
+  // See the long comment at the Phase A branch in poll() for the clamp
+  // rationale.
+  const rawStartupWindow = opts.startupHangMs ?? 120_000;
+  const startupWindow =
+    rawStartupWindow > 0 ? Math.min(rawStartupWindow, stallMs) : 0;
   const gracePeriodMs = opts.gracePeriodMs ?? 5000;
   // Default poll interval is 1s, but never more than half the stall window —
   // a 100ms stallMs with a 1s poll interval would miss the stall by 10x.
@@ -391,6 +417,10 @@ export function attachStallWatchdog(
   let stopped = false;
   let killed = false;
   let killReason: string | undefined = undefined;
+  // Phase A vs Phase B discriminator. Null = Phase A (no activity ever
+  // recorded). Non-null = Phase B (firstActivityAt is the timestamp of
+  // the first activity signal, whether CPU or stream).
+  let firstActivityAt: number | null = null;
 
   // Tool-aware state. All null when parseProgress is not provided —
   // the legacy branches below treat null exactly as today's behavior.
@@ -430,17 +460,28 @@ export function attachStallWatchdog(
 
   const recordActivity = () => {
     lastActivityAt = clock.now();
+    if (firstActivityAt === null) firstActivityAt = lastActivityAt;
   };
 
-  const authPromptDisabled = process.env.GSTACK_DISABLE_AUTH_PROMPT_DETECTOR === "1";
+  const authPromptDisabled =
+    process.env.GSTACK_DISABLE_AUTH_PROMPT_DETECTOR === "1";
 
   const onLine = (chunk: Buffer | string) => {
     if (stopped) return;
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-    // Single non-whitespace byte anywhere in the chunk counts as activity.
-    // Equivalent to: any line in chunk.split(/\r?\n/) has trim().length > 0.
-    // Regex test is a single short-circuit pass; the prior split-and-loop
-    // allocated a string array per chunk just to discover the same answer.
+    // Phase A exit: ANY byte counts. The legacy first-token timer (deleted in
+    // v1.45) cleared on any stdout/stderr byte; preserving that contract in
+    // stream mode requires advancing firstActivityAt on whitespace-only
+    // output too. Without this, a CLI that emits only `\r` progress carets
+    // or ANSI clear sequences for 120s falsely trips startup_hang.
+    if (text.length > 0 && firstActivityAt === null) {
+      firstActivityAt = clock.now();
+    }
+    // Single non-whitespace byte anywhere in the chunk counts as activity
+    // for Phase B's silence tracking. Equivalent to: any line in
+    // chunk.split(/\r?\n/) has trim().length > 0. Regex test is a single
+    // short-circuit pass; the prior split-and-loop allocated a string array
+    // per chunk just to discover the same answer.
     if (/\S/.test(text)) recordActivity();
 
     // Tool-aware progress parsing. Lines are split on \n inside this
@@ -556,27 +597,50 @@ export function attachStallWatchdog(
     }
 
     const silence = clock.now() - lastActivityAt;
-    // Effective stall window:
+    // Effective stall window. Phase A wins when in startup (no activity
+    // ever recorded). Otherwise Phase B's legacy/tool-aware logic applies:
     //   - "slow" → toolStallMs.slow
     //   - "fast" → toolStallMs.fast
     //   - null   → legacy stallMs
     // The legacy path is preserved EXACTLY when parseProgress is absent
     // or when no TOOL_START has been observed yet.
-    let effectiveStallMs = stallMs;
-    if (currentToolBucket !== null && toolStallMs) {
-      effectiveStallMs =
-        currentToolBucket === "slow" ? toolStallMs.slow : toolStallMs.fast;
+    //
+    // Phase A is clamped to stallMs: the startup window must never extend
+    // past the operator's configured stall window. Otherwise a caller with
+    // a short stallMs (integration tests with stallMs: 1000, drain-faults
+    // with investigatorTimeoutMs: 1000, ad-hoc shorter budgets) would
+    // silently get a 120s startup grace and the configured kill never
+    // fires. The clamp preserves Phase A's "kill genuinely-hung startups
+    // earlier than stallMs would" semantics in the LLM case
+    // (min(120_000, 900_000) = 120_000) while collapsing to stallMs in
+    // short-budget cases. startupWindow is hoisted out of poll() — see the
+    // declaration above attachStallWatchdog's body.
+    const inStartupPhase = firstActivityAt === null && startupWindow > 0;
+    let effectiveStallMs: number;
+    if (inStartupPhase) {
+      effectiveStallMs = startupWindow;
+    } else {
+      effectiveStallMs = stallMs;
+      if (currentToolBucket !== null && toolStallMs) {
+        effectiveStallMs =
+          currentToolBucket === "slow" ? toolStallMs.slow : toolStallMs.fast;
+      }
     }
     if (silence >= effectiveStallMs) {
       killed = true;
-      // "silence" when the tool-aware path is active (parseProgress set,
-      // we have seen at least one classified event). "stall" for
-      // the legacy path so existing consumers / tests see the same string.
+      // Phase A → "startup_hang"; Phase B → "silence" when tool-aware path
+      // is active (parseProgress set, at least one classified event); else
+      // "stall" for the legacy path (existing consumers / tests rely on
+      // these strings).
       if (killReason === undefined) {
-        killReason =
-          parseProgress && lastClassifiedActivityAt !== null
-            ? "silence"
-            : "stall";
+        if (inStartupPhase) {
+          killReason = "startup_hang";
+        } else {
+          killReason =
+            parseProgress && lastClassifiedActivityAt !== null
+              ? "silence"
+              : "stall";
+        }
       }
       try {
         opts.onStallKill?.(silence);

@@ -2179,6 +2179,23 @@ export function contentHashDelta(
 const NO_NEW_COMMIT_ERROR_SUFFIX = " did not create a new commit";
 
 /**
+ * Editor / tool backup-file extensions that sub-agents leave behind. Gemini's
+ * `--yolo` mode and sed/vim-style edits routinely write `*.bak`, `*.tmp`,
+ * `*.swp`, `*.orig`, `*.rej`, or `*~` artifacts the agent never cleans up.
+ * The post-agent hygiene gate (`validatePostAgentHygiene`) and the test-only
+ * auto-commit fallback both filter these out of the porcelain `?? path`
+ * status lines so a single stray .bak doesn't pause the phase. The agent's
+ * actual code patch is correct in every observed case; cleaning up artifacts
+ * is mechanical.
+ *
+ * Matches the `?? <path>` form only (untracked files). Modified-tracked files
+ * with these extensions still flag dirty because they represent the user
+ * intentionally checking in a backup.
+ */
+export const EDITOR_ARTIFACT_STATUS =
+  /^\?\? .*(?:\.bak|\.tmp|\.swp|\.orig|\.rej|~)$/;
+
+/**
  * Capture HEAD sha for each sibling repo. Used by `validatePostAgentHygiene`
  * to accept a phase whose deliverable landed in a sibling (e.g.
  * `agnt2-gstack/implemented/<doc>.md` for a `[research]` phase whose
@@ -2351,7 +2368,9 @@ export function validatePostAgentHygiene(opts: {
     : /^\?\? \.llm-tmp(\/|$)/;
   const filteredAfter: GitSnapshot = {
     ...after,
-    status: after.status.filter((line) => !allowedStatus.test(line)),
+    status: after.status.filter(
+      (line) => !allowedStatus.test(line) && !EDITOR_ARTIFACT_STATUS.test(line),
+    ),
   };
   const dirty = contentHashDelta(opts.before, filteredAfter, opts.cwd);
   if (dirty.length > 0) {
@@ -5745,7 +5764,9 @@ function applyGateHygiene(opts: {
   if (errors.length > 0 && isGateRole) {
     const after = captureGitSnapshot(opts.cwd);
     const allowedStatus = /^\?\? \.llm-tmp(\/|$)/;
-    const dirtyLines = after.status.filter((line) => !allowedStatus.test(line));
+    const dirtyLines = after.status.filter(
+      (line) => !allowedStatus.test(line) && !EDITOR_ARTIFACT_STATUS.test(line),
+    );
     const onlyDirtyError =
       errors.length === 1 && errors[0].includes("left the working tree dirty");
     if (onlyDirtyError && dirtyLines.length > 0) {

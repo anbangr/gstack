@@ -48,6 +48,7 @@ function emit(
           | "progress_gap"
           | "stall"
           | "auth_required"
+          | "startup_hang"
           | undefined,
         lastTool: result?.lastTool,
         lastBucket: result?.lastBucket,
@@ -72,7 +73,16 @@ export function markPhaseFailed(
     state.phases[phaseIdx].status = "failed";
     state.phases[phaseIdx].error = reason;
   }
-  return emit("PHASE_FAILED", reason, ctx, state, phaseIdx, undefined, reason, result);
+  return emit(
+    "PHASE_FAILED",
+    reason,
+    ctx,
+    state,
+    phaseIdx,
+    undefined,
+    reason,
+    result,
+  );
 }
 
 export function markFeatureFailed(
@@ -293,10 +303,17 @@ export function renderRoleStepFailure(
   }
   if (result.stallKilled) {
     const ms = result.stallSilenceMs ?? 0;
-    const reasonLabel =
-      result.killReason === "progress_gap"
-        ? `no classified progress for ${ms}ms`
-        : `no output for ${ms}ms`;
+    let reasonLabel: string;
+    switch (result.killReason) {
+      case "progress_gap":
+        reasonLabel = `no classified progress for ${ms}ms`;
+        break;
+      case "startup_hang":
+        reasonLabel = `no CPU and no output during startup window of ${ms}ms`;
+        break;
+      default:
+        reasonLabel = `no output for ${ms}ms`;
+    }
     return {
       kind: "stalled",
       summary: `${role} stalled (${reasonLabel}, killed by watchdog)`,

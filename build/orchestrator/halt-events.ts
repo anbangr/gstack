@@ -64,8 +64,14 @@ export interface HaltEvent {
     /**
      * Why the watchdog killed. Absent for non-watchdog halts. New in
      * v1.40.x — see docs/superpowers/specs/2026-05-21-subagent-progress-watchdog-design.md.
+     * `startup_hang` added in v1.45 — see docs/superpowers/specs/2026-05-25-cpu-aware-startup-hang-watchdog-design.md.
      */
-    killReason?: "silence" | "progress_gap" | "stall" | "auth_required";
+    killReason?:
+      | "silence"
+      | "progress_gap"
+      | "stall"
+      | "auth_required"
+      | "startup_hang";
     /** Last classified tool at kill time. Null when never classified. */
     lastTool?: string | null;
     /** Last classified bucket at kill time. Null when never classified. */
@@ -149,7 +155,9 @@ export function emitHaltEvent(
   const safeRun = safeRegistryRunId(event.runId);
   const finalPath = path.join(dir, `${safeRun}-${faultId}.json`);
   const tmpPath = `${finalPath}.tmp.${process.pid}`;
-  fs.writeFileSync(tmpPath, JSON.stringify(full, null, 2) + "\n", { mode: 0o600 });
+  fs.writeFileSync(tmpPath, JSON.stringify(full, null, 2) + "\n", {
+    mode: 0o600,
+  });
   fs.renameSync(tmpPath, finalPath);
   return faultId;
 }
@@ -184,7 +192,9 @@ export function emitHaltEventResolved(
       runId,
       faultId,
     };
-    fs.writeFileSync(tmpPath, JSON.stringify(body, null, 2) + "\n", { mode: 0o600 });
+    fs.writeFileSync(tmpPath, JSON.stringify(body, null, 2) + "\n", {
+      mode: 0o600,
+    });
     fs.renameSync(tmpPath, finalPath);
     return true;
   } catch (err) {
@@ -261,7 +271,10 @@ export function loadPendingInvestigations(opts?: {
   queueDir?: string;
 }): HaltEvent[] {
   return loadPendingEntries(opts)
-    .filter((e): e is Extract<PendingEntry, { kind: "detected" }> => e.kind === "detected")
+    .filter(
+      (e): e is Extract<PendingEntry, { kind: "detected" }> =>
+        e.kind === "detected",
+    )
     .map((e) => e.event);
 }
 
@@ -269,7 +282,11 @@ export function markInvestigated(
   runId: string,
   faultId: string,
   // _outcome is reserved for future use; logging happens at the call site.
-  _outcome: "investigated" | "skipped-no-context" | "self-healed" | "audit-skipped",
+  _outcome:
+    | "investigated"
+    | "skipped-no-context"
+    | "self-healed"
+    | "audit-skipped",
   opts?: { queueDir?: string },
 ): void {
   const safeRun = safeRegistryRunId(runId);
@@ -293,7 +310,12 @@ export interface BuildHaltSnapshotInput {
    * halt-event-helpers when the halt was triggered by a stall-kill.
    * Absent for non-watchdog halts.
    */
-  killReason?: "silence" | "progress_gap" | "stall" | "auth_required";
+  killReason?:
+    | "silence"
+    | "progress_gap"
+    | "stall"
+    | "auth_required"
+    | "startup_hang";
   lastTool?: string | null;
   lastBucket?: "fast" | "slow" | null;
 }
@@ -320,7 +342,9 @@ export function buildHaltSnapshot(
   try {
     const raw = fs.readFileSync(input.stdoutLogPath, "utf8");
     const lines = raw.split("\n");
-    stdoutTail = lines.slice(Math.max(0, lines.length - STDOUT_TAIL_LINES)).join("\n");
+    stdoutTail = lines
+      .slice(Math.max(0, lines.length - STDOUT_TAIL_LINES))
+      .join("\n");
   } catch {
     stdoutTail = "";
   }

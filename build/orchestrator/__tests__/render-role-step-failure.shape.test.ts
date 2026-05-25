@@ -139,6 +139,27 @@ describe("renderRoleStepFailure", () => {
     expect(result.summary).not.toContain("no output");
   });
 
+  test("edge: startup_hang killReason produces a startup-specific stalled summary", () => {
+    // For killReason="startup_hang" the watchdog fired due to silent CPU
+    // during the initial startup window. The summary must reflect the
+    // distinctive silent-CPU failure mode, not generic stdout silence.
+    if (typeof helpers.renderRoleStepFailure !== "function") {
+      expect(false).toBe(true);
+      return;
+    }
+    const result = helpers.renderRoleStepFailure("planSynthesizer", {
+      ...baseResult(),
+      stallKilled: true,
+      stallSilenceMs: 120_000,
+      killReason: "startup_hang",
+    }) as FailureRender;
+    expect(result.kind).toBe("stalled");
+    expect(result.summary).toContain("planSynthesizer");
+    expect(result.summary).toContain("startup");
+    expect(result.summary).toContain("120000");
+    expect(result.stallSilenceMs).toBe(120_000);
+  });
+
   test("edge: helper is pure and side-effect-free", () => {
     if (typeof helpers.renderRoleStepFailure !== "function") {
       expect(false).toBe(true);

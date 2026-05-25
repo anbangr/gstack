@@ -76,6 +76,29 @@ const SHIP_TIMEOUT_MS = envNumberOrDefault(
   BUILD_DEFAULTS.timeoutsMs.ship,
 );
 
+/**
+ * Resolve the Phase A startup-hang window from
+ * GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS. Historical name; current semantics
+ * are documented at the call site and in stall-watchdog.ts's
+ * StallWatchdogOptions.startupHangMs JSDoc.
+ *
+ * Returns:
+ *  - the parsed positive integer when the env var is set to a positive value,
+ *  - 0 when the env var is set to literal "0" (disables Phase A entirely),
+ *  - 120_000 otherwise (default).
+ *
+ * Direct env-read instead of envNumberOrDefault because the latter coerces
+ * 0 → fallback, leaving no way to disable Phase A via env.
+ */
+function resolveStartupHangMs(): number {
+  const raw = process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS;
+  if (raw === undefined) return 120_000;
+  const trimmed = raw.trim();
+  if (trimmed === "0") return 0;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
+}
+
 function geminiBin(): string {
   return process.env.GEMINI_BIN || "gemini";
 }
@@ -573,7 +596,6 @@ export function spawnCaptured(args: {
     const startedAt = Date.now();
     let stallKilled = false;
     let stallSilenceMs = 0;
-    let firstTokenKilled = false;
     let stdoutBuf = "";
     let stderrBuf = "";
     let stdoutBytes = 0;
@@ -767,53 +789,15 @@ export function spawnCaptured(args: {
     let backpressurePausedMs = 0;
     let watchdogActivityHook: (() => void) | null = null;
 
-    let firstTokenTimer: unknown = null;
-    let firstTokenKillTimer: unknown = null;
-    const firstTokenDeadlineMs = envNumberOrDefault(
-      "GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS",
-      120000,
-    );
-    const clearFirstTokenTimers = () => {
-      if (firstTokenTimer) {
-        clearTimeout(firstTokenTimer as ReturnType<typeof setTimeout>);
-        firstTokenTimer = null;
-      }
-      if (firstTokenKillTimer) {
-        clearTimeout(firstTokenKillTimer as ReturnType<typeof setTimeout>);
-        firstTokenKillTimer = null;
-      }
-    };
-    const noteFirstToken = () => {
-      if (stdoutBytes + stderrBytes > 0) clearFirstTokenTimers();
-    };
-    if (firstTokenDeadlineMs > 0) {
-      firstTokenTimer = setTimeout(() => {
-        if (stdoutBytes + stderrBytes > 0 || stallKilled) return;
-        firstTokenKilled = true;
-        stallKilled = true;
-        stallSilenceMs = firstTokenDeadlineMs;
-        if (typeof child.pid === "number") {
-          killProcessAndGroup(child.pid, "SIGTERM");
-          firstTokenKillTimer = setTimeout(() => {
-            if (typeof child.pid === "number") {
-              killProcessAndGroup(child.pid, "SIGKILL");
-            }
-          }, 5000);
-        }
-      }, firstTokenDeadlineMs);
-    }
-
     child.stdout?.on("data", (chunk: Buffer | string) => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       stdoutBytes += text.length;
-      noteFirstToken();
       stdoutBuf = truncate(stdoutBuf + text);
       writeChannel("OUT", text);
     });
     child.stderr?.on("data", (chunk: Buffer | string) => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       stderrBytes += text.length;
-      noteFirstToken();
       stderrBuf = truncate(stderrBuf + text);
       writeChannel("ERR", text);
     });
@@ -836,6 +820,12 @@ export function spawnCaptured(args: {
       {
         stallMs: args.timeoutMs,
         provider,
+        // GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS keeps its historical name
+        // for operator-override continuity. New semantics: Phase A window
+        // (CPU + stream both silent). Set to 0 to disable Phase A.
+        // The watchdog clamps the effective Phase A window to stallMs
+        // internally so this caller can pass the env-derived value as-is.
+        startupHangMs: resolveStartupHangMs(),
         onStallKill: (silenceMs) => {
           stallKilled = true;
           stallSilenceMs = silenceMs;
@@ -862,7 +852,6 @@ export function spawnCaptured(args: {
     if (args.closeStdin) child.stdin?.end();
 
     const finish = (exitCode: number | null, signal: NodeJS.Signals | null) => {
-      clearFirstTokenTimers();
       watchdog.stop();
       // If the watchdog killed us, treat as timedOut. Otherwise a SIGTERM/
       // SIGKILL signal means an external killer (not the watchdog) — surface
@@ -976,9 +965,7 @@ export function spawnCaptured(args: {
           stallKilled,
           stallSilenceMs,
           exitSignal,
-          killReason: firstTokenKilled
-            ? "first_token_timeout"
-            : watchdog.killReason(),
+          killReason: watchdog.killReason(),
           lastTool: watchdog.lastTool(),
           lastBucket: watchdog.lastBucket(),
           logPath: args.logPath,
