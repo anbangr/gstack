@@ -614,6 +614,45 @@ function pickProviderForBin(bin: string): Provider {
 }
 
 /**
+ * Bug 1 (polis-mesh / simclaw / 12 pending PROVIDER_TIMEOUT records):
+ * resolve a per-provider override for the watchdog's silence (stallMs)
+ * window. Default behavior (unset) returns `defaultMs` (the caller's
+ * timeoutMs) — current behavior preserved. Two opt-in env vars allow
+ * operators to extend (or shorten) the patience window without raising
+ * the OVERALL timeout:
+ *
+ *   GSTACK_BUILD_STREAM_SILENCE_MS_CLAUDE=1800000  # 30 min for claude
+ *   GSTACK_BUILD_STREAM_SILENCE_MS_KIMI=1200000    # 20 min for kimi
+ *   GSTACK_BUILD_STREAM_SILENCE_MS=600000          # global default
+ *
+ * The provider-specific var beats the global. Setting to 0 disables the
+ * override and returns defaultMs. Use case: long-thinking models on big
+ * diffs (opus xhigh feature-review) that emit one chunk and then think
+ * server-side for many minutes — pre-fix the legacy stallMs window
+ * silently killed them as "stall" even though the API was still working.
+ */
+export function resolveStreamSilenceMs(
+  provider: Provider,
+  defaultMs: number,
+): number {
+  const upper = provider.toUpperCase();
+  const perProvider = process.env[`GSTACK_BUILD_STREAM_SILENCE_MS_${upper}`];
+  const global = process.env["GSTACK_BUILD_STREAM_SILENCE_MS"];
+  const raw =
+    perProvider !== undefined && perProvider !== ""
+      ? perProvider
+      : global !== undefined && global !== ""
+        ? global
+        : undefined;
+  if (raw === undefined) return defaultMs;
+  const trimmed = raw.trim();
+  if (trimmed === "0" || trimmed === "") return defaultMs;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || n <= 0) return defaultMs;
+  return n;
+}
+
+/**
  * Pick the parser for a provider, or `null` to disable tool-aware
  * windowing for this subagent. Null is returned when the env-var kill
  * switch is set OR the provider has no useful parser (shell etc.).
@@ -897,7 +936,10 @@ export function spawnCaptured(args: {
         ? { mode: "cpu", child }
         : { mode: "stream", child },
       {
-        stallMs: args.timeoutMs,
+        // Bug 1: allow per-provider stream-silence override via env without
+        // raising the overall timeout. Defaults to args.timeoutMs (current
+        // behavior). See resolveStreamSilenceMs for the env-var contract.
+        stallMs: resolveStreamSilenceMs(provider, args.timeoutMs),
         provider,
         // GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS keeps its historical name
         // for operator-override continuity. New semantics: Phase A window
