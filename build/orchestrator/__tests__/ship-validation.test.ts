@@ -4,25 +4,30 @@
  */
 import { describe, it, expect } from "bun:test";
 import {
+  parseGithubOwnerRepo,
   parsePrReference,
   validateShipCompletion,
   type RunCommandFn,
 } from "../ship-validation";
 
 describe("parsePrReference", () => {
-  it("extracts PR number from canonical GitHub URL", () => {
+  it("extracts PR number + owner + repo from canonical GitHub URL", () => {
     expect(
       parsePrReference("Created https://github.com/foo/bar/pull/42 for review."),
     ).toEqual({
       prNumber: 42,
       prUrl: "https://github.com/foo/bar/pull/42",
+      prOwner: "foo",
+      prRepo: "bar",
     });
   });
 
-  it("extracts PR number from 'PR #N' reference", () => {
+  it("extracts PR number from 'PR #N' reference (no owner/repo)", () => {
     expect(parsePrReference("Opened PR #1234. Ready to land.")).toEqual({
       prNumber: 1234,
       prUrl: null,
+      prOwner: null,
+      prRepo: null,
     });
   });
 
@@ -32,19 +37,50 @@ describe("parsePrReference", () => {
     );
     expect(out.prNumber).toBe(100);
     expect(out.prUrl).toBe("https://github.com/foo/bar/pull/100");
+    expect(out.prOwner).toBe("foo");
+    expect(out.prRepo).toBe("bar");
   });
 
   it("returns nulls when no PR reference is present", () => {
     expect(parsePrReference("All tests passed. READY TO LAND.")).toEqual({
       prNumber: null,
       prUrl: null,
+      prOwner: null,
+      prRepo: null,
     });
   });
 
   it("ignores PR-like text inside other domains", () => {
     expect(
       parsePrReference("see https://example.com/foo/bar/pull/9 not GH"),
-    ).toEqual({ prNumber: null, prUrl: null });
+    ).toEqual({ prNumber: null, prUrl: null, prOwner: null, prRepo: null });
+  });
+
+  // T6 /review LOW finding (deferred from PR #96; addressed here):
+  // PR #0 is not a valid GitHub PR. parsePrReference must reject it at
+  // the parser layer rather than letting `gh pr view 0` surface as
+  // pr_not_found_on_github (a misleading reason for what is actually a
+  // parser-input problem).
+  it("rejects PR #0 (not a valid GitHub PR number)", () => {
+    expect(parsePrReference("Opened PR #0 for review")).toEqual({
+      prNumber: null,
+      prUrl: null,
+      prOwner: null,
+      prRepo: null,
+    });
+    expect(parsePrReference("see https://github.com/foo/bar/pull/0")).toEqual(
+      { prNumber: null, prUrl: null, prOwner: null, prRepo: null },
+    );
+  });
+
+  it("rejects leading-zero numbers that parse to 0", () => {
+    // Number("0000") === 0 → reject
+    expect(parsePrReference("see PR #0000 here")).toEqual({
+      prNumber: null,
+      prUrl: null,
+      prOwner: null,
+      prRepo: null,
+    });
   });
 });
 
@@ -131,6 +167,12 @@ describe("validateShipCompletion", () => {
         status: 0,
         stdout: `${sha}\trefs/heads/${branch}\n`,
       },
+      // git remote get-url origin (T6 /review repo-match check)
+      {
+        cmd: "git",
+        status: 0,
+        stdout: "https://github.com/foo/bar.git\n",
+      },
       {
         cmd: "gh",
         status: 0,
@@ -162,6 +204,11 @@ describe("validateShipCompletion", () => {
         cmd: "git",
         status: 0,
         stdout: `${sha}\trefs/heads/${branch}\n`,
+      },
+      {
+        cmd: "git",
+        status: 0,
+        stdout: "https://github.com/foo/bar.git\n",
       },
       {
         cmd: "gh",
@@ -259,6 +306,7 @@ describe("validateShipCompletion", () => {
     const sha = "e".repeat(40);
     const runCommand = mockRun([
       { cmd: "git", status: 0, stdout: `${sha}\trefs/heads/${branch}\n` },
+      { cmd: "git", status: 0, stdout: "https://github.com/foo/bar.git\n" },
       {
         cmd: "gh",
         status: 0,
@@ -283,6 +331,7 @@ describe("validateShipCompletion", () => {
     const sha = "f".repeat(40);
     const runCommand = mockRun([
       { cmd: "git", status: 0, stdout: `${sha}\trefs/heads/${branch}\n` },
+      { cmd: "git", status: 0, stdout: "https://github.com/foo/bar.git\n" },
       {
         cmd: "gh",
         status: 0,
@@ -388,6 +437,7 @@ describe("validateShipCompletion", () => {
     const sha = "2".repeat(40);
     const runCommand = mockRun([
       { cmd: "git", status: 0, stdout: `${sha}\trefs/heads/${branch}\n` },
+      { cmd: "git", status: 0, stdout: "https://github.com/foo/bar.git\n" },
       {
         cmd: "gh",
         status: 0,
@@ -408,5 +458,341 @@ describe("validateShipCompletion", () => {
     if (out.ok) {
       expect(out.prNumber).toBe(77);
     }
+  });
+
+  // T6 /review MEDIUM finding (deferred from PR #96; addressed here).
+  // PR_URL_RE accepts any github.com/<owner>/<repo>/pull/N. A sub-agent
+  // could quote a real PR URL from a sibling repo (or a fork) and the
+  // headRefName check would only fire if branch names happened to collide.
+  // Repo-match closes that gap by binding the validator to `git remote
+  // get-url origin`.
+
+  it("MEDIUM /review: returns pr_repo_mismatch when prose URL is from a different repo", () => {
+    const sha = "3".repeat(40);
+    const runCommand = mockRun([
+      { cmd: "git", status: 0, stdout: `${sha}\trefs/heads/${branch}\n` },
+      { cmd: "git", status: 0, stdout: "https://github.com/me/myrepo.git\n" },
+    ]);
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Opened https://github.com/attacker/sibling/pull/42",
+      runCommand,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe("pr_repo_mismatch");
+      expect(out.evidence.join(" ")).toContain("attacker/sibling");
+      expect(out.evidence.join(" ")).toContain("me/myrepo");
+    }
+  });
+
+  it("MEDIUM /review: repo-match is case-insensitive", () => {
+    const sha = "4".repeat(40);
+    const runCommand = mockRun([
+      { cmd: "git", status: 0, stdout: `${sha}\trefs/heads/${branch}\n` },
+      { cmd: "git", status: 0, stdout: "https://github.com/Foo/Bar.git\n" },
+      {
+        cmd: "gh",
+        status: 0,
+        stdout: JSON.stringify({
+          url: "https://github.com/foo/bar/pull/42",
+          headRefName: branch,
+          state: "OPEN",
+        }),
+      },
+    ]);
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Opened https://github.com/foo/bar/pull/42",
+      runCommand,
+    });
+    expect(out.ok).toBe(true);
+  });
+
+  it("MEDIUM /review: bare 'PR #N' references skip repo-match (no URL to check against)", () => {
+    const sha = "5".repeat(40);
+    // No git remote get-url mock — bare references don't trigger that subprocess.
+    const runCommand = mockRun([
+      { cmd: "git", status: 0, stdout: `${sha}\trefs/heads/${branch}\n` },
+      {
+        cmd: "gh",
+        status: 0,
+        stdout: JSON.stringify({
+          url: "https://github.com/foo/bar/pull/42",
+          headRefName: branch,
+          state: "OPEN",
+        }),
+      },
+    ]);
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Opened PR #42",
+      runCommand,
+    });
+    expect(out.ok).toBe(true);
+  });
+
+  it("MEDIUM /review: soft-fails when git remote get-url errors (no origin → skip check)", () => {
+    const sha = "6".repeat(40);
+    const runCommand = mockRun([
+      { cmd: "git", status: 0, stdout: `${sha}\trefs/heads/${branch}\n` },
+      {
+        cmd: "git",
+        status: 128,
+        stderr: "fatal: No such remote 'origin'",
+      },
+      {
+        cmd: "gh",
+        status: 0,
+        stdout: JSON.stringify({
+          url: "https://github.com/foo/bar/pull/42",
+          headRefName: branch,
+          state: "OPEN",
+        }),
+      },
+    ]);
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Opened https://github.com/foo/bar/pull/42",
+      runCommand,
+    });
+    expect(out.ok).toBe(true);
+  });
+});
+
+// T6 /review MEDIUM: auto-land mode validation wiring. post-merge mode
+// skips the branch_not_pushed check (branch may be deleted by squash-
+// merge + delete-branch) and accepts OPEN or MERGED for the PR state.
+describe("validateShipCompletion: mode: post-merge (auto-land)", () => {
+  const branch = "feat/cancel-api-followups";
+  const cwd = "/tmp/whatever";
+
+  it("does NOT call git ls-remote in post-merge mode (branch may be deleted)", () => {
+    let lsRemoteCalled = false;
+    const runCommand: RunCommandFn = (cmd, args) => {
+      if (cmd === "git" && args[0] === "ls-remote") lsRemoteCalled = true;
+      if (cmd === "git" && args[0] === "remote") {
+        return { status: 0, stdout: "https://github.com/foo/bar.git\n", stderr: "" };
+      }
+      if (cmd === "gh") {
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            url: "https://github.com/foo/bar/pull/42",
+            headRefName: branch,
+            state: "MERGED",
+          }),
+          stderr: "",
+        };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Opened https://github.com/foo/bar/pull/42 and merged it",
+      runCommand,
+      mode: "post-merge",
+    });
+    expect(out.ok).toBe(true);
+    expect(lsRemoteCalled).toBe(false);
+    if (out.ok) {
+      expect(out.sha).toBeUndefined();
+      expect(out.prNumber).toBe(42);
+    }
+  });
+
+  it("accepts state MERGED in post-merge mode (auto-land's land role squash-merged)", () => {
+    const runCommand: RunCommandFn = (cmd, args) => {
+      if (cmd === "git" && args[0] === "remote") {
+        return { status: 0, stdout: "https://github.com/foo/bar.git\n", stderr: "" };
+      }
+      if (cmd === "gh") {
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            url: "https://github.com/foo/bar/pull/42",
+            headRefName: branch,
+            state: "MERGED",
+          }),
+          stderr: "",
+        };
+      }
+      return { status: 1, stdout: "", stderr: "" };
+    };
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Opened https://github.com/foo/bar/pull/42, merged.",
+      runCommand,
+      mode: "post-merge",
+    });
+    expect(out.ok).toBe(true);
+  });
+
+  it("accepts state OPEN in post-merge mode (land role hasn't merged yet)", () => {
+    const runCommand: RunCommandFn = (cmd, args) => {
+      if (cmd === "git" && args[0] === "remote") {
+        return { status: 0, stdout: "https://github.com/foo/bar.git\n", stderr: "" };
+      }
+      if (cmd === "gh") {
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            url: "https://github.com/foo/bar/pull/42",
+            headRefName: branch,
+            state: "OPEN",
+          }),
+          stderr: "",
+        };
+      }
+      return { status: 1, stdout: "", stderr: "" };
+    };
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "PR #42 ready",
+      runCommand,
+      mode: "post-merge",
+    });
+    expect(out.ok).toBe(true);
+  });
+
+  it("rejects state CLOSED in post-merge mode (closed without merge is not success)", () => {
+    const runCommand: RunCommandFn = (cmd, args) => {
+      if (cmd === "git" && args[0] === "remote") {
+        return { status: 0, stdout: "https://github.com/foo/bar.git\n", stderr: "" };
+      }
+      if (cmd === "gh") {
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            url: "https://github.com/foo/bar/pull/42",
+            headRefName: branch,
+            state: "CLOSED",
+          }),
+          stderr: "",
+        };
+      }
+      return { status: 1, stdout: "", stderr: "" };
+    };
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Opened https://github.com/foo/bar/pull/42",
+      runCommand,
+      mode: "post-merge",
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe("pr_not_open");
+    }
+  });
+
+  it("still catches the headline hallucination case: no PR reference + gh pr list empty", () => {
+    // Auto-land mode: kimi-as-ship fabricated "READY TO LAND" but never
+    // created a PR. ship-output.md has no PR URL or "PR #N", AND
+    // gh pr list --head <branch> returns []. Validator falls back to gh
+    // pr list as a discovery path (legitimate land-role outputs sometimes
+    // just say "merged" without quoting a URL), but when that ALSO returns
+    // empty the hallucination is confirmed.
+    const runCommand: RunCommandFn = (cmd, args) => {
+      if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+        return { status: 0, stdout: "[]", stderr: "" };
+      }
+      throw new Error(`unexpected mock-runCommand call: ${cmd} ${args.join(" ")}`);
+    };
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Everything passed. READY TO LAND. 196 tests passed.",
+      runCommand,
+      mode: "post-merge",
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe("no_pr_reference_in_output");
+    }
+  });
+
+  it("falls back to gh pr list when output has no PR ref (legitimate merged PR exists)", () => {
+    // Land role just reported "merged" without quoting a URL. Validator
+    // discovers the merged PR via gh pr list and accepts it.
+    const runCommand: RunCommandFn = (cmd, args) => {
+      if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            {
+              number: 42,
+              state: "MERGED",
+              headRefName: branch,
+              url: "https://github.com/foo/bar/pull/42",
+            },
+          ]),
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected: ${cmd} ${args.join(" ")}`);
+    };
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Merged successfully.",
+      runCommand,
+      mode: "post-merge",
+    });
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.prNumber).toBe(42);
+      expect(out.prUrl).toBe("https://github.com/foo/bar/pull/42");
+    }
+  });
+});
+
+describe("parseGithubOwnerRepo", () => {
+  it("parses https URL with .git suffix", () => {
+    expect(parseGithubOwnerRepo("https://github.com/foo/bar.git")).toEqual({
+      owner: "foo",
+      repo: "bar",
+    });
+  });
+
+  it("parses https URL without .git", () => {
+    expect(parseGithubOwnerRepo("https://github.com/foo/bar")).toEqual({
+      owner: "foo",
+      repo: "bar",
+    });
+  });
+
+  it("parses git@github.com:owner/repo.git", () => {
+    expect(parseGithubOwnerRepo("git@github.com:foo/bar.git")).toEqual({
+      owner: "foo",
+      repo: "bar",
+    });
+  });
+
+  it("parses ssh://git@github.com/owner/repo", () => {
+    expect(parseGithubOwnerRepo("ssh://git@github.com/foo/bar.git")).toEqual({
+      owner: "foo",
+      repo: "bar",
+    });
+  });
+
+  it("returns null for non-github URLs", () => {
+    expect(parseGithubOwnerRepo("https://gitlab.com/foo/bar")).toBeNull();
+    expect(parseGithubOwnerRepo("file:///tmp/repo")).toBeNull();
+    expect(parseGithubOwnerRepo("")).toBeNull();
+  });
+
+  it("trims trailing slash", () => {
+    expect(parseGithubOwnerRepo("https://github.com/foo/bar/")).toEqual({
+      owner: "foo",
+      repo: "bar",
+    });
   });
 });

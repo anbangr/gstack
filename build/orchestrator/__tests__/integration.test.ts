@@ -865,9 +865,47 @@ test("normal resume ships origin-verified features before starting later feature
     ).toBe(0);
 
     const ghPath = path.join(binDir, "gh");
+    // Fake gh handles three shapes of `gh pr list`:
+    //  1. `gh pr list ... --json number --jq length` (verifyPostShip) →
+    //     echo "0" (no open PRs). `--jq` forces this path regardless of
+    //     `--json`.
+    //  2. `gh pr list ... --head <branch> ... --json number,state,...`
+    //     WITHOUT --jq (post-merge validator added by T6 /review #2
+    //     follow-up) → synthesize a MERGED PR for the branch so the
+    //     validator can confirm the ship actually landed.
+    //  3. Anything else → echo "0" (preserves the legacy default).
     fs.writeFileSync(
       ghPath,
-      '#!/bin/sh\nif [ "$1" = "pr" ] && [ "$2" = "list" ]; then echo 0; exit 0; fi\necho unexpected gh "$@" >&2\nexit 1\n',
+      [
+        "#!/bin/sh",
+        'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then',
+        '  has_jq=0',
+        '  has_json=0',
+        '  for arg in "$@"; do',
+        '    [ "$arg" = "--jq" ] && has_jq=1',
+        '    [ "$arg" = "--json" ] && has_json=1',
+        '  done',
+        '  # --jq path (verifyPostShip): scalar count, regardless of --json.',
+        '  if [ "$has_jq" = "1" ]; then',
+        '    echo 0',
+        '    exit 0',
+        '  fi',
+        '  # --json without --jq (post-merge validator): JSON array shape.',
+        '  if [ "$has_json" = "1" ]; then',
+        '    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")',
+        '    while [ "$#" -gt 0 ]; do',
+        '      if [ "$1" = "--head" ]; then shift; branch="$1"; fi',
+        '      shift || true',
+        '    done',
+        '    printf \'[{"number":1,"state":"MERGED","headRefName":"%s","url":"https://github.com/foo/bar/pull/1"}]\\n\' "$branch"',
+        '    exit 0',
+        '  fi',
+        '  echo 0',
+        '  exit 0',
+        "fi",
+        'echo unexpected gh "$@" >&2',
+        "exit 1",
+      ].join("\n") + "\n",
       { mode: 0o755 },
     );
     const geminiPath = path.join(binDir, "gemini");
