@@ -2568,7 +2568,7 @@ describe("clearFailureStateOnCommit", () => {
 
   it("clears failedAtPhase, failureReason, and feature.error when phase that matched failedAtPhase commits", () => {
     const state = stateWithFailure();
-    clearFailureStateOnCommit(state, 0, 0);
+    clearFailureStateOnCommit(state, 0, 0, "failed");
     expect(state.failedAtPhase).toBeUndefined();
     expect(state.failureReason).toBeUndefined();
     expect(state.features?.[0]?.error).toBeUndefined();
@@ -2578,7 +2578,7 @@ describe("clearFailureStateOnCommit", () => {
   it("leaves failure flags intact when failedAtPhase points at a different phase still failed", () => {
     const state = stateWithFailure();
     state.failedAtPhase = 5;
-    clearFailureStateOnCommit(state, 0, 0);
+    clearFailureStateOnCommit(state, 0, 0, "failed");
     // failedAtPhase=5 stays AND failureReason / feature flags stay too —
     // the build is still in a failed state from phase 5's perspective even
     // though phase 0 just committed cleanly.
@@ -2591,8 +2591,9 @@ describe("clearFailureStateOnCommit", () => {
   it("clears failure flags when failedAtPhase is null but the committing phase was status:failed (partial recovery)", () => {
     const state = stateWithFailure();
     delete state.failedAtPhase;
-    // phases[0].status is already "failed" from stateWithFailure factory.
-    clearFailureStateOnCommit(state, 0, 0);
+    // Pass pre-commit status explicitly — by the time callers invoke this
+    // helper, state.phases[0].status has already been overwritten to "committed".
+    clearFailureStateOnCommit(state, 0, 0, "failed");
     expect(state.failedAtPhase).toBeUndefined();
     expect(state.failureReason).toBeUndefined();
     expect(state.features?.[0]?.status).toBe("running");
@@ -2606,7 +2607,7 @@ describe("clearFailureStateOnCommit", () => {
       phases: [basePhase()],
       features: [{ number: "1", name: "F", status: "running" }],
     } as unknown as BuildState;
-    clearFailureStateOnCommit(state, 0, 0);
+    clearFailureStateOnCommit(state, 0, 0, "pending");
     expect(state.failedAtPhase).toBeUndefined();
     expect(state.failureReason).toBeUndefined();
     expect(state.features?.[0]?.status).toBe("running");
@@ -2615,8 +2616,27 @@ describe("clearFailureStateOnCommit", () => {
   it("handles missing featureIndex (legacy state shape)", () => {
     const state = stateWithFailure();
     delete (state as any).features;
-    clearFailureStateOnCommit(state, 0, undefined);
+    clearFailureStateOnCommit(state, 0, undefined, "failed");
     expect(state.failedAtPhase).toBeUndefined();
     expect(state.failureReason).toBeUndefined();
+  });
+
+  it("REGRESSION /review-T1: does NOT use post-commit phase status (caller must pass pre-commit status)", () => {
+    // Reproduces the regression caught by /review on T1: if the helper read
+    // state.phases[phaseIndex].status itself, the partial-recovery branch
+    // would silently never fire because callers invoke this helper AFTER
+    // markCommitted has overwritten the status to "committed".
+    const state = stateWithFailure();
+    delete state.failedAtPhase;
+    // Simulate the caller's flow: markCommitted ran first → status is now
+    // "committed" on disk. Caller still passes the original pre-commit
+    // status as the 4th arg.
+    (state.phases as any)[0].status = "committed";
+    clearFailureStateOnCommit(state, 0, 0, "failed");
+    // The partial-recovery clear MUST still fire even though the on-state
+    // status is now "committed".
+    expect(state.failureReason).toBeUndefined();
+    expect(state.features?.[0]?.status).toBe("running");
+    expect(state.features?.[0]?.error).toBeUndefined();
   });
 });

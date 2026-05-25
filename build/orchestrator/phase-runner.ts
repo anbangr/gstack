@@ -1018,9 +1018,17 @@ export function clearFailureStateOnCommit(
   state: BuildState,
   phaseIndex: number,
   featureIndex: number | undefined,
+  /**
+   * The phase's status BEFORE markCommitted overwrote it. Required because
+   * both call sites invoke this helper AFTER markCommitted, by which time
+   * state.phases[phaseIndex].status === "committed" and reading it here
+   * would always return false for the partial-recovery edge case (failedAtPhase
+   * null but phase itself was marked "failed" earlier).
+   */
+  phaseStatusBeforeCommit: PhaseState["status"],
 ): void {
   const failedHere = state.failedAtPhase === phaseIndex;
-  const phaseWasFailed = state.phases?.[phaseIndex]?.status === "failed";
+  const phaseWasFailed = phaseStatusBeforeCommit === "failed";
   // Mirrors the original `clearsBuildFailure` predicate from the manual
   // recovery path: clear when this phase is the recorded failure point, OR
   // when no top-level failure was recorded but the phase itself was marked

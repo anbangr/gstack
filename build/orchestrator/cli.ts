@@ -6604,9 +6604,15 @@ export function markPhaseCommittedAfterManualRecovery(args: {
     });
     const _committedSha =
       _shaR.status === 0 ? (_shaR.stdout || "").trim() || undefined : undefined;
+    const _statusBeforeCommit = phaseState.status;
     args.state.phases[phase.index] = markCommitted(phaseState, _committedSha);
     args.state.currentPhaseIndex = findNextPhaseIndex(args.state.phases);
-    clearFailureStateOnCommit(args.state, phase.index, phase.featureIndex);
+    clearFailureStateOnCommit(
+      args.state,
+      phase.index,
+      phase.featureIndex,
+      _statusBeforeCommit,
+    );
   }
   return { ok: true, phaseIndex: phase.index };
 }
@@ -7436,6 +7442,7 @@ async function runPhase(args: {
         _shaR.status === 0
           ? (_shaR.stdout || "").trim() || undefined
           : undefined;
+      const _statusBeforeCommit = phaseState.status;
       phaseState = markCommitted(phaseState, _committedSha);
       state.phases[phase.index] = phaseState;
       state.currentPhaseIndex = phase.index + 1;
@@ -7445,7 +7452,12 @@ async function runPhase(args: {
       // did not. A phase that hit RETRY_CAP_HIT, set failedAtPhase=N, was
       // re-launched, and committed cleanly would leave a stale failedAtPhase=N
       // on disk — surfacing as PREMATURE_COMPLETION on the next detector pass.
-      clearFailureStateOnCommit(state, phase.index, phase.featureIndex);
+      clearFailureStateOnCommit(
+        state,
+        phase.index,
+        phase.featureIndex,
+        _statusBeforeCommit,
+      );
       saveState(state, { noGbrain, log: console.warn });
       printPhaseReport(phase, phaseState, args.nextPhaseName, args.cwd);
       return "done";
