@@ -927,3 +927,169 @@ describe("attachStallWatchdog (cpu mode)", () => {
     ctrl.stop();
   });
 });
+
+describe("attachStallWatchdog (Phase A: startup-hang)", () => {
+  // Local copy of helper — the CPU-mode block has its own at line ~620.
+  const single = (pidNum: number, cpuMs: number) =>
+    new Map<number, number>([[pidNum, cpuMs]]);
+
+  it("Phase A fires when CPU=0 and stream=0 for startupHangMs (cpu mode)", () => {
+    const { clock, advance } = makeFakeClock();
+    const { child } = makeFakeChild();
+    (child as unknown as { pid: number }).pid = 12345;
+    // Brand-new pid with zero CPU; the existing CPU sampler records it as
+    // "first sighting with zero cputime" which is NOT activity.
+    const sampleCpuFn = () => single(12345, 0);
+    let killSilence: number | null = null;
+    const ctrl = attachStallWatchdog(
+      { mode: "cpu", child },
+      {
+        stallMs: 60_000, // long legacy window — must NOT be what fires
+        provider: "shell",
+        pollIntervalMs: 100,
+        gracePeriodMs: 50,
+        clock,
+        sampleCpuFn,
+        startupHangMs: 1_000, // short for the test
+        onStallKill: (s) => {
+          killSilence = s;
+        },
+      },
+    );
+    advance(1_200); // past the 1s Phase A window
+    expect(ctrl.stallKilled()).toBe(true);
+    expect(ctrl.killReason()).toBe("startup_hang");
+    expect(killSilence).not.toBeNull();
+    expect(killSilence!).toBeGreaterThanOrEqual(1_000);
+    ctrl.stop();
+  });
+
+  it("Phase A does NOT fire when CPU > 0 even with zero stream output (main bug fix)", () => {
+    const { clock, advance } = makeFakeClock();
+    const { child } = makeFakeChild();
+    (child as unknown as { pid: number }).pid = 12345;
+    // CPU climbs every poll — like a Codex reasoning subagent burning CPU
+    // on TLS / event loop while waiting on the model server.
+    let cpuMs = 50; // starts non-zero so first sighting registers as activity
+    const sampleCpuFn = () => {
+      cpuMs += 50;
+      return single(12345, cpuMs);
+    };
+    const ctrl = attachStallWatchdog(
+      { mode: "cpu", child },
+      {
+        stallMs: 60_000,
+        provider: "codex",
+        pollIntervalMs: 100,
+        gracePeriodMs: 50,
+        clock,
+        sampleCpuFn,
+        startupHangMs: 1_000,
+      },
+    );
+    advance(3_000); // 3x the startup window
+    expect(ctrl.stallKilled()).toBe(false);
+    expect(ctrl.killReason()).toBeUndefined();
+    ctrl.stop();
+  });
+
+  it("Phase A does NOT fire when stream emits bytes even with zero CPU (stream mode)", () => {
+    const { clock, advance } = makeFakeClock();
+    const { child, emitStdout } = makeFakeChild();
+    const ctrl = attachStallWatchdog(
+      { mode: "stream", child },
+      {
+        stallMs: 60_000,
+        provider: "shell",
+        pollIntervalMs: 100,
+        gracePeriodMs: 50,
+        clock,
+        startupHangMs: 1_000,
+      },
+    );
+    // Emit a byte at t=500ms. firstActivityAt is set; Phase A no longer
+    // applies; Phase B uses stallMs=60s.
+    advance(500);
+    emitStdout("hello\n");
+    advance(2_000); // past the 1s Phase A window but well under 60s stallMs
+    expect(ctrl.stallKilled()).toBe(false);
+    ctrl.stop();
+  });
+
+  it("Phase A→B transitions to legacy stallMs after first activity", () => {
+    const { clock, advance } = makeFakeClock();
+    const { child, emitStdout } = makeFakeChild();
+    const ctrl = attachStallWatchdog(
+      { mode: "stream", child },
+      {
+        stallMs: 2_000, // short legacy window for the test
+        provider: "shell",
+        pollIntervalMs: 100,
+        gracePeriodMs: 50,
+        clock,
+        startupHangMs: 500, // even shorter Phase A
+      },
+    );
+    advance(200);
+    emitStdout("first\n"); // sets firstActivityAt → Phase B
+    advance(2_500); // past stallMs from the byte
+    expect(ctrl.stallKilled()).toBe(true);
+    // Reason is the legacy "stall" string (Phase B uses pre-existing logic).
+    expect(ctrl.killReason()).toBe("stall");
+    ctrl.stop();
+  });
+
+  it("startupHangMs=0 disables Phase A entirely (falls back to legacy stallMs from spawn)", () => {
+    const { clock, advance } = makeFakeClock();
+    const { child } = makeFakeChild();
+    (child as unknown as { pid: number }).pid = 12345;
+    const sampleCpuFn = () => single(12345, 0); // zero CPU, no activity
+    const ctrl = attachStallWatchdog(
+      { mode: "cpu", child },
+      {
+        stallMs: 5_000, // legacy window from spawn
+        provider: "shell",
+        pollIntervalMs: 100,
+        gracePeriodMs: 50,
+        clock,
+        sampleCpuFn,
+        startupHangMs: 0, // disabled
+      },
+    );
+    advance(1_000); // way past what would have been Phase A
+    // Still alive because legacy stallMs (5s) hasn't elapsed
+    expect(ctrl.stallKilled()).toBe(false);
+    advance(5_000); // now past legacy stallMs
+    expect(ctrl.stallKilled()).toBe(true);
+    expect(ctrl.killReason()).toBe("stall");
+    ctrl.stop();
+  });
+
+  it("Phase A defaults to 120_000ms when startupHangMs option omitted", () => {
+    // Belt-and-suspenders: confirms the in-watchdog default matches the
+    // env-var-side default of 120_000. If someone changes one without the
+    // other, this test fails fast.
+    const { clock, advance } = makeFakeClock();
+    const { child } = makeFakeChild();
+    (child as unknown as { pid: number }).pid = 12345;
+    const sampleCpuFn = () => single(12345, 0);
+    const ctrl = attachStallWatchdog(
+      { mode: "cpu", child },
+      {
+        stallMs: 600_000,
+        provider: "shell",
+        pollIntervalMs: 1_000,
+        gracePeriodMs: 50,
+        clock,
+        sampleCpuFn,
+        // startupHangMs omitted on purpose
+      },
+    );
+    advance(119_000); // 1s before default 120s
+    expect(ctrl.stallKilled()).toBe(false);
+    advance(2_000); // now past 120s
+    expect(ctrl.stallKilled()).toBe(true);
+    expect(ctrl.killReason()).toBe("startup_hang");
+    ctrl.stop();
+  });
+});
