@@ -5,6 +5,7 @@ import {
   markCommitted,
   findNextPhaseIndex,
   clearFailureStateOnCommit,
+  shouldCommit,
   DEFAULT_MAX_CODEX_ITERATIONS,
   DEFAULT_CODEX_GEMINI_RERUN_FREQ,
   type Action,
@@ -2638,5 +2639,62 @@ describe("clearFailureStateOnCommit", () => {
     expect(state.failureReason).toBeUndefined();
     expect(state.features?.[0]?.status).toBe("running");
     expect(state.features?.[0]?.error).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// shouldCommit — Bug 3 (polis-mesh / mitosis-prototype / tidy-haven
+// PREMATURE_COMPLETION cluster). Pins the three-way commit gate contract.
+// ---------------------------------------------------------------------------
+describe("shouldCommit", () => {
+  function baseResult(overrides: Partial<SubAgentResult> = {}): SubAgentResult {
+    return {
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+      timedOut: false,
+      stallKilled: false,
+      logPath: "/tmp/log",
+      durationMs: 0,
+      retries: 0,
+      ...overrides,
+    } as SubAgentResult;
+  }
+
+  it("returns true for a clean success (exit 0, not timed out, no hygiene failure)", () => {
+    expect(shouldCommit(baseResult())).toBe(true);
+  });
+
+  it("returns false when timedOut (stall watchdog SIGTERMed)", () => {
+    expect(shouldCommit(baseResult({ timedOut: true }))).toBe(false);
+  });
+
+  it("returns false even when exitCode is 0 if timedOut (gemini graceful SIGTERM exit 0 trap)", () => {
+    // Bug 7 echo: Gemini handles SIGTERM and exits 0. shouldCommit must
+    // still reject this because timedOut === true.
+    expect(
+      shouldCommit(baseResult({ timedOut: true, exitCode: 0 })),
+    ).toBe(false);
+  });
+
+  it("returns false when exitCode is non-zero", () => {
+    expect(shouldCommit(baseResult({ exitCode: 1 }))).toBe(false);
+    expect(shouldCommit(baseResult({ exitCode: 137 }))).toBe(false);
+  });
+
+  it("returns false when exitCode is null (signal-killed)", () => {
+    expect(shouldCommit(baseResult({ exitCode: null }))).toBe(false);
+  });
+
+  it("returns false when hygieneFailure is true even if exitCode 0 (belt-and-suspenders against future decoupling)", () => {
+    expect(
+      shouldCommit(baseResult({ exitCode: 0, hygieneFailure: true })),
+    ).toBe(false);
+  });
+
+  it("returns false for the realistic hygieneFailureResult shape (exit 1 + hygieneFailure true)", () => {
+    expect(
+      shouldCommit(baseResult({ exitCode: 1, hygieneFailure: true })),
+    ).toBe(false);
   });
 });
