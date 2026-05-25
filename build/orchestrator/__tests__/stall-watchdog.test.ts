@@ -125,6 +125,7 @@ describe("attachStallWatchdog (stream mode)", () => {
         provider: "shell",
         pollIntervalMs: 50,
         gracePeriodMs: 50,
+        startupHangMs: 0,
         clock,
         onStallKill: (s) => {
           killSilence = s;
@@ -154,6 +155,7 @@ describe("attachStallWatchdog (stream mode)", () => {
         provider: "shell",
         pollIntervalMs: 50,
         gracePeriodMs: 100,
+        startupHangMs: 0,
         clock,
         onStallKill: (s) => {
           killSilence = s;
@@ -192,6 +194,7 @@ describe("attachStallWatchdog (stream mode)", () => {
           provider: "shell",
           pollIntervalMs: 50,
           gracePeriodMs: 150,
+          startupHangMs: 0,
           clock,
         },
       );
@@ -230,6 +233,7 @@ describe("attachStallWatchdog (stream mode)", () => {
           provider: "shell",
           pollIntervalMs: 50,
           gracePeriodMs: 5000,
+          startupHangMs: 0,
           clock,
         },
       );
@@ -268,6 +272,7 @@ describe("attachStallWatchdog (stream mode)", () => {
           provider: "shell",
           pollIntervalMs: 50,
           gracePeriodMs: 100,
+          startupHangMs: 0,
           clock,
         },
       );
@@ -291,6 +296,7 @@ describe("attachStallWatchdog (stream mode)", () => {
         provider: "shell",
         pollIntervalMs: 50,
         gracePeriodMs: 100,
+        startupHangMs: 0,
         clock,
       },
     );
@@ -315,6 +321,7 @@ describe("attachStallWatchdog (stream mode)", () => {
         provider: "shell",
         pollIntervalMs: 50,
         gracePeriodMs: 100,
+        startupHangMs: 0,
         clock,
       },
     );
@@ -337,6 +344,7 @@ describe("attachStallWatchdog (stream mode)", () => {
         provider: "shell",
         pollIntervalMs: 50,
         gracePeriodMs: 100,
+        startupHangMs: 0,
         clock,
       },
     );
@@ -362,6 +370,7 @@ describe("attachStallWatchdog (stream mode)", () => {
         provider: "shell",
         pollIntervalMs: 50,
         gracePeriodMs: 100,
+        startupHangMs: 0,
         clock,
       },
     );
@@ -381,6 +390,7 @@ describe("attachStallWatchdog (stream mode)", () => {
         provider: "shell",
         pollIntervalMs: 1000,
         gracePeriodMs: 100,
+        startupHangMs: 0,
         clock,
       },
     );
@@ -407,6 +417,7 @@ describe("attachStallWatchdog (mtime mode)", () => {
         provider: "shell",
         pollIntervalMs: 50,
         gracePeriodMs: 100,
+        startupHangMs: 0,
         clock,
         statFn,
       },
@@ -434,6 +445,7 @@ describe("attachStallWatchdog (mtime mode)", () => {
         provider: "shell",
         pollIntervalMs: 50,
         gracePeriodMs: 100,
+        startupHangMs: 0,
         clock,
         statFn,
         onStallKill: (s) => {
@@ -464,6 +476,7 @@ describe("attachStallWatchdog (mtime mode)", () => {
         provider: "shell",
         pollIntervalMs: 50,
         gracePeriodMs: 100,
+        startupHangMs: 0,
         clock,
         statFn,
       },
@@ -662,6 +675,7 @@ describe("attachStallWatchdog (cpu mode)", () => {
         provider: "kimi",
         pollIntervalMs: 100,
         gracePeriodMs: 50,
+        startupHangMs: 0,
         clock,
         sampleCpuFn,
         onStallKill: (s) => {
@@ -718,6 +732,7 @@ describe("attachStallWatchdog (cpu mode)", () => {
         provider: "shell",
         pollIntervalMs: 100,
         gracePeriodMs: 50,
+        startupHangMs: 0,
         clock,
         sampleCpuFn,
       },
@@ -743,6 +758,7 @@ describe("attachStallWatchdog (cpu mode)", () => {
         provider: "shell",
         pollIntervalMs: 100,
         gracePeriodMs: 50,
+        startupHangMs: 0,
         clock,
         sampleCpuFn,
       },
@@ -771,6 +787,7 @@ describe("attachStallWatchdog (cpu mode)", () => {
         provider: "shell",
         pollIntervalMs: 100,
         gracePeriodMs: 50,
+        startupHangMs: 0,
         clock,
         sampleCpuFn,
       },
@@ -918,6 +935,7 @@ describe("attachStallWatchdog (cpu mode)", () => {
         provider: "shell",
         pollIntervalMs: 100,
         gracePeriodMs: 50,
+        startupHangMs: 0,
         clock,
         sampleCpuFn,
       },
@@ -1082,7 +1100,6 @@ describe("attachStallWatchdog (Phase A: startup-hang)", () => {
         gracePeriodMs: 50,
         clock,
         sampleCpuFn,
-        // startupHangMs omitted on purpose
       },
     );
     advance(119_000); // 1s before default 120s
