@@ -1,7 +1,7 @@
 ---
 name: build
 preamble-tier: 4
-version: 1.29.0
+version: 1.30.0
 description: |
   gstack autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -1225,6 +1225,26 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
      MUST include `<!-- testCmd: -->` in the phase body if the per-phase test
      runner differs from the repo root command. This prevents the verify-red gate
      from misdetecting the runner and halting with `RED_GATE_ZERO_TESTS_COLLECTED`.
+   - **Co-located tests for `package main` shims**: When a `code` phase produces
+     a Go `package main` binary (e.g. `cmd/foo/main.go`,
+     `experiments/x/cmd/foo/main.go`), emit `<!-- testCmd: -->` even in a
+     monoglot Go repo where the previous bullet would otherwise let you skip it.
+     The command MUST include the binary's directory in the path list, because
+     Go requires `package main` tests to live alongside `main.go` and the
+     test-writer will place `main_test.go` next to the binary. If the testCmd
+     points only at the sibling `test/` tree, verify-red exercises the wrong
+     directory, sees existing unit tests all-pass, and halts with
+     `Gemini could not produce failing tests after N attempts (GSTACK_BUILD_RED_MAX_ITER)`.
+     Concrete example: a phase that creates
+     `experiments/e1/cmd/polis-step/main.go` with unit tests under
+     `test/unit/polisstep/` needs
+     `<!-- testCmd: go test ./experiments/e1/cmd/polis-step/... ./test/unit/polisstep/... -->`.
+     List the co-located path first so a build failure there surfaces
+     immediately. This rule is Go-specific; do not generalize the path-union
+     syntax to Python (`pytest` does not take Go-style `./...` paths) or Rust
+     (`cargo test` discovers tests via the crate, not paths). For non-Go
+     ecosystems with similar co-location, write the override using that
+     ecosystem's native runner and test-selection mechanism.
 
    **Non-Coding Phase Templates**
 
