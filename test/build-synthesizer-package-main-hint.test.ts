@@ -37,4 +37,27 @@ describe("build synthesizer prompt: package-main co-located testCmd hint", () =>
     );
     expect(nextSectionIdx).toBeGreaterThan(anchorIdx);
   });
+
+  test("bullet pins the unioned go-test command shape", () => {
+    const tmpl = fs.readFileSync(TMPL, "utf-8");
+    expect(tmpl).toMatch(
+      /MUST include the binary's directory in the path list/,
+    );
+    expect(tmpl).toMatch(
+      /go test \.\/experiments\/e1\/cmd\/polis-step\/\.\.\. \.\/test\/unit\/polisstep\/\.\.\./,
+    );
+  });
+
+  test("bullet does not push Gemini toward Python/Rust path-union over-generalization", () => {
+    const tmpl = fs.readFileSync(TMPL, "utf-8");
+    const anchorIdx = tmpl.indexOf(ANCHOR);
+    const nextSectionIdx = tmpl.indexOf(
+      "Non-Coding Phase Templates",
+      anchorIdx,
+    );
+    const bulletText = tmpl.slice(anchorIdx, nextSectionIdx);
+    expect(bulletText).toMatch(/do not generalize/i);
+    expect(bulletText).toMatch(/Python/);
+    expect(bulletText).toMatch(/Rust/);
+  });
 });
