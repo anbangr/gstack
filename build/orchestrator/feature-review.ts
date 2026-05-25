@@ -263,6 +263,49 @@ export function fingerprintFeatureReviewFailure(args: {
  */
 export const SAME_SHAPE_REPEAT_HALT_THRESHOLD = 2;
 
+/**
+ * Bug 2 (polis-mesh 2026-05-25): when the stall watchdog SIGTERMs a feature-
+ * review sub-agent, the orchestrator reads the output file once synchronously
+ * (cli.ts ~line 7034) and then routes the result through classifyFeatureReview-
+ * Timeout. If the sub-agent was mid-flush when SIGTERM hit, that single read
+ * sees an empty or truncated file even though the verdict was written to disk
+ * milliseconds later. Result: a structured verdict is misclassified as TIMEOUT,
+ * the iteration is wasted, and the user sees a fake stall.
+ *
+ * This helper performs a delayed re-read AFTER the SIGTERM has fully unwound.
+ * Returns a structured-verdict classification when the re-read produces a
+ * parseable verdict; otherwise returns null and the caller falls through to
+ * the existing TIMEOUT path. Only "structured-verdict" is treated as a
+ * recovery — we deliberately do NOT promote pass-evidence-timeout / unclear-
+ * timeout here because those require the same prose-based heuristics that
+ * already ran on the first read and would have caught it then.
+ */
+export async function recoverVerdictFromStalledFile(args: {
+  outputFilePath: string;
+  /** Delay between SIGTERM-time first read and the recovery re-read. Default 1000ms. */
+  delayMs?: number;
+  /** Test seam: override fs.readFileSync. */
+  readFileFn?: (p: string) => string;
+  /** Test seam: override setTimeout-based sleep. */
+  sleepFn?: (ms: number) => Promise<void>;
+}): Promise<FeatureReviewTimeoutClassification | null> {
+  const delay = args.delayMs ?? 1000;
+  const read = args.readFileFn ?? ((p) => fs.readFileSync(p, "utf8"));
+  const sleep =
+    args.sleepFn ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
+  await sleep(delay);
+  let raw = "";
+  try {
+    raw = read(args.outputFilePath);
+  } catch {
+    return null;
+  }
+  if (!raw.trim()) return null;
+  const classification = classifyFeatureReviewTimeout(raw);
+  if (classification.kind === "structured-verdict") return classification;
+  return null;
+}
+
 export function classifyFeatureReviewTimeout(
   raw: string,
 ): FeatureReviewTimeoutClassification {

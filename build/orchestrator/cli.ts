@@ -116,6 +116,7 @@ import {
   buildFeatureReviewPrompt,
   classifyFeatureReviewTimeout,
   fingerprintFeatureReviewFailure,
+  recoverVerdictFromStalledFile,
   SAME_SHAPE_REPEAT_HALT_THRESHOLD,
   parseFeatureReviewVerdict,
   shouldSkipFeatureReview,
@@ -7048,11 +7049,30 @@ async function runFeatureReviewIteration(args: {
 
     let timedOutWithStructuredVerdict = false;
     if (result.timedOut) {
-      const timeoutClassification = classifyFeatureReviewTimeout(artifactRaw);
+      let timeoutClassification = classifyFeatureReviewTimeout(artifactRaw);
       verdict = timeoutClassification.verdict;
       _metricsFinalVerdict = verdict.verdict;
       if (timeoutClassification.kind === "pass-evidence-timeout") {
         _metricsPassEvidenceTimeout = true;
+      }
+      // Bug 2 (polis-mesh 2026-05-25): race recovery — the first read happened
+      // immediately after SIGTERM, so the output file may have been empty or
+      // truncated mid-flush. Sleep + re-read once; if the sub-agent finished
+      // writing a structured verdict after the SIGTERM unwound, recover it
+      // rather than wasting an iteration on a fake TIMEOUT.
+      if (timeoutClassification.kind !== "structured-verdict") {
+        const recovered = await recoverVerdictFromStalledFile({
+          outputFilePath,
+        });
+        if (recovered) {
+          console.warn(
+            `  ↻ feature-review: recovered structured verdict from ${outputFilePath} after stall-kill (raced flush)`,
+          );
+          timeoutClassification = recovered;
+          verdict = recovered.verdict;
+          _metricsFinalVerdict = verdict.verdict;
+          _metricsPassEvidenceTimeout = false;
+        }
       }
       if (timeoutClassification.kind === "structured-verdict") {
         fr.finalVerdict = verdict.verdict as any;
