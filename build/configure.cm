@@ -26,25 +26,25 @@
       "reasoning": "high"
     },
     "testWriter": {
-      "provider": "kimi",
-      "model": "kimi-code/kimi-for-coding",
+      "provider": "gemini",
+      "model": "gemini-3.5-flash",
       "reasoning": "high",
-      "backupProvider": "gemini",
-      "backupModel": "gemini-3.1-pro-preview"
+      "backupProvider": "codex",
+      "backupModel": "gpt-5.3-codex-spark"
     },
     "primaryImpl": {
-      "provider": "kimi",
-      "model": "kimi-code/kimi-for-coding",
+      "provider": "codex",
+      "model": "gpt-5.5",
       "reasoning": "high",
       "backupProvider": "gemini",
-      "backupModel": "gemini-3.1-pro-preview"
+      "backupModel": "gemini-3.5-flash"
     },
     "testFixer": {
-      "provider": "kimi",
-      "model": "kimi-code/kimi-for-coding",
+      "provider": "gemini",
+      "model": "gemini-3.5-flash",
       "reasoning": "high",
-      "backupProvider": "gemini",
-      "backupModel": "gemini-3.1-pro-preview"
+      "backupProvider": "codex",
+      "backupModel": "gpt-5.3-codex-spark"
     },
     "secondaryImpl": {
       "provider": "codex",
@@ -84,7 +84,7 @@
       "reasoning": "high",
       "command": "/ship",
       "backupProvider": "gemini",
-      "backupModel": "gemini-3.1-pro-preview"
+      "backupModel": "gemini-3.5-flash"
     },
     "land": {
       "provider": "kimi",
@@ -92,7 +92,7 @@
       "reasoning": "high",
       "command": "/land-and-deploy",
       "backupProvider": "gemini",
-      "backupModel": "gemini-3.1-pro-preview"
+      "backupModel": "gemini-3.5-flash"
     },
     "featureVerifier": {
       "provider": "codex",
