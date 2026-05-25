@@ -388,6 +388,14 @@ export function attachStallWatchdog(
   opts: StallWatchdogOptions,
 ): StallWatchdogController {
   const stallMs = opts.stallMs;
+  // Phase A startup-hang window. Hoisted out of the poll loop because both
+  // inputs (opts.startupHangMs, stallMs) are immutable for the watchdog's
+  // lifetime — recomputing per tick reads as if startupHangMs could change.
+  // See the long comment at the Phase A branch in poll() for the clamp
+  // rationale.
+  const rawStartupWindow = opts.startupHangMs ?? 120_000;
+  const startupWindow =
+    rawStartupWindow > 0 ? Math.min(rawStartupWindow, stallMs) : 0;
   const gracePeriodMs = opts.gracePeriodMs ?? 5000;
   // Default poll interval is 1s, but never more than half the stall window —
   // a 100ms stallMs with a 1s poll interval would miss the stall by 10x.
@@ -596,10 +604,8 @@ export function attachStallWatchdog(
     // fires. The clamp preserves Phase A's "kill genuinely-hung startups
     // earlier than stallMs would" semantics in the LLM case
     // (min(120_000, 900_000) = 120_000) while collapsing to stallMs in
-    // short-budget cases.
-    const rawStartupWindow = opts.startupHangMs ?? 120_000;
-    const startupWindow =
-      rawStartupWindow > 0 ? Math.min(rawStartupWindow, stallMs) : 0;
+    // short-budget cases. startupWindow is hoisted out of poll() — see the
+    // declaration above attachStallWatchdog's body.
     const inStartupPhase = firstActivityAt === null && startupWindow > 0;
     let effectiveStallMs: number;
     if (inStartupPhase) {

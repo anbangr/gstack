@@ -48,6 +48,7 @@ function emit(
           | "progress_gap"
           | "stall"
           | "auth_required"
+          | "startup_hang"
           | undefined,
         lastTool: result?.lastTool,
         lastBucket: result?.lastBucket,
