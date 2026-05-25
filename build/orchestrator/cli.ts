@@ -5300,7 +5300,7 @@ async function runReviewGates(opts: {
       cwd: opts.cwd,
       label: `${name} gate`,
       parentWorkspace: parentBeforeGate,
-      phaseRef: { phaseNumber: opts.phaseNumber },
+      phaseRef: phaseRefForHygieneHint(opts.phase),
       inputFilePath: opts.inputFilePath,
       allowNonTestPaths: phaseAllowsGateSourceFixes(opts.phase),
     });
@@ -5329,7 +5329,7 @@ async function runReviewGates(opts: {
         cwd: opts.cwd,
         label: `${name} sandbox retry gate`,
         parentWorkspace: parentBeforeGate,
-        phaseRef: { phaseNumber: opts.phaseNumber },
+        phaseRef: phaseRefForHygieneHint(opts.phase),
         inputFilePath: opts.inputFilePath,
         allowNonTestPaths: phaseAllowsGateSourceFixes(opts.phase),
       });
@@ -5817,6 +5817,35 @@ function applyGateHygiene(opts: {
   }
   if (errors.length === 0) return opts.result;
   return hygieneFailureResult(errors.join("\n"), opts.result.logPath);
+}
+
+/**
+ * Build a phaseRef for formatGateHygieneRecoveryHint from a Phase.
+ *
+ * Bug T3 (tidy-haven 2026-05-21 review-qa-hygiene-manual-recovery-phase-id-risk):
+ * pre-helper, the gate hygiene recovery hint was constructed with
+ * `phaseRef: { phaseNumber: opts.phaseNumber }` which dropped the feature number
+ * and produced messages like `--mark-phase-committed 1` for plans where the
+ * canonical recovery argument should have been `--mark-phase-committed 2.1`.
+ * Operators following the hint risked marking the wrong phase.
+ *
+ * Plans use two phase-number conventions:
+ *   - dot-numbered: phase.number === "2.1" (feature.phase stem already merged)
+ *   - bare:         phase.number === "1"   (per-feature stem only)
+ *
+ * In the bare case we must surface `featureNumber` so the formatter emits
+ * `featureNumber.phaseNumber`. In the dot-numbered case we must NOT pass
+ * `featureNumber` separately or the formatter would emit `featureNumber.phase.number`
+ * (e.g., "1.2.1"). This helper picks the right shape.
+ */
+export function phaseRefForHygieneHint(phase: Phase): {
+  featureNumber?: string;
+  phaseNumber: string;
+} {
+  if (phase.number.includes(".")) {
+    return { phaseNumber: phase.number };
+  }
+  return { featureNumber: phase.featureNumber, phaseNumber: phase.number };
 }
 
 export function formatGateHygieneRecoveryHint(opts: {

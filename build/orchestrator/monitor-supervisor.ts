@@ -201,6 +201,60 @@ function stripJsonFence(raw: string): string {
   return (fenced?.[1] ?? trimmed).trim();
 }
 
+/**
+ * Extract the first balanced top-level JSON object/array from a string.
+ *
+ * Bug T3 (polis-paper-prereqs 2026-05-20 monitor-agent-json-corruption):
+ * monitor sub-agents occasionally emit a valid JSON object followed by bare
+ * sentinel text on a new line (e.g., `GATE FAIL` from a hygiene gate that
+ * fired mid-prompt). JSON.parse rejects the whole payload, parseMonitorAgentJson
+ * returns null, and the escalation surface loses the agent's verdict.
+ *
+ * This helper scans for the first `{` or `[`, walks until the matching closer
+ * (respecting strings + escape sequences), and returns the slice. Returns the
+ * input unchanged if no balanced top-level object is found, so downstream
+ * JSON.parse still errors visibly when the input is genuinely malformed.
+ */
+export function extractFirstJsonObject(input: string): string {
+  let start = -1;
+  let open: "{" | "[" | null = null;
+  for (let i = 0; i < input.length; i++) {
+    const c = input[i];
+    if (c === "{" || c === "[") {
+      start = i;
+      open = c;
+      break;
+    }
+  }
+  if (start === -1 || open === null) return input;
+  const close = open === "{" ? "}" : "]";
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < input.length; i++) {
+    const c = input[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (c === "\\" && inString) {
+      escape = true;
+      continue;
+    }
+    if (c === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (c === open) depth++;
+    else if (c === close) {
+      depth--;
+      if (depth === 0) return input.slice(start, i + 1);
+    }
+  }
+  return input;
+}
+
 function stringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is string => typeof item === "string");
@@ -212,7 +266,9 @@ function isStringArray(value: unknown): value is string[] {
 
 export function parseMonitorAgentJson(raw: string): MonitorAgentJson | null {
   try {
-    const parsed = JSON.parse(stripJsonFence(raw)) as Record<string, unknown>;
+    const parsed = JSON.parse(
+      extractFirstJsonObject(stripJsonFence(raw)),
+    ) as Record<string, unknown>;
     const verdict = parsed.verdict;
     if (
       verdict !== "host_action_required" &&

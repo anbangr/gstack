@@ -1108,4 +1108,33 @@ describe("monitor agent supervisor", () => {
     expect(parseMonitorAgentJson("{}")).toBeNull();
     expect(parseMonitorAgentJson('{"verdict":"no_action"}')).toBeNull();
   });
+
+  // Bug T3 (polis-paper-prereqs 2026-05-20 monitor-agent-json-corruption):
+  // monitor sub-agents sometimes emit bare sentinel text (e.g., `GATE FAIL`)
+  // on a new line after the JSON object. JSON.parse would reject the whole
+  // payload; extractFirstJsonObject keeps the parse alive.
+  it("parses JSON with trailing bare sentinel text after the closing brace", () => {
+    const raw = `{"verdict":"host_action_required","summary":"hung","attempted":["restart"],"recommendedHostAction":"investigate","suggestedCommands":[],"userChoices":["abort"]}
+GATE FAIL`;
+    const parsed = parseMonitorAgentJson(raw);
+    expect(parsed?.verdict).toBe("host_action_required");
+    expect(parsed?.summary).toBe("hung");
+  });
+
+  it("parses JSON preceded by chatter and followed by sentinel text", () => {
+    const raw = `Here is the diagnosis:
+
+{"verdict":"no_action","summary":"healthy","attempted":[],"recommendedHostAction":"none","suggestedCommands":[],"userChoices":[]}
+
+GATE PASS — no escalation needed.`;
+    const parsed = parseMonitorAgentJson(raw);
+    expect(parsed?.verdict).toBe("no_action");
+  });
+
+  it("does not get fooled by braces inside string values", () => {
+    const raw = `{"verdict":"no_action","summary":"saw {fake} braces in log","attempted":[],"recommendedHostAction":"none","suggestedCommands":[],"userChoices":[]}
+trailing junk`;
+    const parsed = parseMonitorAgentJson(raw);
+    expect(parsed?.summary).toBe("saw {fake} braces in log");
+  });
 });
