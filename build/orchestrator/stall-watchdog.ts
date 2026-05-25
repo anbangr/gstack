@@ -469,10 +469,19 @@ export function attachStallWatchdog(
   const onLine = (chunk: Buffer | string) => {
     if (stopped) return;
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-    // Single non-whitespace byte anywhere in the chunk counts as activity.
-    // Equivalent to: any line in chunk.split(/\r?\n/) has trim().length > 0.
-    // Regex test is a single short-circuit pass; the prior split-and-loop
-    // allocated a string array per chunk just to discover the same answer.
+    // Phase A exit: ANY byte counts. The legacy first-token timer (deleted in
+    // v1.45) cleared on any stdout/stderr byte; preserving that contract in
+    // stream mode requires advancing firstActivityAt on whitespace-only
+    // output too. Without this, a CLI that emits only `\r` progress carets
+    // or ANSI clear sequences for 120s falsely trips startup_hang.
+    if (text.length > 0 && firstActivityAt === null) {
+      firstActivityAt = clock.now();
+    }
+    // Single non-whitespace byte anywhere in the chunk counts as activity
+    // for Phase B's silence tracking. Equivalent to: any line in
+    // chunk.split(/\r?\n/) has trim().length > 0. Regex test is a single
+    // short-circuit pass; the prior split-and-loop allocated a string array
+    // per chunk just to discover the same answer.
     if (/\S/.test(text)) recordActivity();
 
     // Tool-aware progress parsing. Lines are split on \n inside this

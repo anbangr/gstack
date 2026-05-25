@@ -1083,6 +1083,35 @@ describe("attachStallWatchdog (Phase A: startup-hang)", () => {
     ctrl.stop();
   });
 
+  it("Phase A exits on whitespace-only stdout (regression: legacy first-token timer cleared on any byte)", () => {
+    // The deleted first-token timer in spawnCaptured used
+    // stdoutBytes + stderrBytes > 0 — any byte cleared it. Phase B's
+    // recordActivity uses /\S/.test, which is strictly stricter (requires
+    // non-whitespace). Without a whitespace-friendly Phase A exit path, a
+    // CLI emitting only carriage returns or ANSI clears for 120s would
+    // falsely trip startup_hang. This test pins the legacy contract.
+    const { clock, advance } = makeFakeClock();
+    const { child, emitStdout } = makeFakeChild();
+    const ctrl = attachStallWatchdog(
+      { mode: "stream", child },
+      {
+        stallMs: 60_000,
+        provider: "shell",
+        pollIntervalMs: 100,
+        gracePeriodMs: 50,
+        clock,
+        startupHangMs: 1_000,
+      },
+    );
+    // Emit a pure-whitespace byte at t=500ms. Phase A should exit (no kill)
+    // even though /\S/ doesn't match — the byte arrived.
+    advance(500);
+    emitStdout("\r");
+    advance(2_000); // past 1s startupHangMs but well under 60s stallMs
+    expect(ctrl.stallKilled()).toBe(false);
+    ctrl.stop();
+  });
+
   it("Phase A defaults to 120_000ms when startupHangMs option omitted", () => {
     // Belt-and-suspenders: confirms the in-watchdog default matches the
     // env-var-side default of 120_000. If someone changes one without the
