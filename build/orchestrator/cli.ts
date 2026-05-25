@@ -68,6 +68,7 @@ import {
   decideNextAction,
   applyResult,
   markCommitted,
+  clearFailureStateOnCommit,
   findNextPhaseIndex,
   DEFAULT_MAX_CODEX_ITERATIONS,
   DEFAULT_MAX_TEST_ITERATIONS,
@@ -6594,9 +6595,6 @@ export function markPhaseCommittedAfterManualRecovery(args: {
   // the "preview" to disk — the opposite of what --dry-run promises.
   // Plan-file flips above are already gated on !args.dryRun (line 4328+).
   if (!args.dryRun) {
-    const clearsBuildFailure =
-      args.state.failedAtPhase === phase.index ||
-      (args.state.failedAtPhase == null && phaseState.status === "failed");
     // T7: capture HEAD sha for per-phase diff blocks (T8). Best-effort —
     // detached HEAD, no commits, or transient I/O leaves the field
     // undefined; downstream consumers tolerate that.
@@ -6608,19 +6606,7 @@ export function markPhaseCommittedAfterManualRecovery(args: {
       _shaR.status === 0 ? (_shaR.stdout || "").trim() || undefined : undefined;
     args.state.phases[phase.index] = markCommitted(phaseState, _committedSha);
     args.state.currentPhaseIndex = findNextPhaseIndex(args.state.phases);
-    if (args.state.failedAtPhase === phase.index) {
-      delete args.state.failedAtPhase;
-    }
-    if (clearsBuildFailure) {
-      delete args.state.failureReason;
-    }
-    const feature = args.state.features?.[phase.featureIndex];
-    if (feature && clearsBuildFailure) {
-      if (feature.status === "paused" || feature.status === "failed") {
-        feature.status = "running";
-      }
-      delete feature.error;
-    }
+    clearFailureStateOnCommit(args.state, phase.index, phase.featureIndex);
   }
   return { ok: true, phaseIndex: phase.index };
 }
@@ -7453,6 +7439,13 @@ async function runPhase(args: {
       phaseState = markCommitted(phaseState, _committedSha);
       state.phases[phase.index] = phaseState;
       state.currentPhaseIndex = phase.index + 1;
+      // Bug 5 (tidy-haven 2026-05-21): the manual-recovery commit path in
+      // markPhaseCommittedAfterManualRecovery cleared failedAtPhase / failureReason
+      // / feature.error after a successful re-commit, but this AUTOMATED path
+      // did not. A phase that hit RETRY_CAP_HIT, set failedAtPhase=N, was
+      // re-launched, and committed cleanly would leave a stale failedAtPhase=N
+      // on disk — surfacing as PREMATURE_COMPLETION on the next detector pass.
+      clearFailureStateOnCommit(state, phase.index, phase.featureIndex);
       saveState(state, { noGbrain, log: console.warn });
       printPhaseReport(phase, phaseState, args.nextPhaseName, args.cwd);
       return "done";
