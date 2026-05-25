@@ -129,13 +129,16 @@ before ship. Five less-critical findings are deferred to v1.44.1.0:
   follow), gets read as empty, JSON.parse fails with a clear error.
   Not exploitable but worth a `lstat` check for symlink safety in
   defense-in-depth.
-- F5: SKILL.md.tmpl tells Claude to call `gstack-build investigate-finalize`
-  but doesn't tell Claude to `cd` to the worktree path first. If Claude's
-  cwd has drifted, the bug report lands in `<cwd>/inbox` instead of the
-  intended project root. The `GSTACK_INBOX_DIR` env var works around this
-  for tests, but production users may hit it. Fix: have the briefing
-  emit an absolute inbox path that finalize uses via `--inbox-dir`, or
-  add a `cd <worktreePath>` line to the SKILL.md template.
+- F5: **FIXED** in v1.45.x. `writeBugReport` and `drainFaultsFromHaltEventsQueue`
+  Sink 3 now default to `${GSTACK_HOME:-~/.gstack}/skill-faults/inbox/`
+  via the new `defaultInboxDir()` helper in `investigate-report-writer.ts`.
+  Auto-filed reports never pollute the cwd or any workspace root regardless
+  of where Claude was invoked. Tradeoff: bug reports no longer auto-discover
+  as `plan-status` source-plan candidates (which only scans
+  `<gstackRepo>/inbox/`); if you want one promoted to a candidate, copy it
+  manually. Tests pinning the new default:
+  `__tests__/investigate-report-writer-severity.test.ts`,
+  `__tests__/auto-drain.test.ts`.
 
 **Effort:** M cumulative (F1+F2 are the most impactful, ~half-day each)
 **Priority:** P2
@@ -2401,7 +2404,6 @@ known failure modes.
 **Depends on / blocked by:** v1.40.1.0 (the `--test-framework` flag and
 `Framework` type union must exist before the plan-file block has anything
 to feed). Already shipped.
-
 
 ## feature-review optimisation follow-ups (build skill v1.28.0)
 

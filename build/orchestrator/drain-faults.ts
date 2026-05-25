@@ -70,10 +70,8 @@ import {
   parseInvestigationReport,
   type InvestigationReport,
 } from "./investigator-dispatch";
-import {
-  AUDIT_HALT_KINDS,
-  loadLearnedPatterns,
-} from "./skill-fault-detector";
+import { defaultInboxDir } from "./investigate-report-writer";
+import { AUDIT_HALT_KINDS, loadLearnedPatterns } from "./skill-fault-detector";
 const AUDIT_HALT_KIND_SET = new Set<string>(AUDIT_HALT_KINDS);
 
 // ---------------------------------------------------------------------------
@@ -898,7 +896,11 @@ export interface DrainHaltEventsOptions {
   investigatorModel?: string;
   /** Per-investigator timeout in ms. Default 10 minutes. */
   investigatorTimeoutMs?: number;
-  /** Override inbox dir for auto-filing. Default <cwd>/inbox. */
+  /**
+   * Override inbox dir for auto-filing. Default
+   * `~/.gstack/skill-faults/inbox/` (see `defaultInboxDir`). Respects
+   * `GSTACK_INBOX_DIR` as a middle-precedence override.
+   */
   inboxDir?: string;
   /**
    * TEST-ONLY: synchronous mock returning an InvestigationReport. When set,
@@ -1042,7 +1044,8 @@ async function spawnInvestigatorCapture(args: {
   // Short-circuit if the signal is already aborted — don't spawn at all.
   if (args.signal?.aborted) return null;
 
-  const builder = PROVIDER_DISPATCH[args.config.provider as InvestigatorProvider];
+  const builder =
+    PROVIDER_DISPATCH[args.config.provider as InvestigatorProvider];
   if (!builder) return null;
   const { cmd, args: cmdArgs } = builder({
     prompt: args.prompt,
@@ -1244,9 +1247,7 @@ function isoDateUtc(d: Date): string {
  * matcherKind semantics the detector uses. Returns the matched pattern's
  * category, or null. On match, callers short-circuit the investigator.
  */
-function learnedPatternMatch(
-  he: HaltEvent,
-): { category: string } | null {
+function learnedPatternMatch(he: HaltEvent): { category: string } | null {
   let patterns;
   try {
     patterns = loadLearnedPatterns();
@@ -1318,8 +1319,7 @@ export async function drainFaultsFromHaltEventsQueue(
     failed: 0,
   };
 
-  const queueDir =
-    opts.queueDir ?? path.join(getGstackHome(), "skill-faults");
+  const queueDir = opts.queueDir ?? path.join(getGstackHome(), "skill-faults");
   const max = opts.max ?? 20;
   const severityMin = opts.severityMin ?? "MEDIUM";
   const minRank = SEVERITY_RANK[severityMin];
@@ -1346,7 +1346,7 @@ export async function drainFaultsFromHaltEventsQueue(
   });
   const detectedByKey = new Map<
     string,
-    Extract<typeof allEntries[number], { kind: "detected" }>
+    Extract<(typeof allEntries)[number], { kind: "detected" }>
   >();
   for (const e of allEntries) {
     if (e.kind === "detected") {
@@ -1656,7 +1656,7 @@ export async function drainFaultsFromHaltEventsQueue(
       report.outcome === "needs-human";
     if (SEVERITY_RANK[he.severity] >= SEVERITY_RANK.HIGH && actionable) {
       try {
-        const inboxDir = opts.inboxDir ?? path.join(process.cwd(), "inbox");
+        const inboxDir = opts.inboxDir ?? defaultInboxDir();
         fs.mkdirSync(inboxDir, { recursive: true });
         const inboxName = `${isoDateUtc(now)}-halt-${he.faultId}.md`;
         fs.writeFileSync(
@@ -1709,10 +1709,7 @@ export async function drainFaultsFromHaltEventsQueue(
   if (abortedDuringLoop) {
     result.aborted = true;
     const accounted =
-      result.processed +
-      result.skipped +
-      result.shortCircuited +
-      result.failed;
+      result.processed + result.skipped + result.shortCircuited + result.failed;
     result.deferred = Math.max(0, events.length - accounted);
   } else {
     result.aborted = false;

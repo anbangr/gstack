@@ -957,7 +957,12 @@ machine — gbrain's daemon handles incremental refresh on a schedule.
   `assertCodexAuth()` probes (see `sub-agents.ts`).
 - `GSTACK_DISABLE_PROVIDER_CLASSIFIER=1` — Revert to pre-PR1b cap-hit
   behavior instead of `classifyProviderFailure()` (see `cli.ts`).
-- `GSTACK_INBOX_DIR` — Override the inbox directory for bug reports written
-  by `gstack-build investigate-finalize` (default: `<cwd>/inbox`). Used by
-  E2E tests to isolate output, and by users who keep their triage inbox in
-  a non-default location.
+- `GSTACK_INBOX_DIR` — Override the inbox directory for auto-filed bug
+  reports written by `gstack-build investigate-finalize` and halt-event
+  auto-files from `drainFaultsFromHaltEventsQueue` (default:
+  `${GSTACK_HOME:-~/.gstack}/skill-faults/inbox/`, resolved by
+  `defaultInboxDir()` in `build/orchestrator/investigate-report-writer.ts`).
+  Used by E2E tests to isolate output, and by users who keep their triage
+  inbox in a non-default location. Pre-v1.45 the fallback was `<cwd>/inbox`,
+  which polluted workspace roots when Claude's cwd drifted; the new default
+  keeps every auto-filed report under `~/.gstack/` regardless of cwd.
