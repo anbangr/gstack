@@ -564,6 +564,196 @@ describe("validateShipCompletion", () => {
   });
 });
 
+// T6 /review MEDIUM: auto-land mode validation wiring. post-merge mode
+// skips the branch_not_pushed check (branch may be deleted by squash-
+// merge + delete-branch) and accepts OPEN or MERGED for the PR state.
+describe("validateShipCompletion: mode: post-merge (auto-land)", () => {
+  const branch = "feat/cancel-api-followups";
+  const cwd = "/tmp/whatever";
+
+  it("does NOT call git ls-remote in post-merge mode (branch may be deleted)", () => {
+    let lsRemoteCalled = false;
+    const runCommand: RunCommandFn = (cmd, args) => {
+      if (cmd === "git" && args[0] === "ls-remote") lsRemoteCalled = true;
+      if (cmd === "git" && args[0] === "remote") {
+        return { status: 0, stdout: "https://github.com/foo/bar.git\n", stderr: "" };
+      }
+      if (cmd === "gh") {
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            url: "https://github.com/foo/bar/pull/42",
+            headRefName: branch,
+            state: "MERGED",
+          }),
+          stderr: "",
+        };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Opened https://github.com/foo/bar/pull/42 and merged it",
+      runCommand,
+      mode: "post-merge",
+    });
+    expect(out.ok).toBe(true);
+    expect(lsRemoteCalled).toBe(false);
+    if (out.ok) {
+      expect(out.sha).toBeUndefined();
+      expect(out.prNumber).toBe(42);
+    }
+  });
+
+  it("accepts state MERGED in post-merge mode (auto-land's land role squash-merged)", () => {
+    const runCommand: RunCommandFn = (cmd, args) => {
+      if (cmd === "git" && args[0] === "remote") {
+        return { status: 0, stdout: "https://github.com/foo/bar.git\n", stderr: "" };
+      }
+      if (cmd === "gh") {
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            url: "https://github.com/foo/bar/pull/42",
+            headRefName: branch,
+            state: "MERGED",
+          }),
+          stderr: "",
+        };
+      }
+      return { status: 1, stdout: "", stderr: "" };
+    };
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Opened https://github.com/foo/bar/pull/42, merged.",
+      runCommand,
+      mode: "post-merge",
+    });
+    expect(out.ok).toBe(true);
+  });
+
+  it("accepts state OPEN in post-merge mode (land role hasn't merged yet)", () => {
+    const runCommand: RunCommandFn = (cmd, args) => {
+      if (cmd === "git" && args[0] === "remote") {
+        return { status: 0, stdout: "https://github.com/foo/bar.git\n", stderr: "" };
+      }
+      if (cmd === "gh") {
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            url: "https://github.com/foo/bar/pull/42",
+            headRefName: branch,
+            state: "OPEN",
+          }),
+          stderr: "",
+        };
+      }
+      return { status: 1, stdout: "", stderr: "" };
+    };
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "PR #42 ready",
+      runCommand,
+      mode: "post-merge",
+    });
+    expect(out.ok).toBe(true);
+  });
+
+  it("rejects state CLOSED in post-merge mode (closed without merge is not success)", () => {
+    const runCommand: RunCommandFn = (cmd, args) => {
+      if (cmd === "git" && args[0] === "remote") {
+        return { status: 0, stdout: "https://github.com/foo/bar.git\n", stderr: "" };
+      }
+      if (cmd === "gh") {
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            url: "https://github.com/foo/bar/pull/42",
+            headRefName: branch,
+            state: "CLOSED",
+          }),
+          stderr: "",
+        };
+      }
+      return { status: 1, stdout: "", stderr: "" };
+    };
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Opened https://github.com/foo/bar/pull/42",
+      runCommand,
+      mode: "post-merge",
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe("pr_not_open");
+    }
+  });
+
+  it("still catches the headline hallucination case: no PR reference + gh pr list empty", () => {
+    // Auto-land mode: kimi-as-ship fabricated "READY TO LAND" but never
+    // created a PR. ship-output.md has no PR URL or "PR #N", AND
+    // gh pr list --head <branch> returns []. Validator falls back to gh
+    // pr list as a discovery path (legitimate land-role outputs sometimes
+    // just say "merged" without quoting a URL), but when that ALSO returns
+    // empty the hallucination is confirmed.
+    const runCommand: RunCommandFn = (cmd, args) => {
+      if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+        return { status: 0, stdout: "[]", stderr: "" };
+      }
+      throw new Error(`unexpected mock-runCommand call: ${cmd} ${args.join(" ")}`);
+    };
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Everything passed. READY TO LAND. 196 tests passed.",
+      runCommand,
+      mode: "post-merge",
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe("no_pr_reference_in_output");
+    }
+  });
+
+  it("falls back to gh pr list when output has no PR ref (legitimate merged PR exists)", () => {
+    // Land role just reported "merged" without quoting a URL. Validator
+    // discovers the merged PR via gh pr list and accepts it.
+    const runCommand: RunCommandFn = (cmd, args) => {
+      if (cmd === "gh" && args[0] === "pr" && args[1] === "list") {
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            {
+              number: 42,
+              state: "MERGED",
+              headRefName: branch,
+              url: "https://github.com/foo/bar/pull/42",
+            },
+          ]),
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected: ${cmd} ${args.join(" ")}`);
+    };
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Merged successfully.",
+      runCommand,
+      mode: "post-merge",
+    });
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.prNumber).toBe(42);
+      expect(out.prUrl).toBe("https://github.com/foo/bar/pull/42");
+    }
+  });
+});
+
 describe("parseGithubOwnerRepo", () => {
   it("parses https URL with .git suffix", () => {
     expect(parseGithubOwnerRepo("https://github.com/foo/bar.git")).toEqual({

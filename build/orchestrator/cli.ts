@@ -12386,6 +12386,43 @@ async function main() {
             console.log(
               `  ✓ shipped (${(result.durationMs / 1000).toFixed(0)}s)`,
             );
+            // Bug 6 post-merge validation (T6 /review MEDIUM follow-up):
+            // shipAndDeploy returns the LAND step's result, but the ship
+            // sub-agent's verdict lives in <logDir>/ship-output.md. Read
+            // both — either could carry a PR URL the validator can verify.
+            // Without this, a kimi-as-ship hallucination in auto-land mode
+            // surfaces as a less-precise "post-ship guardrail failed" from
+            // verifyPostShip (which can't distinguish "no PR ever made"
+            // from "PR merged and closed" — both look like 0 open PRs).
+            const shipOutputPath = path.join(
+              logDir(`${slug}-feature-${featureState.number}`),
+              "ship-output.md",
+            );
+            const autoLandOutputText = [
+              result.stdout,
+              result.stderr,
+              fs.existsSync(shipOutputPath)
+                ? fs.readFileSync(shipOutputPath, "utf8")
+                : "",
+            ].join("\n");
+            const autoLandValidation = validateShipCompletion({
+              cwd,
+              branch: branchForShip,
+              outputText: autoLandOutputText,
+              mode: "post-merge",
+            });
+            if (!autoLandValidation.ok) {
+              featureState.status = "paused";
+              featureState.error = `ship_hallucinated_success: ${autoLandValidation.reason}; ${autoLandValidation.evidence.join("; ")}; see ${result.logPath}`;
+              state.failureReason = `Feature ${featureState.number}: ${featureState.error}`;
+              saveState(state, {
+                noGbrain: args.noGbrain,
+                log: console.warn,
+              });
+              console.error(`✗ ${featureState.error}`);
+              exitCode = 1;
+              break;
+            }
             const { ok, report } = await verifyPostShip(
               cwd,
               featureState.branch || state.branch,
