@@ -5734,20 +5734,22 @@ describe("ship failure sets state.failureReason at paused paths", () => {
     expect(state.failureReason).toMatch(/Feature 1: ship failed/);
   }, 30_000);
 
-  it("Location C: unparseable PR + no open PR on remote → state.failureReason names the branch", () => {
+  it("Location C: unparseable PR + no PR mentioned in output → state.failureReason flags ship_hallucinated_success (Bug 6)", () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-ship-loc-c-"));
     const runId = `ship-loc-c-${process.pid}`;
     const repo = initRepoWithOrigin();
     const planFile = committedPlanFile();
     seedShipState(repo, planFile, runId);
 
-    // exits 0 without writing to staged output → mergeOutputFile returns empty stdout
+    // exits 0 without writing to staged output → mergeOutputFile returns empty stdout.
+    // Bug 6 (cancel-api-followups-v1-20 2026-05-20) wired validateShipCompletion
+    // ahead of resolveShipPr, so this scenario now intercepts as ship_hallucinated_success
+    // (no PR reference in output) instead of the older "no open PR exists on remote"
+    // resolveShipPr-fallback error.
     const fakeKimi = path.join(tmpDir!, "kimi");
     fs.writeFileSync(fakeKimi, "#!/bin/sh\nexit 0\n");
     fs.chmodSync(fakeKimi, 0o755);
 
-    // fake gh that always fails: parser-fallback path is also a dead end,
-    // so resolveShipPr returns the "no open PR exists on remote" error.
     const fakeGhDir = path.join(tmpDir!, "fake-gh");
     fs.mkdirSync(fakeGhDir, { recursive: true });
     fs.writeFileSync(path.join(fakeGhDir, "gh"), "#!/bin/sh\nexit 1\n");
@@ -5760,17 +5762,23 @@ describe("ship failure sets state.failureReason at paused paths", () => {
 
     expect(result.status).toBe(1);
     const state = loadSavedState(runId);
-    expect(state.failureReason).toMatch(/no open PR exists on remote/);
+    expect(state.failureReason).toMatch(/ship_hallucinated_success/);
+    expect(state.failureReason).toMatch(/no_pr_reference_in_output/);
   }, 30_000);
 
-  it("Location D: markPrQueued failure → state.failureReason contains could not be marked queued", () => {
+  it("Location D: PR mentioned but gh pr view fails → state.failureReason flags pr_not_found_on_github (Bug 6)", () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-ship-loc-d-"));
     const runId = `ship-loc-d-${process.pid}`;
     const repo = initRepoWithOrigin();
     const planFile = committedPlanFile();
     seedShipState(repo, planFile, runId);
 
-    // writes "PR #123" to the staged output path extracted from the -p prompt
+    // writes "PR #123" to the staged output path extracted from the -p prompt.
+    // Bug 6 (cancel-api-followups-v1-20 2026-05-20): validateShipCompletion
+    // now runs `gh pr view 123` before resolveShipPr, so a fake-gh that always
+    // fails surfaces as `pr_not_found_on_github` (the validator's discriminator
+    // for "PR number is fabricated"), intercepting strictly earlier than the
+    // older markPrQueued failure path.
     const fakeKimi = path.join(tmpDir!, "kimi");
     fs.writeFileSync(
       fakeKimi,
@@ -5785,7 +5793,6 @@ process.exit(0);
     );
     fs.chmodSync(fakeKimi, 0o755);
 
-    // fake gh that always fails — markPrQueued calls "gh pr edit"
     const fakeGhDir = path.join(tmpDir!, "fake-gh");
     fs.mkdirSync(fakeGhDir, { recursive: true });
     fs.writeFileSync(path.join(fakeGhDir, "gh"), "#!/bin/sh\nexit 1\n");
@@ -5798,7 +5805,8 @@ process.exit(0);
 
     expect(result.status).toBe(1);
     const state = loadSavedState(runId);
-    expect(state.failureReason).toMatch(/could not be marked queued/);
+    expect(state.failureReason).toMatch(/ship_hallucinated_success/);
+    expect(state.failureReason).toMatch(/pr_not_found_on_github/);
   }, 30_000);
 });
 

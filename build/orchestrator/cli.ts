@@ -148,6 +148,7 @@ import {
   isAllowedFeatureBranch,
 } from "./release-daemon";
 import {
+  currentBranch,
   defaultReleaseQueueDir,
   markPrQueued,
   prBaseAndHead,
@@ -157,6 +158,7 @@ import {
   writeReleaseQueueRecord,
   type ReleaseQueueRecord,
 } from "./release-queue";
+import { validateShipCompletion } from "./ship-validation";
 import { canonicalRepoIdentity } from "./release-identity";
 import { createWorktrees, applyWinner, teardownWorktrees } from "./worktree";
 import {
@@ -12277,6 +12279,30 @@ async function main() {
                   ? fs.readFileSync(result.outputFilePath, "utf8")
                   : "",
               ].join("\n");
+              // Bug 6 (cancel-api-followups-v1-20 2026-05-20
+              // SHIP_ROLE_HALLUCINATED_SUCCESS): defense-in-depth before
+              // resolveShipPr — independently verify via git ls-remote +
+              // gh pr view that the push and PR really happened. Without
+              // this, a ship role configured as a model lacking a real
+              // /gstack-ship skill (e.g. kimi) can fabricate a "READY TO
+              // LAND" report on exit 0 with no push or PR ever made.
+              const validation = validateShipCompletion({
+                cwd,
+                branch: branchForShip,
+                outputText,
+              });
+              if (!validation.ok) {
+                featureState.status = "paused";
+                featureState.error = `ship_hallucinated_success: ${validation.reason}; ${validation.evidence.join("; ")}; see ${result.logPath}`;
+                state.failureReason = `Feature ${featureState.number}: ${featureState.error}`;
+                saveState(state, {
+                  noGbrain: args.noGbrain,
+                  log: console.warn,
+                });
+                console.error(`✗ ${featureState.error}`);
+                exitCode = 1;
+                break;
+              }
               const resolved = resolveShipPr({
                 outputText,
                 branch: branchForShip,
@@ -12706,15 +12732,52 @@ async function main() {
           );
           exitCode = 1;
         } else {
-          const now = new Date().toISOString();
-          for (const f of state.features ?? []) {
-            if (f.status === "origin_verified") {
-              f.status = "committed";
-              f.completedAt = now;
+          // Bug 6 (cancel-api-followups-v1-20 2026-05-20
+          // SHIP_ROLE_HALLUCINATED_SUCCESS) plan-level ship variant:
+          // a fabricated success report previously left state.completed=true
+          // with shippedAt:null and no PR on remote. Validate before flipping
+          // state.completed in queued mode; auto-land mode delegates to the
+          // existing verifyPostShip (which catches the merged case).
+          if (args.releaseMode === "queued") {
+            const planShipBranch =
+              currentBranch(cwd) ||
+              state.features?.[0]?.branch ||
+              state.branch ||
+              "";
+            const planOutputText = [
+              planShipResult.stdout,
+              planShipResult.stderr,
+              planShipResult.outputFilePath &&
+              fs.existsSync(planShipResult.outputFilePath)
+                ? fs.readFileSync(planShipResult.outputFilePath, "utf8")
+                : "",
+            ].join("\n");
+            const planValidation = validateShipCompletion({
+              cwd,
+              branch: planShipBranch,
+              outputText: planOutputText,
+            });
+            if (!planValidation.ok) {
+              state.failureReason = `plan-level ship_hallucinated_success: ${planValidation.reason}; ${planValidation.evidence.join("; ")}; see ${planShipResult.logPath}`;
+              console.error(`✗ ${state.failureReason}`);
+              saveState(state, {
+                noGbrain: args.noGbrain,
+                log: console.warn,
+              });
+              exitCode = 1;
             }
           }
-          state.completed = true;
-          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+          if (exitCode === 0) {
+            const now = new Date().toISOString();
+            for (const f of state.features ?? []) {
+              if (f.status === "origin_verified") {
+                f.status = "committed";
+                f.completedAt = now;
+              }
+            }
+            state.completed = true;
+            saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+          }
         }
       }
 
