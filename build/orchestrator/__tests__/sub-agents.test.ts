@@ -3745,15 +3745,17 @@ describe("spawnCaptured streaming", () => {
     }
   });
 
-  it("kills zero-output child at first-token deadline", async () => {
+  it("kills zero-cpu zero-output child at startup-hang deadline", async () => {
     const tmpDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), "spawncaptured-first-token-"),
+      path.join(os.tmpdir(), "spawncaptured-startup-hang-"),
     );
-    const logPath = path.join(tmpDir, "first-token.log");
+    const logPath = path.join(tmpDir, "startup-hang.log");
     const oldDeadline = process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS;
     process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS = "50";
     try {
       const result = await spawnCaptured({
+        // `sleep 10` consumes ~zero CPU — the canonical hung-but-alive
+        // signature. Phase A must kill within startupHangMs.
         bin: "bash",
         argv: ["-c", "sleep 10"],
         cwd: tmpDir,
@@ -3763,11 +3765,50 @@ describe("spawnCaptured streaming", () => {
       });
       expect(result.timedOut).toBe(true);
       expect(result.stallKilled).toBe(true);
-      expect(result.killReason).toBe("first_token_timeout");
-      expect(result.stallSilenceMs).toBe(50);
+      expect(result.killReason).toBe("startup_hang");
+      // stallSilenceMs is the silence window at kill, which equals the
+      // startupHangMs (50ms in this test). Allow some tolerance because the
+      // poll interval can round up.
+      expect(result.stallSilenceMs).toBeGreaterThanOrEqual(50);
       const log = fs.readFileSync(logPath, "utf8");
       expect(log).toContain("# stdout_bytes: 0");
       expect(log).toContain("# stderr_bytes: 0");
+    } finally {
+      if (oldDeadline === undefined)
+        delete process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS;
+      else process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS = oldDeadline;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT kill cpu-burning silent child at startup-hang deadline (main bug fix)", async () => {
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "spawncaptured-cpu-burn-"),
+    );
+    const logPath = path.join(tmpDir, "cpu-burn.log");
+    const oldDeadline = process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS;
+    // Phase A deadline at 200ms; busy-loop must survive past that and exit
+    // cleanly on its own at t=400ms.
+    process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS = "200";
+    try {
+      const result = await spawnCaptured({
+        // Busy-loop for 400ms then exit. Burns 100% CPU continuously, emits
+        // zero output. Phase A must NOT kill it because CPU > 0 from spawn.
+        bin: "bash",
+        argv: [
+          "-c",
+          "end=$(($(date +%s%N)/1000000+400)); while [ $(($(date +%s%N)/1000000)) -lt $end ]; do :; done",
+        ],
+        cwd: tmpDir,
+        timeoutMs: 5000,
+        logPath,
+        closeStdin: true,
+      });
+      // Process exited on its own — no stall, no timeout.
+      expect(result.stallKilled).toBe(false);
+      expect(result.timedOut).toBe(false);
+      expect(result.killReason).toBeUndefined();
+      expect(result.exitCode).toBe(0);
     } finally {
       if (oldDeadline === undefined)
         delete process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS;

@@ -596,7 +596,6 @@ export function spawnCaptured(args: {
     const startedAt = Date.now();
     let stallKilled = false;
     let stallSilenceMs = 0;
-    let firstTokenKilled = false;
     let stdoutBuf = "";
     let stderrBuf = "";
     let stdoutBytes = 0;
@@ -790,53 +789,15 @@ export function spawnCaptured(args: {
     let backpressurePausedMs = 0;
     let watchdogActivityHook: (() => void) | null = null;
 
-    let firstTokenTimer: unknown = null;
-    let firstTokenKillTimer: unknown = null;
-    const firstTokenDeadlineMs = envNumberOrDefault(
-      "GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS",
-      120000,
-    );
-    const clearFirstTokenTimers = () => {
-      if (firstTokenTimer) {
-        clearTimeout(firstTokenTimer as ReturnType<typeof setTimeout>);
-        firstTokenTimer = null;
-      }
-      if (firstTokenKillTimer) {
-        clearTimeout(firstTokenKillTimer as ReturnType<typeof setTimeout>);
-        firstTokenKillTimer = null;
-      }
-    };
-    const noteFirstToken = () => {
-      if (stdoutBytes + stderrBytes > 0) clearFirstTokenTimers();
-    };
-    if (firstTokenDeadlineMs > 0) {
-      firstTokenTimer = setTimeout(() => {
-        if (stdoutBytes + stderrBytes > 0 || stallKilled) return;
-        firstTokenKilled = true;
-        stallKilled = true;
-        stallSilenceMs = firstTokenDeadlineMs;
-        if (typeof child.pid === "number") {
-          killProcessAndGroup(child.pid, "SIGTERM");
-          firstTokenKillTimer = setTimeout(() => {
-            if (typeof child.pid === "number") {
-              killProcessAndGroup(child.pid, "SIGKILL");
-            }
-          }, 5000);
-        }
-      }, firstTokenDeadlineMs);
-    }
-
     child.stdout?.on("data", (chunk: Buffer | string) => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       stdoutBytes += text.length;
-      noteFirstToken();
       stdoutBuf = truncate(stdoutBuf + text);
       writeChannel("OUT", text);
     });
     child.stderr?.on("data", (chunk: Buffer | string) => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       stderrBytes += text.length;
-      noteFirstToken();
       stderrBuf = truncate(stderrBuf + text);
       writeChannel("ERR", text);
     });
@@ -896,7 +857,6 @@ export function spawnCaptured(args: {
     if (args.closeStdin) child.stdin?.end();
 
     const finish = (exitCode: number | null, signal: NodeJS.Signals | null) => {
-      clearFirstTokenTimers();
       watchdog.stop();
       // If the watchdog killed us, treat as timedOut. Otherwise a SIGTERM/
       // SIGKILL signal means an external killer (not the watchdog) — surface
@@ -1010,9 +970,7 @@ export function spawnCaptured(args: {
           stallKilled,
           stallSilenceMs,
           exitSignal,
-          killReason: firstTokenKilled
-            ? "first_token_timeout"
-            : watchdog.killReason(),
+          killReason: watchdog.killReason(),
           lastTool: watchdog.lastTool(),
           lastBucket: watchdog.lastBucket(),
           logPath: args.logPath,
