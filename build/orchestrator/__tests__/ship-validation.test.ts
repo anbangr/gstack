@@ -253,4 +253,160 @@ describe("validateShipCompletion", () => {
       expect(out.reason).toBe("git_unavailable");
     }
   });
+
+  // T6 /review findings — hardening tests added after adversarial review.
+  it("CRITICAL /review: returns pr_headref_missing when gh JSON omits headRefName (no silent pass)", () => {
+    const sha = "e".repeat(40);
+    const runCommand = mockRun([
+      { cmd: "git", status: 0, stdout: `${sha}\trefs/heads/${branch}\n` },
+      {
+        cmd: "gh",
+        status: 0,
+        // Hostile/buggy gh: JSON missing headRefName. Pre-fix this passed
+        // validation silently because the check was `if (parsed.headRefName && ...)`.
+        stdout: JSON.stringify({ url: "https://github.com/foo/bar/pull/42" }),
+      },
+    ]);
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Opened https://github.com/foo/bar/pull/42",
+      runCommand,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe("pr_headref_missing");
+    }
+  });
+
+  it("HIGH /review: returns pr_not_open when gh reports a non-OPEN PR (closed/merged/draft)", () => {
+    const sha = "f".repeat(40);
+    const runCommand = mockRun([
+      { cmd: "git", status: 0, stdout: `${sha}\trefs/heads/${branch}\n` },
+      {
+        cmd: "gh",
+        status: 0,
+        stdout: JSON.stringify({
+          url: "https://github.com/foo/bar/pull/42",
+          headRefName: branch,
+          state: "MERGED",
+        }),
+      },
+    ]);
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Opened PR https://github.com/foo/bar/pull/42",
+      runCommand,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe("pr_not_open");
+    }
+  });
+
+  it("MEDIUM /review: rejects empty branch name without calling git ls-remote (detached-HEAD guard)", () => {
+    let gitCalls = 0;
+    const runCommand: RunCommandFn = (cmd) => {
+      if (cmd === "git") gitCalls++;
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    const out = validateShipCompletion({
+      cwd,
+      branch: "",
+      outputText: "ship-out text",
+      runCommand,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe("invalid_branch");
+    }
+    expect(gitCalls).toBe(0); // never touched git
+  });
+
+  it("MEDIUM /review: rejects branch with shell metacharacters", () => {
+    const out = validateShipCompletion({
+      cwd,
+      branch: "feat/foo;rm -rf /",
+      outputText: "any",
+      runCommand: () => {
+        throw new Error("should not be called");
+      },
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe("invalid_branch");
+    }
+  });
+
+  it("HIGH /review: returns validator_timeout (not ship_hallucinated_success) when ls-remote is killed by timeout", () => {
+    const runCommand = mockRun([
+      {
+        cmd: "git",
+        status: null as unknown as number, // spawnSync timeout returns status: null
+        stderr: "killed by signal SIGTERM",
+      },
+    ]);
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "any",
+      runCommand,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe("validator_timeout");
+    }
+  });
+
+  it("HIGH /review: returns validator_timeout when gh is killed by timeout (not fabrication)", () => {
+    const sha = "1".repeat(40);
+    const runCommand = mockRun([
+      { cmd: "git", status: 0, stdout: `${sha}\trefs/heads/${branch}\n` },
+      {
+        cmd: "gh",
+        status: null as unknown as number,
+        stderr: "killed by signal SIGTERM",
+      },
+    ]);
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: "Opened PR #42",
+      runCommand,
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe("validator_timeout");
+    }
+  });
+
+  it("LOW /review: caps very large outputText to defend against OOM/regex DoS", () => {
+    // 2 MB of junk + a real PR URL at the very end. Validator should still
+    // find the URL because it slices from the END.
+    const huge = "x".repeat(2 * 1024 * 1024);
+    const sha = "2".repeat(40);
+    const runCommand = mockRun([
+      { cmd: "git", status: 0, stdout: `${sha}\trefs/heads/${branch}\n` },
+      {
+        cmd: "gh",
+        status: 0,
+        stdout: JSON.stringify({
+          url: "https://github.com/foo/bar/pull/77",
+          headRefName: branch,
+          state: "OPEN",
+        }),
+      },
+    ]);
+    const out = validateShipCompletion({
+      cwd,
+      branch,
+      outputText: `${huge}\nOpened https://github.com/foo/bar/pull/77`,
+      runCommand,
+    });
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.prNumber).toBe(77);
+    }
+  });
 });
