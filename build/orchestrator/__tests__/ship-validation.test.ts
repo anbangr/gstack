@@ -46,6 +46,29 @@ describe("parsePrReference", () => {
       parsePrReference("see https://example.com/foo/bar/pull/9 not GH"),
     ).toEqual({ prNumber: null, prUrl: null });
   });
+
+  // T6 /review LOW finding (deferred from PR #96; addressed here):
+  // PR #0 is not a valid GitHub PR. parsePrReference must reject it at
+  // the parser layer rather than letting `gh pr view 0` surface as
+  // pr_not_found_on_github (a misleading reason for what is actually a
+  // parser-input problem).
+  it("rejects PR #0 (not a valid GitHub PR number)", () => {
+    expect(parsePrReference("Opened PR #0 for review")).toEqual({
+      prNumber: null,
+      prUrl: null,
+    });
+    expect(
+      parsePrReference("see https://github.com/foo/bar/pull/0"),
+    ).toEqual({ prNumber: null, prUrl: null });
+  });
+
+  it("rejects leading-zero numbers that parse to 0", () => {
+    // Number("0000") === 0 → reject
+    expect(parsePrReference("see PR #0000 here")).toEqual({
+      prNumber: null,
+      prUrl: null,
+    });
+  });
 });
 
 function mockRun(

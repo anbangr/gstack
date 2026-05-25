@@ -88,18 +88,24 @@ export function parsePrReference(outputText: string): {
   prNumber: number | null;
   prUrl: string | null;
 } {
+  // PR numbers must be positive integers. Reject 0, negatives, leading-zero
+  // junk that parses to 0, and non-finite inputs. `gh pr view 0` returns
+  // non-zero with a generic "no PR found" message that would surface to
+  // callers as `pr_not_found_on_github` — misleading for what is really a
+  // parser-input problem (T6 /review LOW finding).
+  const validPr = (n: number): boolean => Number.isFinite(n) && n > 0;
   const urlMatch = outputText.match(PR_URL_RE);
   if (urlMatch) {
     const n = Number(urlMatch[1]);
     return {
-      prNumber: Number.isFinite(n) ? n : null,
-      prUrl: urlMatch[0],
+      prNumber: validPr(n) ? n : null,
+      prUrl: validPr(n) ? urlMatch[0] : null,
     };
   }
   const numMatch = outputText.match(PR_NUMBER_RE);
   if (numMatch) {
     const n = Number(numMatch[1]);
-    return { prNumber: Number.isFinite(n) ? n : null, prUrl: null };
+    return { prNumber: validPr(n) ? n : null, prUrl: null };
   }
   return { prNumber: null, prUrl: null };
 }
