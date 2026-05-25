@@ -5605,6 +5605,7 @@ describe("ship failure sets state.failureReason at paused paths", () => {
     repoPath: string,
     planFile: string,
     runId: string,
+    branch: string = "main",
   ): void {
     const stateSlug = `build-${runId}`;
     const registryDir = path.join(tmpDir!, "registry");
@@ -5616,7 +5617,7 @@ describe("ship failure sets state.failureReason at paused paths", () => {
         planFile,
         planBasename: "plan",
         slug: stateSlug,
-        branch: "main",
+        branch,
         startedAt: new Date().toISOString(),
         lastUpdatedAt: new Date().toISOString(),
         launch: {
@@ -5639,7 +5640,7 @@ describe("ship failure sets state.failureReason at paused paths", () => {
             name: "Test Ship",
             phaseIndexes: [0],
             status: "phases_done",
-            branch: "main",
+            branch,
           },
         ],
         phases: [
@@ -5807,6 +5808,51 @@ process.exit(0);
     const state = loadSavedState(runId);
     expect(state.failureReason).toMatch(/ship_hallucinated_success/);
     expect(state.failureReason).toMatch(/pr_not_found_on_github/);
+  }, 30_000);
+
+  // T6 /review LOW finding (deferred from PR #96; addressed here).
+  // Location C/D both seed branch="main" which initRepoWithOrigin DOES push
+  // to the bare origin, so neither test exercises validateShipCompletion's
+  // branch_not_pushed path through cli.ts. A unit test in
+  // ship-validation.test.ts covers the validator alone, but the integration
+  // wiring from cli.ts → resolveShipPr → validator was never end-to-end
+  // pinned for the unpushed-branch case.
+  it("Location E: branch never pushed to origin → state.failureReason flags branch_not_pushed", () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-ship-loc-e-"));
+    const runId = `ship-loc-e-${process.pid}`;
+    const repo = initRepoWithOrigin();
+    // Create the feature branch LOCALLY so syncFeatureBranchWithBase's
+    // `git checkout <branch>` succeeds. Do NOT push it — so the validator's
+    // `git ls-remote origin refs/heads/<branch>` returns empty and surfaces
+    // branch_not_pushed.
+    const featureBranch = "feat/never-pushed";
+    spawnSync("git", ["-C", repo, "checkout", "-b", featureBranch], {
+      encoding: "utf8",
+    });
+    spawnSync("git", ["-C", repo, "checkout", "main"], { encoding: "utf8" });
+    const planFile = committedPlanFile();
+    seedShipState(repo, planFile, runId, featureBranch);
+
+    // kimi exits 0 with no output → mergeOutputFile returns empty stdout →
+    // validator gets to its ls-remote check before any PR-reference logic.
+    const fakeKimi = path.join(tmpDir!, "kimi");
+    fs.writeFileSync(fakeKimi, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(fakeKimi, 0o755);
+
+    const fakeGhDir = path.join(tmpDir!, "fake-gh");
+    fs.mkdirSync(fakeGhDir, { recursive: true });
+    fs.writeFileSync(path.join(fakeGhDir, "gh"), "#!/bin/sh\nexit 1\n");
+    fs.chmodSync(path.join(fakeGhDir, "gh"), 0o755);
+
+    const result = runShipCli(planFile, repo, runId, {
+      KIMI_BIN: fakeKimi,
+      PATH: `${fakeGhDir}:${process.env.PATH ?? ""}`,
+    });
+
+    expect(result.status).toBe(1);
+    const state = loadSavedState(runId);
+    expect(state.failureReason).toMatch(/ship_hallucinated_success/);
+    expect(state.failureReason).toMatch(/branch_not_pushed/);
   }, 30_000);
 });
 
