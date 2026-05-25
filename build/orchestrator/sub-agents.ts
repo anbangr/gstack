@@ -76,6 +76,29 @@ const SHIP_TIMEOUT_MS = envNumberOrDefault(
   BUILD_DEFAULTS.timeoutsMs.ship,
 );
 
+/**
+ * Resolve the Phase A startup-hang window from
+ * GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS. Historical name; current semantics
+ * are documented at the call site and in stall-watchdog.ts's
+ * StallWatchdogOptions.startupHangMs JSDoc.
+ *
+ * Returns:
+ *  - the parsed positive integer when the env var is set to a positive value,
+ *  - 0 when the env var is set to literal "0" (disables Phase A entirely),
+ *  - 120_000 otherwise (default).
+ *
+ * Direct env-read instead of envNumberOrDefault because the latter coerces
+ * 0 → fallback, leaving no way to disable Phase A via env.
+ */
+function resolveStartupHangMs(): number {
+  const raw = process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS;
+  if (raw === undefined) return 120_000;
+  const trimmed = raw.trim();
+  if (trimmed === "0") return 0;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
+}
+
 function geminiBin(): string {
   return process.env.GEMINI_BIN || "gemini";
 }
@@ -836,6 +859,17 @@ export function spawnCaptured(args: {
       {
         stallMs: args.timeoutMs,
         provider,
+        // GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS keeps its historical name
+        // for operator-override continuity. New semantics: Phase A window
+        // (CPU + stream both silent). Set to 0 to disable Phase A.
+        //
+        // Clamp to args.timeoutMs so Phase A never extends past the
+        // operator's configured stall window. Without this, short-timeout
+        // callers (integration tests with timeoutMs=2000, ad-hoc shorter
+        // budgets) would silently get a 120s startup grace, breaking the
+        // configured wall-clock semantics. resolveStartupHangMs() returns
+        // 0 when env=0 — preserved through Math.min — disabling Phase A.
+        startupHangMs: Math.min(resolveStartupHangMs(), args.timeoutMs),
         onStallKill: (silenceMs) => {
           stallKilled = true;
           stallSilenceMs = silenceMs;
