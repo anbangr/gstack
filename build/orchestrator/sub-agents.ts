@@ -85,18 +85,26 @@ const SHIP_TIMEOUT_MS = envNumberOrDefault(
  * Returns:
  *  - the parsed positive integer when the env var is set to a positive value,
  *  - 0 when the env var is set to literal "0" (disables Phase A entirely),
- *  - 120_000 otherwise (default).
+ *  - 300_000 otherwise (default — 5 minutes).
+ *
+ * Default raised from 120_000ms in v1.45.x. The 120s cap was set for chatty
+ * providers (claude streams instantly; gemini streams within seconds). Reasoning
+ * models like `kimi-code/kimi-for-coding` at reasoning:high routinely need 2-3
+ * minutes before first byte under `--final-message-only`. 5 minutes is a more
+ * honest cap: short enough to catch genuine hangs, long enough to let reasoning
+ * models think. Operators wanting the old 120s set
+ * `GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS=120000`.
  *
  * Direct env-read instead of envNumberOrDefault because the latter coerces
  * 0 → fallback, leaving no way to disable Phase A via env.
  */
 function resolveStartupHangMs(): number {
   const raw = process.env.GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS;
-  if (raw === undefined) return 120_000;
+  if (raw === undefined) return 300_000;
   const trimmed = raw.trim();
   if (trimmed === "0") return 0;
   const parsed = Number(trimmed);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 300_000;
 }
 
 function geminiBin(): string {

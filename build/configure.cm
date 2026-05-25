@@ -28,7 +28,9 @@
     "testWriter": {
       "provider": "kimi",
       "model": "kimi-code/kimi-for-coding",
-      "reasoning": "high"
+      "reasoning": "high",
+      "backupProvider": "gemini",
+      "backupModel": "gemini-3.1-pro-preview"
     },
     "primaryImpl": {
       "provider": "kimi",
