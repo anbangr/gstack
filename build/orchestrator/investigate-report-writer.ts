@@ -10,6 +10,15 @@ function defaultFaultsDir(): string {
   return path.join(home, "skill-faults");
 }
 
+/**
+ * Default destination for auto-filed bug reports and halt-event inbox markdown.
+ * Lives under GSTACK_HOME so it never pollutes the cwd or any workspace root.
+ * Callers can override via an explicit `inboxDir` argument or `GSTACK_INBOX_DIR`.
+ */
+export function defaultInboxDir(): string {
+  return path.join(defaultFaultsDir(), "inbox");
+}
+
 export function bugReportSlug(args: {
   report: InvestigationReport;
   ctx: InvestigationContext;
@@ -116,9 +125,7 @@ export function writeBugReport(args: {
   dateOverride?: string;
 }): WriteBugReportResult {
   const inboxDir =
-    args.inboxDir ??
-    process.env.GSTACK_INBOX_DIR ??
-    path.resolve(process.cwd(), "inbox");
+    args.inboxDir ?? process.env.GSTACK_INBOX_DIR ?? defaultInboxDir();
   if (args.noInbox) {
     return { skipped: true, path: null, reason: "noInbox=true" };
   }
@@ -126,7 +133,11 @@ export function writeBugReport(args: {
     return { skipped: true, path: null, reason: "symptoms-only fault" };
   }
   if (args.ctx.severity !== "HIGH" && args.ctx.severity !== "CRITICAL") {
-    return { skipped: true, path: null, reason: `severity=${args.ctx.severity}` };
+    return {
+      skipped: true,
+      path: null,
+      reason: `severity=${args.ctx.severity}`,
+    };
   }
   if (args.report.outcome === "duplicate-of") {
     return { skipped: true, path: null, reason: "duplicate-of outcome" };
@@ -157,7 +168,10 @@ function renderBugReportMarkdown(
   date: string,
 ): string {
   const title =
-    report.rootCause.split(/[.!?\n]/, 1)[0].trim().slice(0, 80) || ctx.faultId;
+    report.rootCause
+      .split(/[.!?\n]/, 1)[0]
+      .trim()
+      .slice(0, 80) || ctx.faultId;
   const lines: string[] = [];
   lines.push(`# Bug: ${title}`);
   lines.push("");
@@ -171,7 +185,9 @@ function renderBugReportMarkdown(
   lines.push("## Symptom");
   lines.push("");
   lines.push(
-    ctx.haltEvent?.message ?? ctx.symptoms ?? "(see machine report for details)",
+    ctx.haltEvent?.message ??
+      ctx.symptoms ??
+      "(see machine report for details)",
   );
   lines.push("");
   if (ctx.statePath || ctx.stdoutLogPath || ctx.livingPlanPath) {
@@ -179,7 +195,8 @@ function renderBugReportMarkdown(
     lines.push("");
     if (ctx.statePath) lines.push(`- state: \`${ctx.statePath}\``);
     if (ctx.stdoutLogPath) lines.push(`- stdout: \`${ctx.stdoutLogPath}\``);
-    if (ctx.livingPlanPath) lines.push(`- living plan: \`${ctx.livingPlanPath}\``);
+    if (ctx.livingPlanPath)
+      lines.push(`- living plan: \`${ctx.livingPlanPath}\``);
     if (ctx.worktreePath) lines.push(`- worktree: \`${ctx.worktreePath}\``);
     lines.push("");
   }
