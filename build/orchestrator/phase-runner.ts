@@ -740,7 +740,7 @@ export function applyResult(
     const cap = resolveRedSpecCap(testCount.collected);
     if (attempts >= cap) {
       next.status = "failed";
-      next.error = `Gemini could not produce failing tests after ${attempts} attempts (GSTACK_BUILD_RED_MAX_ITER). If the test runner is misdetected (e.g. vitest ran for a pytest phase), override per-phase by adding \`<!-- testCmd: <your-test-command> -->\` to the phase body in the plan.`;
+      next.error = `RED_SPEC_EXHAUSTED: Gemini could not produce failing tests after ${attempts} attempts (GSTACK_BUILD_RED_MAX_ITER). Resolved testCmd: ${extra?.testCmd ?? "unknown"}. If the test runner is misdetected (e.g. vitest ran for a pytest phase, or root \`npm test\` skips a subtree like sidecar-v2/), override per-phase by adding \`<!-- testCmd: <your-test-command> -->\` to the phase body in the plan.`;
       return next;
     }
     next.status = "test_spec_running";
