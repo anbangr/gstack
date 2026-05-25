@@ -114,6 +114,16 @@ function geminiBin(): string {
 }
 
 /**
+ * Codex binary resolver. Reads `CODEX_BIN` from the environment at call
+ * time so tests that mutate the env after module load can swap in a
+ * fake binary. Production sets the env once at startup so this is a
+ * no-cost wrapper around the legacy `CODEX_BIN` module constant.
+ */
+function codexBin(): string {
+  return process.env.CODEX_BIN || CODEX_BIN;
+}
+
+/**
  * Bug T4 (mitosis-control-plane-cp-pod-log-archival 2026-05-25): Gemini's
  * file editor creates `*.bak` backup files when overwriting files in `--yolo`
  * mode and does NOT clean them up. The leftover untracked `.bak` poisons the
@@ -201,6 +211,31 @@ let _codexAuthCache:
   | { ok: boolean; reason?: string; skipped?: boolean }
   | undefined;
 
+let _kimiAuthPromise:
+  | Promise<{ ok: boolean; reason?: string; skipped?: boolean }>
+  | undefined;
+let _kimiAuthCache:
+  | { ok: boolean; reason?: string; skipped?: boolean }
+  | undefined;
+
+/**
+ * Stderr/stdout patterns that indicate the provider needs interactive
+ * auth (login, re-auth, token refresh). Cross-provider — same general
+ * shapes recur across Gemini, Codex, Kimi CLIs. Matched in probeAuthSync
+ * so a non-zero auth-status exit returns the more specific
+ * "auth_required" reason instead of a generic "exit N", and so the auth
+ * preflight refuses to fall through to the version-only probe when the
+ * real signal is "please log in" (which --version would mask).
+ *
+ * Closes the p9 signature where Gemini exited 0 on an auth prompt — the
+ * provider detected non-TTY stdin and returned a zero-byte "nothing to
+ * do" instead of failing. The probe now classifies the prompt up front
+ * so the orchestrator emits PROVIDER_AUTH_REQUIRED before any phase
+ * starts spending budget.
+ */
+const AUTH_REQUIRED_RE =
+  /authentication required|please (?:authenticate|log ?in|sign ?in|re-?authenticate)|not (?:authenticated|logged ?in|signed ?in)|invalid (?:api )?key|401 Unauthorized|token expired|access denied|api key (?:is )?required|credentials (?:are )?required/i;
+
 function resolveBinInPath(bin: string): string {
   if (path.isAbsolute(bin)) return bin;
   const pathEnv = process.env.PATH ?? "";
@@ -220,16 +255,52 @@ function probeAuthSync(
   bin: string,
   argv: string[],
   timeoutMs: number,
-): { ok: boolean; reason?: string } {
+): { ok: boolean; reason?: string; authRequired?: boolean } {
   const resolvedBin = resolveBinInPath(bin);
   try {
+    // stdio: stdin closed ("ignore" → /dev/null on POSIX), stdout + stderr
+    // captured. Capturing stderr is the change that closes the p9 gap —
+    // pre-fix the probe ignored stderr, so an auth-prompt provider that
+    // wrote "please log in" to stderr and exited non-zero looked like a
+    // generic "exit 1" — masked by the version-only fallback.
+    //
+    // encoding: 'utf8' coerces stdout/stderr to strings instead of
+    // Buffers; without it the AUTH_REQUIRED_RE scan sees the empty-
+    // string fallback and never fires.
     const result = registeredSpawnSync(resolvedBin, argv, {
-      stdio: ["ignore", "pipe", "ignore"],
+      stdio: ["ignore", "pipe", "pipe"],
       timeout: timeoutMs,
+      encoding: "utf8",
     });
+    const rawStdout = result.stdout;
+    const rawStderr = result.stderr;
+    const stdout =
+      typeof rawStdout === "string"
+        ? rawStdout
+        : Buffer.isBuffer(rawStdout)
+          ? rawStdout.toString("utf8")
+          : "";
+    const stderr =
+      typeof rawStderr === "string"
+        ? rawStderr
+        : Buffer.isBuffer(rawStderr)
+          ? rawStderr.toString("utf8")
+          : "";
+    const combined = `${stdout}\n${stderr}`;
+    // Auth-required wins over exit-code: a provider that exits 0 after
+    // detecting non-TTY stdin still leaves the "please log in" string
+    // in stderr/stdout. Classify that as authRequired regardless of
+    // exit status — caller should NOT fall through to --version probe
+    // because --version exits 0 even on broken auth.
+    if (AUTH_REQUIRED_RE.test(combined)) {
+      const match = combined.match(AUTH_REQUIRED_RE);
+      return {
+        ok: false,
+        authRequired: true,
+        reason: `auth_required: ${match?.[0] ?? "interactive auth prompt"}`,
+      };
+    }
     if (result.status === 0) return { ok: true };
-    const stdout = typeof result.stdout === "string" ? result.stdout : "";
-    const stderr = typeof result.stderr === "string" ? result.stderr : "";
     return {
       ok: false,
       reason: stdout.trim() || stderr.trim() || `exit ${result.status}`,
@@ -257,6 +328,19 @@ export async function assertGeminiAuth(): Promise<{
       _geminiAuthCache = primary;
       return primary;
     }
+    // Auth-required wins: do NOT fall through to --version because that
+    // probe exits 0 on a broken-auth install and masks the real signal.
+    // This is the p9 fix path — Gemini exited 0 on an auth prompt, the
+    // --version fallback returned ok:true, and the orchestrator burned
+    // a real phase budget on a provider that was never going to work.
+    if (primary.authRequired) {
+      const result = {
+        ok: false,
+        reason: `Gemini auth required (${primary.reason})`,
+      };
+      _geminiAuthCache = result;
+      return result;
+    }
     const fallback = probeAuthSync(bin, ["--version"], 5000);
     if (fallback.ok) {
       _geminiAuthCache = fallback;
@@ -278,6 +362,8 @@ export function _resetAuthPreflightForTests(): void {
   _geminiAuthPromise = undefined;
   _codexAuthCache = undefined;
   _codexAuthPromise = undefined;
+  _kimiAuthCache = undefined;
+  _kimiAuthPromise = undefined;
 }
 
 export async function assertCodexAuth(): Promise<{
@@ -292,12 +378,21 @@ export async function assertCodexAuth(): Promise<{
   if (_codexAuthPromise) return _codexAuthPromise;
 
   _codexAuthPromise = (async () => {
-    const primary = probeAuthSync(CODEX_BIN, ["auth", "status"], 5000);
+    const bin = codexBin();
+    const primary = probeAuthSync(bin, ["auth", "status"], 5000);
     if (primary.ok) {
       _codexAuthCache = primary;
       return primary;
     }
-    const fallback = probeAuthSync(CODEX_BIN, ["--version"], 5000);
+    if (primary.authRequired) {
+      const result = {
+        ok: false,
+        reason: `Codex auth required (${primary.reason})`,
+      };
+      _codexAuthCache = result;
+      return result;
+    }
+    const fallback = probeAuthSync(bin, ["--version"], 5000);
     if (fallback.ok) {
       _codexAuthCache = fallback;
       return fallback;
@@ -311,6 +406,56 @@ export async function assertCodexAuth(): Promise<{
   })();
 
   return _codexAuthPromise;
+}
+
+/**
+ * Kimi auth preflight. Same shape as Gemini/Codex — probe `auth status`
+ * with stdin closed; if it reports an auth prompt, surface that without
+ * falling through to --version. Added to close the p17 signature where
+ * Kimi+Gemini both stall-killed with zero stdout — the p17 trace
+ * suggested Kimi was hitting an interactive auth path that nothing was
+ * detecting upstream of the watchdog.
+ */
+export async function assertKimiAuth(): Promise<{
+  ok: boolean;
+  reason?: string;
+  skipped?: boolean;
+}> {
+  if (process.env.GSTACK_DISABLE_AUTH_PREFLIGHT === "1") {
+    return { ok: true, skipped: true };
+  }
+  if (_kimiAuthCache) return _kimiAuthCache;
+  if (_kimiAuthPromise) return _kimiAuthPromise;
+
+  _kimiAuthPromise = (async () => {
+    const bin = kimiBin();
+    const primary = probeAuthSync(bin, ["auth", "status"], 5000);
+    if (primary.ok) {
+      _kimiAuthCache = primary;
+      return primary;
+    }
+    if (primary.authRequired) {
+      const result = {
+        ok: false,
+        reason: `Kimi auth required (${primary.reason})`,
+      };
+      _kimiAuthCache = result;
+      return result;
+    }
+    const fallback = probeAuthSync(bin, ["--version"], 5000);
+    if (fallback.ok) {
+      _kimiAuthCache = fallback;
+      return fallback;
+    }
+    const result = {
+      ok: false,
+      reason: `Kimi auth required (${primary.reason || fallback.reason})`,
+    };
+    _kimiAuthCache = result;
+    return result;
+  })();
+
+  return _kimiAuthPromise;
 }
 
 /**

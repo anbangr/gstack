@@ -258,6 +258,97 @@ export function recordRedGateZeroTestsCollected(
   );
 }
 
+/**
+ * Hygiene gate failure — the post-agent hygiene check detected the role
+ * subprocess left the worktree in a bad state. Common signatures:
+ *   - "did not create a new commit" (primary implementor commits gone missing)
+ *   - "recovery FAILED" (post-impl recovery couldn't restore tree)
+ *   - "hygiene failed" (generic)
+ *
+ * Distinct from RETRY_CAP_HIT because the failure is structural (worktree
+ * mutation, missing commit), not iteration-budget exhaustion. Routing this
+ * to the right investigator playbook matters: hygiene faults need state
+ * restoration / replay, not "try more iterations."
+ */
+export function recordHygieneFailure(
+  state: BuildState,
+  phaseIdx: number,
+  role: string,
+  evidence: string,
+  ctx: HelperContext,
+): string {
+  return emit(
+    "HYGIENE_FAIL",
+    `${role} hygiene failed: ${evidence}`,
+    ctx,
+    state,
+    phaseIdx,
+    undefined, // featureIndex
+    evidence, // failureReason
+  );
+}
+
+/**
+ * Red-spec exhaustion — Gemini test-writer ran the max number of attempts
+ * (GSTACK_BUILD_RED_MAX_ITER) and the test runner kept reporting "all
+ * tests pass" with zero failures. Distinct from RED_GATE_ZERO_TESTS_COLLECTED
+ * (which fires when the runner finds zero tests at all) and RETRY_CAP_HIT
+ * (which is convergence/Codex-review). Common root causes:
+ *   - Root test command skips a subtree where the test-writer authored tests
+ *   - Test framework mismatch (vitest expected, jest configured)
+ *   - The test-writer's tests are too weak / trivially pass before impl
+ */
+export function recordRedSpecExhausted(
+  state: BuildState,
+  phaseIdx: number,
+  attempts: number,
+  testCmd: string,
+  ctx: HelperContext,
+): string {
+  return emit(
+    "RED_SPEC_EXHAUSTED",
+    `Gemini test-spec exhausted after ${attempts} attempts. Resolved testCmd: ${testCmd}. If a subtree was skipped (e.g. root runner omits sidecar-v2/), add \`<!-- testCmd: -->\` to the phase body.`,
+    ctx,
+    state,
+    phaseIdx,
+  );
+}
+
+/**
+ * Watchdog stall kill with no recoverable provider verdict. The role
+ * subprocess ran past the watchdog window with no progress AND no
+ * matchable provider-failure signature in its log (no quota, no capacity,
+ * no auth, no transport — just silent zero-stdout death). Distinct from
+ * PROVIDER_TIMEOUT which is set by classifyProviderFailure when stall
+ * markers ALSO match a provider-evidence regex. Used as the explicit
+ * "zero-stdout stall, unclassified" halt kind so the investigator-bot
+ * routes to provider-stall recovery, not convergence retry-cap.
+ */
+export function recordStallKilled(
+  state: BuildState,
+  phaseIdx: number,
+  role: string,
+  silenceMs: number,
+  stdoutBytes: number,
+  killReason: string,
+  ctx: HelperContext,
+): string {
+  return emit(
+    "STALL_KILLED",
+    `${role} stalled (${killReason}, ${silenceMs}ms silence, ${stdoutBytes} stdout bytes)`,
+    ctx,
+    state,
+    phaseIdx,
+    undefined, // featureIndex
+    undefined, // failureReason
+    {
+      killReason,
+      lastTool: null,
+      lastBucket: null,
+    },
+  );
+}
+
 // ------------------------------------------------------------------
 // FailureRender — structured view of why a role step failed
 // ------------------------------------------------------------------

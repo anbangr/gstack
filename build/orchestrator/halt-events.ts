@@ -23,7 +23,9 @@ export type HaltEventKind =
   | "PROVIDER_OVERLOADED"
   | "PROVIDER_TRANSPORT_ERROR"
   | "PROVIDER_AUTH_REQUIRED"
-  | "RED_GATE_ZERO_TESTS_COLLECTED";
+  | "RED_GATE_ZERO_TESTS_COLLECTED"
+  | "HYGIENE_FAIL"
+  | "RED_SPEC_EXHAUSTED";
 
 export type HaltSeverity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
 
@@ -94,6 +96,8 @@ export function severityFor(kind: HaltEventKind): HaltSeverity {
     case "PROVIDER_TRANSPORT_ERROR":
     case "PROVIDER_AUTH_REQUIRED":
     case "RED_GATE_ZERO_TESTS_COLLECTED":
+    case "HYGIENE_FAIL":
+    case "RED_SPEC_EXHAUSTED":
       return "HIGH";
     case "PHASE_REWIND":
     case "DUAL_IMPL_SWAP":

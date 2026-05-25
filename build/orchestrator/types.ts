@@ -311,6 +311,16 @@ export interface PhaseState {
   gemini?: SubAgentInvocation;
   /** Invocation record for the test-specification Gemini call. */
   geminiTestSpec?: SubAgentInvocation;
+  /**
+   * Paths the test-writer added or modified during the most recent test-spec
+   * iteration. Captured from `git diff --name-only` against the pre-testspec
+   * HEAD. Used by `resolveTestCmdForPhase` to infer a subtree-aware testCmd
+   * (e.g. `npm --prefix sidecar-v2 test` when all touched paths share the
+   * `sidecar-v2/` prefix) — generalises the synthesizer's PR #95 Go cmd-dir
+   * hint to TypeScript/Python subtrees. Empty array or absent field means
+   * fall through to existing static testCmd resolution.
+   */
+  testWriterTouchedPaths?: string[];
   /** Number of times VERIFY_RED returned exit==0 (tests too easy). Capped by GSTACK_BUILD_RED_MAX_ITER. */
   redSpecAttempts?: number;
   /** State of the post-testspec / post-impl test runs. */
