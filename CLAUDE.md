@@ -966,3 +966,12 @@ machine — gbrain's daemon handles incremental refresh on a schedule.
   inbox in a non-default location. Pre-v1.45 the fallback was `<cwd>/inbox`,
   which polluted workspace roots when Claude's cwd drifted; the new default
   keeps every auto-filed report under `~/.gstack/` regardless of cwd.
+- `GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS` — Controls the Phase A startup-hang
+  window (default 120000ms). Phase A kills a sub-agent only when both CPU
+  usage and stdout are silent for this duration; a CPU-busy process (e.g., a
+  long-reasoning Codex or Claude call thinking server-side) satisfies Phase A
+  on the first poll and is never killed here. Set to `0` to disable Phase A
+  entirely. Historical name kept for backward compatibility; semantics changed
+  in v1.45.0.0 from a flat first-token timer to a CPU-aware startup detector.
+  The killReason emitted on a Phase A kill is `"startup_hang"` (changed from
+  `"first_token_timeout"` in v1.45.0.0).

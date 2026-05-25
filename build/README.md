@@ -448,8 +448,9 @@ padded budgets to avoid mid-flight kills.
 | `GSTACK_BUILD_CODEX_REVIEW_SANDBOX`    | Codex review/QA sandbox override; explicit values disable automatic sandbox retry.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `GSTACK_QA_NO_AUTO_COMMIT`             | When truthy (`1`/`true`/`yes`), disables the hygiene gate's auto-commit path for test-only dirty diffs left by Review/QA roles. Recovery is manual.                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `GSTACK_QA_NO_AUTO_SPLIT`              | When truthy (`1`/`true`/`yes`), disables the hygiene gate's auto-split for mixed test+production diffs from Review/QA roles. The single test-only auto-commit path still fires.                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS` | Phase A startup-hang window in milliseconds (default 120000). Phase A kills a sub-agent only when both CPU usage and stdout are silent for this duration; a CPU-burning process (e.g. a long-reasoning Codex or Claude call with server-side thinking) satisfies Phase A on the first poll and runs on. Set to `0` to disable Phase A entirely. Historical name kept for backward compatibility; semantics changed from a flat first-token timer to a CPU-aware startup detector in v1.45.0.0. The `killReason` emitted on a Phase A kill is `"startup_hang"`.                                 |
 | `GSTACK_BUILD_WATCHDOG_CPU`            | Set to `1` to opt into CPU-time liveness probing for sub-agents. The watchdog samples per-pid kernel CPU usage via `ps -o pid=,cputime= -g <pgid>` and resets the stall timer whenever any pid in the group shows a positive CPU delta. Stdout activity still resets the timer (safety net). Designed for sub-agents that run silently by design (e.g. `kimi --print --final-message-only`, `codex exec` without `--json`). macOS + Linux only; on Windows or containers lacking `ps`, the opt-in is ignored with a one-line stderr notice and the standard stream-mode watchdog runs instead. |
-| `GSTACK_TOOL_AWARE_WATCHDOG`           | Set to `0` to disable tool-aware stall windowing and revert to the flat `stallMs` liveness model for all providers. Default is on. The tool-aware path parses each provider's stdout for `TOOL_START`/`TOOL_END` events via `subagent-progress-parser.ts` and applies per-bucket stall windows (`toolStallMs.fast` / `toolStallMs.slow`) instead of the single `stallMs` value. A separate progress-gap arm kills sub-agents that produce noisy stdout with no classified tool events beyond `progressGapMs`. |
+| `GSTACK_TOOL_AWARE_WATCHDOG`           | Set to `0` to disable tool-aware stall windowing and revert to the flat `stallMs` liveness model for all providers. Default is on. The tool-aware path parses each provider's stdout for `TOOL_START`/`TOOL_END` events via `subagent-progress-parser.ts` and applies per-bucket stall windows (`toolStallMs.fast` / `toolStallMs.slow`) instead of the single `stallMs` value. A separate progress-gap arm kills sub-agents that produce noisy stdout with no classified tool events beyond `progressGapMs`.                                                                                  |
 
 Role env vars use `GSTACK_BUILD_<ROLE>_<FIELD>`, where role is
 `TEST_WRITER`, `PRIMARY_IMPL`, `TEST_FIXER`, `SECONDARY_IMPL`, `REVIEW`,
@@ -466,28 +467,28 @@ full CLI role (since v1.28.0) and accepts the standard
 
 ## Module Map
 
-| File                                           | Responsibility                                                         |
-| ---------------------------------------------- | ---------------------------------------------------------------------- |
-| `SKILL.md.tmpl`                                | Human-facing `/build` workflow and CLI-monitoring instructions.        |
-| `configure.cm`                                 | Role routing, retry caps, and timeouts (source of truth for defaults). |
-| `bin/gstack-build-phase-guardrail`             | Post-feature guardrail: PR merged, origin/main up to date, tree clean. |
-| `orchestrator/cli.ts`                          | CLI args, startup gates, lock, main loop, ship guardrails.             |
-| `orchestrator/parser.ts`                       | Markdown plan parser.                                                  |
-| `orchestrator/phase-runner.ts`                 | Pure phase state machine.                                              |
-| `orchestrator/sub-agents.ts`                   | Gemini, Codex, Claude, test, verdict, and judge wrappers.              |
-| `orchestrator/plan-mutator.ts`                 | Atomic checkbox updates in the plan file.                              |
-| `orchestrator/state.ts`                        | Local JSON state, gbrain mirror, lock files, log paths.                |
-| `orchestrator/worktree.ts`                     | Dual-impl worktree creation, teardown, and winner apply.               |
-| `orchestrator/ship.ts`                         | Final `/ship` plus `/land-and-deploy` delegation.                      |
-| `orchestrator/feature-review.ts`               | Per-feature meta-review pass with same-shape repeat detection.         |
-| `orchestrator/feature-review-metrics.ts`       | JSONL instrumentation for feature-review baseline + tuning.            |
-| `orchestrator/feature-review-cache.ts`         | Verdict cache that skips re-review on unchanged FEATURE_PASS.          |
-| `orchestrator/feature-verifier.ts`             | Pre-merge `featureVerifier` gate + post-merge tree-hash audit.         |
-| `orchestrator/types.ts`                        | Shared phase and build state types.                                    |
-| `orchestrator/investigate-mode.ts`             | `/build investigate` entry: context resolution, briefing + hint.       |
-| `orchestrator/investigate-context.ts`          | Resolves context from active run / halt event / symptoms to briefing.  |
-| `orchestrator/investigate-report-writer.ts`    | Validates `InvestigationReport`, writes machine + bug-report artifacts.|
-| `orchestrator/investigate-lock.ts`             | `O_EXCL` fault lock with nonce, stale reclaim, ownership verification. |
+| File                                        | Responsibility                                                          |
+| ------------------------------------------- | ----------------------------------------------------------------------- |
+| `SKILL.md.tmpl`                             | Human-facing `/build` workflow and CLI-monitoring instructions.         |
+| `configure.cm`                              | Role routing, retry caps, and timeouts (source of truth for defaults).  |
+| `bin/gstack-build-phase-guardrail`          | Post-feature guardrail: PR merged, origin/main up to date, tree clean.  |
+| `orchestrator/cli.ts`                       | CLI args, startup gates, lock, main loop, ship guardrails.              |
+| `orchestrator/parser.ts`                    | Markdown plan parser.                                                   |
+| `orchestrator/phase-runner.ts`              | Pure phase state machine.                                               |
+| `orchestrator/sub-agents.ts`                | Gemini, Codex, Claude, test, verdict, and judge wrappers.               |
+| `orchestrator/plan-mutator.ts`              | Atomic checkbox updates in the plan file.                               |
+| `orchestrator/state.ts`                     | Local JSON state, gbrain mirror, lock files, log paths.                 |
+| `orchestrator/worktree.ts`                  | Dual-impl worktree creation, teardown, and winner apply.                |
+| `orchestrator/ship.ts`                      | Final `/ship` plus `/land-and-deploy` delegation.                       |
+| `orchestrator/feature-review.ts`            | Per-feature meta-review pass with same-shape repeat detection.          |
+| `orchestrator/feature-review-metrics.ts`    | JSONL instrumentation for feature-review baseline + tuning.             |
+| `orchestrator/feature-review-cache.ts`      | Verdict cache that skips re-review on unchanged FEATURE_PASS.           |
+| `orchestrator/feature-verifier.ts`          | Pre-merge `featureVerifier` gate + post-merge tree-hash audit.          |
+| `orchestrator/types.ts`                     | Shared phase and build state types.                                     |
+| `orchestrator/investigate-mode.ts`          | `/build investigate` entry: context resolution, briefing + hint.        |
+| `orchestrator/investigate-context.ts`       | Resolves context from active run / halt event / symptoms to briefing.   |
+| `orchestrator/investigate-report-writer.ts` | Validates `InvestigationReport`, writes machine + bug-report artifacts. |
+| `orchestrator/investigate-lock.ts`          | `O_EXCL` fault lock with nonce, stale reclaim, ownership verification.  |
 
 ## Testing
 
