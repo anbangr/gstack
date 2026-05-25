@@ -88,6 +88,7 @@ const MODULE_TEST_OWNERS: Record<string, string[]> = {
   "role-config.ts": ["role-config.test.ts", "cli.test.ts"],
   "safe-jsonpath.ts": ["safe-jsonpath.test.ts"],
   "ship.ts": ["cli.test.ts", "integration.test.ts"],
+  "ship-validation.ts": ["ship-validation.test.ts", "cli.test.ts"],
   "skill-fault-detector.ts": ["../../../test/skill-fault-detector.test.ts"],
   "stall-watchdog.ts": [
     "stall-watchdog.test.ts",

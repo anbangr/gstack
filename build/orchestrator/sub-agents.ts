@@ -24,6 +24,7 @@ import {
   spawnSync as registeredSpawnSync,
 } from "./child-registry";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { logDir, ensureLogDir, deriveGeminiTmpKey } from "./state";
 import type { RoleConfig, RoleProvider, RoleReasoning } from "./role-config";
@@ -47,6 +48,7 @@ import {
   type Provider,
 } from "./stall-watchdog";
 import { computeFaultId, emitHaltEventResolved } from "./halt-events";
+import { countSubprocessRetryAttempts } from "./halt-event-helpers";
 
 export type CodexSandbox =
   | "read-only"
@@ -109,6 +111,76 @@ function resolveStartupHangMs(): number {
 
 function geminiBin(): string {
   return process.env.GEMINI_BIN || "gemini";
+}
+
+/**
+ * Bug T4 (mitosis-control-plane-cp-pod-log-archival 2026-05-25): Gemini's
+ * file editor creates `*.bak` backup files when overwriting files in `--yolo`
+ * mode and does NOT clean them up. The leftover untracked `.bak` poisons the
+ * post-agent hygiene gate and rejects an otherwise-clean implementation
+ * commit (`completed: false` despite a working `git commit`).
+ *
+ * Sweep all `*.bak` files in the cwd whose mtime is newer than the spawn-start
+ * timestamp. Restricting to mtime > sinceMs ensures we don't delete a user's
+ * pre-existing `.bak` files. Uses `find` for portability and speed (avoids
+ * walking a large worktree from Node.js).
+ *
+ * Returns the list of deleted paths. Best-effort: any failure mode (find not
+ * available, sentinel file write fails, individual unlink fails) is swallowed
+ * — the hygiene gate is the safety net behind this sweep.
+ */
+export function sweepBakFilesNewerThan(
+  cwd: string,
+  sinceMs: number,
+): string[] {
+  if (!fs.existsSync(cwd)) return [];
+  const sentinel = path.join(
+    os.tmpdir(),
+    `gstack-bak-sweep-${process.pid}-${Date.now()}.ref`,
+  );
+  try {
+    fs.writeFileSync(sentinel, "");
+    // Anchor `-newer` comparison to sinceMs. fs.utimes accepts seconds (Date).
+    const ref = new Date(sinceMs);
+    fs.utimesSync(sentinel, ref, ref);
+  } catch {
+    try {
+      fs.unlinkSync(sentinel);
+    } catch {}
+    return [];
+  }
+  let stdout = "";
+  try {
+    const r = registeredSpawnSync(
+      "find",
+      [cwd, "-type", "f", "-name", "*.bak", "-newer", sentinel],
+      { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+    );
+    if (r.status === 0 && typeof r.stdout === "string") {
+      stdout = r.stdout;
+    }
+  } catch {
+    // find unavailable, etc.
+  } finally {
+    try {
+      fs.unlinkSync(sentinel);
+    } catch {}
+  }
+  const paths = stdout
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const deleted: string[] = [];
+  for (const p of paths) {
+    try {
+      fs.unlinkSync(p);
+      deleted.push(p);
+    } catch {
+      // Path raced (deleted by something else), permission denied, etc.
+      // Skip silently — hygiene gate will surface anything left.
+    }
+  }
+  return deleted;
 }
 
 // ------------------------------------------------------------------
@@ -524,6 +596,15 @@ export interface SubAgentResult {
    * other exitCode=1 outcomes (provider crash, transport failure, etc).
    */
   hygieneFailure?: boolean;
+  /**
+   * Bug 7: count of "Attempt N/M failed" lines observed in stderr — these
+   * are the sub-agent CLI's own internal retries (Gemini retryWithBackoff,
+   * Codex transport retry), distinct from the orchestrator's outer
+   * retries field. Surfaces invisible retries so FAIL handlers don't
+   * conflate subprocess capacity-stall with outer convergence retry-cap.
+   * Optional for back-compat; populated by spawnCaptured.
+   */
+  subprocessRetryAttempts?: number;
 }
 
 /**
@@ -540,6 +621,45 @@ function pickProviderForBin(bin: string): Provider {
   if (bin === geminiBin()) return "gemini";
   if (bin === process.env.GEMINI_BIN) return "gemini";
   return "shell";
+}
+
+/**
+ * Bug 1 (polis-mesh / simclaw / 12 pending PROVIDER_TIMEOUT records):
+ * resolve a per-provider override for the watchdog's silence (stallMs)
+ * window. Default behavior (unset) returns `defaultMs` (the caller's
+ * timeoutMs) — current behavior preserved. Two opt-in env vars allow
+ * operators to extend (or shorten) the patience window without raising
+ * the OVERALL timeout:
+ *
+ *   GSTACK_BUILD_STREAM_SILENCE_MS_CLAUDE=1800000  # 30 min for claude
+ *   GSTACK_BUILD_STREAM_SILENCE_MS_KIMI=1200000    # 20 min for kimi
+ *   GSTACK_BUILD_STREAM_SILENCE_MS=600000          # global default
+ *
+ * The provider-specific var beats the global. Setting to 0 disables the
+ * override and returns defaultMs. Use case: long-thinking models on big
+ * diffs (opus xhigh feature-review) that emit one chunk and then think
+ * server-side for many minutes — pre-fix the legacy stallMs window
+ * silently killed them as "stall" even though the API was still working.
+ */
+export function resolveStreamSilenceMs(
+  provider: Provider,
+  defaultMs: number,
+): number {
+  const upper = provider.toUpperCase();
+  const perProvider = process.env[`GSTACK_BUILD_STREAM_SILENCE_MS_${upper}`];
+  const global = process.env["GSTACK_BUILD_STREAM_SILENCE_MS"];
+  const raw =
+    perProvider !== undefined && perProvider !== ""
+      ? perProvider
+      : global !== undefined && global !== ""
+        ? global
+        : undefined;
+  if (raw === undefined) return defaultMs;
+  const trimmed = raw.trim();
+  if (trimmed === "0" || trimmed === "") return defaultMs;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || n <= 0) return defaultMs;
+  return n;
 }
 
 /**
@@ -826,7 +946,10 @@ export function spawnCaptured(args: {
         ? { mode: "cpu", child }
         : { mode: "stream", child },
       {
-        stallMs: args.timeoutMs,
+        // Bug 1: allow per-provider stream-silence override via env without
+        // raising the overall timeout. Defaults to args.timeoutMs (current
+        // behavior). See resolveStreamSilenceMs for the env-var contract.
+        stallMs: resolveStreamSilenceMs(provider, args.timeoutMs),
         provider,
         // GSTACK_BUILD_FIRST_TOKEN_DEADLINE_MS keeps its historical name
         // for operator-override continuity. New semantics: Phase A window
@@ -965,6 +1088,13 @@ export function spawnCaptured(args: {
             })();
 
       logFlushed.then(() => {
+        // Bug 7: count subprocess-internal CLI retries (Gemini retryWithBackoff,
+        // Codex transport retry) from combined stderr + stdout. Surfaces invisible
+        // retries to downstream FAIL handlers so subprocess capacity-stall isn't
+        // misclassified as outer convergence retry-cap exhaustion.
+        const subprocessRetryAttempts = countSubprocessRetryAttempts(
+          `${stderrBuf}\n${stdoutBuf}`,
+        );
         resolve({
           stdout: stdoutBuf,
           stderr: stderrBuf,
@@ -979,6 +1109,7 @@ export function spawnCaptured(args: {
           logPath: args.logPath,
           durationMs: Date.now() - startedAt,
           retries: 0,
+          ...(subprocessRetryAttempts > 0 ? { subprocessRetryAttempts } : {}),
         });
       });
     };
@@ -1691,6 +1822,7 @@ export async function runRoleTask(opts: {
       : `${opts.logPrefix}.log`,
   );
 
+  const spawnStartedAt = Date.now();
   const result = await spawnCaptured({
     bin: geminiBin(),
     argv,
@@ -1704,6 +1836,12 @@ export async function runRoleTask(opts: {
   });
 
   cleanupStaged();
+  const swept = sweepBakFilesNewerThan(opts.cwd, spawnStartedAt);
+  if (swept.length > 0) {
+    console.warn(
+      `  · gemini cleanup: removed ${swept.length} .bak file(s) left by --yolo (${swept.slice(0, 3).join(", ")}${swept.length > 3 ? "..." : ""})`,
+    );
+  }
   return mergeOutputFile(result, opts.outputFilePath);
 }
 
@@ -2969,6 +3107,7 @@ export async function runGeminiTestSpec(opts: {
     `phase-${opts.phaseNumber}-gemini-testspec-${opts.iteration}.log`,
   );
 
+  const spawnStartedAt = Date.now();
   const result = await spawnCaptured({
     bin: geminiBin(),
     argv,
@@ -2981,6 +3120,12 @@ export async function runGeminiTestSpec(opts: {
   // Stall kills aren't retried under liveness semantics — same stall window
   // would just stall again. Caller can surface this via result.stallKilled.
   cleanupStaged();
+  const swept = sweepBakFilesNewerThan(opts.cwd, spawnStartedAt);
+  if (swept.length > 0) {
+    console.warn(
+      `  · gemini-testspec cleanup: removed ${swept.length} .bak file(s) left by --yolo`,
+    );
+  }
   return mergeOutputFile(result, opts.outputFilePath);
 }
 

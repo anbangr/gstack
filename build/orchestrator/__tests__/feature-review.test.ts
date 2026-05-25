@@ -16,6 +16,7 @@ import {
   classifyFeatureReviewTimeout,
   classifyFeatureReviewResult,
   fingerprintFeatureReviewFailure,
+  recoverVerdictFromStalledFile,
   SAME_SHAPE_REPEAT_HALT_THRESHOLD,
   shouldSkipFeatureReview,
   compileGlob,
@@ -1267,5 +1268,104 @@ describe("isPathInLogDir — containment check", () => {
   it("returns false for undefined / empty input", () => {
     expect(isPathInLogDir(undefined, dir)).toBe(false);
     expect(isPathInLogDir("", dir)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// recoverVerdictFromStalledFile — Bug 2 (polis-mesh 2026-05-25)
+// ---------------------------------------------------------------------------
+describe("recoverVerdictFromStalledFile", () => {
+  // Use a synthetic sleep that resolves immediately so tests stay <10ms.
+  const fastSleep = (_: number) => Promise.resolve();
+
+  it("returns null when the re-read file is still empty after the delay", async () => {
+    const result = await recoverVerdictFromStalledFile({
+      outputFilePath: "/tmp/whatever",
+      readFileFn: () => "",
+      sleepFn: fastSleep,
+    });
+    expect(result).toBeNull();
+  });
+
+  it("returns null when the re-read file is whitespace-only", async () => {
+    const result = await recoverVerdictFromStalledFile({
+      outputFilePath: "/tmp/whatever",
+      readFileFn: () => "   \n  \t\n",
+      sleepFn: fastSleep,
+    });
+    expect(result).toBeNull();
+  });
+
+  it("returns null when the re-read file errors (vanished, unreadable)", async () => {
+    const result = await recoverVerdictFromStalledFile({
+      outputFilePath: "/tmp/whatever",
+      readFileFn: () => {
+        throw new Error("ENOENT");
+      },
+      sleepFn: fastSleep,
+    });
+    expect(result).toBeNull();
+  });
+
+  it("returns null when the re-read file has prose evidence but no structured verdict (pass-evidence-timeout is NOT promoted)", async () => {
+    const result = await recoverVerdictFromStalledFile({
+      outputFilePath: "/tmp/whatever",
+      readFileFn: () => "All tests passed. No findings.",
+      sleepFn: fastSleep,
+    });
+    // pass-evidence-timeout shape — deliberately NOT recovered because the
+    // first-read classification would already have caught it.
+    expect(result).toBeNull();
+  });
+
+  it("returns structured-verdict classification when re-read file contains FEATURE_PASS", async () => {
+    const result = await recoverVerdictFromStalledFile({
+      outputFilePath: "/tmp/whatever",
+      readFileFn: () =>
+        "## VERDICT\nFEATURE_PASS\n\n## Findings\nAll good.\n",
+      sleepFn: fastSleep,
+    });
+    expect(result).not.toBeNull();
+    expect(result!.kind).toBe("structured-verdict");
+    expect(result!.verdict.verdict).toBe("FEATURE_PASS");
+  });
+
+  it("returns structured-verdict for FEATURE_REDO with phase list", async () => {
+    const result = await recoverVerdictFromStalledFile({
+      outputFilePath: "/tmp/whatever",
+      readFileFn: () =>
+        "## VERDICT\nFEATURE_REDO\n\n## Phases to redo\n- 1.2\n\n## Findings\nFlake.\n",
+      sleepFn: fastSleep,
+    });
+    expect(result).not.toBeNull();
+    expect(result!.kind).toBe("structured-verdict");
+    expect(result!.verdict.verdict).toBe("FEATURE_REDO");
+    expect(result!.verdict.phasesToRedo).toEqual(["1.2"]);
+  });
+
+  it("actually awaits the sleep before reading (read fn called once, after sleep)", async () => {
+    let sleepResolved = false;
+    let readCalledBeforeSleep = false;
+    let readCount = 0;
+    const sleepFn = (_: number) =>
+      new Promise<void>((r) => {
+        setTimeout(() => {
+          sleepResolved = true;
+          r();
+        }, 5);
+      });
+    const readFileFn = (_: string) => {
+      readCount++;
+      if (!sleepResolved) readCalledBeforeSleep = true;
+      return "## VERDICT\nFEATURE_PASS\n";
+    };
+    const result = await recoverVerdictFromStalledFile({
+      outputFilePath: "/tmp/whatever",
+      readFileFn,
+      sleepFn,
+    });
+    expect(readCalledBeforeSleep).toBe(false);
+    expect(readCount).toBe(1);
+    expect(result?.kind).toBe("structured-verdict");
   });
 });

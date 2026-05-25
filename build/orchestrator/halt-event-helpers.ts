@@ -474,6 +474,7 @@ export function parseRoleLogFailureEvidence(text: string): {
   exit?: string;
   stdoutBytes?: number;
   stderrBytes?: number;
+  subprocessRetryAttempts?: number;
 } {
   const readBool = (name: string): boolean | undefined => {
     const m = text.match(new RegExp(`^# ${name}:\\s*(true|false)\\s*$`, "im"));
@@ -491,7 +492,36 @@ export function parseRoleLogFailureEvidence(text: string): {
     exit,
     stdoutBytes: readNumber("stdout_bytes"),
     stderrBytes: readNumber("stderr_bytes"),
+    subprocessRetryAttempts: countSubprocessRetryAttempts(text),
   };
+}
+
+/**
+ * Bug 7 (simclaw 2026-05-23 provider-timeout-misreported-as-codex-retry-cap):
+ * sub-agent CLIs (Gemini's retryWithBackoff, Codex's transport retry) may
+ * make many internal HTTP retry attempts that DON'T surface to the
+ * orchestrator's outer retry budget. The outer `providerRetryAttempts`
+ * stays at 0 while the agent's stderr shows 7+ internal attempts. When the
+ * agent eventually stalls or gives up, the FAIL handler conflates the
+ * subprocess capacity-stall with outer convergence retry-cap exhaustion,
+ * routing to the wrong investigation playbook.
+ *
+ * Count occurrences of "Attempt N failed" or "Attempt N/M failed" patterns
+ * in stderr/log text. Surfaced via parseRoleLogFailureEvidence so callers
+ * (the FAIL classifier in cli.ts) can distinguish "outer convergence cap"
+ * from "subprocess internal retries on a degraded API."
+ *
+ * Returns 0 when no matches found; never throws.
+ */
+export function countSubprocessRetryAttempts(text: string): number {
+  if (!text) return 0;
+  // Gemini CLI shape: "Attempt 1/5 failed", "Attempt 2/5 failed: ..."
+  // Generic shape: "Attempt 3 failed", "Attempt 3 failed with capacity exhausted"
+  // Anchored at line start (allow leading whitespace) so we don't accidentally
+  // match "...this Attempt 1 failed..." in prose.
+  const re = /(?:^|\n)\s*Attempt\s+\d+(?:\/\d+)?\s+failed\b/gi;
+  const matches = text.match(re);
+  return matches ? matches.length : 0;
 }
 
 function firstMatchSnippet(text: string, re: RegExp): string {

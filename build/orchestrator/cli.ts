@@ -68,6 +68,7 @@ import {
   decideNextAction,
   applyResult,
   markCommitted,
+  clearFailureStateOnCommit,
   findNextPhaseIndex,
   DEFAULT_MAX_CODEX_ITERATIONS,
   DEFAULT_MAX_TEST_ITERATIONS,
@@ -115,6 +116,7 @@ import {
   buildFeatureReviewPrompt,
   classifyFeatureReviewTimeout,
   fingerprintFeatureReviewFailure,
+  recoverVerdictFromStalledFile,
   SAME_SHAPE_REPEAT_HALT_THRESHOLD,
   parseFeatureReviewVerdict,
   shouldSkipFeatureReview,
@@ -146,6 +148,7 @@ import {
   isAllowedFeatureBranch,
 } from "./release-daemon";
 import {
+  currentBranch,
   defaultReleaseQueueDir,
   markPrQueued,
   prBaseAndHead,
@@ -155,6 +158,7 @@ import {
   writeReleaseQueueRecord,
   type ReleaseQueueRecord,
 } from "./release-queue";
+import { validateShipCompletion } from "./ship-validation";
 import { canonicalRepoIdentity } from "./release-identity";
 import { createWorktrees, applyWinner, teardownWorktrees } from "./worktree";
 import {
@@ -4676,8 +4680,40 @@ export function buildCodexReviewBody(
   );
 }
 
-function phaseAllowsGateSourceFixes(phase: Phase): boolean {
-  return phase.kind === "code" && /fix-on-review/i.test(phase.body);
+/**
+ * Should the post-agent hygiene gate auto-commit non-test path mutations
+ * left dirty by the review/QA gate?
+ *
+ * Two cases return true:
+ *
+ * 1. `kind: "code"` phases that opt into inline fixes via a `fix-on-review`
+ *    marker in the phase body. The skill template normally constrains Review
+ *    & QA to test paths, but `fix-on-review` is the explicit opt-out for
+ *    phases where a reviewer is allowed to fix the production source it just
+ *    inspected.
+ *
+ * 2. Non-code phase kinds (`research | writing | experiment | manual`) where
+ *    the phase's PRIMARY deliverable IS a non-test artifact: a paper section,
+ *    an audit document, a benchmark log, prepared manual-step files. The
+ *    review gate inspecting those deliverables can legitimately commit them
+ *    via the auto-commit path. Without this, the tidy-haven 2026-05-21 and
+ *    polis-paper-prereqs 2026-05-20 fault classes left agents stuck on the
+ *    hygiene gate even when the dirty file was the agreed deliverable
+ *    (Bug T5).
+ *
+ * Code phases without `fix-on-review` still reject non-test dirt — the
+ * skill template's test-only contract stays the default for code work.
+ */
+export function phaseAllowsGateSourceFixes(phase: Phase): boolean {
+  if (phase.kind === "code") {
+    return /fix-on-review/i.test(phase.body);
+  }
+  return (
+    phase.kind === "research" ||
+    phase.kind === "writing" ||
+    phase.kind === "experiment" ||
+    phase.kind === "manual"
+  );
 }
 
 export function buildOriginVerificationBody(args: {
@@ -5298,7 +5334,7 @@ async function runReviewGates(opts: {
       cwd: opts.cwd,
       label: `${name} gate`,
       parentWorkspace: parentBeforeGate,
-      phaseRef: { phaseNumber: opts.phaseNumber },
+      phaseRef: phaseRefForHygieneHint(opts.phase),
       inputFilePath: opts.inputFilePath,
       allowNonTestPaths: phaseAllowsGateSourceFixes(opts.phase),
     });
@@ -5327,7 +5363,7 @@ async function runReviewGates(opts: {
         cwd: opts.cwd,
         label: `${name} sandbox retry gate`,
         parentWorkspace: parentBeforeGate,
-        phaseRef: { phaseNumber: opts.phaseNumber },
+        phaseRef: phaseRefForHygieneHint(opts.phase),
         inputFilePath: opts.inputFilePath,
         allowNonTestPaths: phaseAllowsGateSourceFixes(opts.phase),
       });
@@ -5815,6 +5851,35 @@ function applyGateHygiene(opts: {
   }
   if (errors.length === 0) return opts.result;
   return hygieneFailureResult(errors.join("\n"), opts.result.logPath);
+}
+
+/**
+ * Build a phaseRef for formatGateHygieneRecoveryHint from a Phase.
+ *
+ * Bug T3 (tidy-haven 2026-05-21 review-qa-hygiene-manual-recovery-phase-id-risk):
+ * pre-helper, the gate hygiene recovery hint was constructed with
+ * `phaseRef: { phaseNumber: opts.phaseNumber }` which dropped the feature number
+ * and produced messages like `--mark-phase-committed 1` for plans where the
+ * canonical recovery argument should have been `--mark-phase-committed 2.1`.
+ * Operators following the hint risked marking the wrong phase.
+ *
+ * Plans use two phase-number conventions:
+ *   - dot-numbered: phase.number === "2.1" (feature.phase stem already merged)
+ *   - bare:         phase.number === "1"   (per-feature stem only)
+ *
+ * In the bare case we must surface `featureNumber` so the formatter emits
+ * `featureNumber.phaseNumber`. In the dot-numbered case we must NOT pass
+ * `featureNumber` separately or the formatter would emit `featureNumber.phase.number`
+ * (e.g., "1.2.1"). This helper picks the right shape.
+ */
+export function phaseRefForHygieneHint(phase: Phase): {
+  featureNumber?: string;
+  phaseNumber: string;
+} {
+  if (phase.number.includes(".")) {
+    return { phaseNumber: phase.number };
+  }
+  return { featureNumber: phase.featureNumber, phaseNumber: phase.number };
 }
 
 export function formatGateHygieneRecoveryHint(opts: {
@@ -6594,9 +6659,6 @@ export function markPhaseCommittedAfterManualRecovery(args: {
   // the "preview" to disk — the opposite of what --dry-run promises.
   // Plan-file flips above are already gated on !args.dryRun (line 4328+).
   if (!args.dryRun) {
-    const clearsBuildFailure =
-      args.state.failedAtPhase === phase.index ||
-      (args.state.failedAtPhase == null && phaseState.status === "failed");
     // T7: capture HEAD sha for per-phase diff blocks (T8). Best-effort —
     // detached HEAD, no commits, or transient I/O leaves the field
     // undefined; downstream consumers tolerate that.
@@ -6606,21 +6668,15 @@ export function markPhaseCommittedAfterManualRecovery(args: {
     });
     const _committedSha =
       _shaR.status === 0 ? (_shaR.stdout || "").trim() || undefined : undefined;
+    const _statusBeforeCommit = phaseState.status;
     args.state.phases[phase.index] = markCommitted(phaseState, _committedSha);
     args.state.currentPhaseIndex = findNextPhaseIndex(args.state.phases);
-    if (args.state.failedAtPhase === phase.index) {
-      delete args.state.failedAtPhase;
-    }
-    if (clearsBuildFailure) {
-      delete args.state.failureReason;
-    }
-    const feature = args.state.features?.[phase.featureIndex];
-    if (feature && clearsBuildFailure) {
-      if (feature.status === "paused" || feature.status === "failed") {
-        feature.status = "running";
-      }
-      delete feature.error;
-    }
+    clearFailureStateOnCommit(
+      args.state,
+      phase.index,
+      phase.featureIndex,
+      _statusBeforeCommit,
+    );
   }
   return { ok: true, phaseIndex: phase.index };
 }
@@ -7056,11 +7112,30 @@ async function runFeatureReviewIteration(args: {
 
     let timedOutWithStructuredVerdict = false;
     if (result.timedOut) {
-      const timeoutClassification = classifyFeatureReviewTimeout(artifactRaw);
+      let timeoutClassification = classifyFeatureReviewTimeout(artifactRaw);
       verdict = timeoutClassification.verdict;
       _metricsFinalVerdict = verdict.verdict;
       if (timeoutClassification.kind === "pass-evidence-timeout") {
         _metricsPassEvidenceTimeout = true;
+      }
+      // Bug 2 (polis-mesh 2026-05-25): race recovery — the first read happened
+      // immediately after SIGTERM, so the output file may have been empty or
+      // truncated mid-flush. Sleep + re-read once; if the sub-agent finished
+      // writing a structured verdict after the SIGTERM unwound, recover it
+      // rather than wasting an iteration on a fake TIMEOUT.
+      if (timeoutClassification.kind !== "structured-verdict") {
+        const recovered = await recoverVerdictFromStalledFile({
+          outputFilePath,
+        });
+        if (recovered) {
+          console.warn(
+            `  ↻ feature-review: recovered structured verdict from ${outputFilePath} after stall-kill (raced flush)`,
+          );
+          timeoutClassification = recovered;
+          verdict = recovered.verdict;
+          _metricsFinalVerdict = verdict.verdict;
+          _metricsPassEvidenceTimeout = false;
+        }
       }
       if (timeoutClassification.kind === "structured-verdict") {
         fr.finalVerdict = verdict.verdict as any;
@@ -7450,9 +7525,22 @@ async function runPhase(args: {
         _shaR.status === 0
           ? (_shaR.stdout || "").trim() || undefined
           : undefined;
+      const _statusBeforeCommit = phaseState.status;
       phaseState = markCommitted(phaseState, _committedSha);
       state.phases[phase.index] = phaseState;
       state.currentPhaseIndex = phase.index + 1;
+      // Bug 5 (tidy-haven 2026-05-21): the manual-recovery commit path in
+      // markPhaseCommittedAfterManualRecovery cleared failedAtPhase / failureReason
+      // / feature.error after a successful re-commit, but this AUTOMATED path
+      // did not. A phase that hit RETRY_CAP_HIT, set failedAtPhase=N, was
+      // re-launched, and committed cleanly would leave a stale failedAtPhase=N
+      // on disk — surfacing as PREMATURE_COMPLETION on the next detector pass.
+      clearFailureStateOnCommit(
+        state,
+        phase.index,
+        phase.featureIndex,
+        _statusBeforeCommit,
+      );
       saveState(state, { noGbrain, log: console.warn });
       printPhaseReport(phase, phaseState, args.nextPhaseName, args.cwd);
       return "done";
@@ -12191,6 +12279,30 @@ async function main() {
                   ? fs.readFileSync(result.outputFilePath, "utf8")
                   : "",
               ].join("\n");
+              // Bug 6 (cancel-api-followups-v1-20 2026-05-20
+              // SHIP_ROLE_HALLUCINATED_SUCCESS): defense-in-depth before
+              // resolveShipPr — independently verify via git ls-remote +
+              // gh pr view that the push and PR really happened. Without
+              // this, a ship role configured as a model lacking a real
+              // /gstack-ship skill (e.g. kimi) can fabricate a "READY TO
+              // LAND" report on exit 0 with no push or PR ever made.
+              const validation = validateShipCompletion({
+                cwd,
+                branch: branchForShip,
+                outputText,
+              });
+              if (!validation.ok) {
+                featureState.status = "paused";
+                featureState.error = `ship_hallucinated_success: ${validation.reason}; ${validation.evidence.join("; ")}; see ${result.logPath}`;
+                state.failureReason = `Feature ${featureState.number}: ${featureState.error}`;
+                saveState(state, {
+                  noGbrain: args.noGbrain,
+                  log: console.warn,
+                });
+                console.error(`✗ ${featureState.error}`);
+                exitCode = 1;
+                break;
+              }
               const resolved = resolveShipPr({
                 outputText,
                 branch: branchForShip,
@@ -12620,15 +12732,52 @@ async function main() {
           );
           exitCode = 1;
         } else {
-          const now = new Date().toISOString();
-          for (const f of state.features ?? []) {
-            if (f.status === "origin_verified") {
-              f.status = "committed";
-              f.completedAt = now;
+          // Bug 6 (cancel-api-followups-v1-20 2026-05-20
+          // SHIP_ROLE_HALLUCINATED_SUCCESS) plan-level ship variant:
+          // a fabricated success report previously left state.completed=true
+          // with shippedAt:null and no PR on remote. Validate before flipping
+          // state.completed in queued mode; auto-land mode delegates to the
+          // existing verifyPostShip (which catches the merged case).
+          if (args.releaseMode === "queued") {
+            const planShipBranch =
+              currentBranch(cwd) ||
+              state.features?.[0]?.branch ||
+              state.branch ||
+              "";
+            const planOutputText = [
+              planShipResult.stdout,
+              planShipResult.stderr,
+              planShipResult.outputFilePath &&
+              fs.existsSync(planShipResult.outputFilePath)
+                ? fs.readFileSync(planShipResult.outputFilePath, "utf8")
+                : "",
+            ].join("\n");
+            const planValidation = validateShipCompletion({
+              cwd,
+              branch: planShipBranch,
+              outputText: planOutputText,
+            });
+            if (!planValidation.ok) {
+              state.failureReason = `plan-level ship_hallucinated_success: ${planValidation.reason}; ${planValidation.evidence.join("; ")}; see ${planShipResult.logPath}`;
+              console.error(`✗ ${state.failureReason}`);
+              saveState(state, {
+                noGbrain: args.noGbrain,
+                log: console.warn,
+              });
+              exitCode = 1;
             }
           }
-          state.completed = true;
-          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+          if (exitCode === 0) {
+            const now = new Date().toISOString();
+            for (const f of state.features ?? []) {
+              if (f.status === "origin_verified") {
+                f.status = "committed";
+                f.completedAt = now;
+              }
+            }
+            state.completed = true;
+            saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+          }
         }
       }
 

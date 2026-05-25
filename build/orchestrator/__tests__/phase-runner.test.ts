@@ -4,6 +4,8 @@ import {
   applyResult,
   markCommitted,
   findNextPhaseIndex,
+  clearFailureStateOnCommit,
+  shouldCommit,
   DEFAULT_MAX_CODEX_ITERATIONS,
   DEFAULT_CODEX_GEMINI_RERUN_FREQ,
   type Action,
@@ -2294,7 +2296,9 @@ describe("applyResult — VERIFY_RED with runner introspection", () => {
       { testCmd: "npx vitest run" },
     );
     expect(next.status).toBe("failed");
-    expect(next.error).toMatch(/could not produce failing tests|trivially pass/i);
+    expect(next.error).toMatch(
+      /could not produce failing tests|trivially pass/i,
+    );
   });
 
   it("jest passed>0 → retry cap is 1", () => {
@@ -2310,7 +2314,9 @@ describe("applyResult — VERIFY_RED with runner introspection", () => {
       { testCmd: "jest --json" },
     );
     expect(next.status).toBe("failed");
-    expect(next.error).toMatch(/could not produce failing tests|trivially pass/i);
+    expect(next.error).toMatch(
+      /could not produce failing tests|trivially pass/i,
+    );
   });
 
   it("pytest passed>0 → retry cap is 1", () => {
@@ -2325,7 +2331,9 @@ describe("applyResult — VERIFY_RED with runner introspection", () => {
       { testCmd: "pytest" },
     );
     expect(next.status).toBe("failed");
-    expect(next.error).toMatch(/could not produce failing tests|trivially pass/i);
+    expect(next.error).toMatch(
+      /could not produce failing tests|trivially pass/i,
+    );
   });
 
   it("bun passed>0 → retry cap is 1", () => {
@@ -2338,7 +2346,9 @@ describe("applyResult — VERIFY_RED with runner introspection", () => {
       { testCmd: "bun test" },
     );
     expect(next.status).toBe("failed");
-    expect(next.error).toMatch(/could not produce failing tests|trivially pass/i);
+    expect(next.error).toMatch(
+      /could not produce failing tests|trivially pass/i,
+    );
   });
 
   it("mocha passed>0 → retry cap is 1", () => {
@@ -2350,7 +2360,9 @@ describe("applyResult — VERIFY_RED with runner introspection", () => {
       { testCmd: "mocha" },
     );
     expect(next.status).toBe("failed");
-    expect(next.error).toMatch(/could not produce failing tests|trivially pass/i);
+    expect(next.error).toMatch(
+      /could not produce failing tests|trivially pass/i,
+    );
   });
 
   it("go passed>0 → retry cap is 1", () => {
@@ -2362,7 +2374,9 @@ describe("applyResult — VERIFY_RED with runner introspection", () => {
       { testCmd: "go test ./..." },
     );
     expect(next.status).toBe("failed");
-    expect(next.error).toMatch(/could not produce failing tests|trivially pass/i);
+    expect(next.error).toMatch(
+      /could not produce failing tests|trivially pass/i,
+    );
   });
 
   // --- failing tests: one fixture per runner → valid red state ---
@@ -2474,8 +2488,7 @@ describe("applyResult — VERIFY_RED with runner introspection", () => {
 
   it("mixed stdout/stderr runner summary is parsed", () => {
     const stdout = "bun test v1.3.12\n";
-    const stderr =
-      " 0 pass\n 0 fail\nRan 0 tests across 0 files. [22.00ms]\n";
+    const stderr = " 0 pass\n 0 fail\nRan 0 tests across 0 files. [22.00ms]\n";
     const next = applyResult(
       verifyRedState(),
       { type: "VERIFY_RED", phaseIndex: 0 } as any,
@@ -2499,7 +2512,9 @@ describe("applyResult — VERIFY_RED with runner introspection", () => {
       { testCmd: "npx vitest run" },
     );
     expect(next.status).toBe("failed");
-    expect(next.error).toMatch(/could not produce failing tests|trivially pass/i);
+    expect(next.error).toMatch(
+      /could not produce failing tests|trivially pass/i,
+    );
   });
 
   it("malformed JSON stdout falls back to stdout regex", () => {
@@ -2534,5 +2549,152 @@ describe("applyResult — VERIFY_RED with runner introspection", () => {
       if (prev === undefined) delete process.env.GSTACK_BUILD_RED_LEGACY_CAP;
       else process.env.GSTACK_BUILD_RED_LEGACY_CAP = prev;
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// clearFailureStateOnCommit — Bug 5 (tidy-haven 2026-05-21)
+// ---------------------------------------------------------------------------
+describe("clearFailureStateOnCommit", () => {
+  function stateWithFailure(): BuildState {
+    return {
+      planFile: "/tmp/plan.md",
+      slug: "test",
+      phases: [basePhase({ index: 0, number: "1.1", status: "failed" })],
+      features: [{ number: "1", name: "F", status: "failed", error: "boom" }],
+      failedAtPhase: 0,
+      failureReason: "RETRY_CAP_HIT: codex",
+    } as unknown as BuildState;
+  }
+
+  it("clears failedAtPhase, failureReason, and feature.error when phase that matched failedAtPhase commits", () => {
+    const state = stateWithFailure();
+    clearFailureStateOnCommit(state, 0, 0, "failed");
+    expect(state.failedAtPhase).toBeUndefined();
+    expect(state.failureReason).toBeUndefined();
+    expect(state.features?.[0]?.error).toBeUndefined();
+    expect(state.features?.[0]?.status).toBe("running");
+  });
+
+  it("leaves failure flags intact when failedAtPhase points at a different phase still failed", () => {
+    const state = stateWithFailure();
+    state.failedAtPhase = 5;
+    clearFailureStateOnCommit(state, 0, 0, "failed");
+    // failedAtPhase=5 stays AND failureReason / feature flags stay too —
+    // the build is still in a failed state from phase 5's perspective even
+    // though phase 0 just committed cleanly.
+    expect(state.failedAtPhase).toBe(5);
+    expect(state.failureReason).toBe("RETRY_CAP_HIT: codex");
+    expect(state.features?.[0]?.status).toBe("failed");
+    expect(state.features?.[0]?.error).toBe("boom");
+  });
+
+  it("clears failure flags when failedAtPhase is null but the committing phase was status:failed (partial recovery)", () => {
+    const state = stateWithFailure();
+    delete state.failedAtPhase;
+    // Pass pre-commit status explicitly — by the time callers invoke this
+    // helper, state.phases[0].status has already been overwritten to "committed".
+    clearFailureStateOnCommit(state, 0, 0, "failed");
+    expect(state.failedAtPhase).toBeUndefined();
+    expect(state.failureReason).toBeUndefined();
+    expect(state.features?.[0]?.status).toBe("running");
+    expect(state.features?.[0]?.error).toBeUndefined();
+  });
+
+  it("is a no-op when state has no failure baggage", () => {
+    const state: BuildState = {
+      planFile: "/tmp/plan.md",
+      slug: "test",
+      phases: [basePhase()],
+      features: [{ number: "1", name: "F", status: "running" }],
+    } as unknown as BuildState;
+    clearFailureStateOnCommit(state, 0, 0, "pending");
+    expect(state.failedAtPhase).toBeUndefined();
+    expect(state.failureReason).toBeUndefined();
+    expect(state.features?.[0]?.status).toBe("running");
+  });
+
+  it("handles missing featureIndex (legacy state shape)", () => {
+    const state = stateWithFailure();
+    delete (state as any).features;
+    clearFailureStateOnCommit(state, 0, undefined, "failed");
+    expect(state.failedAtPhase).toBeUndefined();
+    expect(state.failureReason).toBeUndefined();
+  });
+
+  it("REGRESSION /review-T1: does NOT use post-commit phase status (caller must pass pre-commit status)", () => {
+    // Reproduces the regression caught by /review on T1: if the helper read
+    // state.phases[phaseIndex].status itself, the partial-recovery branch
+    // would silently never fire because callers invoke this helper AFTER
+    // markCommitted has overwritten the status to "committed".
+    const state = stateWithFailure();
+    delete state.failedAtPhase;
+    // Simulate the caller's flow: markCommitted ran first → status is now
+    // "committed" on disk. Caller still passes the original pre-commit
+    // status as the 4th arg.
+    (state.phases as any)[0].status = "committed";
+    clearFailureStateOnCommit(state, 0, 0, "failed");
+    // The partial-recovery clear MUST still fire even though the on-state
+    // status is now "committed".
+    expect(state.failureReason).toBeUndefined();
+    expect(state.features?.[0]?.status).toBe("running");
+    expect(state.features?.[0]?.error).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// shouldCommit — Bug 3 (polis-mesh / mitosis-prototype / tidy-haven
+// PREMATURE_COMPLETION cluster). Pins the three-way commit gate contract.
+// ---------------------------------------------------------------------------
+describe("shouldCommit", () => {
+  function baseResult(overrides: Partial<SubAgentResult> = {}): SubAgentResult {
+    return {
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+      timedOut: false,
+      stallKilled: false,
+      logPath: "/tmp/log",
+      durationMs: 0,
+      retries: 0,
+      ...overrides,
+    } as SubAgentResult;
+  }
+
+  it("returns true for a clean success (exit 0, not timed out, no hygiene failure)", () => {
+    expect(shouldCommit(baseResult())).toBe(true);
+  });
+
+  it("returns false when timedOut (stall watchdog SIGTERMed)", () => {
+    expect(shouldCommit(baseResult({ timedOut: true }))).toBe(false);
+  });
+
+  it("returns false even when exitCode is 0 if timedOut (gemini graceful SIGTERM exit 0 trap)", () => {
+    // Bug 7 echo: Gemini handles SIGTERM and exits 0. shouldCommit must
+    // still reject this because timedOut === true.
+    expect(
+      shouldCommit(baseResult({ timedOut: true, exitCode: 0 })),
+    ).toBe(false);
+  });
+
+  it("returns false when exitCode is non-zero", () => {
+    expect(shouldCommit(baseResult({ exitCode: 1 }))).toBe(false);
+    expect(shouldCommit(baseResult({ exitCode: 137 }))).toBe(false);
+  });
+
+  it("returns false when exitCode is null (signal-killed)", () => {
+    expect(shouldCommit(baseResult({ exitCode: null }))).toBe(false);
+  });
+
+  it("returns false when hygieneFailure is true even if exitCode 0 (belt-and-suspenders against future decoupling)", () => {
+    expect(
+      shouldCommit(baseResult({ exitCode: 0, hygieneFailure: true })),
+    ).toBe(false);
+  });
+
+  it("returns false for the realistic hygieneFailureResult shape (exit 1 + hygieneFailure true)", () => {
+    expect(
+      shouldCommit(baseResult({ exitCode: 1, hygieneFailure: true })),
+    ).toBe(false);
   });
 });

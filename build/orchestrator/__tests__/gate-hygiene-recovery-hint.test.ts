@@ -1,5 +1,28 @@
 import { describe, it, expect } from "bun:test";
-import { formatGateHygieneRecoveryHint } from "../cli";
+import {
+  formatGateHygieneRecoveryHint,
+  phaseRefForHygieneHint,
+} from "../cli";
+import type { Phase } from "../types";
+
+function fakePhase(overrides: Partial<Phase> = {}): Phase {
+  return {
+    index: 0,
+    number: "1",
+    name: "P",
+    featureIndex: 0,
+    featureNumber: "1",
+    featureName: "F",
+    kind: "code",
+    implementationDone: false,
+    reviewDone: false,
+    implementationCheckboxLine: -1,
+    reviewCheckboxLine: -1,
+    testSpecCheckboxLine: -1,
+    body: "",
+    ...overrides,
+  } as unknown as Phase;
+}
 
 describe("formatGateHygieneRecoveryHint", () => {
   it("includes the --mark-phase-committed command with the phase number", () => {
@@ -44,5 +67,41 @@ describe("formatGateHygieneRecoveryHint", () => {
       nonTestPaths: [],
     });
     expect(hint).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// phaseRefForHygieneHint — Bug T3 (tidy-haven 2026-05-21 review-qa-hygiene
+// -manual-recovery-phase-id-risk)
+// ---------------------------------------------------------------------------
+describe("phaseRefForHygieneHint", () => {
+  it("merges featureNumber + bare phase number for bare-stem plans", () => {
+    // Bare convention: phase.number === "1" (per-feature stem), feature is "3".
+    // Pre-fix the caller dropped featureNumber and produced `--mark-phase-committed 1`,
+    // ambiguous when the plan has multiple features each with a phase 1.
+    const ref = phaseRefForHygieneHint(
+      fakePhase({ number: "1", featureNumber: "3" }),
+    );
+    expect(ref).toEqual({ featureNumber: "3", phaseNumber: "1" });
+    const hint = formatGateHygieneRecoveryHint({
+      phaseRef: ref,
+      nonTestPaths: ["src/x.ts"],
+    });
+    expect(hint).toContain("--mark-phase-committed 3.1");
+  });
+
+  it("does NOT double-prefix when phase.number already contains a dot (dot-numbered plans)", () => {
+    // Dot convention: phase.number === "2.1" already encodes feature.phase.
+    // Passing both featureNumber AND phase.number would produce "1.2.1" — broken.
+    const ref = phaseRefForHygieneHint(
+      fakePhase({ number: "2.1", featureNumber: "1" }),
+    );
+    expect(ref).toEqual({ phaseNumber: "2.1" });
+    const hint = formatGateHygieneRecoveryHint({
+      phaseRef: ref,
+      nonTestPaths: ["src/x.ts"],
+    });
+    expect(hint).toContain("--mark-phase-committed 2.1");
+    expect(hint).not.toContain("--mark-phase-committed 1.2.1");
   });
 });

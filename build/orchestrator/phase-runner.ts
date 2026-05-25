@@ -17,6 +17,7 @@
  */
 
 import type {
+  BuildState,
   DualImplCandidateKey,
   DualImplState,
   DualImplTestResult,
@@ -194,8 +195,7 @@ function detectRunnerFromTestCmd(testCmd: string | undefined): string {
   if (cmd.includes("mocha")) return "mocha";
   if (cmd.includes("go test")) return "go";
   // bun test is the catch-all when no other runner is detected
-  if (cmd.includes("bun test") || cmd.includes("bun run test"))
-    return "bun";
+  if (cmd.includes("bun test") || cmd.includes("bun run test")) return "bun";
   // Fallback: if it looks like a shell command with no recognized runner,
   // return "unknown" so extractTestCount falls back to stdout parsing.
   return "unknown";
@@ -998,6 +998,83 @@ export function markCommitted(
   };
   delete next.error;
   return next;
+}
+
+/**
+ * Bug 3 (polis-mesh / mitosis-prototype / tidy-haven PREMATURE_COMPLETION):
+ * the three-way gate every commit-transition MUST honor before flipping a
+ * phase to `committed`. Centralizes the contract:
+ *
+ *   1. NOT timed out (stall watchdog SIGTERMed → soft failure).
+ *   2. exitCode === 0 (process completed normally OR returned hygiene-fail
+ *      shape — hygieneFailureResult returns exitCode: 1, so this gate
+ *      naturally rejects hygiene failures too).
+ *   3. NOT hygieneFailure (belt-and-suspenders: if a future refactor sets
+ *      exitCode: 0 on a hygiene-rejected result, this still blocks the
+ *      commit — the rule is "hygiene PASS required, not exit code 0").
+ *
+ * Existing phase-runner.ts sites use the equivalent `!timedOut &&
+ * exitCode === 0` pattern (with the implicit hygieneFailure -> exitCode 1
+ * coupling); this helper documents the contract and protects against
+ * future drift where hygiene might decouple from exit code. New
+ * commit-transition code MUST call shouldCommit(result) instead of
+ * re-deriving the predicate.
+ */
+export function shouldCommit(result: SubAgentResult): boolean {
+  if (result.timedOut) return false;
+  if (result.exitCode !== 0) return false;
+  if (result.hygieneFailure) return false;
+  return true;
+}
+
+/**
+ * Clear top-level failure baggage when a phase reaches `committed`.
+ *
+ * Pre-this-helper, only the manual-recovery commit path
+ * (`markPhaseCommittedAfterManualRecovery` in cli.ts) cleared
+ * `state.failedAtPhase` / `state.failureReason` / `feature.error` after a
+ * successful re-commit; the AUTOMATED `MARK_COMPLETE` path in phaseRunnerLoop
+ * did not. Result: a phase that hit RETRY_CAP_HIT, set `failedAtPhase=N`,
+ * was re-launched, and committed cleanly would leave a stale
+ * `failedAtPhase=N` field on disk — surfacing as PREMATURE_COMPLETION on
+ * the next detector pass (tidy-haven 2026-05-21 fault report).
+ *
+ * Centralized here so both call sites share the same semantics.
+ */
+export function clearFailureStateOnCommit(
+  state: BuildState,
+  phaseIndex: number,
+  featureIndex: number | undefined,
+  /**
+   * The phase's status BEFORE markCommitted overwrote it. Required because
+   * both call sites invoke this helper AFTER markCommitted, by which time
+   * state.phases[phaseIndex].status === "committed" and reading it here
+   * would always return false for the partial-recovery edge case (failedAtPhase
+   * null but phase itself was marked "failed" earlier).
+   */
+  phaseStatusBeforeCommit: PhaseState["status"],
+): void {
+  const failedHere = state.failedAtPhase === phaseIndex;
+  const phaseWasFailed = phaseStatusBeforeCommit === "failed";
+  // Mirrors the original `clearsBuildFailure` predicate from the manual
+  // recovery path: clear when this phase is the recorded failure point, OR
+  // when no top-level failure was recorded but the phase itself was marked
+  // failed (orchestrator recovered partially and never set failedAtPhase).
+  const clears = failedHere || (state.failedAtPhase == null && phaseWasFailed);
+  if (failedHere) {
+    delete state.failedAtPhase;
+  }
+  if (clears) {
+    delete state.failureReason;
+  }
+  const feature =
+    featureIndex != null ? state.features?.[featureIndex] : undefined;
+  if (feature && clears) {
+    if (feature.status === "paused" || feature.status === "failed") {
+      feature.status = "running";
+    }
+    delete feature.error;
+  }
 }
 
 /**
