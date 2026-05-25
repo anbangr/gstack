@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   classifyProviderFailure,
+  countSubprocessRetryAttempts,
   parseRoleLogFailureEvidence,
   recordProviderFailureVerdict,
 } from "../halt-event-helpers";
@@ -228,5 +229,62 @@ describe("recordProviderFailureVerdict — emits correct halt kind", () => {
     );
     const pending = loadPendingInvestigations({ queueDir: ctx.queueDir });
     expect(pending[0].kind).toBe("PROVIDER_TIMEOUT");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// countSubprocessRetryAttempts — Bug 7 (simclaw 2026-05-23
+// provider-timeout-misreported-as-codex-retry-cap)
+// ---------------------------------------------------------------------------
+describe("countSubprocessRetryAttempts", () => {
+  test("returns 0 for empty / undefined / non-matching input", () => {
+    expect(countSubprocessRetryAttempts("")).toBe(0);
+    expect(countSubprocessRetryAttempts("nothing to see here")).toBe(0);
+    expect(countSubprocessRetryAttempts("Attempt success")).toBe(0);
+  });
+
+  test("counts Gemini retryWithBackoff lines (Attempt N/M failed)", () => {
+    const log = [
+      "Attempt 1/5 failed: MODEL_CAPACITY_EXHAUSTED",
+      "sleeping 2000ms",
+      "Attempt 2/5 failed: MODEL_CAPACITY_EXHAUSTED",
+      "sleeping 4000ms",
+      "Attempt 3/5 failed: MODEL_CAPACITY_EXHAUSTED",
+    ].join("\n");
+    expect(countSubprocessRetryAttempts(log)).toBe(3);
+  });
+
+  test("counts generic 'Attempt N failed' without /M suffix", () => {
+    const log =
+      "Attempt 1 failed: HTTP 529\nbackoff\nAttempt 2 failed: HTTP 529";
+    expect(countSubprocessRetryAttempts(log)).toBe(2);
+  });
+
+  test("does NOT match prose like 'in this Attempt 1 failed something'", () => {
+    // The leading `in this ` puts non-whitespace before Attempt — the regex
+    // anchors at line-start (after optional whitespace), so this should not match.
+    expect(
+      countSubprocessRetryAttempts(
+        "Some narrative in this Attempt 1 failed analysis...",
+      ),
+    ).toBe(0);
+  });
+
+  test("case-insensitive", () => {
+    expect(countSubprocessRetryAttempts("attempt 1 failed: noisy")).toBe(1);
+    expect(countSubprocessRetryAttempts("ATTEMPT 2/3 FAILED: x")).toBe(1);
+  });
+
+  test("parseRoleLogFailureEvidence surfaces subprocessRetryAttempts", () => {
+    const log = [
+      "# timed_out: false",
+      "# stall_killed: true",
+      "# exit: null",
+      "Attempt 1/5 failed: capacity",
+      "Attempt 2/5 failed: capacity",
+    ].join("\n");
+    const evidence = parseRoleLogFailureEvidence(log);
+    expect(evidence.stallKilled).toBe(true);
+    expect(evidence.subprocessRetryAttempts).toBe(2);
   });
 });

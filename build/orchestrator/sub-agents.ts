@@ -48,6 +48,7 @@ import {
   type Provider,
 } from "./stall-watchdog";
 import { computeFaultId, emitHaltEventResolved } from "./halt-events";
+import { countSubprocessRetryAttempts } from "./halt-event-helpers";
 
 export type CodexSandbox =
   | "read-only"
@@ -595,6 +596,15 @@ export interface SubAgentResult {
    * other exitCode=1 outcomes (provider crash, transport failure, etc).
    */
   hygieneFailure?: boolean;
+  /**
+   * Bug 7: count of "Attempt N/M failed" lines observed in stderr — these
+   * are the sub-agent CLI's own internal retries (Gemini retryWithBackoff,
+   * Codex transport retry), distinct from the orchestrator's outer
+   * retries field. Surfaces invisible retries so FAIL handlers don't
+   * conflate subprocess capacity-stall with outer convergence retry-cap.
+   * Optional for back-compat; populated by spawnCaptured.
+   */
+  subprocessRetryAttempts?: number;
 }
 
 /**
@@ -1078,6 +1088,13 @@ export function spawnCaptured(args: {
             })();
 
       logFlushed.then(() => {
+        // Bug 7: count subprocess-internal CLI retries (Gemini retryWithBackoff,
+        // Codex transport retry) from combined stderr + stdout. Surfaces invisible
+        // retries to downstream FAIL handlers so subprocess capacity-stall isn't
+        // misclassified as outer convergence retry-cap exhaustion.
+        const subprocessRetryAttempts = countSubprocessRetryAttempts(
+          `${stderrBuf}\n${stdoutBuf}`,
+        );
         resolve({
           stdout: stdoutBuf,
           stderr: stderrBuf,
@@ -1092,6 +1109,7 @@ export function spawnCaptured(args: {
           logPath: args.logPath,
           durationMs: Date.now() - startedAt,
           retries: 0,
+          ...(subprocessRetryAttempts > 0 ? { subprocessRetryAttempts } : {}),
         });
       });
     };
