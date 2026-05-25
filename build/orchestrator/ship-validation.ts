@@ -25,7 +25,7 @@
  * The default uses node:child_process.spawnSync.
  */
 
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./child-registry";
 
 export type ShipValidationFailure =
   | "branch_not_pushed"
