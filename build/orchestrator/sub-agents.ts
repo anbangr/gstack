@@ -23,10 +23,7 @@ import {
   spawn as registeredSpawn,
   spawnSync as registeredSpawnSync,
 } from "./child-registry";
-import {
-  spawn as childProcessSpawn,
-  spawnSync,
-} from "node:child_process";
+import { spawn as childProcessSpawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -143,10 +140,7 @@ function codexBin(): string {
  * available, sentinel file write fails, individual unlink fails) is swallowed
  * — the hygiene gate is the safety net behind this sweep.
  */
-export function sweepBakFilesNewerThan(
-  cwd: string,
-  sinceMs: number,
-): string[] {
+export function sweepBakFilesNewerThan(cwd: string, sinceMs: number): string[] {
   if (!fs.existsSync(cwd)) return [];
   const sentinel = path.join(
     os.tmpdir(),
@@ -3754,14 +3748,49 @@ export function buildCodexImplArgv(opts: {
   sandbox?: CodexSandbox;
   reasoning?: RoleReasoning;
   model?: string;
+  /**
+   * Bug H: role-shaped prompt switch. Without this, every codex call gets
+   * the implementor prompt ("Implement the changes... make tests pass"),
+   * which is exactly the wrong instruction for a test-writer role — codex
+   * obediently writes the production code AND the tests, then PR #102's
+   * role boundary refuses the output and the phase halts dirty. The
+   * polis-mesh F5 build run on 2026-05-26 was the canonical incident,
+   * triggered the moment configure.cm flipped testWriter from gemini
+   * (passively role-restrained by being less capable) to codex/gpt-5.5
+   * (eager generalist). Threaded from cli.ts:runRoleTask → runCodexImpl
+   * → here. Unknown / undefined falls through to the implementor prompt
+   * (back-compat for dual-impl tournament + every existing call site).
+   */
+  roleId?: "test-writer" | "test-fixer" | "primary-impl" | string;
 }): string[] {
-  const codexPrompt = [
-    `Read implementation instructions at ${opts.inputFilePath}.`,
-    `Implement the changes autonomously using your edit tools.`,
-    `Do NOT change test assertions — only make tests pass.`,
-    `When done, write your output summary (files changed, tests run, what's verified) to ${opts.outputFilePath}.`,
-    `Return ONLY the output file path. No narrative.`,
-  ].join(" ");
+  // Role-shaped prompt selection. test-writer gets a strict RED-test-only
+  // prompt that mirrors the downstream PR #102 boundary check, so codex
+  // refuses to write production code at the prompt layer instead of at
+  // the recovery-refusal layer. test-fixer keeps the legacy "make tests
+  // pass; don't touch assertions" prompt (its job is impl-side fixes).
+  // Everything else (primary-impl, dual-impl tournament, undefined) gets
+  // the existing implementor prompt — unchanged.
+  let codexPrompt: string;
+  if (opts.roleId === "test-writer") {
+    codexPrompt = [
+      `Read test-spec instructions at ${opts.inputFilePath}.`,
+      `You are the TEST WRITER. Your job is to write FAILING tests that pin the described behavior.`,
+      `Touch ONLY test files: paths under __tests__/, test/, tests/, spec/, specs/, or matching *.test.* / *.spec.* / *_test.* (Go).`,
+      `Do NOT write production code. Do NOT implement helpers, modules, or fixtures outside test paths.`,
+      `Do NOT make existing tests pass. The phase EXPECTS a RED test run after you commit.`,
+      `If the spec asks for a new helper, ASSUME it exists and import it; the primary implementor phase will create it next.`,
+      `When done, write your output summary (test files added, test command run, expected RED failures) to ${opts.outputFilePath}.`,
+      `Return ONLY the output file path. No narrative.`,
+    ].join(" ");
+  } else {
+    codexPrompt = [
+      `Read implementation instructions at ${opts.inputFilePath}.`,
+      `Implement the changes autonomously using your edit tools.`,
+      `Do NOT change test assertions — only make tests pass.`,
+      `When done, write your output summary (files changed, tests run, what's verified) to ${opts.outputFilePath}.`,
+      `Return ONLY the output file path. No narrative.`,
+    ].join(" ");
+  }
 
   const sandbox =
     opts.sandbox ||
@@ -3805,6 +3834,13 @@ export async function runCodexImpl(opts: {
   /** Optional prefix for log filenames — used by fix-loop passes to avoid overwriting the initial impl log. */
   logPrefix?: string;
   timeoutMs?: number;
+  /**
+   * Bug H: thread role identity into buildCodexImplArgv so the prompt
+   * shape matches what the role's downstream hygiene gate expects. See
+   * the JSDoc on buildCodexImplArgv for the test-writer vs implementor
+   * split. Unknown / undefined preserves the legacy implementor prompt.
+   */
+  roleId?: "test-writer" | "test-fixer" | "primary-impl" | string;
 }): Promise<SubAgentResult> {
   ensureLogDir(opts.slug);
 
