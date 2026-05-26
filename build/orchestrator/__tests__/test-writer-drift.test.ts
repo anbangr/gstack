@@ -35,6 +35,7 @@ import { spawnSync } from "node:child_process";
 import {
   buildGeminiTestSpecPrompt,
   captureGitSnapshot,
+  classifyTestWriterCommit,
   recoverMutableAgentCommit,
 } from "../cli";
 import type { Phase } from "../types";
@@ -246,13 +247,86 @@ describe("Leg 3: post-commit detection (static-grep wiring)", () => {
 
     const block = content.slice(blockStart, blockEnd);
     expect(block).toContain("TEST_WRITER_NO_TEST_FILES_COMMITTED");
+    expect(block).toContain("TEST_WRITER_MIXED_COMMIT");
     expect(block).toContain("role drift");
     expect(block).toContain("--mark-phase-committed");
     expect(block).toContain("git reset --hard HEAD~1");
-    // The new logic must distinguish "no commit" (touched.length === 0 AND
-    // allCommitted.length === 0 → silent skip) from "commit but all non-test"
-    // (allCommitted.length > 0 AND touched.length === 0 → fail phase).
+    // The detection must call the shared helper so a refactor cannot
+    // silently fall back to the pre-fix permissive `touched.length > 0`
+    // branch (which let mixed commits through).
+    expect(block).toContain("classifyTestWriterCommit(");
+    // The new logic must distinguish "no commit" (allCommitted.length === 0
+    // → silent skip) from "commit but non-conformant" (allCommitted.length
+    // > 0 AND cls.ok === false → fail phase).
     expect(block).toMatch(/allCommitted\.length\s*>\s*0/);
+  });
+});
+
+describe("Leg 3: classifyTestWriterCommit helper", () => {
+  // The helper is the single source of truth for "did the test-writer
+  // stay inside its role boundary?" Both the in-process check (leg 3)
+  // and these tests reuse the same regex contract. A mixed commit
+  // (test path + production path) is role drift just as much as a
+  // pure-production commit — these tests pin that strictness so a
+  // future refactor cannot silently fall back to the pre-fix
+  // `touched.length > 0` branch.
+
+  it("T-E-1: pure test paths → ok:true, testPaths populated, nonTestPaths empty", () => {
+    const cls = classifyTestWriterCommit([
+      "__tests__/foo.test.ts",
+      "test/helpers/seed.ts",
+    ]);
+    expect(cls.ok).toBe(true);
+    expect(cls.testPaths.length).toBe(2);
+    expect(cls.nonTestPaths.length).toBe(0);
+  });
+
+  it("T-E-2: pure production paths → ok:false, nonTestPaths populated", () => {
+    const cls = classifyTestWriterCommit([
+      "src/postgres-idempotency.ts",
+      "lib/db.ts",
+    ]);
+    expect(cls.ok).toBe(false);
+    expect(cls.testPaths.length).toBe(0);
+    expect(cls.nonTestPaths.length).toBe(2);
+  });
+
+  it("T-E-3: MIXED test + production → ok:false (this was the leg-3 bypass)", () => {
+    // Before the strict classifier, this case fell into the happy path
+    // because `touched.length > 0` was true. Defense in depth requires
+    // ALL committed paths to be test paths.
+    const cls = classifyTestWriterCommit([
+      "__tests__/foo.test.ts",
+      "src/postgres-idempotency.ts",
+    ]);
+    expect(cls.ok).toBe(false);
+    expect(cls.testPaths).toEqual(["__tests__/foo.test.ts"]);
+    expect(cls.nonTestPaths).toEqual(["src/postgres-idempotency.ts"]);
+  });
+
+  it("T-E-4: empty commit list → ok:false (no commit is not the happy path)", () => {
+    const cls = classifyTestWriterCommit([]);
+    expect(cls.ok).toBe(false);
+    expect(cls.testPaths.length).toBe(0);
+    expect(cls.nonTestPaths.length).toBe(0);
+  });
+
+  it("T-E-5: file-basename convention (*.test.* / *.spec.*) is recognized", () => {
+    const cls = classifyTestWriterCommit([
+      "anywhere/feature.test.ts",
+      "lib/db.spec.js",
+    ]);
+    expect(cls.ok).toBe(true);
+    expect(cls.testPaths.length).toBe(2);
+  });
+
+  it("T-E-6: case-insensitive directory name matching", () => {
+    const cls = classifyTestWriterCommit([
+      "Tests/foo.test.ts",
+      "__TESTS__/bar.test.ts",
+    ]);
+    expect(cls.ok).toBe(true);
+    expect(cls.testPaths.length).toBe(2);
   });
 });
 
