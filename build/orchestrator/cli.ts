@@ -8038,8 +8038,30 @@ async function runPhase(args: {
       console.log(
         `  → Test Specification writer ${roleLabel(args.roles.testWriter)}: Phase ${phase.number} (iter ${action.iteration})`,
       );
+      // Hoist outputFilePath so applyMutableAgentHygiene can verify
+      // `requireNonEmptyOutput` after both dry-run and real-run branches.
+      const outputFilePath = path.join(
+        logDir(state.slug),
+        `phase-${phase.number}-gemini-testspec-${action.iteration}-output.md`,
+      );
+      // Mirror RUN_GEMINI (primary-impl) hygiene capture: snapshot git +
+      // sibling repos + parent workspace BEFORE the role runs so the
+      // post-role hygiene check can detect missing commits and tree
+      // mutations attributable to the test-writer. Previously the
+      // test-writer phase only checked exitCode and let drift fall through
+      // as a deferred RED_GATE_ZERO_TESTS_COLLECTED one phase later.
+      const before = dryRun ? null : captureGitSnapshot(cwd);
+      const siblingBaselines =
+        dryRun || siblingRepos.length === 0
+          ? undefined
+          : captureSiblingRepoBaselines(siblingRepos);
+      let parentBeforeRole: {
+        workspaceRoot: string | null;
+        snapshot: GitSnapshot | null;
+      };
       let result: SubAgentResult;
       if (dryRun) {
+        parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);
         result = mockResult({
           exitCode: 0,
           stdout: `[dry-run] ${roleLabel(args.roles.testWriter)} would write failing tests`,
@@ -8048,10 +8070,6 @@ async function runPhase(args: {
         const inputFilePath = path.join(
           logDir(state.slug),
           `phase-${phase.number}-gemini-testspec-${action.iteration}-input.md`,
-        );
-        const outputFilePath = path.join(
-          logDir(state.slug),
-          `phase-${phase.number}-gemini-testspec-${action.iteration}-output.md`,
         );
         const resolvedPhase4 = {
           ...phase,
@@ -8066,6 +8084,7 @@ async function runPhase(args: {
           ),
         );
         fs.writeFileSync(outputFilePath, "");
+        parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);
         result = await runRoleTask({
           role: args.roles.testWriter,
           inputFilePath,
@@ -8077,13 +8096,39 @@ async function runPhase(args: {
           logPrefix: "test-writer",
         });
       }
-      phaseState = applyResult(phaseState, action, result);
+      // Test-writer must commit failing tests. A drifting sub-agent that
+      // returns exit 0 with a summary but no commits used to silently
+      // advance to test_spec_done and fail one phase later at VERIFY_RED
+      // with the misleading RED_GATE_ZERO_TESTS_COLLECTED fault. Now the
+      // missing commit halts here with a clear, attributable hygiene
+      // error. requireNewCommit is unconditional: RUN_GEMINI_TEST_SPEC is
+      // only dispatched for kind === "code" phases (decideNextAction at
+      // phase-runner.ts routes non-code kinds through RUN_GEMINI directly),
+      // and audit-only doesn't apply here — the test-writer's job is to
+      // produce committed failing tests, full stop.
+      result = await applyMutableAgentHygiene({
+        result,
+        before,
+        cwd,
+        label: "test-writer",
+        outputFilePath,
+        requireNonEmptyOutput: true,
+        requireNewCommit: true,
+        allowSubmoduleRecovery: args.allowSubmoduleRecovery,
+        parentWorkspace: parentBeforeRole,
+        siblingRepoBaselines: siblingBaselines,
+      });
+      phaseState = applyResult(phaseState, action, result, { outputFilePath });
       // Capture test-writer touched paths for subtree-aware testCmd
-      // inference. Reads the most recent commit's diff (the test-writer
-      // hygiene gate requires a commit per iteration) and filters to
-      // test-shaped paths. Best-effort: any failure leaves the field
-      // empty and resolveTestCmdForPhase falls back to static resolution.
-      if (!dryRun) {
+      // inference. The hygiene gate above guarantees a commit per
+      // iteration on success, so HEAD~1..HEAD reflects what the
+      // test-writer actually wrote. Skip when the gate failed
+      // (phaseState.status !== "test_spec_done") — there's no fresh
+      // commit to read, and the diff against the prior unrelated commit
+      // could misattribute test files. Best-effort: any failure leaves
+      // the field empty and resolveTestCmdForPhase falls back to static
+      // resolution.
+      if (!dryRun && phaseState.status === "test_spec_done") {
         try {
           const diff = spawnSync(
             "git",
