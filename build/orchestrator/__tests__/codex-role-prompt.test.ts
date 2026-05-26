@@ -60,10 +60,10 @@ describe("Bug H — buildCodexImplArgv role-shaped prompt", () => {
     const argv = buildCodexImplArgv({ ...baseOpts, roleId: "test-writer" });
     const prompt = extractPrompt(argv);
     expect(prompt).toContain("You are the TEST WRITER");
-    expect(prompt).toContain("write FAILING tests");
+    expect(prompt).toContain("NEW FAILING tests");
     expect(prompt).toContain("Touch ONLY test files");
     expect(prompt).toContain("Do NOT write production code");
-    expect(prompt).toContain("Do NOT make existing tests pass");
+    expect(prompt).toContain("Do NOT modify existing passing tests");
     // The legacy implementor copy that caused Bug H MUST NOT appear.
     expect(prompt).not.toContain("Implement the changes autonomously");
     expect(prompt).not.toContain(
@@ -148,5 +148,109 @@ describe("Bug H — cli.ts threading guards (static-grep)", () => {
     expect(cliContent).toMatch(
       /role:\s*args\.roles\.testWriter[\s\S]{0,1200}roleId:\s*"test-writer"/,
     );
+  });
+
+  it("T-H5d: roleId: 'test-writer' appears exactly once in cli.ts (only the runRoleTask dispatch)", () => {
+    // Red-team review (PR #105+) flagged that an accidental copy-paste of
+    // `roleId: "test-writer"` onto a non-test-writer dispatch (e.g.,
+    // primaryImpl, secondaryImpl, test-fixer, feature-review) would
+    // silently route the wrong role through the test-writer prompt and
+    // cause empty production-code phases. Pin the count so any future
+    // duplicate triggers CI investigation. Note: counts only the literal
+    // `roleId: "test-writer"` form — applyMutableAgentHygiene's separate
+    // `roleId: "test-writer"` call (cli.ts:8535 region) uses the same
+    // literal because PR #102's hygiene gate is keyed off the same role
+    // identity, so the expected count is 2 occurrences total: one on the
+    // runRoleTask dispatch, one on the applyMutableAgentHygiene call.
+    const count = (cliContent.match(/roleId:\s*"test-writer"/g) || []).length;
+    expect(count).toBe(2);
+  });
+});
+
+describe("Bug H — prompt-enforcer drift guard", () => {
+  // Multi-specialist confirmed finding (testing + red-team): the
+  // test-writer prompt's allowlist of path patterns MUST stay narrower
+  // than (or equal to) the downstream classifyTestWriterCommit enforcer
+  // regex at cli.ts:2138 (`/(^|\/)(__tests__|test|tests|spec|specs)\//i`
+  // + `/\.(test|spec)\.[a-z]+$/i`). Earlier prompt versions promised
+  // codex that Go-style `*_test.go` files were allowed, but the enforcer
+  // only matches directory-based test paths + `.test.*`/`.spec.*`
+  // suffixes — so a Go test-writer following the prompt would commit
+  // `foo_test.go` and immediately get refused. Same Bug H symptom,
+  // different cause. These tests pin the prompt to the enforcer surface.
+
+  it("T-H6a: test-writer prompt enumerates exactly the dir prefixes the enforcer accepts", () => {
+    const argv = buildCodexImplArgv({
+      inputFilePath: "/tmp/in.md",
+      outputFilePath: "/tmp/out.md",
+      cwd: "/tmp/cwd",
+      roleId: "test-writer",
+    });
+    const prompt = extractPrompt(argv);
+    for (const dir of ["__tests__/", "test/", "tests/", "spec/", "specs/"]) {
+      expect(prompt).toContain(dir);
+    }
+    // Must mention the suffix-based escape hatch the enforcer also accepts.
+    expect(prompt).toMatch(/\*\.test\.\*|\*\.spec\.\*/);
+  });
+
+  it("T-H6b: test-writer prompt does NOT promise patterns the enforcer rejects", () => {
+    const argv = buildCodexImplArgv({
+      inputFilePath: "/tmp/in.md",
+      outputFilePath: "/tmp/out.md",
+      cwd: "/tmp/cwd",
+      roleId: "test-writer",
+    });
+    const prompt = extractPrompt(argv);
+    // Go's `*_test.go` basename is NOT matched by either enforcer regex:
+    // it has no `__tests__|test|tests|spec|specs/` directory prefix AND
+    // the suffix regex is `\.(test|spec)\.[a-z]+$`, not `_test\.`. Until
+    // the enforcer is widened (separate concern), the prompt must NOT
+    // promise this pattern.
+    expect(prompt).not.toMatch(/\*_test\.\*/);
+    expect(prompt).not.toMatch(/_test\.go/);
+  });
+
+  it("T-H6c: test-writer prompt clarifies 'add new tests' vs 'break existing ones'", () => {
+    // Earlier prompt said "Do NOT make existing tests pass" which an
+    // over-literal codex could read as "make existing tests fail" (i.e.,
+    // delete assertions or comment out imports). The tightened form
+    // separates 'add NEW failing tests' from 'do not modify existing
+    // passing tests to make them fail'. Pin both halves.
+    const argv = buildCodexImplArgv({
+      inputFilePath: "/tmp/in.md",
+      outputFilePath: "/tmp/out.md",
+      cwd: "/tmp/cwd",
+      roleId: "test-writer",
+    });
+    const prompt = extractPrompt(argv);
+    expect(prompt).toMatch(/NEW FAILING tests|ADD new failing tests/i);
+    expect(prompt).toMatch(/leave existing ones untouched|do not modify existing passing tests/i);
+  });
+
+  it("T-H6d: test-writer prompt and classifyTestWriterCommit enforcer use the same dir-prefix list", () => {
+    // Read the enforcer regex literal from cli.ts and verify the prompt
+    // mentions every directory the enforcer would accept. A divergence
+    // in either direction (prompt adds a dir not in enforcer, or
+    // enforcer adds a dir not in prompt) fails CI and forces both sides
+    // to be updated together. The enforcer literal is:
+    //   const TEST_PATH_RE = /(^|\/)(__tests__|test|tests|spec|specs)\//i;
+    // Match the inner `(__tests__|...)` alternation group.
+    const enforcerMatch = cliContent.match(
+      /TEST_PATH_RE\s*=\s*\/\(\^\|\\\/\)\(([^)]+)\)\\\//,
+    );
+    expect(enforcerMatch).not.toBeNull();
+    const enforcerDirs = (enforcerMatch![1] ?? "").split("|");
+    expect(enforcerDirs.length).toBeGreaterThan(0);
+    const argv = buildCodexImplArgv({
+      inputFilePath: "/tmp/in.md",
+      outputFilePath: "/tmp/out.md",
+      cwd: "/tmp/cwd",
+      roleId: "test-writer",
+    });
+    const prompt = extractPrompt(argv);
+    for (const dir of enforcerDirs) {
+      expect(prompt).toContain(`${dir}/`);
+    }
   });
 });
