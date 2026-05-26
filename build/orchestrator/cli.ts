@@ -2335,13 +2335,22 @@ const NO_NEW_COMMIT_ERROR_SUFFIX = " did not create a new commit";
  * in stdout+stderr after a non-zero exit, the agent did the work but the
  * commit step was blocked by the sandbox boundary — route through host-side
  * recovery instead of early-returning. Match shape:
- *   `Unable to create '<path>/.git/worktrees/<name>/index.lock': Operation not permitted`
+ *   `fatal: Unable to create '<path>/.git/worktrees/<name>/index.lock': Operation not permitted`
+ *
+ * Anchored on git's canonical `fatal:` prefix to make stdout spoofing
+ * harder. An agent can emit any string in its summary, but reproducing
+ * the FULL `fatal: Unable to create ... .git/worktrees/<seg>/index.lock
+ * ... Operation not permitted` shape — including the `fatal:` prefix and
+ * the path-traversal terminator (closing quote OR colon) — requires
+ * deliberate fakery that's visible in the audit trail. Catches the
+ * adversarial-reviewer finding F1 about regex-only-gated auto-commit
+ * recovery being an exfiltration vector.
  *
  * Bug E in
  * ~/.claude/plans/fix-codex-sandbox-linked-worktree-commit.md.
  */
 export const CODEX_SANDBOX_EPERM_RE =
-  /Unable to create [^\n]*\.git\/worktrees\/[^\/\n]+\/index\.lock[^\n]*Operation not permitted/;
+  /fatal:\s+Unable to create [^\n]*\.git\/worktrees\/[^\/\n]+\/index\.lock(?=['"\s:—-])[^\n]*Operation not permitted/;
 
 /**
  * Editor / tool backup-file extensions that sub-agents leave behind. Gemini's
@@ -3180,7 +3189,18 @@ export async function recoverMutableAgentCommit(opts: {
     // the original message body intact (operators see the agent's summary
     // first) and adds the attribution at the end where `git log` consumers
     // expect machine-readable footers. Bug E Leg 2.
-    message = `${message}\n\nRecovery-Reason: ${opts.recoveryReason}`;
+    //
+    // Defensive dedupe: if the agent's summary already happens to contain
+    // a `Recovery-Reason:` line (collision with the agent's own footer
+    // conventions, or output-summary parsing), strip those first so the
+    // resulting commit has exactly ONE Recovery-Reason trailer that
+    // log-parsing tools key off cleanly. Adversarial reviewer finding F6.
+    const stripped = message
+      .split("\n")
+      .filter((line) => !/^Recovery-Reason:/i.test(line.trim()))
+      .join("\n")
+      .replace(/\n+$/, "");
+    message = `${stripped}\n\nRecovery-Reason: ${opts.recoveryReason}`;
   }
   const commit = spawnSync("git", ["commit", "-m", message], {
     cwd: opts.cwd,
@@ -6352,10 +6372,19 @@ export async function applyMutableAgentHygiene(opts: {
     // the original log path and recovery's commit info, but flips
     // exitCode to 0 so downstream phase routing treats it as a success.
     if (sandboxBlockedCommit && recovery.recovered) {
+      // Preserve the original stderr (which contains the EPERM line) with
+      // a sentinel prefix so fault-triage greps still find "Operation not
+      // permitted" while downstream phase routing sees exit 0. Wiping
+      // stderr to "" loses signal that operators search on. Adversarial
+      // reviewer finding F5.
+      const origStderr = opts.result.stderr ?? "";
+      const stderrPrefix = recovery.commit
+        ? `[hygiene] suppressed sandbox EPERM (recovered as ${recovery.commit}):\n`
+        : `[hygiene] suppressed sandbox EPERM (recovery committed):\n`;
       return {
         ...opts.result,
         exitCode: 0,
-        stderr: "",
+        stderr: origStderr ? stderrPrefix + origStderr : stderrPrefix.trim(),
         stdout:
           (opts.result.stdout ?? "") +
           (recovery.commit

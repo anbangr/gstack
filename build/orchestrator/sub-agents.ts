@@ -532,31 +532,45 @@ export function assertGeminiModel(
  * ~/.claude/plans/fix-codex-sandbox-linked-worktree-commit.md.
  */
 export function computeCodexWritableRoots(cwd: string): string[] {
+  // All-or-nothing: if ANY probe fails, return []. A partial result
+  // (one flag succeeded, the other timed out) would let Codex commit
+  // its index into the per-worktree dir but EPERM on the shared
+  // objects/refs, leaving loose objects orphaned in the shared dir.
+  // Adversarial reviewer finding F2. Defensive worse-than-bare-fallback
+  // is preferable to silent half-state.
   const roots = new Set<string>();
   const cwdResolved = path.resolve(cwd);
   for (const flag of ["--git-dir", "--git-common-dir"]) {
+    let probeResult: ReturnType<typeof spawnSync> | null = null;
     try {
-      const probe = spawnSync("git", ["-C", cwd, "rev-parse", flag], {
+      probeResult = spawnSync("git", ["-C", cwd, "rev-parse", flag], {
         encoding: "utf8",
         timeout: 3000,
       });
-      if (probe.status !== 0 || typeof probe.stdout !== "string") continue;
-      const raw = probe.stdout.trim();
-      if (!raw) continue;
-      const resolved = path.isAbsolute(raw)
-        ? raw
-        : path.resolve(cwd, raw);
-      // Only add if it's OUTSIDE cwd. The workspace-write sandbox already
-      // grants write to everything under cwd, so adding cwd's own .git is
-      // redundant and clutters the argv.
-      if (
-        resolved !== cwdResolved &&
-        !resolved.startsWith(cwdResolved + path.sep)
-      ) {
-        roots.add(resolved);
-      }
     } catch {
-      // git missing, timeout, etc. — defensive: skip this flag.
+      // git missing, spawn failure — return [] (all-or-nothing).
+      return [];
+    }
+    if (!probeResult || probeResult.status !== 0) {
+      // git exited non-zero — could be "not a git repo" (legit []) OR a
+      // transient failure. Bail to [] either way; the cli.ts caller's
+      // sandbox-recovery fallback (Leg 2) will catch the resulting EPERM
+      // if this was a real linked worktree. The non-repo case also
+      // correctly returns [].
+      return [];
+    }
+    if (typeof probeResult.stdout !== "string") return [];
+    const raw = probeResult.stdout.trim();
+    if (!raw) return [];
+    const resolved = path.isAbsolute(raw) ? raw : path.resolve(cwd, raw);
+    // Only add if it's OUTSIDE cwd. The workspace-write sandbox already
+    // grants write to everything under cwd, so adding cwd's own .git is
+    // redundant and clutters the argv.
+    if (
+      resolved !== cwdResolved &&
+      !resolved.startsWith(cwdResolved + path.sep)
+    ) {
+      roots.add(resolved);
     }
   }
   return Array.from(roots);
@@ -569,12 +583,32 @@ const _codexWritableRootsCache = new Map<string, string[]>();
  * subprocess churn under burst conditions (3 Codex spawns per phase × 50
  * phases = 150 spawns). Per-session lifetime — same as the gemini model
  * probe cache.
+ *
+ * Cache key is `fs.realpathSync(cwd)` (when resolvable) to prevent path
+ * collisions from symlinks or relative-vs-absolute callers landing
+ * different entries for the same physical worktree. Falls back to the
+ * raw cwd if realpath fails (cwd doesn't exist, permission). Empty
+ * results are NOT cached — a transient git failure that produced `[]`
+ * gets a re-probe on the next call instead of permanently degrading
+ * the session. Adversarial reviewer findings F4 + the F2 transient-
+ * failure-caching concern from the pre-landing review.
  */
 export function cachedComputeCodexWritableRoots(cwd: string): string[] {
-  const cached = _codexWritableRootsCache.get(cwd);
+  let key: string;
+  try {
+    key = fs.realpathSync(cwd);
+  } catch {
+    key = cwd;
+  }
+  const cached = _codexWritableRootsCache.get(key);
   if (cached) return cached;
   const roots = computeCodexWritableRoots(cwd);
-  _codexWritableRootsCache.set(cwd, roots);
+  // Only cache non-empty results. Transient git failures that produce
+  // [] should retry on the next call rather than permanently degrade
+  // the session back to pre-fix behavior.
+  if (roots.length > 0) {
+    _codexWritableRootsCache.set(key, roots);
+  }
   return roots;
 }
 
