@@ -11245,6 +11245,16 @@ async function main() {
   const startedAt = Date.now();
   const FINALIZATION_REQUIRED = 13;
   let exitCode = 1;
+  // Captures any ExitError thrown inside the outer try below so the finally
+  // block can honor its code. Without this, `process.exit(exitCode)` at the
+  // end of the finally would mask thrown ExitError codes — exitCode is set
+  // to 0 on the success path BEFORE the failure branches throw, so an
+  // ExitError(3) thrown after a successful prior phase exits 0 (false
+  // success). The monitor then auto-resumes the crashed run because the
+  // exit code looks healthy; combined with synth_failure being a
+  // resume-retry trigger, this produces an infinite restart storm.
+  // See ~/.claude/plans/fix-plan-review-loop-stalemate-restart-storm.md.
+  let pendingExitError: ExitError | null = null;
   let heartbeat: HeartbeatController | null = null;
   let uninstallWrap: (() => void) | null = null;
 
@@ -13153,6 +13163,15 @@ async function main() {
         }
       }
     }
+  } catch (err) {
+    // Capture ExitError so finally's process.exit honors the thrown code.
+    // Re-throw so any other exception types still propagate to the top-level
+    // catch at main().catch(...) below. The finally block ALWAYS calls
+    // process.exit, so the re-throw here is defensive — if the finally ever
+    // grows a branch that returns without exiting, the top-level catch will
+    // still see the error.
+    if (err instanceof ExitError) pendingExitError = err;
+    throw err;
   } finally {
     // Belt-and-suspenders for the gate-visibility reconcile race: even if
     // shutdown hit the failure branch (so the success-path mark didn't
@@ -13271,7 +13290,12 @@ async function main() {
   }
   removeHeartbeatSidecar(heartbeatPath);
 
-  process.exit(exitCode);
+  // Honor any ExitError thrown inside the outer try. Without this, exitCode
+  // (defaults to 1, set to 0 on the success path) would mask the thrown
+  // code — an ExitError(3) thrown AFTER a successful prior phase would exit
+  // 0 because `exitCode = 0` ran before the throw. See the pendingExitError
+  // declaration near the top of this function.
+  process.exit(pendingExitError?.code ?? exitCode);
 }
 
 /**
