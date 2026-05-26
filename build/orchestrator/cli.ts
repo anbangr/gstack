@@ -7981,9 +7981,43 @@ async function runPhase(args: {
           ...phase,
           body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd),
         };
+        // Bug A: when phaseState carries a pendingFeatureReviewOutputPath
+        // (set by FEATURE_REDO dispatch via resetPhaseStateForRedo), read
+        // the reviewer's findings and thread them into buildGeminiPromptBody.
+        // Without this the impl agent sees the standard phase description,
+        // observes the existing worktree code looks fine, makes no commit,
+        // and the hygiene gate rejects "did not create a new commit" —
+        // exactly the deadlock the bug report describes. Best-effort: if
+        // the findings file is missing/unreadable, fall through to the
+        // standard prompt with a warning rather than crash. The
+        // pendingFeatureReviewOutputPath field is cleared inside applyResult
+        // (RUN_GEMINI branch) so a subsequent retry without a fresh
+        // FEATURE_REDO sees no stale findings.
+        let pendingFeatureFindings: string | null = null;
+        if (phaseState.pendingFeatureReviewOutputPath) {
+          try {
+            pendingFeatureFindings = fs.readFileSync(
+              phaseState.pendingFeatureReviewOutputPath,
+              "utf8",
+            );
+            console.log(
+              `  ↻ FEATURE_REDO: threading feature-review findings from ${phaseState.pendingFeatureReviewOutputPath} into impl prompt`,
+            );
+          } catch (err) {
+            console.warn(
+              `  ⚠ FEATURE_REDO: failed to read findings at ${phaseState.pendingFeatureReviewOutputPath} (${err instanceof Error ? err.message : String(err)}); proceeding with standard prompt`,
+            );
+            pendingFeatureFindings = null;
+          }
+        }
         fs.writeFileSync(
           inputFilePath,
-          buildGeminiPromptBody(resolvedPhase1, state.planFile, state.branch),
+          buildGeminiPromptBody(
+            resolvedPhase1,
+            state.planFile,
+            state.branch,
+            pendingFeatureFindings,
+          ),
         );
         // Pre-create empty output file so a missing-file error is unambiguous.
         fs.writeFileSync(outputFilePath, "");
