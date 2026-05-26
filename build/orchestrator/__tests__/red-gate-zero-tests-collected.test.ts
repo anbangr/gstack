@@ -316,4 +316,77 @@ describe("red-gate zero-tests-collected edge cases", () => {
       /action\.reason\.startsWith\("RED_GATE_ZERO_TESTS_COLLECTED"\)/,
     );
   });
+
+  // Bug A regression: wrapper-script testCmd (resolves to runner "unknown")
+  // with vitest JSON in stdout should NOT halt with RED_GATE_ZERO_TESTS_COLLECTED.
+  // Previously, "unknown" runner discarded stdout and returned zero. Now the
+  // best-effort fallback recovers the vitest count and the orchestrator proceeds
+  // through the normal red-cap path instead of a spurious zero-collection halt.
+  test("edge: wrapper-script testCmd + vitest JSON stdout → no spurious zero-collection halt", () => {
+    const state = basePhase({ status: "test_spec_done" });
+    const action = { type: "VERIFY_RED" as const, phaseIndex: 0 };
+    const stdout = JSON.stringify({
+      numTotalTests: 14,
+      numPassedTests: 14,
+      numFailedTests: 0,
+    });
+    const next = applyResult(state, action, verifyRedResult(stdout, 0), {
+      phaseBody: "some body without suppression",
+      testCmd: "sh scripts/test.sh",
+    });
+    // 14 collected, all passing, exit=0 → tests trivially passed (not red).
+    // The next red-cap iteration kicks in (or fails at the cap), but the
+    // failure is "could not produce failing tests", NOT a zero-collection halt.
+    expect(next.error ?? "").not.toMatch(/RED_GATE_ZERO_TESTS_COLLECTED/);
+  });
+
+  // Bug B regression: phase-runner RUN_GEMINI_TEST_SPEC must surface a
+  // hygiene failure (exit=1) as status="failed", not silently advance to
+  // test_spec_done. This pins the behavior at the state-machine layer:
+  // when the cli dispatch wraps test-writer in applyMutableAgentHygiene
+  // and the gate fires, the resulting non-zero exit triggers the existing
+  // failure branch in applyResult for RUN_GEMINI_TEST_SPEC.
+  test("Bug B: RUN_GEMINI_TEST_SPEC with hygiene-failed result (exit=1) → status failed, no test_spec_done", () => {
+    const state = basePhase({ status: "test_spec_running" });
+    const action = {
+      type: "RUN_GEMINI_TEST_SPEC" as const,
+      phaseIndex: 0,
+      iteration: 1,
+    };
+    const hygieneFailed: SubAgentResult = {
+      stdout:
+        "# Post-agent hygiene failure\n\ntest-writer left the working tree dirty and produced no new commit\n\nGATE FAIL",
+      stderr: "",
+      exitCode: 1,
+      timedOut: false,
+      logPath: "/tmp/test-writer-hygiene.log",
+      durationMs: 1234,
+      retries: 0,
+    };
+    const next = applyResult(state, action, hygieneFailed);
+    expect(next.status).toBe("failed");
+    expect(next.status).not.toBe("test_spec_done");
+    expect(next.error).toBeDefined();
+  });
+
+  // Bug B wiring check: cli.ts must wrap the RUN_GEMINI_TEST_SPEC dispatch
+  // in applyMutableAgentHygiene with requireNewCommit=true and a "test-writer"
+  // label. Pins the structural fix so a refactor can't silently drop the gate.
+  test("Bug B: cli.ts RUN_GEMINI_TEST_SPEC dispatch wires applyMutableAgentHygiene", () => {
+    const cliPath = path.resolve(import.meta.dir, "../cli.ts");
+    const content = fs.readFileSync(cliPath, "utf-8");
+    // Find the RUN_GEMINI_TEST_SPEC dispatch block.
+    const blockStart = content.indexOf('"RUN_GEMINI_TEST_SPEC"');
+    expect(blockStart).toBeGreaterThan(0);
+    // Slice forward to the next `if (action.type ===` block boundary or end.
+    const blockEnd = content.indexOf(
+      'if (action.type === "VERIFY_RED")',
+      blockStart,
+    );
+    expect(blockEnd).toBeGreaterThan(blockStart);
+    const block = content.slice(blockStart, blockEnd);
+    expect(block).toContain("applyMutableAgentHygiene");
+    expect(block).toMatch(/label:\s*"test-writer"/);
+    expect(block).toMatch(/requireNewCommit:\s*true/);
+  });
 });
