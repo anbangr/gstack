@@ -2329,6 +2329,30 @@ export function contentHashDelta(
 const NO_NEW_COMMIT_ERROR_SUFFIX = " did not create a new commit";
 
 /**
+ * Canonical signature of the EPERM that Codex's `workspace-write` sandbox
+ * produces when it tries to write to the linked-worktree's git metadata
+ * directory (`.git/worktrees/<name>/index.lock`). When this string appears
+ * in stdout+stderr after a non-zero exit, the agent did the work but the
+ * commit step was blocked by the sandbox boundary — route through host-side
+ * recovery instead of early-returning. Match shape:
+ *   `fatal: Unable to create '<path>/.git/worktrees/<name>/index.lock': Operation not permitted`
+ *
+ * Anchored on git's canonical `fatal:` prefix to make stdout spoofing
+ * harder. An agent can emit any string in its summary, but reproducing
+ * the FULL `fatal: Unable to create ... .git/worktrees/<seg>/index.lock
+ * ... Operation not permitted` shape — including the `fatal:` prefix and
+ * the path-traversal terminator (closing quote OR colon) — requires
+ * deliberate fakery that's visible in the audit trail. Catches the
+ * adversarial-reviewer finding F1 about regex-only-gated auto-commit
+ * recovery being an exfiltration vector.
+ *
+ * Bug E in
+ * ~/.claude/plans/fix-codex-sandbox-linked-worktree-commit.md.
+ */
+export const CODEX_SANDBOX_EPERM_RE =
+  /fatal:\s+Unable to create [^\n]*\.git\/worktrees\/[^\/\n]+\/index\.lock(?=['"\s:—-])[^\n]*Operation not permitted/;
+
+/**
  * Editor / tool backup-file extensions that sub-agents leave behind. Gemini's
  * `--yolo` mode and sed/vim-style edits routinely write `*.bak`, `*.tmp`,
  * `*.swp`, `*.orig`, `*.rej`, or `*~` artifacts the agent never cleans up.
@@ -2936,6 +2960,16 @@ export async function recoverMutableAgentCommit(opts: {
    * them is structural future-proofing and has no behavioral effect yet.
    */
   roleId?: RoleHygieneId;
+  /**
+   * When set, tag the recovery commit message with the cause so the audit
+   * trail shows WHY host-side recovery ran. Currently set to
+   * `"codex sandbox blocked commit"` by applyMutableAgentHygiene when it
+   * detects the canonical EPERM signature in stdout+stderr (Bug E Leg 2).
+   * Operators reading `git log` see the distinction between normal
+   * recovery (agent forgot to commit) vs sandbox recovery (agent tried
+   * to commit but workspace-write blocked it).
+   */
+  recoveryReason?: string;
   allowSubmoduleRecovery?: string[];
 }): Promise<{
   recovered: boolean;
@@ -3149,7 +3183,25 @@ export async function recoverMutableAgentCommit(opts: {
     };
   }
 
-  const message = extractCommitMessage(summary, opts.label);
+  let message = extractCommitMessage(summary, opts.label);
+  if (opts.recoveryReason) {
+    // Append a structured trailer naming why host-side recovery ran. Keeps
+    // the original message body intact (operators see the agent's summary
+    // first) and adds the attribution at the end where `git log` consumers
+    // expect machine-readable footers. Bug E Leg 2.
+    //
+    // Defensive dedupe: if the agent's summary already happens to contain
+    // a `Recovery-Reason:` line (collision with the agent's own footer
+    // conventions, or output-summary parsing), strip those first so the
+    // resulting commit has exactly ONE Recovery-Reason trailer that
+    // log-parsing tools key off cleanly. Adversarial reviewer finding F6.
+    const stripped = message
+      .split("\n")
+      .filter((line) => !/^Recovery-Reason:/i.test(line.trim()))
+      .join("\n")
+      .replace(/\n+$/, "");
+    message = `${stripped}\n\nRecovery-Reason: ${opts.recoveryReason}`;
+  }
   const commit = spawnSync("git", ["commit", "-m", message], {
     cwd: opts.cwd,
     encoding: "utf8",
@@ -6241,8 +6293,31 @@ export async function applyMutableAgentHygiene(opts: {
       opts.result.logPath,
     );
   }
+  // Bug E Leg 2 — Codex sandbox-blocked-commit detection. When Codex
+  // runs inside a linked worktree without --add-dir (or when Leg 1's
+  // path-resolution heuristic misses), the agent's `git commit` step
+  // fails with EPERM on `.git/worktrees/<name>/index.lock` and Codex
+  // returns a non-zero exit code. The vanilla early-return below would
+  // then bypass `recoverMutableAgentCommit` entirely — even though the
+  // tree is dirty in the files the agent's output summary lists, exactly
+  // the case recovery exists to handle. Detect the canonical EPERM
+  // signature in stdout+stderr and route through recovery instead. See
+  // ~/.claude/plans/fix-codex-sandbox-linked-worktree-commit.md.
+  const combinedOutput =
+    (opts.result.stdout ?? "") + (opts.result.stderr ?? "");
+  const sandboxBlockedCommit = CODEX_SANDBOX_EPERM_RE.test(combinedOutput);
+  if (sandboxBlockedCommit) {
+    console.warn(
+      `  ↻ ${opts.label}: detected Codex sandbox-blocked commit (EPERM on .git/worktrees/.../index.lock); routing through host-side recovery instead of early-returning`,
+    );
+  }
   // Original early-return for timeouts and nonzero exits (no blind signal).
-  if (opts.result.timedOut || opts.result.exitCode !== 0) {
+  // Sandbox-blocked commits bypass this so recovery runs — the agent did
+  // the work, only the commit step failed.
+  if (
+    (opts.result.timedOut || opts.result.exitCode !== 0) &&
+    !sandboxBlockedCommit
+  ) {
     return opts.result;
   }
   const preCleaned = cleanupGeneratedCacheChanges(opts.cwd);
@@ -6262,6 +6337,9 @@ export async function applyMutableAgentHygiene(opts: {
         outputFilePath: opts.outputFilePath,
         label: opts.label,
         roleId: opts.roleId,
+        recoveryReason: sandboxBlockedCommit
+          ? "codex sandbox blocked commit"
+          : undefined,
         allowSubmoduleRecovery: opts.allowSubmoduleRecovery,
       })
     : { recovered: false, errors: [] as string[], cleaned: [] as string[] };
@@ -6285,7 +6363,37 @@ export async function applyMutableAgentHygiene(opts: {
     ...recovery.errors,
     ...checks.flatMap((check) => check.errors),
   ];
-  if (errors.length === 0) return opts.result;
+  if (errors.length === 0) {
+    // Bug E Leg 2 — when sandbox-blocked recovery succeeded, opts.result
+    // still carries the agent's non-zero exit code (Codex itself exited
+    // non-zero because its git commit failed). Returning that unchanged
+    // would make the caller mark the phase as failed despite the recovery
+    // commit landing cleanly. Synthesize a success result that preserves
+    // the original log path and recovery's commit info, but flips
+    // exitCode to 0 so downstream phase routing treats it as a success.
+    if (sandboxBlockedCommit && recovery.recovered) {
+      // Preserve the original stderr (which contains the EPERM line) with
+      // a sentinel prefix so fault-triage greps still find "Operation not
+      // permitted" while downstream phase routing sees exit 0. Wiping
+      // stderr to "" loses signal that operators search on. Adversarial
+      // reviewer finding F5.
+      const origStderr = opts.result.stderr ?? "";
+      const stderrPrefix = recovery.commit
+        ? `[hygiene] suppressed sandbox EPERM (recovered as ${recovery.commit}):\n`
+        : `[hygiene] suppressed sandbox EPERM (recovery committed):\n`;
+      return {
+        ...opts.result,
+        exitCode: 0,
+        stderr: origStderr ? stderrPrefix + origStderr : stderrPrefix.trim(),
+        stdout:
+          (opts.result.stdout ?? "") +
+          (recovery.commit
+            ? `\n\n[hygiene] codex sandbox blocked commit; host-side recovery committed as ${recovery.commit}.`
+            : ""),
+      };
+    }
+    return opts.result;
+  }
   // NO_CHANGES_NEEDED sentinel — opt-in for review re-runs. When the ONLY
   // remaining hygiene error is the no-new-commit one AND the agent wrote
   // `NO_CHANGES_NEEDED` on its own line in the output summary, treat as
