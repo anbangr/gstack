@@ -47,6 +47,7 @@ import {
   type RunRoleTaskOpts,
 } from "../sub-agents";
 import { deriveGeminiTmpKey } from "../state";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -448,6 +449,27 @@ describe("injectCoverageFlags", () => {
     // Project without pytest-cov: orchestrator must NOT inject --cov, or
     // pytest argparse fails with exit 4 before tests run. mitosis-oasis
     // canonical case.
+    //
+    // Test precondition: this assertion only holds if the OS-level Python
+    // doesn't have pytest-cov in its site-packages. hasPytestCov's signal-2
+    // probe (`python3 -c "import pytest_cov"`) trumps the pyproject.toml
+    // grep — when the operator has pytest-cov globally installed (common on
+    // dev machines), the probe correctly returns true even for a tempdir
+    // that doesn't declare the dep. Skip with an explanation rather than
+    // fail on those machines — the production behavior (don't inject when
+    // probe returns false) is the actual contract being asserted.
+    const probe = spawnSync("python3", ["-c", "import pytest_cov"], {
+      stdio: "ignore",
+    });
+    const probePy = spawnSync("python", ["-c", "import pytest_cov"], {
+      stdio: "ignore",
+    });
+    if (probe.status === 0 || probePy.status === 0) {
+      console.warn(
+        "[T-C skip] OS-level python has pytest-cov installed; cannot assert the no-pytest-cov case on this machine.",
+      );
+      return;
+    }
     expect(injectCoverageFlags("pytest", pytestNoCovCwd)).toBe("pytest");
   });
 

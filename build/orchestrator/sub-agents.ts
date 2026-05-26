@@ -507,6 +507,96 @@ export function assertGeminiModel(
   return probePromise;
 }
 
+/**
+ * Compute additional writable roots that Codex needs when spawned inside a
+ * git linked worktree. Returns paths to pass as repeated `--add-dir <path>`
+ * args to `codex exec`.
+ *
+ * The `workspace-write` sandbox grants write access to the cwd, `/tmp`, and
+ * `$TMPDIR`. But linked worktrees store ALL commit metadata (index, HEAD,
+ * logs, refs, objects) in `<parent-repo>/.git/worktrees/<run-name>/` and
+ * `<parent-repo>/.git/` — both OUTSIDE the worktree path. Every `git commit`
+ * fails with `Unable to create .git/worktrees/<name>/index.lock: Operation
+ * not permitted`. Codex produces the work correctly but the commit step
+ * always fails.
+ *
+ * Detection: run `git -C <cwd> rev-parse --git-dir --git-common-dir`. In a
+ * MAIN worktree both return a relative `.git` (resolves inside cwd → skipped).
+ * In a LINKED worktree `--git-dir` returns the per-worktree metadata dir
+ * (`<parent>/.git/worktrees/<name>`) and `--git-common-dir` returns the shared
+ * `<parent>/.git` — both outside cwd, both added. Outside a repo entirely:
+ * git exits non-zero → returns [] defensively (caller falls back to the
+ * existing argv shape and the operator sees the unchanged behavior).
+ *
+ * See Bug E in
+ * ~/.claude/plans/fix-codex-sandbox-linked-worktree-commit.md.
+ */
+export function computeCodexWritableRoots(cwd: string): string[] {
+  const roots = new Set<string>();
+  const cwdResolved = path.resolve(cwd);
+  for (const flag of ["--git-dir", "--git-common-dir"]) {
+    try {
+      const probe = spawnSync("git", ["-C", cwd, "rev-parse", flag], {
+        encoding: "utf8",
+        timeout: 3000,
+      });
+      if (probe.status !== 0 || typeof probe.stdout !== "string") continue;
+      const raw = probe.stdout.trim();
+      if (!raw) continue;
+      const resolved = path.isAbsolute(raw)
+        ? raw
+        : path.resolve(cwd, raw);
+      // Only add if it's OUTSIDE cwd. The workspace-write sandbox already
+      // grants write to everything under cwd, so adding cwd's own .git is
+      // redundant and clutters the argv.
+      if (
+        resolved !== cwdResolved &&
+        !resolved.startsWith(cwdResolved + path.sep)
+      ) {
+        roots.add(resolved);
+      }
+    } catch {
+      // git missing, timeout, etc. — defensive: skip this flag.
+    }
+  }
+  return Array.from(roots);
+}
+
+const _codexWritableRootsCache = new Map<string, string[]>();
+
+/**
+ * Cached wrapper around computeCodexWritableRoots. Per-cwd cache prevents
+ * subprocess churn under burst conditions (3 Codex spawns per phase × 50
+ * phases = 150 spawns). Per-session lifetime — same as the gemini model
+ * probe cache.
+ */
+export function cachedComputeCodexWritableRoots(cwd: string): string[] {
+  const cached = _codexWritableRootsCache.get(cwd);
+  if (cached) return cached;
+  const roots = computeCodexWritableRoots(cwd);
+  _codexWritableRootsCache.set(cwd, roots);
+  return roots;
+}
+
+export function _resetCodexWritableRootsCacheForTests(): void {
+  _codexWritableRootsCache.clear();
+}
+
+/**
+ * Build the `--add-dir <path>` argv block for a Codex spawn. Returns `[]`
+ * unless the sandbox is `workspace-write` AND the cwd is in a linked worktree
+ * (read-only / danger-full-access don't need writable-roots extension, and
+ * main-worktree commits don't need it either).
+ */
+export function buildCodexAddDirArgs(opts: {
+  cwd: string;
+  sandbox: CodexSandbox;
+}): string[] {
+  if (opts.sandbox !== "workspace-write") return [];
+  const roots = cachedComputeCodexWritableRoots(opts.cwd);
+  return roots.flatMap((r) => ["--add-dir", r]);
+}
+
 export async function assertCodexAuth(): Promise<{
   ok: boolean;
   reason?: string;
@@ -1839,6 +1929,10 @@ export function buildCodexReviewArgv(opts: {
     ...(opts.model ? ["-m", opts.model] : []),
     "-s",
     sandbox,
+    // Bug E: extend writable_roots so Codex can commit on linked worktrees.
+    // Returns [] for the main-worktree / non-workspace-write case so this
+    // is a no-op outside the linked-worktree shape.
+    ...buildCodexAddDirArgs({ cwd: opts.cwd, sandbox }),
     "-c",
     `model_reasoning_effort="${reasoning}"`,
     "-C",
@@ -3648,6 +3742,8 @@ export function buildCodexImplArgv(opts: {
     ...(opts.model ? ["-m", opts.model] : []),
     "-s",
     sandbox,
+    // Bug E: extend writable_roots so Codex can commit on linked worktrees.
+    ...buildCodexAddDirArgs({ cwd: opts.cwd, sandbox }),
     "-c",
     `model_reasoning_effort="${reasoning}"`,
     "-C",
@@ -3777,6 +3873,8 @@ export function buildCodexFeatureReviewArgv(opts: {
     ...(opts.model ? ["-m", opts.model] : []),
     "-s",
     sandbox,
+    // Bug E: extend writable_roots so Codex can commit on linked worktrees.
+    ...buildCodexAddDirArgs({ cwd: opts.cwd, sandbox }),
     "-c",
     `model_reasoning_effort="${reasoning}"`,
     "-C",
