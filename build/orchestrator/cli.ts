@@ -11553,19 +11553,76 @@ async function main() {
         }
       }
 
+      // Stalemate guard: a prior loop already failed convergence. Retrying
+      // the same loop with the same plan + same models is deterministic and
+      // produces the restart storm documented in
+      // ~/.claude/plans/fix-plan-review-loop-stalemate-restart-storm.md.
+      // Refuse to re-run; emit a STALEMATE stdout event and exit 3 so the
+      // monitor recognizes "operator intervention required" (and the user's
+      // bd10c04c heartbeat-tracker fix + monitor restart cap break the
+      // auto-resume side of the loop).
+      //
+      // status === "synth_failure_stalemate": stalemate was already
+      //   promoted in a prior session (e.g., the cap path in
+      //   plan-review-loop). Definitely don't retry.
+      // status === "synth_failure": a prior loop crashed mid-run. Per the
+      //   plan, do NOT auto-retry — promote to stalemate immediately and
+      //   surface the failure to the operator. The transient-retry case
+      //   (which the old code optimized for) is the same shape as the
+      //   restart-storm case from the user's perspective; the safer default
+      //   is to halt and let the operator decide whether to re-launch with
+      //   --no-plan-review, edit the plan, or wait for a known-transient
+      //   issue (e.g., provider outage) to resolve.
+      if (
+        !args.dryRun &&
+        !args.noPlanReview &&
+        ((state.planReview as any)?.status === "synth_failure" ||
+          (state.planReview as any)?.status === "synth_failure_stalemate")
+      ) {
+        const priorStatus = (state.planReview as any).status;
+        const promoted = priorStatus === "synth_failure";
+        process.stdout.write(
+          JSON.stringify({
+            event: "STALEMATE",
+            reason: promoted
+              ? "synth_failure_promoted_on_resume"
+              : "synth_failure_stalemate_carried_over",
+            priorStatus,
+            timestamp: new Date().toISOString(),
+          }) + "\n",
+        );
+        if (promoted) {
+          state.planReview = {
+            ...state.planReview,
+            status: "synth_failure_stalemate",
+          } as any;
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+        }
+        console.error(
+          "[gstack-build] plan-review-loop convergence failed in a prior session (status=" +
+            priorStatus +
+            "). STALEMATE — operator intervention required.\n" +
+            "  Options:\n" +
+            "    1. Edit the plan file to address CRITICAL objections, then re-run gstack-build.\n" +
+            "    2. Re-launch with --no-plan-review to bypass the gate (the orchestrator will proceed with the plan as-is).\n" +
+            "    3. Delete state.planReview from the build-state file to restart the loop fresh.\n" +
+            "  See SKILL.md Step 5.5 for full recovery guidance.",
+        );
+        throw new ExitError(3);
+      }
+
       // Plan review: second-opinion pass before Phase 1 of Feature 1.
       // Skipped in dry-run, when --no-plan-review is set, or on resume (already reviewed).
       // Resume re-runs the loop when prior session left a pending status:
       //   - critical_exit_pending: stalemate at exit 3 → user picked manual mode
       //   - user_aborted: user picked [q] / SIGINT → docs promise resume picks up
-      //   - synth_failure: synth crashed → loop never reached APPROVE
+      //   (synth_failure/synth_failure_stalemate handled above — no auto-retry)
       if (
         !args.dryRun &&
         !args.noPlanReview &&
         (!state.planReview ||
           (state.planReview as any).status === "critical_exit_pending" ||
-          (state.planReview as any).status === "user_aborted" ||
-          (state.planReview as any).status === "synth_failure")
+          (state.planReview as any).status === "user_aborted")
       ) {
         const reviewRole = { ...args.roles.planReviewer };
         if (args.planReviewerModel) reviewRole.model = args.planReviewerModel;
@@ -11683,7 +11740,14 @@ async function main() {
         );
 
         if (loopResult.exitCode === 3) {
-          // Stalemate (user picked [m] / non-TTY fail-fast on CRITICAL).
+          // Stalemate. Two sub-cases:
+          //   - outcome === "synth_failure_stalemate": loop hit the cap with
+          //     synth_failure (the defensive cap path in plan-review-loop).
+          //     Record as synth_failure_stalemate so the resume guard above
+          //     recognizes it and refuses to retry.
+          //   - other outcomes (user_manual, etc.): user picked [m] / non-TTY
+          //     fail-fast on CRITICAL. Record as critical_exit_pending.
+          //
           // NOTE: PR #63's runPlanReviewLoop replaced the legacy
           // reconcilePlanReview path. The loop emits via input.output.write
           // (not console.error), so wrap-console.ts no longer writes a
@@ -11692,9 +11756,13 @@ async function main() {
           // pair with on the new path. The legacy reconcilePlanReview
           // function still exists in plan-reviewer.ts with the per-objection
           // orphan fix intact for any caller that still uses it.
+          const stalemateStatus =
+            loopResult.outcome === "synth_failure_stalemate"
+              ? "synth_failure_stalemate"
+              : "critical_exit_pending";
           state.planReview = {
             ...loopResult.finalVerdict,
-            status: "critical_exit_pending",
+            status: stalemateStatus,
           } as any;
           saveState(state, { noGbrain: args.noGbrain, log: console.warn });
           throw new ExitError(3);
