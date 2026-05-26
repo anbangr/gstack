@@ -8524,7 +8524,7 @@ async function runPhase(args: {
         } else {
           const testCmdForRun =
             phase.testSpecCheckboxLine !== -1
-              ? injectCoverageFlags(effectiveTestCmd)
+              ? injectCoverageFlags(effectiveTestCmd, cwd)
               : effectiveTestCmd;
           result = await runTests({
             testCmd: testCmdForRun,

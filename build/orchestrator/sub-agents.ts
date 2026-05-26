@@ -23,6 +23,7 @@ import {
   spawn as registeredSpawn,
   spawnSync as registeredSpawnSync,
 } from "./child-registry";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -3167,11 +3168,58 @@ export function extractCoverageTarget(phaseBody: string): number {
 }
 
 /**
+ * Probe whether the project at `cwd` has pytest-cov available. Two
+ * cheap signals, either is sufficient:
+ *
+ *   1. `pyproject.toml` text mentions `pytest-cov` (catches projects
+ *      that declare it as a dev dep but haven't installed yet).
+ *   2. A subprocess `python -c "import pytest_cov"` exits 0 (catches
+ *      projects that installed via requirements.txt, conda, or a
+ *      pre-existing venv without pyproject.toml).
+ *
+ * Returns false on any error — better to skip injection than to crash
+ * pytest with `unrecognized arguments: --cov`.
+ *
+ * Bug C in ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
+ */
+export function hasPytestCov(cwd: string): boolean {
+  // Signal 1: pyproject.toml text grep
+  try {
+    const py = fs.readFileSync(path.join(cwd, "pyproject.toml"), "utf8");
+    if (/pytest-cov\b/.test(py)) return true;
+  } catch {
+    // No pyproject.toml or unreadable. Fall through to signal 2.
+  }
+  // Signal 2: python import probe
+  try {
+    const probe = spawnSync("python", ["-c", "import pytest_cov"], {
+      cwd,
+      stdio: "ignore",
+      timeout: 3000,
+    });
+    if (probe.status === 0) return true;
+  } catch {
+    // No python on PATH, timeout, or other failure. Treat as unavailable.
+  }
+  return false;
+}
+
+/**
  * Append coverage flags to a test command for the GREEN gate run.
  * Idempotent — if the flag is already present, the command is returned unchanged.
  * Returns the command unchanged for unknown frameworks (caller logs advisory).
+ *
+ * For pytest specifically, requires `pytest-cov` to be installed in the
+ * project at `cwd` before injecting `--cov` flags. Projects that
+ * intentionally disable coverage in CI (mitosis-oasis CLAUDE.md:294 is
+ * the canonical case) hit `pytest: error: unrecognized arguments: --cov`
+ * and exit 4 during argparse, before any tests run. The probe is cheap
+ * and the fallback (no injection) is safe — coverage is a quality
+ * signal, not a correctness gate.
+ *
+ * Bug C in ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
  */
-export function injectCoverageFlags(testCmd: string): string {
+export function injectCoverageFlags(testCmd: string, cwd: string): string {
   const cmd = testCmd.toLowerCase();
   if (/\bvitest\b/.test(cmd)) {
     return testCmd.includes("--coverage") ? testCmd : `${testCmd} --coverage`;
@@ -3185,9 +3233,14 @@ export function injectCoverageFlags(testCmd: string): string {
     return testCmd.includes("--coverage") ? testCmd : `${testCmd} --coverage`;
   }
   if (/\bpytest\b/.test(cmd)) {
-    return testCmd.includes("--cov")
-      ? testCmd
-      : `${testCmd} --cov --cov-report term-missing`;
+    if (testCmd.includes("--cov")) return testCmd;
+    if (!hasPytestCov(cwd)) {
+      console.warn(
+        `[injectCoverageFlags] pytest-cov not installed in ${cwd}; skipping --cov injection (Bug C)`,
+      );
+      return testCmd;
+    }
+    return `${testCmd} --cov --cov-report term-missing`;
   }
   if (/\bgo\s+test\b/.test(cmd)) {
     return testCmd.includes("-cover") ? testCmd : `${testCmd} -cover`;
