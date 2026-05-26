@@ -291,6 +291,67 @@ function readPid(pidFile: string): number | null {
   }
 }
 
+/**
+ * Names of subagent CLIs we recognize as legitimate long-running work.
+ * Matched against `ps` `comm` (image basename, no path) — these are the
+ * binaries gstack-build spawns for primary impl / test-writer / review /
+ * QA / investigator roles. Anything else under the orchestrator PID is
+ * treated as ambient noise (the shell, git, an editor) and does NOT
+ * suppress the stale alarm.
+ */
+const SUBAGENT_PROCESS_NAMES: ReadonlyArray<string> = [
+  "codex",
+  "claude",
+  "gemini",
+  "kimi",
+];
+
+/**
+ * Return true when the orchestrator at `orchPid` has at least one direct
+ * child whose `comm` matches a recognized subagent CLI. Used by the stale
+ * detector to suppress the `USER_ACTION_REQUIRED` escalation during
+ * legitimate long Codex /qa or Claude /review calls (3-10 minutes is
+ * normal), which otherwise burn supervisor escalations on every poll
+ * cycle until loop-guard fires.
+ *
+ * Cross-platform: uses `ps -e -o ppid=,comm=` (POSIX-portable) and
+ * filters in JS rather than relying on Linux-only `--ppid` flag.
+ * Defensive — returns false on any error (no ps, timeout, parse failure):
+ * the caller falls back to the unmodified stale check.
+ *
+ * Bug B in ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
+ */
+export function hasActiveSubagentChild(orchPid: number | null): boolean {
+  if (orchPid == null || orchPid <= 0) return false;
+  try {
+    const probe = spawnSync("ps", ["-e", "-o", "ppid=,comm="], {
+      encoding: "utf8",
+      timeout: 2000,
+    });
+    if (probe.status !== 0 || typeof probe.stdout !== "string") return false;
+    for (const line of probe.stdout.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      // ppid is the first whitespace-separated token; comm is the rest.
+      const m = trimmed.match(/^(\d+)\s+(.+)$/);
+      if (!m) continue;
+      const ppid = Number(m[1]);
+      if (!Number.isInteger(ppid) || ppid !== orchPid) continue;
+      // `comm` may include a leading path or be wrapped in parens for
+      // kernel threads. Take the basename and strip parens.
+      const comm = path
+        .basename(m[2].replace(/^\(/, "").replace(/\)$/, ""))
+        .toLowerCase();
+      if (SUBAGENT_PROCESS_NAMES.some((name) => comm.includes(name))) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function fileMtimeMs(filePath: string): number | null {
   try {
     return fs.statSync(filePath).mtimeMs;
@@ -692,6 +753,15 @@ function readRunSnapshot(
     pid,
     now.getTime(),
   );
+  // Bug B leg 1: suppress the stale alarm when the orchestrator has
+  // legitimate subagent children running. Long Codex /qa or Claude
+  // /review calls (3-10 minutes is normal) produce no state.json writes
+  // during execution. Without this check the lastUpdatedAt ages past
+  // staleWindowMs and the monitor escalates USER_ACTION_REQUIRED,
+  // which loop-guards into Codex supervisor calls — pure cost burn on
+  // healthy work. See
+  // ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
+  const subagentChildAlive = hasActiveSubagentChild(pid);
   return {
     run,
     stateFile,
@@ -712,7 +782,8 @@ function readRunSnapshot(
     recentProcessActivity,
     stale:
       lastUpdatedAtMs != null &&
-      now.getTime() - lastUpdatedAtMs >= staleWindowMs,
+      now.getTime() - lastUpdatedAtMs >= staleWindowMs &&
+      !subagentChildAlive,
     heartbeatStalledMs: heartbeatResult.stalledMs,
   };
 }
