@@ -2079,6 +2079,36 @@ export interface HygieneVerdict {
   errors: string[];
 }
 
+/**
+ * Discriminant for role-specific behavior in the hygiene pipeline.
+ *
+ * Currently used by `recoverMutableAgentCommit` to refuse non-test file
+ * commits when `roleId === "test-writer"` — closes the test-writer role-drift
+ * bug class where Codex would write production-code mutations into existing
+ * files and the role-agnostic recovery path would happily commit them, the
+ * hygiene gate would pass (HEAD moved, tree clean), and the failure would
+ * deferred-surface two phases later at VERIFY_RED as the misleading
+ * RED_GATE_ZERO_TESTS_COLLECTED / RED_SPEC_EXHAUSTED error.
+ *
+ * Adding this discriminant also future-proofs role-specific hygiene rules
+ * for other roles (e.g., review/QA diff-scope restrictions that today live
+ * in documentation could move to enforcement here).
+ *
+ * See ~/.claude/plans/fix-test-writer-role-drift-structural.md.
+ */
+export type RoleHygieneId =
+  | "test-writer"
+  | "primary-impl"
+  | "primary-impl-rerun"
+  | "test-fixer"
+  | "merge-fixer"
+  | "qa"
+  | "review"
+  | "reviewSecondary"
+  | "feature-review"
+  | "audit"
+  | "other";
+
 export function captureGitSnapshot(
   cwd: string,
   opts?: { captureContents?: boolean },
@@ -2859,6 +2889,14 @@ export async function recoverMutableAgentCommit(opts: {
   before: GitSnapshot;
   outputFilePath?: string;
   label: string;
+  /**
+   * Role discriminant. Drives role-specific recovery behavior. Today the
+   * only role that uses this is `test-writer` (refuses non-test commits to
+   * close the role-drift bug class). Other roles accept any committed
+   * content per the existing role-agnostic behavior; passing roleId for
+   * them is structural future-proofing and has no behavioral effect yet.
+   */
+  roleId?: RoleHygieneId;
   allowSubmoduleRecovery?: string[];
 }): Promise<{
   recovered: boolean;
@@ -5994,6 +6032,14 @@ export async function applyMutableAgentHygiene(opts: {
   before: GitSnapshot | null;
   cwd: string;
   label: string;
+  /**
+   * Role discriminant. Optional for backwards compatibility, but every call
+   * site in cli.ts now passes one. Forwarded into recoverMutableAgentCommit
+   * where it drives role-specific recovery behavior (today: test-writer
+   * refuses non-test commits; other roles use the existing role-agnostic
+   * path). See `RoleHygieneId` declaration for the full list.
+   */
+  roleId?: RoleHygieneId;
   outputFilePath?: string;
   requireNonEmptyOutput?: boolean;
   requireNewCommit?: boolean;
@@ -6070,6 +6116,7 @@ export async function applyMutableAgentHygiene(opts: {
         before: opts.before,
         outputFilePath: opts.outputFilePath,
         label: opts.label,
+        roleId: opts.roleId,
         allowSubmoduleRecovery: opts.allowSubmoduleRecovery,
       })
     : { recovered: false, errors: [] as string[], cleaned: [] as string[] };
@@ -7141,6 +7188,7 @@ async function runFeatureReviewIteration(args: {
       before,
       cwd: args.cwd,
       label: "feature review",
+      roleId: "feature-review",
       parentWorkspace: parentBeforeRole,
     });
     if (result.timedOut) {
@@ -7814,6 +7862,7 @@ async function runPhase(args: {
         before,
         cwd,
         label: "primary implementor",
+        roleId: "primary-impl",
         outputFilePath,
         requireNonEmptyOutput: true,
         // Audit-only phases (annotated with `<!-- audit-only -->`) are gates
@@ -7938,6 +7987,7 @@ async function runPhase(args: {
         before,
         cwd,
         label: "primary implementor rerun",
+        roleId: "primary-impl-rerun",
         outputFilePath,
         requireNonEmptyOutput: true,
         // Audit-only phases (annotated with `<!-- audit-only -->`) may also
@@ -8111,6 +8161,7 @@ async function runPhase(args: {
         before,
         cwd,
         label: "test-writer",
+        roleId: "test-writer",
         outputFilePath,
         requireNonEmptyOutput: true,
         requireNewCommit: true,
@@ -8313,6 +8364,7 @@ async function runPhase(args: {
         before,
         cwd,
         label: "test fixer",
+        roleId: "test-fixer",
         outputFilePath,
         requireNonEmptyOutput: true,
         requireNewCommit: true,
@@ -14107,6 +14159,7 @@ async function runMergeFixer(args: {
     before,
     cwd: args.cwd,
     label: "merge fixer",
+    roleId: "merge-fixer",
     outputFilePath,
     requireNonEmptyOutput: true,
     requireNewCommit: true,
