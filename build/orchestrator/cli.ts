@@ -2079,6 +2079,75 @@ export interface HygieneVerdict {
   errors: string[];
 }
 
+/**
+ * Discriminant for role-specific behavior in the hygiene pipeline.
+ *
+ * Currently used by `recoverMutableAgentCommit` to refuse non-test file
+ * commits when `roleId === "test-writer"` — closes the test-writer role-drift
+ * bug class where Codex would write production-code mutations into existing
+ * files and the role-agnostic recovery path would happily commit them, the
+ * hygiene gate would pass (HEAD moved, tree clean), and the failure would
+ * deferred-surface two phases later at VERIFY_RED as the misleading
+ * RED_GATE_ZERO_TESTS_COLLECTED / RED_SPEC_EXHAUSTED error.
+ *
+ * Adding this discriminant also future-proofs role-specific hygiene rules
+ * for other roles (e.g., review/QA diff-scope restrictions that today live
+ * in documentation could move to enforcement here).
+ *
+ * See ~/.claude/plans/fix-test-writer-role-drift-structural.md.
+ */
+export type RoleHygieneId =
+  | "test-writer"
+  | "primary-impl"
+  | "primary-impl-rerun"
+  | "test-fixer"
+  | "merge-fixer"
+  | "qa"
+  | "review"
+  | "reviewSecondary"
+  | "feature-review"
+  | "audit"
+  | "other";
+
+/**
+ * Classify a list of committed paths against the test-writer role boundary.
+ *
+ * Used by leg 3 of the test-writer role-drift structural fix (post-commit
+ * detection in the RUN_GEMINI_TEST_SPEC dispatch). The test-writer role is
+ * authorized to touch test paths only — `__tests__/`, `test/`, `tests/`,
+ * `spec/`, `specs/` directories AND `*.test.*` / `*.spec.*` file basenames.
+ *
+ * `ok` is true ONLY when at least one path was committed AND every path is
+ * a test path. A mixed commit (test paths + production paths) is role drift
+ * and returns `ok:false` with `nonTestPaths` enumerating the violators.
+ * This mirrors the strict refusal in leg 2's `recoverMutableAgentCommit`
+ * test-writer block — if it would be refused at recovery time, it must
+ * also be detected here when the agent commits directly via `git commit`.
+ *
+ * Same regex contract as the leg 2 refusal block above and the existing
+ * `testWriterTouchedPaths` inference at the top of the file. Soften
+ * through an override option rather than relaxing the regex.
+ *
+ * See ~/.claude/plans/fix-test-writer-role-drift-structural.md leg 3.
+ */
+export function classifyTestWriterCommit(allCommitted: string[]): {
+  ok: boolean;
+  testPaths: string[];
+  nonTestPaths: string[];
+} {
+  const TEST_PATH_RE = /(^|\/)(__tests__|test|tests|spec|specs)\//i;
+  const TEST_FILE_RE = /\.(test|spec)\.[a-z]+$/i;
+  const isTestPath = (p: string) =>
+    TEST_PATH_RE.test(p) || TEST_FILE_RE.test(p);
+  const testPaths = allCommitted.filter(isTestPath);
+  const nonTestPaths = allCommitted.filter((p) => !isTestPath(p));
+  return {
+    ok: allCommitted.length > 0 && nonTestPaths.length === 0,
+    testPaths,
+    nonTestPaths,
+  };
+}
+
 export function captureGitSnapshot(
   cwd: string,
   opts?: { captureContents?: boolean },
@@ -2859,6 +2928,14 @@ export async function recoverMutableAgentCommit(opts: {
   before: GitSnapshot;
   outputFilePath?: string;
   label: string;
+  /**
+   * Role discriminant. Drives role-specific recovery behavior. Today the
+   * only role that uses this is `test-writer` (refuses non-test commits to
+   * close the role-drift bug class). Other roles accept any committed
+   * content per the existing role-agnostic behavior; passing roleId for
+   * them is structural future-proofing and has no behavioral effect yet.
+   */
+  roleId?: RoleHygieneId;
   allowSubmoduleRecovery?: string[];
 }): Promise<{
   recovered: boolean;
@@ -2986,6 +3063,62 @@ export async function recoverMutableAgentCommit(opts: {
       console.warn(
         `[${opts.label}] unexpected error checking .git/index.lock: ${(err as Error).message}`,
       );
+    }
+  }
+
+  // Leg 2 of the test-writer role-drift structural fix: when the recovery
+  // is happening for the test-writer role, REFUSE to stage any file that
+  // doesn't look like a test path. The role-agnostic recovery path used to
+  // happily commit production-code mutations (e.g. postgres-idempotency.ts)
+  // when the agent's output summary listed them, satisfying the hygiene
+  // gate's "did HEAD move?" check but failing two phases later at
+  // VERIFY_RED as the misleading RED_SPEC_EXHAUSTED. Refusing at recovery
+  // time means the drift surfaces immediately with attribution to the
+  // test-writer role, not deferred to a downstream gate with the wrong
+  // suggested fix.
+  //
+  // The regex matches the same conventions the orchestrator already uses
+  // for testWriterTouchedPaths inference: test/, tests/, __tests__/,
+  // spec/, specs/ directories AND *.test.* / *.spec.* file basenames.
+  // Mixed test+non-test stagedPaths are also refused (strict) — a
+  // legitimate test-writer commit may touch fixtures and helpers under
+  // test/ but should NEVER touch production source files. If a future
+  // need arises to soften this (e.g., allowing schema-only fixture
+  // updates in production paths), thread an override through the
+  // recovery options rather than relaxing the regex here.
+  //
+  // See ~/.claude/plans/fix-test-writer-role-drift-structural.md leg 2.
+  if (opts.roleId === "test-writer") {
+    const TEST_PATH_RE = /(^|\/)(__tests__|test|tests|spec|specs)\//i;
+    const TEST_FILE_RE = /\.(test|spec)\.[a-z]+$/i;
+    const isTestPath = (p: string) =>
+      TEST_PATH_RE.test(p) || TEST_FILE_RE.test(p);
+    const nonTestPaths = stagedPaths.filter((p) => !isTestPath(p));
+    if (nonTestPaths.length > 0) {
+      const sample = nonTestPaths.slice(0, 5).join(", ");
+      const moreSuffix =
+        nonTestPaths.length > 5 ? ` (+${nonTestPaths.length - 5} more)` : "";
+      return {
+        recovered: false,
+        errors: [
+          `test-writer recovery REFUSED: agent's output summary listed ` +
+            `${nonTestPaths.length} non-test file(s): ${sample}${moreSuffix}. ` +
+            `The test-writer role may ONLY edit files under __tests__/, test/, ` +
+            `tests/, spec/, specs/, or matching *.test.* / *.spec.*. This is ` +
+            `role drift — the agent wrote a production-code implementation ` +
+            `instead of failing tests. Phase aborted; the working tree is left ` +
+            `as-is so you can inspect what the agent produced.\n\n` +
+            `Recovery options:\n` +
+            `  1. Re-run with --mark-phase-committed <phase> if you accept the ` +
+            `agent's production-code output and want the phase marked done ` +
+            `(skips VERIFY_RED for this phase).\n` +
+            `  2. Edit the plan to clarify "write tests for X" instead of ` +
+            `"implement X" — the role-drift pattern is most acute when the ` +
+            `phase title contains imperative verbs like "Implement", "Build", ` +
+            `or "Add". Then re-run gstack-build to retry the phase.`,
+        ],
+        cleaned: [],
+      };
     }
   }
 
@@ -4967,11 +5100,61 @@ export function buildGeminiTestSpecPrompt(
         ]
       : [];
 
+  // Role-drift prevention block (leg 1 of the test-writer structural
+  // fix). Prepended ABOVE the phase description so it's the first thing
+  // the agent reads, before the implementation-style language in the
+  // phase body can prime the agent toward writing production code.
+  //
+  // Empirically, Codex backup drifts when:
+  // - The phase title contains imperative verbs (Implement/Build/Add)
+  // - The phase body references existing production source files
+  // - The agent interprets "Implement X" as "implement the feature X"
+  //   rather than "implement the failing tests for X"
+  //
+  // The existing `Do NOT implement the feature. Do NOT write production
+  // code.` instruction (in specInstructions) is too easy for Codex to
+  // interpret as "don't write the FINAL production code yet" rather than
+  // "don't write production code AT ALL in this phase". This block is
+  // explicit about the orchestrator-side consequence (commit refused as
+  // role drift) so the agent has a concrete cost to defection.
+  //
+  // The instruction set here is intentionally short and structurally
+  // identical to the recovery refusal message at recoverMutableAgentCommit
+  // — the agent sees the same words it would see in the failure case, so
+  // there's no ambiguity about which paths count as test paths.
+  //
+  // See ~/.claude/plans/fix-test-writer-role-drift-structural.md leg 1.
+  const roleDriftPrevention = [
+    `## CRITICAL — role boundary (test-writer)`,
+    ``,
+    `You are the **test-writer** role. Your ONLY job in this phase is to`,
+    `commit failing tests. You MUST NOT write production code.`,
+    ``,
+    `Allowed file paths (commit refused otherwise):`,
+    `- \`__tests__/**\``,
+    `- \`test/**\`, \`tests/**\``,
+    `- \`spec/**\`, \`specs/**\``,
+    `- Any file matching \`*.test.*\` or \`*.spec.*\``,
+    ``,
+    `Re-read the phase description below with that constraint. If it sounds`,
+    `like "implement X", interpret that as "implement the FAILING TESTS that`,
+    `will eventually validate X". The production code that makes those tests`,
+    `pass comes in a LATER phase, not this one.`,
+    ``,
+    `If you cannot write a failing test (e.g., the test target file does not`,
+    `exist yet and you need clarification), exit nonzero with a one-line`,
+    `reason in stderr. Do NOT write an "Implementation summary" describing`,
+    `what the production code should do — the orchestrator will treat that`,
+    `as role drift and refuse to commit your changes.`,
+    ``,
+  ];
+
   return [
     `# Phase ${phase.number}: ${phase.name} — Test Specification`,
     ``,
     `Plan file: ${planFile}`,
     ``,
+    ...roleDriftPrevention,
     `## Phase description (verbatim from the plan)`,
     ``,
     phase.body.trim(),
@@ -5994,6 +6177,14 @@ export async function applyMutableAgentHygiene(opts: {
   before: GitSnapshot | null;
   cwd: string;
   label: string;
+  /**
+   * Role discriminant. Optional for backwards compatibility, but every call
+   * site in cli.ts now passes one. Forwarded into recoverMutableAgentCommit
+   * where it drives role-specific recovery behavior (today: test-writer
+   * refuses non-test commits; other roles use the existing role-agnostic
+   * path). See `RoleHygieneId` declaration for the full list.
+   */
+  roleId?: RoleHygieneId;
   outputFilePath?: string;
   requireNonEmptyOutput?: boolean;
   requireNewCommit?: boolean;
@@ -6070,6 +6261,7 @@ export async function applyMutableAgentHygiene(opts: {
         before: opts.before,
         outputFilePath: opts.outputFilePath,
         label: opts.label,
+        roleId: opts.roleId,
         allowSubmoduleRecovery: opts.allowSubmoduleRecovery,
       })
     : { recovered: false, errors: [] as string[], cleaned: [] as string[] };
@@ -7141,6 +7333,7 @@ async function runFeatureReviewIteration(args: {
       before,
       cwd: args.cwd,
       label: "feature review",
+      roleId: "feature-review",
       parentWorkspace: parentBeforeRole,
     });
     if (result.timedOut) {
@@ -7814,6 +8007,7 @@ async function runPhase(args: {
         before,
         cwd,
         label: "primary implementor",
+        roleId: "primary-impl",
         outputFilePath,
         requireNonEmptyOutput: true,
         // Audit-only phases (annotated with `<!-- audit-only -->`) are gates
@@ -7938,6 +8132,7 @@ async function runPhase(args: {
         before,
         cwd,
         label: "primary implementor rerun",
+        roleId: "primary-impl-rerun",
         outputFilePath,
         requireNonEmptyOutput: true,
         // Audit-only phases (annotated with `<!-- audit-only -->`) may also
@@ -8111,6 +8306,7 @@ async function runPhase(args: {
         before,
         cwd,
         label: "test-writer",
+        roleId: "test-writer",
         outputFilePath,
         requireNonEmptyOutput: true,
         requireNewCommit: true,
@@ -8136,18 +8332,71 @@ async function runPhase(args: {
             { encoding: "utf8" },
           );
           if (diff.status === 0 && typeof diff.stdout === "string") {
-            const TEST_PATH_RE = /(^|\/)(__tests__|test|tests|spec|specs)\//i;
-            const TEST_FILE_RE = /\.(test|spec)\.[a-z]+$/i;
-            const touched = diff.stdout
+            const allCommitted = diff.stdout
               .split("\n")
               .map((p) => p.trim())
-              .filter(
-                (p) =>
-                  p.length > 0 &&
-                  (TEST_PATH_RE.test(p) || TEST_FILE_RE.test(p)),
-              );
-            if (touched.length > 0) {
-              phaseState = { ...phaseState, testWriterTouchedPaths: touched };
+              .filter((p) => p.length > 0);
+            const cls = classifyTestWriterCommit(allCommitted);
+            if (cls.ok) {
+              phaseState = {
+                ...phaseState,
+                testWriterTouchedPaths: cls.testPaths,
+              };
+            } else if (allCommitted.length > 0) {
+              // Leg 3 of the test-writer role-drift structural fix
+              // (defense in depth). Leg 2 (recovery refusal) closes the
+              // common drift path where the agent leaves dirty files and
+              // the recovery commits them. But the test-writer agent runs
+              // under --yolo file tools and CAN call `git commit` directly,
+              // bypassing the recovery path entirely. If it does so AND
+              // either (a) commits zero test files OR (b) mixes test files
+              // with production paths, the hygiene gate's HEAD-moved check
+              // passes (HEAD did move) but the actual contents violate the
+              // role boundary. This branch catches both cases post-commit
+              // and fails the phase with TEST_WRITER_NO_TEST_FILES_COMMITTED
+              // (zero-test case) or TEST_WRITER_MIXED_COMMIT (mixed case).
+              // The strictness mirrors leg 2's `recoverMutableAgentCommit`
+              // refusal: if it would be refused at recovery time, it must
+              // also be detected here. See
+              // ~/.claude/plans/fix-test-writer-role-drift-structural.md
+              // leg 3.
+              const mixed = cls.testPaths.length > 0;
+              const offenders = mixed ? cls.nonTestPaths : allCommitted;
+              const sample = offenders.slice(0, 6).join(", ");
+              const moreCount = Math.max(0, offenders.length - 6);
+              const moreSuffix = moreCount > 0 ? ` (+${moreCount} more)` : "";
+              const errorCode = mixed
+                ? "TEST_WRITER_MIXED_COMMIT"
+                : "TEST_WRITER_NO_TEST_FILES_COMMITTED";
+              const describe = mixed
+                ? `committed ${allCommitted.length} file(s), of which ` +
+                  `${cls.nonTestPaths.length} are non-test paths (the ` +
+                  `${cls.testPaths.length} test path(s) do not absolve ` +
+                  `the production-code drift)`
+                : `committed ${allCommitted.length} file(s) but NONE ` +
+                  `match test paths`;
+              const errorMsg =
+                `${errorCode} at iteration ${action.iteration}: the ` +
+                `test-writer ${describe} ` +
+                `(allowed: __tests__/, test/, tests/, spec/, specs/, ` +
+                `*.test.*, *.spec.*).\n` +
+                `Drifted files: ${sample}${moreSuffix}\n` +
+                `This is role drift — the agent committed production code ` +
+                `directly (bypassing the recovery path) instead of writing ` +
+                `failing tests only. Recovery options:\n` +
+                `  1. Run gstack-build with --mark-phase-committed <phase> ` +
+                `if you accept the agent's production-code output and want ` +
+                `the phase marked done.\n` +
+                `  2. Reset to before the bogus commit:\n` +
+                `       cd ${cwd}\n` +
+                `       git reset --hard HEAD~1\n` +
+                `     Then re-run with a clarified phase description ` +
+                `("write tests for X" rather than "implement X").`;
+              phaseState = {
+                ...phaseState,
+                status: "failed",
+                error: errorMsg,
+              };
             }
           }
         } catch {
@@ -8313,6 +8562,7 @@ async function runPhase(args: {
         before,
         cwd,
         label: "test fixer",
+        roleId: "test-fixer",
         outputFilePath,
         requireNonEmptyOutput: true,
         requireNewCommit: true,
@@ -14107,6 +14357,7 @@ async function runMergeFixer(args: {
     before,
     cwd: args.cwd,
     label: "merge fixer",
+    roleId: "merge-fixer",
     outputFilePath,
     requireNonEmptyOutput: true,
     requireNewCommit: true,
