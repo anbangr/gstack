@@ -365,6 +365,113 @@ export function _resetAuthPreflightForTests(): void {
   _codexAuthPromise = undefined;
   _kimiAuthCache = undefined;
   _kimiAuthPromise = undefined;
+  _geminiModelProbeCache.clear();
+  _geminiModelWarnedSet.clear();
+}
+
+/**
+ * Parse Gemini CLI stderr for `ModelNotFoundError` / `code: 404`. Pure
+ * function — no I/O, fully testable. Used by `assertGeminiModel` to
+ * classify the probe result.
+ *
+ * Returns:
+ *   - `{ ok: true }` when the stderr shows no model-not-found signal
+ *     (either an empty stderr or unrelated warnings).
+ *   - `{ ok: false, reason: "model-not-found", model? }` when a 404 is
+ *     detected. `model` is extracted from the stderr if the Gemini CLI
+ *     named it; absent otherwise.
+ *
+ * Bug D in ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
+ */
+export function parseGeminiModelProbeStderr(stderr: string): {
+  ok: boolean;
+  reason?: "model-not-found";
+  model?: string;
+} {
+  if (!stderr) return { ok: true };
+  // Match either the canonical Gemini error type or the raw HTTP 404 code
+  // that the bundled CLI also surfaces.
+  if (
+    /ModelNotFoundError/i.test(stderr) ||
+    /code:\s*404/i.test(stderr) ||
+    /Requested entity was not found/i.test(stderr)
+  ) {
+    // Best-effort model extraction. Gemini CLI sometimes echoes the
+    // requested model in a "model: <name>" line; if not, leave undefined
+    // and the caller falls back to "the configured model".
+    const m = stderr.match(/model[:=]\s*['"]?([\w.\-/]+)['"]?/i);
+    return { ok: false, reason: "model-not-found", model: m?.[1] };
+  }
+  return { ok: true };
+}
+
+const _geminiModelProbeCache = new Map<
+  string,
+  { ok: boolean; reason?: "model-not-found"; model?: string }
+>();
+const _geminiModelWarnedSet = new Set<string>();
+
+/**
+ * Probe whether the Gemini CLI accepts a given model identifier. Sends a
+ * 1-token no-op prompt with `-m <model>` and parses stderr for 404 signals.
+ * Cached per model identifier for the session.
+ *
+ * Logs ONE startup warning per invalid model the first time it's seen,
+ * with a remediation pointer to configure.cm. After that, the result is
+ * served from cache silently — the warning is informational, never
+ * blocking.
+ *
+ * Gated by `GSTACK_DISABLE_AUTH_PREFLIGHT=1` env knob (matches the
+ * existing auth preflights — single off switch).
+ *
+ * Bug D in ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
+ */
+export async function assertGeminiModel(model: string): Promise<{
+  ok: boolean;
+  reason?: "model-not-found";
+  model?: string;
+  skipped?: boolean;
+}> {
+  if (process.env.GSTACK_DISABLE_AUTH_PREFLIGHT === "1") {
+    return { ok: true, skipped: true };
+  }
+  if (!model) return { ok: true };
+  const cached = _geminiModelProbeCache.get(model);
+  if (cached) return cached;
+  const bin = geminiBin();
+  let probeStderr = "";
+  try {
+    const probe = spawnSync(
+      bin,
+      ["-m", model, "--output-format", "text"],
+      {
+        input: "ping",
+        encoding: "utf8",
+        timeout: 15000,
+      },
+    );
+    probeStderr = String(probe.stderr ?? "");
+  } catch (err) {
+    // Probe itself failed (no binary, timeout, etc.). Treat as unknown
+    // and let the runtime call surface the real error — don't add noise.
+    const result = { ok: true as const };
+    _geminiModelProbeCache.set(model, result);
+    return result;
+  }
+  const parsed = parseGeminiModelProbeStderr(probeStderr);
+  _geminiModelProbeCache.set(model, parsed);
+  if (!parsed.ok && !_geminiModelWarnedSet.has(model)) {
+    _geminiModelWarnedSet.add(model);
+    const named = parsed.model ? `'${parsed.model}'` : `'${model}'`;
+    console.warn(
+      `[gstack-build] Gemini model ${named} returned 404 ModelNotFoundError on preflight probe. ` +
+        `Every primary call will burn ~10s before falling back. Fix: edit ` +
+        `build/configure.cm (or the active install at ~/.claude/skills/gstack/build/configure.cm) ` +
+        `to use a currently-valid Gemini model identifier (e.g. 'gemini-2.5-flash'). ` +
+        `See Bug D in ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.`,
+    );
+  }
+  return parsed;
 }
 
 export async function assertCodexAuth(): Promise<{
@@ -1939,6 +2046,14 @@ export async function runRoleTask(opts: {
       durationMs: 0,
       retries: 0,
     };
+  }
+  // Bug D: model validity probe. Fires once per session per model and
+  // emits a one-time startup warning if the configured model 404s.
+  // Non-blocking — the actual call still runs (and will fall back to
+  // the backup provider via the existing fallback path on failure).
+  // Caches the result so we don't burn an extra probe call per phase.
+  if (opts.model) {
+    void assertGeminiModel(opts.model);
   }
 
   const {
