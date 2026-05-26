@@ -3021,12 +3021,10 @@ export async function recoverMutableAgentCommit(opts: {
       .filter((line) => !/^[?!]/.test(line) && line.length >= 3)
       .map(parsePorcelainPath),
   );
-  let files = extractSummaryFilePaths(summary, opts.cwd).filter(
-    (filePath) => {
-      const abs = path.join(opts.cwd, filePath);
-      return fs.existsSync(abs) || dirtyPaths.has(filePath);
-    },
-  );
+  let files = extractSummaryFilePaths(summary, opts.cwd).filter((filePath) => {
+    const abs = path.join(opts.cwd, filePath);
+    return fs.existsSync(abs) || dirtyPaths.has(filePath);
+  });
   // Bug F: when the agent's output summary is prose-style and lacks
   // backtick-quoted paths or markdown links, extractSummaryFilePaths
   // returns []. The agent's WORK is still in git status — recovery should
@@ -5430,6 +5428,15 @@ export async function runRoleTask(opts: {
   logPrefix: string;
   timeoutMs?: number;
   /**
+   * Bug H: role identity passed through to provider-specific wrappers.
+   * The codex wrapper (buildCodexImplArgv) switches the prompt shape
+   * when roleId === "test-writer" so the agent receives RED-test-only
+   * instructions instead of the default implementor "make tests pass"
+   * prompt. Gemini/kimi wrappers ignore it today — added there if and
+   * when those providers exhibit the same role-confusion class.
+   */
+  roleId?: "test-writer" | "test-fixer" | "primary-impl" | string;
+  /**
    * Run identifier matching wrap-console.ts's keying
    * (`state.launch?.runId ?? state.slug`). Threaded so the Class 4 RESOLVED
    * emit's pair key matches the DETECTED row wrap-console wrote for the
@@ -5479,6 +5486,10 @@ export async function runRoleTask(opts: {
       model: opts.role.model,
       reasoning: opts.role.reasoning,
       timeoutMs: effectiveTimeoutMs,
+      // Bug H: thread role identity so buildCodexImplArgv selects the
+      // test-writer prompt for test-writer roles (avoids the production-
+      // code-overreach failure mode that PR #102 was catching downstream).
+      roleId: opts.roleId,
     });
   } else {
     result = await runClaudeTask({
@@ -7918,10 +7929,7 @@ async function runPhase(args: {
             // PROVIDER_TIMEOUT. Check the parsed sentinels before the
             // generic provider classifier so the more-specific signal wins.
             const evidence = parseRoleLogFailureEvidence(text);
-            if (
-              evidence.stallKilled &&
-              (evidence.stdoutBytes ?? -1) === 0
-            ) {
+            if (evidence.stallKilled && (evidence.stdoutBytes ?? -1) === 0) {
               recordStallKilled(
                 state,
                 phaseState.index,
@@ -7982,7 +7990,8 @@ async function runPhase(args: {
       // RED_GATE_ZERO_TESTS_COLLECTED (which fires when the runner finds
       // zero tests immediately).
       if (!classified && action.reason.startsWith("RED_SPEC_EXHAUSTED")) {
-        const testCmd = resolveTestCmdForPhase(args, cwd, phase, phaseState) ?? "unknown";
+        const testCmd =
+          resolveTestCmdForPhase(args, cwd, phase, phaseState) ?? "unknown";
         const attempts = phaseState.redSpecAttempts ?? 0;
         recordRedSpecExhausted(
           state,
@@ -7998,7 +8007,8 @@ async function runPhase(args: {
         !classified &&
         action.reason.startsWith("RED_GATE_ZERO_TESTS_COLLECTED")
       ) {
-        const testCmd = resolveTestCmdForPhase(args, cwd, phase, phaseState) ?? "unknown";
+        const testCmd =
+          resolveTestCmdForPhase(args, cwd, phase, phaseState) ?? "unknown";
         recordRedGateZeroTestsCollected(
           state,
           phaseState.index,
@@ -8515,6 +8525,13 @@ async function runPhase(args: {
           phaseNumber: phase.number,
           iteration: action.iteration,
           logPrefix: "test-writer",
+          // Bug H: drives the role-shaped codex prompt switch in
+          // buildCodexImplArgv. Without this, a codex/gpt-5.5 test-writer
+          // receives the implementor prompt and over-reaches into
+          // production code; PR #102 then refuses the output. See
+          // .claude/worktrees/fix-codex-test-writer-role-confusion-prompt
+          // for the canonical polis-mesh F5 evidence.
+          roleId: "test-writer",
         });
       }
       // Test-writer must commit failing tests. A drifting sub-agent that
@@ -8662,7 +8679,12 @@ async function runPhase(args: {
           });
         }
       }
-      const effectiveTestCmd = resolveTestCmdForPhase(args, cwd, phase, phaseState);
+      const effectiveTestCmd = resolveTestCmdForPhase(
+        args,
+        cwd,
+        phase,
+        phaseState,
+      );
       phaseState = applyResult(phaseState, action, result, {
         phaseBody: phase.body,
         testCmd: effectiveTestCmd ?? undefined,
@@ -8912,7 +8934,12 @@ async function runPhase(args: {
         const phaseN = phase.number;
         const it = action.iteration;
 
-        const dualTestCmd = resolveTestCmdForPhase(args, cwd, phase, phaseState);
+        const dualTestCmd = resolveTestCmdForPhase(
+          args,
+          cwd,
+          phase,
+          phaseState,
+        );
 
         const runCandidate = async (candidate: DualImplCandidateKey) => {
           const opponent: DualImplCandidateKey =
