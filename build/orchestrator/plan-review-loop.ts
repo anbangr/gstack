@@ -168,8 +168,16 @@ export type ExitReason =
   | "user_manual"
   | "user_abort"
   | "reviewer_unavailable"
-  /** synthFn rejected or returned ok:false — runtime failure, exit code 1. */
-  | "synth_failure";
+  /** synthFn rejected or returned ok:false mid-loop — runtime failure, exit code 1. Retry on resume is valid (transient model/network blip). */
+  | "synth_failure"
+  /**
+   * synthFn returned ok:false at the round cap (round >= maxRounds) — convergence
+   * failed deterministically. Exit code 3 (STALEMATE), same operational class as
+   * a user-picked manual stalemate. Retry on resume is NOT valid: same plan +
+   * same reviewer + same synth model will reproduce the failure. Operator must
+   * edit the plan to break the loop. See SKILL.md Step 5.5.
+   */
+  | "synth_failure_stalemate";
 
 /**
  * One row written to `~/.gstack/analytics/convergence.jsonl` per completed build.
@@ -1416,12 +1424,33 @@ export async function runPlanReviewLoop(
           console.warn(
             `[plan-review-loop] synth returned ok:false at round ${round} (continue path)`,
           );
+          // Stalemate when this is the last round in the loop — no more
+          // rounds to try, operator must edit the plan to break the cycle.
+          // SKILL.md Step 5.5 contracts Exit 3 for this case.
+          const stalemate = round >= input.maxRounds;
+          if (stalemate) {
+            process.stdout.write(
+              JSON.stringify({
+                event: "STALEMATE",
+                reason: "synth_failure_at_round_cap",
+                path: "continue",
+                round,
+                maxRounds: input.maxRounds,
+                timestamp: new Date().toISOString(),
+              }) + "\n",
+            );
+          }
           writeAggregate({
-            outcome: "synth_failure",
+            outcome: stalemate ? "synth_failure_stalemate" : "synth_failure",
             round,
             verdict: "STALEMATE",
           });
-          return finalResult("synth_failure", round, 1, verdict);
+          return finalResult(
+            stalemate ? "synth_failure_stalemate" : "synth_failure",
+            round,
+            stalemate ? 3 : 1,
+            verdict,
+          );
         }
         continue;
       }
@@ -1460,12 +1489,36 @@ export async function runPlanReviewLoop(
       console.warn(
         `[plan-review-loop] synth returned ok:false at round ${round}`,
       );
+      // Stalemate when this is the last round in the loop (no more rounds
+      // to try). SKILL.md Step 5.5 contracts Exit 3 for STALEMATE; mid-loop
+      // synth_failure keeps the existing exit-1 / retry-once semantics so
+      // transient model/network blips can still recover. cli.ts holds the
+      // retry counter that promotes repeated mid-loop synth_failure to
+      // stalemate on resume (see Fix B in the plan).
+      const stalemate = round >= input.maxRounds;
+      if (stalemate) {
+        process.stdout.write(
+          JSON.stringify({
+            event: "STALEMATE",
+            reason: "synth_failure_at_round_cap",
+            path: "main",
+            round,
+            maxRounds: input.maxRounds,
+            timestamp: new Date().toISOString(),
+          }) + "\n",
+        );
+      }
       writeAggregate({
-        outcome: "synth_failure",
+        outcome: stalemate ? "synth_failure_stalemate" : "synth_failure",
         round,
         verdict: "STALEMATE",
       });
-      return finalResult("synth_failure", round, 1, verdict);
+      return finalResult(
+        stalemate ? "synth_failure_stalemate" : "synth_failure",
+        round,
+        stalemate ? 3 : 1,
+        verdict,
+      );
     }
   }
 

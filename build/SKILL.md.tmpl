@@ -921,14 +921,18 @@ prior commit.
    - **Exit 1 (runtime error)**: Existing error path. See Step M3.
    - **Exit 2 (test failure)**: Existing test-fix path. See Step M3.
 
-   - **Exit 3 (STALEMATE)**: User picked `[m]anual mode` at the bail-out or stalemate gate, OR the non-TTY `fail-fast` mode fired on a CRITICAL round.
+   - **Exit 3 (STALEMATE)**: One of three sub-cases:
+     - User picked `[m]anual mode` at the bail-out or stalemate gate, OR the non-TTY `fail-fast` mode fired on a CRITICAL round (`state.planReview.status === "critical_exit_pending"`).
+     - **synth_failure_stalemate**: a prior session's synthesizer returned `ok:false` and the orchestrator's stalemate guard refused to auto-retry on resume (`state.planReview.status === "synth_failure"` or `"synth_failure_stalemate"`). A stdout STALEMATE event like `{"event":"STALEMATE","reason":"synth_failure_promoted_on_resume",...}` accompanies this exit.
 
-     1. Read `~/.gstack/build-state/<stateSlug>/plan-review-report.json` (where `stateSlug` is `runs[0].stateSlug` from the manifest). Extract the `objections` array (CRITICAL severity only) and the `round` field. Also read `~/.gstack/build-state/<stateSlug>/plan-review-history.jsonl` for the full trajectory.
+     1. Read `~/.gstack/build-state/<stateSlug>/plan-review-report.json` (where `stateSlug` is `runs[0].stateSlug` from the manifest). Extract the `objections` array (CRITICAL severity only) and the `round` field. Also read `~/.gstack/build-state/<stateSlug>/plan-review-history.jsonl` for the full trajectory. For synth_failure_stalemate, also check the convergence aggregate at `~/.gstack/analytics/convergence.jsonl` for the `outcome` field — a value of `synth_failure` or `synth_failure_stalemate` confirms the sub-case.
 
      2. AskUser with options:
-        - A) **Override** — proceed with the current plan as-is (re-launch `gstack-build` with `--no-plan-review`)
-        - B) **Apply suggested fixes** — read the CRITICAL objections, edit the plan file manually, then re-launch (the loop will restart from round 1 because the plan changed substantively; alternatively keep history.jsonl and the next reviewer call will see the prior rounds)
-        - C) **Edit manually** — open the living plan file in `$EDITOR`, resolve the objections by hand, then re-launch
+        - A) **Override** — proceed with the current plan as-is (re-launch `gstack-build` with `--no-plan-review`). For synth_failure_stalemate this is often the right call when the failure was caused by a known-transient provider issue (model outage, rate limit).
+        - B) **Apply suggested fixes** — read the CRITICAL objections, edit the plan file manually, then re-launch (the loop will restart from round 1 because the plan changed substantively; alternatively keep history.jsonl and the next reviewer call will see the prior rounds). For synth_failure_stalemate, also delete `state.planReview` from the build-state file so the loop starts fresh — leaving the synth_failure status would re-trigger the stalemate guard.
+        - C) **Edit manually** — open the living plan file in `$EDITOR`, resolve the objections by hand, then re-launch.
+
+     **Restart storm note** (post-fix-plan-review-loop-stalemate-restart-storm): the monitor caps auto-resumes at 3 per run (configurable via `GSTACK_MONITOR_MAX_AUTO_RESUME`). If you see `RUN_HALTED_STALEMATE` or `RUN_HALTED_RESTART_CAP` events in the monitor log, the monitor stopped trying to auto-resume — manual intervention is required.
 
    - **Exit 4 (USER ABORT)**: User picked `[q]uit` at the triage gate or stalemate gate.
 

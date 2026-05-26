@@ -223,6 +223,167 @@ describe("evaluateMonitorOnce", () => {
     expect(result.terminalEvent.resumeAttempted).toBe(true);
   });
 
+  // ─── Fix C component 2: stalemate refuses auto-resume + restart cap ───
+  // Bug C of the plan-review-loop restart storm: the monitor auto-resumed
+  // dead runs without checking whether the prior session left a
+  // synth_failure_stalemate marker, and without any restart-attempt cap.
+  // These tests pin the two new guards.
+
+  it("Fix C: refuses auto-resume when planReview.status is synth_failure_stalemate", () => {
+    const data = manifest();
+    const run = data.runs[0];
+    writeState(run, {
+      lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+      planReview: { status: "synth_failure_stalemate" } as any,
+    });
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:04:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+    expect(result.terminalEvent.event).toBe("RUN_HALTED_STALEMATE");
+    expect(result.terminalEvent.stalemateStatus).toBe(
+      "synth_failure_stalemate",
+    );
+    // The counter file MUST NOT have been bumped — we never tried to resume.
+    const counterPath = path.join(
+      stateDir,
+      `${run.stateSlug}.resume-count`,
+    );
+    expect(fs.existsSync(counterPath)).toBe(false);
+  });
+
+  it("Fix C: refuses auto-resume when planReview.status is synth_failure (pre-promotion)", () => {
+    // Even before cli.ts has had a chance to promote synth_failure to
+    // synth_failure_stalemate (e.g., the monitor sees a stale run that the
+    // process never got to handle), the monitor refuses auto-resume to
+    // prevent the restart-storm chain from starting.
+    const data = manifest();
+    const run = data.runs[0];
+    writeState(run, {
+      lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+      planReview: { status: "synth_failure" } as any,
+    });
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:04:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+    expect(result.terminalEvent.event).toBe("RUN_HALTED_STALEMATE");
+    expect(result.terminalEvent.stalemateStatus).toBe("synth_failure");
+  });
+
+  it("Fix C: hits restart cap after default 3 auto-resumes", () => {
+    const data = manifest();
+    const run = data.runs[0];
+    writeState(run, {
+      lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+    });
+    // Pre-stage the counter at the cap.
+    const counterPath = path.join(
+      stateDir,
+      `${run.stateSlug}.resume-count`,
+    );
+    fs.writeFileSync(counterPath, "3");
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:04:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+    expect(result.terminalEvent.event).toBe("RUN_HALTED_RESTART_CAP");
+    expect(result.terminalEvent.resumeCount).toBe(3);
+    expect(result.terminalEvent.maxResumes).toBe(3);
+  });
+
+  it("Fix C: GSTACK_MONITOR_MAX_AUTO_RESUME env override raises the cap", () => {
+    const prev = process.env.GSTACK_MONITOR_MAX_AUTO_RESUME;
+    process.env.GSTACK_MONITOR_MAX_AUTO_RESUME = "10";
+    try {
+      const data = manifest();
+      const run = data.runs[0];
+      writeState(run, {
+        lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+      });
+      // Counter at 5 — below the raised cap of 10, so should resume.
+      const counterPath = path.join(
+        stateDir,
+        `${run.stateSlug}.resume-count`,
+      );
+      fs.writeFileSync(counterPath, "5");
+      const result = evaluateMonitorOnce({
+        manifestPath: writeManifest(data),
+        now: new Date("2026-05-08T00:04:00.000Z"),
+        pollMs: 60_000,
+        spawnResume: false,
+      });
+      expect(result.terminalEvent.event).toBe("RUN_RESUMED");
+      expect(result.terminalEvent.maxResumes).toBe(10);
+      expect(result.terminalEvent.resumeCount).toBe(6);
+    } finally {
+      if (prev !== undefined)
+        process.env.GSTACK_MONITOR_MAX_AUTO_RESUME = prev;
+      else delete process.env.GSTACK_MONITOR_MAX_AUTO_RESUME;
+    }
+  });
+
+  it("Fix C: RUN_RESUMED metadata includes resumeCount and maxResumes for observability", () => {
+    // Even in dry-run (spawnResume=false), the RUN_RESUMED event surfaces
+    // the resume counter so monitors and log tails can detect approaching
+    // cap conditions. The actual counter-file write happens on real spawn.
+    const data = manifest();
+    const run = data.runs[0];
+    writeState(run, {
+      lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+    });
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:04:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+    expect(result.terminalEvent.event).toBe("RUN_RESUMED");
+    expect(result.terminalEvent.resumeCount).toBe(1);
+    expect(result.terminalEvent.maxResumes).toBe(3);
+  });
+
+  it("Fix C: counter persists across monitor ticks (cap respects pre-staged count)", () => {
+    // Verifies the counter-file contract end-to-end: pre-stage 2, expect
+    // the next resume's metadata to report 3 (= cap), then the tick AFTER
+    // (counter pre-staged at 3) hits the cap.
+    const data = manifest();
+    const run = data.runs[0];
+    writeState(run, {
+      lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+    });
+    const counterPath = path.join(
+      stateDir,
+      `${run.stateSlug}.resume-count`,
+    );
+    fs.writeFileSync(counterPath, "2");
+    const result1 = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:04:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+    expect(result1.terminalEvent.event).toBe("RUN_RESUMED");
+    expect(result1.terminalEvent.resumeCount).toBe(3);
+
+    // Simulate the next tick: the prior resume bumped the counter to 3.
+    fs.writeFileSync(counterPath, "3");
+    const result2 = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:04:30.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+    expect(result2.terminalEvent.event).toBe("RUN_HALTED_RESTART_CAP");
+  });
+
   it("removes a dead state lock before auto-resuming a stale run", () => {
     const data = manifest();
     const run = data.runs[0];
@@ -601,9 +762,7 @@ describe("evaluateMonitorOnce", () => {
     });
 
     expect(result.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
-    expect(result.terminalEvent.message).toContain(
-      "state has not advanced",
-    );
+    expect(result.terminalEvent.message).toContain("state has not advanced");
     void run;
   });
 
@@ -856,6 +1015,172 @@ describe("evaluateMonitorOnce", () => {
       gstackConfigBin: "",
     });
     expect(over.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
+  });
+
+  it("STALL ARM: stateLastUpdatedAt advance is NOT progress (spawnResume tracker-reset regression)", () => {
+    // Regression: the original tracker `moved` check treated any change to
+    // sidecar.stateLastUpdatedAt as progress. spawnResume's resumed process
+    // loads saved state and writes a fresh `lastUpdatedAt` timestamp on
+    // bootstrap — without any actual work being done. Under the OLD code,
+    // that no-op rewrite reset the stall clock to 0. If a stall keeps
+    // triggering RUN_STALE → auto-resume cycles within the stall threshold,
+    // the watchdog could NEVER fire.
+    //
+    // After the fix: only drainProcessedCount and phase count as progress.
+    // stateLastUpdatedAt is still preserved on the tracker for diagnostics
+    // but is no longer compared.
+    const oldStateAt = "2026-05-08T00:00:00.000Z";
+    const newStateAt = "2026-05-08T00:10:00.000Z"; // 10 min later (simulating spawnResume rewrite)
+    const { data, run } = setupRunWithSidecar(
+      // Current sidecar: stateLastUpdatedAt ADVANCED, but drainProcessedCount + phase frozen.
+      { stateLastUpdatedAt: newStateAt, drainProcessedCount: 0 },
+      {
+        freshStdoutAt: new Date("2026-05-08T00:30:00.000Z"),
+        stateAt: newStateAt,
+      },
+    );
+
+    // Pre-seed tracker as if observed 20 minutes ago, with the OLD
+    // stateLastUpdatedAt value. Under the OLD code: tracker.lastSeenStateLastUpdatedAt
+    // (oldStateAt) !== sidecar.stateLastUpdatedAt (newStateAt) → moved=true → reset → stalledMs=0 → no escalation.
+    // Under the FIX: drainProcessedCount unchanged, phase unchanged → moved=false → stalledMs = 20 min → escalates.
+    const trackerPath = path.join(
+      stateDir,
+      `${run.stateSlug}.heartbeat-track.json`,
+    );
+    fs.writeFileSync(
+      trackerPath,
+      JSON.stringify({
+        lastSeenStateLastUpdatedAt: oldStateAt,
+        lastSeenDrainProcessedCount: 0,
+        lastSeenPhase: 0,
+        lastChangedAt: Date.parse("2026-05-08T00:10:00.000Z"),
+      }),
+    );
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:30:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+      buildStallThresholdMs: 15 * 60 * 1000,
+    });
+
+    expect(result.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
+    expect(result.terminalEvent.message).toContain("state has not advanced");
+    void run;
+  });
+
+  it("STALL ARM: phase advance IS progress (resets stall clock)", () => {
+    // Counter-test for the regression above. When phase actually advances
+    // (real progress, not just a state rewrite), the stall clock must reset.
+    const stateAt = "2026-05-08T00:00:00.000Z";
+    const { data, run } = setupRunWithSidecar(
+      { stateLastUpdatedAt: stateAt, drainProcessedCount: 0 },
+      {
+        freshStdoutAt: new Date("2026-05-08T00:30:00.000Z"),
+        stateAt,
+      },
+    );
+
+    // Manually upgrade the sidecar to phase 2 (the setupRunWithSidecar helper
+    // hard-codes phase: 0). Pre-seed tracker with lastSeenPhase: 1 so the
+    // current sidecar represents real phase advancement.
+    const sidecarPath = path.join(stateDir, `${run.stateSlug}.heartbeat.json`);
+    const sidecar = JSON.parse(fs.readFileSync(sidecarPath, "utf-8"));
+    sidecar.phase = 2;
+    fs.writeFileSync(sidecarPath, JSON.stringify(sidecar));
+
+    const trackerPath = path.join(
+      stateDir,
+      `${run.stateSlug}.heartbeat-track.json`,
+    );
+    fs.writeFileSync(
+      trackerPath,
+      JSON.stringify({
+        lastSeenStateLastUpdatedAt: stateAt,
+        lastSeenDrainProcessedCount: 0,
+        lastSeenPhase: 1, // Phase 1 last poll, now phase 2 → moved → reset.
+        lastChangedAt: Date.parse("2026-05-08T00:10:00.000Z"),
+      }),
+    );
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:30:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+      buildStallThresholdMs: 15 * 60 * 1000,
+    });
+
+    // Phase advanced → tracker resets → no stall → RUN_RUNNING.
+    expect(result.terminalEvent.event).toBe("MONITOR_REENTER");
+    const runEvents = result.events.filter(
+      (e) => "runId" in e && e.runId === run.runId,
+    );
+    const last = runEvents[runEvents.length - 1];
+    expect(last.event).toBe("RUN_RUNNING");
+
+    // Tracker should now have lastSeenPhase: 2.
+    const updated = JSON.parse(fs.readFileSync(trackerPath, "utf-8"));
+    expect(updated.lastSeenPhase).toBe(2);
+  });
+
+  it("STALL ARM: pre-fix tracker without lastSeenPhase still works (backwards-compat)", () => {
+    // Trackers written before this fix don't have a lastSeenPhase field.
+    // The fix must not falsely reset such trackers (which would re-introduce
+    // the pre-fix no-fire behavior for a different reason).
+    const stateAt = "2026-05-08T00:00:00.000Z";
+    const { data, run } = setupRunWithSidecar(
+      { stateLastUpdatedAt: stateAt, drainProcessedCount: 0 },
+      {
+        freshStdoutAt: new Date("2026-05-08T00:30:00.000Z"),
+        stateAt,
+      },
+    );
+
+    // Pre-seed tracker with the OLD schema: no lastSeenPhase. Sidecar has
+    // phase=0 (set by setupRunWithSidecar). Under a naive check (`phase !==
+    // undefined`), this would treat the tracker as "moved" every tick. The
+    // gated check correctly treats absent lastSeenPhase as a no-op.
+    const trackerPath = path.join(
+      stateDir,
+      `${run.stateSlug}.heartbeat-track.json`,
+    );
+    fs.writeFileSync(
+      trackerPath,
+      JSON.stringify({
+        lastSeenStateLastUpdatedAt: stateAt,
+        lastSeenDrainProcessedCount: 0,
+        // Intentionally NO lastSeenPhase.
+        lastChangedAt: Date.parse("2026-05-08T00:10:00.000Z"),
+      }),
+    );
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:30:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+      buildStallThresholdMs: 15 * 60 * 1000,
+    });
+
+    // Stall accumulated 20 min on the pre-fix tracker → escalates correctly.
+    expect(result.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
+    expect(result.terminalEvent.message).toContain("state has not advanced");
+
+    // The tracker has been upgraded in place to include lastSeenPhase=0
+    // (or undefined → preserved as undefined; either is acceptable so long
+    // as subsequent ticks don't false-trigger). Verify the upgrade path
+    // doesn't double-write: writeHeartbeatTracker only fires on `moved`,
+    // and we just asserted no movement happened.
+    const trackerAfter = JSON.parse(fs.readFileSync(trackerPath, "utf-8"));
+    // lastChangedAt MUST be preserved from the original 00:10 timestamp, not
+    // bumped to "now" — that would mask the stall in a follow-up tick.
+    expect(trackerAfter.lastChangedAt).toBe(
+      Date.parse("2026-05-08T00:10:00.000Z"),
+    );
+    void run;
   });
 
   it("emits MONITOR_ERROR instead of crashing when the resume executable is missing", () => {
