@@ -5061,11 +5061,61 @@ export function buildGeminiTestSpecPrompt(
         ]
       : [];
 
+  // Role-drift prevention block (leg 1 of the test-writer structural
+  // fix). Prepended ABOVE the phase description so it's the first thing
+  // the agent reads, before the implementation-style language in the
+  // phase body can prime the agent toward writing production code.
+  //
+  // Empirically, Codex backup drifts when:
+  // - The phase title contains imperative verbs (Implement/Build/Add)
+  // - The phase body references existing production source files
+  // - The agent interprets "Implement X" as "implement the feature X"
+  //   rather than "implement the failing tests for X"
+  //
+  // The existing `Do NOT implement the feature. Do NOT write production
+  // code.` instruction (in specInstructions) is too easy for Codex to
+  // interpret as "don't write the FINAL production code yet" rather than
+  // "don't write production code AT ALL in this phase". This block is
+  // explicit about the orchestrator-side consequence (commit refused as
+  // role drift) so the agent has a concrete cost to defection.
+  //
+  // The instruction set here is intentionally short and structurally
+  // identical to the recovery refusal message at recoverMutableAgentCommit
+  // — the agent sees the same words it would see in the failure case, so
+  // there's no ambiguity about which paths count as test paths.
+  //
+  // See ~/.claude/plans/fix-test-writer-role-drift-structural.md leg 1.
+  const roleDriftPrevention = [
+    `## CRITICAL — role boundary (test-writer)`,
+    ``,
+    `You are the **test-writer** role. Your ONLY job in this phase is to`,
+    `commit failing tests. You MUST NOT write production code.`,
+    ``,
+    `Allowed file paths (commit refused otherwise):`,
+    `- \`__tests__/**\``,
+    `- \`test/**\`, \`tests/**\``,
+    `- \`spec/**\`, \`specs/**\``,
+    `- Any file matching \`*.test.*\` or \`*.spec.*\``,
+    ``,
+    `Re-read the phase description below with that constraint. If it sounds`,
+    `like "implement X", interpret that as "implement the FAILING TESTS that`,
+    `will eventually validate X". The production code that makes those tests`,
+    `pass comes in a LATER phase, not this one.`,
+    ``,
+    `If you cannot write a failing test (e.g., the test target file does not`,
+    `exist yet and you need clarification), exit nonzero with a one-line`,
+    `reason in stderr. Do NOT write an "Implementation summary" describing`,
+    `what the production code should do — the orchestrator will treat that`,
+    `as role drift and refuse to commit your changes.`,
+    ``,
+  ];
+
   return [
     `# Phase ${phase.number}: ${phase.name} — Test Specification`,
     ``,
     `Plan file: ${planFile}`,
     ``,
+    ...roleDriftPrevention,
     `## Phase description (verbatim from the plan)`,
     ``,
     phase.body.trim(),
