@@ -223,6 +223,167 @@ describe("evaluateMonitorOnce", () => {
     expect(result.terminalEvent.resumeAttempted).toBe(true);
   });
 
+  // ─── Fix C component 2: stalemate refuses auto-resume + restart cap ───
+  // Bug C of the plan-review-loop restart storm: the monitor auto-resumed
+  // dead runs without checking whether the prior session left a
+  // synth_failure_stalemate marker, and without any restart-attempt cap.
+  // These tests pin the two new guards.
+
+  it("Fix C: refuses auto-resume when planReview.status is synth_failure_stalemate", () => {
+    const data = manifest();
+    const run = data.runs[0];
+    writeState(run, {
+      lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+      planReview: { status: "synth_failure_stalemate" } as any,
+    });
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:04:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+    expect(result.terminalEvent.event).toBe("RUN_HALTED_STALEMATE");
+    expect(result.terminalEvent.stalemateStatus).toBe(
+      "synth_failure_stalemate",
+    );
+    // The counter file MUST NOT have been bumped — we never tried to resume.
+    const counterPath = path.join(
+      stateDir,
+      `${run.stateSlug}.resume-count`,
+    );
+    expect(fs.existsSync(counterPath)).toBe(false);
+  });
+
+  it("Fix C: refuses auto-resume when planReview.status is synth_failure (pre-promotion)", () => {
+    // Even before cli.ts has had a chance to promote synth_failure to
+    // synth_failure_stalemate (e.g., the monitor sees a stale run that the
+    // process never got to handle), the monitor refuses auto-resume to
+    // prevent the restart-storm chain from starting.
+    const data = manifest();
+    const run = data.runs[0];
+    writeState(run, {
+      lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+      planReview: { status: "synth_failure" } as any,
+    });
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:04:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+    expect(result.terminalEvent.event).toBe("RUN_HALTED_STALEMATE");
+    expect(result.terminalEvent.stalemateStatus).toBe("synth_failure");
+  });
+
+  it("Fix C: hits restart cap after default 3 auto-resumes", () => {
+    const data = manifest();
+    const run = data.runs[0];
+    writeState(run, {
+      lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+    });
+    // Pre-stage the counter at the cap.
+    const counterPath = path.join(
+      stateDir,
+      `${run.stateSlug}.resume-count`,
+    );
+    fs.writeFileSync(counterPath, "3");
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:04:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+    expect(result.terminalEvent.event).toBe("RUN_HALTED_RESTART_CAP");
+    expect(result.terminalEvent.resumeCount).toBe(3);
+    expect(result.terminalEvent.maxResumes).toBe(3);
+  });
+
+  it("Fix C: GSTACK_MONITOR_MAX_AUTO_RESUME env override raises the cap", () => {
+    const prev = process.env.GSTACK_MONITOR_MAX_AUTO_RESUME;
+    process.env.GSTACK_MONITOR_MAX_AUTO_RESUME = "10";
+    try {
+      const data = manifest();
+      const run = data.runs[0];
+      writeState(run, {
+        lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+      });
+      // Counter at 5 — below the raised cap of 10, so should resume.
+      const counterPath = path.join(
+        stateDir,
+        `${run.stateSlug}.resume-count`,
+      );
+      fs.writeFileSync(counterPath, "5");
+      const result = evaluateMonitorOnce({
+        manifestPath: writeManifest(data),
+        now: new Date("2026-05-08T00:04:00.000Z"),
+        pollMs: 60_000,
+        spawnResume: false,
+      });
+      expect(result.terminalEvent.event).toBe("RUN_RESUMED");
+      expect(result.terminalEvent.maxResumes).toBe(10);
+      expect(result.terminalEvent.resumeCount).toBe(6);
+    } finally {
+      if (prev !== undefined)
+        process.env.GSTACK_MONITOR_MAX_AUTO_RESUME = prev;
+      else delete process.env.GSTACK_MONITOR_MAX_AUTO_RESUME;
+    }
+  });
+
+  it("Fix C: RUN_RESUMED metadata includes resumeCount and maxResumes for observability", () => {
+    // Even in dry-run (spawnResume=false), the RUN_RESUMED event surfaces
+    // the resume counter so monitors and log tails can detect approaching
+    // cap conditions. The actual counter-file write happens on real spawn.
+    const data = manifest();
+    const run = data.runs[0];
+    writeState(run, {
+      lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+    });
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:04:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+    expect(result.terminalEvent.event).toBe("RUN_RESUMED");
+    expect(result.terminalEvent.resumeCount).toBe(1);
+    expect(result.terminalEvent.maxResumes).toBe(3);
+  });
+
+  it("Fix C: counter persists across monitor ticks (cap respects pre-staged count)", () => {
+    // Verifies the counter-file contract end-to-end: pre-stage 2, expect
+    // the next resume's metadata to report 3 (= cap), then the tick AFTER
+    // (counter pre-staged at 3) hits the cap.
+    const data = manifest();
+    const run = data.runs[0];
+    writeState(run, {
+      lastUpdatedAt: "2026-05-08T00:00:00.000Z",
+    });
+    const counterPath = path.join(
+      stateDir,
+      `${run.stateSlug}.resume-count`,
+    );
+    fs.writeFileSync(counterPath, "2");
+    const result1 = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:04:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+    expect(result1.terminalEvent.event).toBe("RUN_RESUMED");
+    expect(result1.terminalEvent.resumeCount).toBe(3);
+
+    // Simulate the next tick: the prior resume bumped the counter to 3.
+    fs.writeFileSync(counterPath, "3");
+    const result2 = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:04:30.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+    });
+    expect(result2.terminalEvent.event).toBe("RUN_HALTED_RESTART_CAP");
+  });
+
   it("removes a dead state lock before auto-resuming a stale run", () => {
     const data = manifest();
     const run = data.runs[0];

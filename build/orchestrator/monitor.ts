@@ -34,6 +34,8 @@ export type MonitorEventName =
   | "RUN_RUNNING"
   | "RUN_STALE"
   | "RUN_RESUMED"
+  | "RUN_HALTED_STALEMATE"
+  | "RUN_HALTED_RESTART_CAP"
   | "HOST_CONTEXT_SAVE_REQUIRED"
   | "USER_ACTION_REQUIRED"
   | "RUN_FAILED"
@@ -46,6 +48,10 @@ export const MONITOR_EXIT_CODES: Record<MonitorEventName, number> = {
   RUN_RUNNING: 12,
   RUN_STALE: 12,
   RUN_RESUMED: 12,
+  // Both halt events require operator attention; reuse USER_ACTION_REQUIRED's
+  // exit code (11) so wrappers that already key on it get the same signal.
+  RUN_HALTED_STALEMATE: 11,
+  RUN_HALTED_RESTART_CAP: 11,
   HOST_CONTEXT_SAVE_REQUIRED: 10,
   USER_ACTION_REQUIRED: 11,
   RUN_FAILED: 20,
@@ -493,6 +499,56 @@ function writeHeartbeatTracker(
     // Best-effort. If the tracker write fails the monitor regresses to
     // its existing behavior on this tick — i.e. no new silent failure mode.
   }
+}
+
+/**
+ * Per-run auto-resume counter, persisted to a sidecar file so it survives
+ * monitor restarts. Fix C component 2 of the plan-review-loop restart-storm
+ * fix: caps the total number of auto-resumes for a single run so that even
+ * if the heartbeat-tracker (component 1, user's bd10c04c) and the
+ * synth_failure_stalemate guard miss something, the monitor stops trying
+ * after N attempts.
+ *
+ * Cap is controlled by `GSTACK_MONITOR_MAX_AUTO_RESUME`, default 3.
+ * Reset semantics: once a run completes successfully or reaches a terminal
+ * failure state (handled by other monitor code paths), the counter file
+ * naturally goes stale; the next run on a different stateSlug gets a fresh
+ * counter file. Counter files are stored at `<stateDir>/<stateSlug>.resume-count`.
+ */
+function resumeCounterPath(stateDir: string, stateSlug: string): string {
+  return path.join(stateDir, `${stateSlug}.resume-count`);
+}
+
+function readResumeCount(filePath: string): number {
+  try {
+    const raw = fs.readFileSync(filePath, "utf8").trim();
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeResumeCount(filePath: string, count: number): void {
+  try {
+    const tmp = `${filePath}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, String(count), { mode: 0o600 });
+    fs.renameSync(tmp, filePath);
+  } catch {
+    // Best-effort; failure to write means the next monitor tick gets a
+    // potentially-stale count. The synth_failure_stalemate guard above is
+    // the primary defense, so the cap is a secondary safety net.
+  }
+}
+
+const DEFAULT_MAX_AUTO_RESUME = 3;
+
+function maxAutoResumeFromEnv(): number {
+  const raw = process.env.GSTACK_MONITOR_MAX_AUTO_RESUME;
+  if (!raw) return DEFAULT_MAX_AUTO_RESUME;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_MAX_AUTO_RESUME;
+  return n;
 }
 
 /**
@@ -1188,18 +1244,81 @@ export function evaluateMonitorOnce(
             terminalEvent,
           };
         }
+        // Fix C component 2: refuse to auto-resume when prior session left
+        // a synth_failure_stalemate status. Auto-resume would spawn a
+        // process that hits the cli.ts stalemate guard (Fix B), exits 3
+        // immediately, and the next monitor tick sees RUN_STALE again →
+        // resume loop. The user's bd10c04c heartbeat-tracker fix prevents
+        // false-progress signals during the cycle, but the cleanest stop
+        // is to never start the cycle in the first place.
+        const stalemateStatus = (
+          (snapshot.state as any)?.planReview as any
+        )?.status;
+        if (
+          stalemateStatus === "synth_failure_stalemate" ||
+          stalemateStatus === "synth_failure"
+        ) {
+          const terminalEvent = runEvent(
+            "RUN_HALTED_STALEMATE",
+            snapshot,
+            `plan-review-loop stalemate detected (status=${stalemateStatus}); refusing auto-resume — operator intervention required`,
+            now,
+            { stalemateStatus },
+          );
+          return {
+            manifest,
+            events: [...events, terminalEvent],
+            skillFaultEvents,
+            terminalEvent,
+          };
+        }
+
+        // Fix C component 2: per-run restart cap. Secondary safety net for
+        // any future failure class where the monitor keeps auto-resuming
+        // without converging. Counter is stored at
+        // <stateDir>/<stateSlug>.resume-count, default cap 3, overridable
+        // via GSTACK_MONITOR_MAX_AUTO_RESUME.
+        const counterPath = resumeCounterPath(
+          snapshot.stateDir,
+          snapshot.run.stateSlug,
+        );
+        const priorCount = readResumeCount(counterPath);
+        const maxResumes = maxAutoResumeFromEnv();
+        if (priorCount >= maxResumes) {
+          const terminalEvent = runEvent(
+            "RUN_HALTED_RESTART_CAP",
+            snapshot,
+            `auto-resume cap reached (${priorCount}/${maxResumes}); refusing further auto-resume — operator intervention required (set GSTACK_MONITOR_MAX_AUTO_RESUME=N to change the cap)`,
+            now,
+            { resumeCount: priorCount, maxResumes },
+          );
+          return {
+            manifest,
+            events: [...events, terminalEvent],
+            skillFaultEvents,
+            terminalEvent,
+          };
+        }
+
         let resumedPid = 0;
         if (opts.spawnResume !== false) {
           resumedPid = spawnResume(snapshot.run);
+          // Increment the per-run counter only when we actually spawned a
+          // resume — dry-run (spawnResume === false) doesn't burn the budget.
+          writeResumeCount(counterPath, priorCount + 1);
         }
         const terminalEvent = runEvent(
           "RUN_RESUMED",
           snapshot,
           resumedPid > 0
-            ? `stale run auto-resumed as pid ${resumedPid}`
+            ? `stale run auto-resumed as pid ${resumedPid} (attempt ${priorCount + 1}/${maxResumes})`
             : "stale run would be auto-resumed",
           now,
-          { resumeAttempted: true },
+          {
+            resumeAttempted: true,
+            resumeCount: priorCount + 1,
+            maxResumes,
+          },
         );
         return {
           manifest,
