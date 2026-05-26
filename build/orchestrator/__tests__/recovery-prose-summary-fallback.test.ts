@@ -208,6 +208,40 @@ describe("Bug F — prose-summary fallback behavior", () => {
     expect(result.errors).toEqual([]);
   });
 
+  it("T-F8: prose summary + NEW test file (status `A`) via `git add` + roleId=test-writer → accepted", async () => {
+    // Pre-landing review (PR #105) flagged that the original M/R-only
+    // filter missed the most common test-writer output shape: a
+    // brand-new test file staged via `git add`. Git porcelain reports
+    // that as `A ` (added). After the broadening to `!/^[?!]/`, this
+    // case must work end-to-end.
+    const before = captureGitSnapshot(cwd);
+    fs.writeFileSync(
+      path.join(cwd, "test", "new-feature.test.ts"),
+      "// new test from test-writer\nit('new behavior', () => {});\n",
+    );
+    spawnSync("git", ["add", "test/new-feature.test.ts"], { cwd });
+    const outputFilePath = path.join(tmpDir, "agent-output.md");
+    fs.writeFileSync(
+      outputFilePath,
+      "Added a new test for the behavior. Done.\n",
+    );
+    const result = await recoverMutableAgentCommit({
+      cwd,
+      before,
+      outputFilePath,
+      label: "test-writer",
+      roleId: "test-writer",
+    });
+    expect(result.recovered).toBe(true);
+    expect(result.commit).toBeDefined();
+    const log = spawnSync(
+      "git",
+      ["log", "-1", "--name-only", "--format="],
+      { cwd, encoding: "utf8" },
+    );
+    expect(log.stdout).toContain("test/new-feature.test.ts");
+  });
+
   it("T-F7: untracked-only dirty tree → fallback does NOT fire (sibling-repo regression guard)", async () => {
     const before = captureGitSnapshot(cwd);
     // Agent left untracked scratch (?? status) — this is the
@@ -242,28 +276,45 @@ describe("Bug F — prose-summary fallback behavior", () => {
 });
 
 describe("Bug F — static-grep wiring guards", () => {
-  it("T-F6a: cli.ts recoverMutableAgentCommit has the modified-only fallback block", () => {
+  it("T-F6a: cli.ts recoverMutableAgentCommit has the tracked-changes fallback block", () => {
     // The fallback block must be inside recoverMutableAgentCommit and
-    // must use modifiedOrRenamedPaths (NOT raw dirtyPaths). A future
-    // refactor that drops the modified-only filter would silently
+    // must use trackedChangePaths (NOT raw dirtyPaths). A future
+    // refactor that drops the tracked-only filter would silently
     // regress to the untracked-files-get-committed bug class.
-    expect(cliContent).toContain("modifiedOrRenamedPaths");
+    expect(cliContent).toContain("trackedChangePaths");
     expect(cliContent).toMatch(
-      /modifiedOrRenamedPaths\.size\s*>\s*0/,
+      /trackedChangePaths\.size\s*>\s*0/,
     );
     expect(cliContent).toMatch(
-      /falling back to.*modified path\(s\) from git status/,
+      /falling back to.*tracked change\(s\) from git status/,
     );
     // Untracked-not-staged guarantee must appear in the warning so
     // operators reading logs understand the bounded fallback.
     expect(cliContent).toContain("untracked files NOT auto-staged");
   });
 
-  it("T-F6b: modified-paths filter matches `M` and `R` status (not `??`)", () => {
-    // The regex/filter that builds modifiedOrRenamedPaths must include
-    // M (modified) and R (renamed) — both are intentional changes the
-    // agent made to tracked files. Untracked (??) is intentionally
-    // excluded.
-    expect(cliContent).toMatch(/\/\^\[MR\]\/|MR.*filter|filter.*MR/s);
+  it("T-F6b: tracked-change filter excludes `??` (untracked) and `!!` (ignored)", () => {
+    // The regex that builds trackedChangePaths must use the
+    // exclusion form `!/^[?!]/.test(line)` — anything that's NOT
+    // untracked-or-ignored is a tracked change worth recovering.
+    // This includes A (added), M (modified), D (deleted), R (renamed),
+    // C (copied), T (type-changed) — every intentional agent action
+    // on the index or worktree. A future refactor that drops to
+    // M/R-only would re-introduce the "test-writer wrote new file
+    // via `git add`, fallback missed it" bug class flagged in
+    // pre-landing review.
+    expect(cliContent).toMatch(/!\/\^\[\?!\]\//);
+    // Negative assertion: the original M-and-R-only regex is gone.
+    expect(cliContent).not.toMatch(/\/\^\[MR\]\/\.test\(line\)/);
+  });
+
+  it("T-F6c: fallback sorts the file list for deterministic commit ordering", () => {
+    // Without `.sort()`, Set insertion order leaks into the staged
+    // path order, which is non-deterministic across OS/locale for
+    // non-ASCII filenames. extractSummaryFilePaths already sorts;
+    // the fallback must match for cross-run reproducibility.
+    expect(cliContent).toMatch(
+      /Array\.from\(trackedChangePaths\)[\s\S]{0,400}\.sort\(\)/,
+    );
   });
 });

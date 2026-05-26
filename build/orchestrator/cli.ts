@@ -3004,15 +3004,21 @@ export async function recoverMutableAgentCommit(opts: {
   }
 
   const dirtyPaths = new Set(after.status.map(parsePorcelainPath));
-  // Bug F fallback (next block) gates on MODIFIED-only — collect that
-  // subset here. Git porcelain status starts with the XY columns
-  // (e.g., ` M `, `M `, `MM`, `??`). Modified = first char is `M` AND
-  // not `??` (untracked). Renames (`R `) are also intentional changes;
-  // include them. Untracked (`??`) is excluded — agents leave scratch
-  // files (e.g., `stray.txt`) that the hygiene gate correctly rejects.
-  const modifiedOrRenamedPaths = new Set(
+  // Bug F fallback (next block) gates on TRACKED changes only — collect
+  // that subset here. Git porcelain status starts with the XY columns
+  // (e.g., ` M `, `M `, `MM`, `A `, ` D`, `R `, `??`, `!!`). Tracked
+  // changes are anything an agent intentionally did: A=added (most
+  // common: new test file via `git add`), M=modified, D=deleted,
+  // R=renamed, C=copied, T=type-changed. Untracked (`??`) and ignored
+  // (`!!`) are excluded — agents leave scratch artifacts (e.g.,
+  // `stray.txt`) that the hygiene gate correctly rejects, and `!!` is
+  // never the agent's intent. This filter is the AT-MOST-ONE-LINE
+  // tightening that turned the original M/R-only regex (which missed
+  // brand-new test files from test-writer, the most common Bug F shape)
+  // into a complete tracked-change filter.
+  const trackedChangePaths = new Set(
     after.status
-      .filter((line) => /^[MR]/.test(line) || /^.[MR]/.test(line))
+      .filter((line) => !/^[?!]/.test(line) && line.length >= 3)
       .map(parsePorcelainPath),
   );
   let files = extractSummaryFilePaths(summary, opts.cwd).filter(
@@ -3025,22 +3031,24 @@ export async function recoverMutableAgentCommit(opts: {
   // backtick-quoted paths or markdown links, extractSummaryFilePaths
   // returns []. The agent's WORK is still in git status — recovery should
   // stage what the worktree actually changed, not what the summary's
-  // formatting happens to surface. Fall back to MODIFIED paths from git
-  // status (NOT untracked — agents leave scratch artifacts that the
-  // hygiene gate correctly rejects). The downstream role-id refusal
-  // (test-writer non-test boundary from PR #102) still applies, so this
-  // can't bypass the role boundary. The empty-summary gate at line 3002
-  // stays authoritative — agents that wrote nothing get no fallback
-  // recovery. See
+  // formatting happens to surface. Fall back to TRACKED changes from
+  // git status (NOT untracked/ignored — agents leave scratch artifacts
+  // that the hygiene gate correctly rejects). The downstream role-id
+  // refusal (test-writer non-test boundary from PR #102) still applies,
+  // so this can't bypass the role boundary. The empty-summary gate at
+  // line 3002 stays authoritative — agents that wrote nothing get no
+  // fallback recovery. See
   // ~/.claude/plans/fix-recovery-path-extraction-prose-summaries.md.
-  if (files.length === 0 && modifiedOrRenamedPaths.size > 0) {
-    files = Array.from(modifiedOrRenamedPaths).filter((filePath) => {
-      const abs = path.join(opts.cwd, filePath);
-      return fs.existsSync(abs);
-    });
+  if (files.length === 0 && trackedChangePaths.size > 0) {
+    files = Array.from(trackedChangePaths)
+      .filter((filePath) => {
+        const abs = path.join(opts.cwd, filePath);
+        return fs.existsSync(abs);
+      })
+      .sort();
     if (files.length > 0) {
       console.warn(
-        `[${opts.label}] recovery: summary lacks parseable file paths; falling back to ${files.length} modified path(s) from git status (untracked files NOT auto-staged)`,
+        `[${opts.label}] recovery: summary lacks parseable file paths; falling back to ${files.length} tracked change(s) from git status (untracked files NOT auto-staged)`,
       );
     }
   }
