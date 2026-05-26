@@ -3027,6 +3027,62 @@ export async function recoverMutableAgentCommit(opts: {
     }
   }
 
+  // Leg 2 of the test-writer role-drift structural fix: when the recovery
+  // is happening for the test-writer role, REFUSE to stage any file that
+  // doesn't look like a test path. The role-agnostic recovery path used to
+  // happily commit production-code mutations (e.g. postgres-idempotency.ts)
+  // when the agent's output summary listed them, satisfying the hygiene
+  // gate's "did HEAD move?" check but failing two phases later at
+  // VERIFY_RED as the misleading RED_SPEC_EXHAUSTED. Refusing at recovery
+  // time means the drift surfaces immediately with attribution to the
+  // test-writer role, not deferred to a downstream gate with the wrong
+  // suggested fix.
+  //
+  // The regex matches the same conventions the orchestrator already uses
+  // for testWriterTouchedPaths inference: test/, tests/, __tests__/,
+  // spec/, specs/ directories AND *.test.* / *.spec.* file basenames.
+  // Mixed test+non-test stagedPaths are also refused (strict) — a
+  // legitimate test-writer commit may touch fixtures and helpers under
+  // test/ but should NEVER touch production source files. If a future
+  // need arises to soften this (e.g., allowing schema-only fixture
+  // updates in production paths), thread an override through the
+  // recovery options rather than relaxing the regex here.
+  //
+  // See ~/.claude/plans/fix-test-writer-role-drift-structural.md leg 2.
+  if (opts.roleId === "test-writer") {
+    const TEST_PATH_RE = /(^|\/)(__tests__|test|tests|spec|specs)\//i;
+    const TEST_FILE_RE = /\.(test|spec)\.[a-z]+$/i;
+    const isTestPath = (p: string) =>
+      TEST_PATH_RE.test(p) || TEST_FILE_RE.test(p);
+    const nonTestPaths = stagedPaths.filter((p) => !isTestPath(p));
+    if (nonTestPaths.length > 0) {
+      const sample = nonTestPaths.slice(0, 5).join(", ");
+      const moreSuffix =
+        nonTestPaths.length > 5 ? ` (+${nonTestPaths.length - 5} more)` : "";
+      return {
+        recovered: false,
+        errors: [
+          `test-writer recovery REFUSED: agent's output summary listed ` +
+            `${nonTestPaths.length} non-test file(s): ${sample}${moreSuffix}. ` +
+            `The test-writer role may ONLY edit files under __tests__/, test/, ` +
+            `tests/, spec/, specs/, or matching *.test.* / *.spec.*. This is ` +
+            `role drift — the agent wrote a production-code implementation ` +
+            `instead of failing tests. Phase aborted; the working tree is left ` +
+            `as-is so you can inspect what the agent produced.\n\n` +
+            `Recovery options:\n` +
+            `  1. Re-run with --mark-phase-committed <phase> if you accept the ` +
+            `agent's production-code output and want the phase marked done ` +
+            `(skips VERIFY_RED for this phase).\n` +
+            `  2. Edit the plan to clarify "write tests for X" instead of ` +
+            `"implement X" — the role-drift pattern is most acute when the ` +
+            `phase title contains imperative verbs like "Implement", "Build", ` +
+            `or "Add". Then re-run gstack-build to retry the phase.`,
+        ],
+        cleaned: [],
+      };
+    }
+  }
+
   const add = spawnSync("git", ["add", "--", ...stagedPaths], {
     cwd: opts.cwd,
     encoding: "utf8",
