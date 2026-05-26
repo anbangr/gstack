@@ -8245,16 +8245,55 @@ async function runPhase(args: {
           if (diff.status === 0 && typeof diff.stdout === "string") {
             const TEST_PATH_RE = /(^|\/)(__tests__|test|tests|spec|specs)\//i;
             const TEST_FILE_RE = /\.(test|spec)\.[a-z]+$/i;
-            const touched = diff.stdout
+            const isTestPath = (p: string) =>
+              TEST_PATH_RE.test(p) || TEST_FILE_RE.test(p);
+            const allCommitted = diff.stdout
               .split("\n")
               .map((p) => p.trim())
-              .filter(
-                (p) =>
-                  p.length > 0 &&
-                  (TEST_PATH_RE.test(p) || TEST_FILE_RE.test(p)),
-              );
+              .filter((p) => p.length > 0);
+            const touched = allCommitted.filter(isTestPath);
             if (touched.length > 0) {
               phaseState = { ...phaseState, testWriterTouchedPaths: touched };
+            } else if (allCommitted.length > 0) {
+              // Leg 3 of the test-writer role-drift structural fix
+              // (defense in depth). Leg 2 (recovery refusal) closes the
+              // common drift path where the agent leaves dirty files and
+              // the recovery commits them. But the test-writer agent runs
+              // under --yolo file tools and CAN call `git commit` directly,
+              // bypassing the recovery path entirely. If it does so AND
+              // commits zero test files, the hygiene gate's HEAD-moved
+              // check passes (HEAD did move) but the actual contents are
+              // wrong. This branch catches that case post-commit and fails
+              // the phase with the same TEST_WRITER_NO_TEST_FILES_COMMITTED
+              // error class the bug report's hotfix surfaced. See
+              // ~/.claude/plans/fix-test-writer-role-drift-structural.md
+              // leg 3.
+              const sample = allCommitted.slice(0, 6).join(", ");
+              const moreCount = Math.max(0, allCommitted.length - 6);
+              const moreSuffix = moreCount > 0 ? ` (+${moreCount} more)` : "";
+              const errorMsg =
+                `TEST_WRITER_NO_TEST_FILES_COMMITTED at iteration ` +
+                `${action.iteration}: the test-writer committed ` +
+                `${allCommitted.length} file(s) but NONE match test paths ` +
+                `(__tests__/, test/, tests/, spec/, specs/, *.test.*, ` +
+                `*.spec.*).\n` +
+                `Drifted files: ${sample}${moreSuffix}\n` +
+                `This is role drift — the agent committed production code ` +
+                `directly (bypassing the recovery path) instead of writing ` +
+                `failing tests. Recovery options:\n` +
+                `  1. Run gstack-build with --mark-phase-committed <phase> ` +
+                `if you accept the agent's production-code output and want ` +
+                `the phase marked done.\n` +
+                `  2. Reset to before the bogus commit:\n` +
+                `       cd ${cwd}\n` +
+                `       git reset --hard HEAD~1\n` +
+                `     Then re-run with a clarified phase description ` +
+                `("write tests for X" rather than "implement X").`;
+              phaseState = {
+                ...phaseState,
+                status: "failed",
+                error: errorMsg,
+              };
             }
           }
         } catch {
