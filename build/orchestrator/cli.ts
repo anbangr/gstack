@@ -6681,12 +6681,21 @@ function countCommitsSinceBase(
  * startup `--reset-phase N` flag but operates on a single phase by
  * index for mid-run reset.
  *
+ * When `opts.featureReviewOutputPath` is set (called from FEATURE_REDO
+ * dispatch), the path is persisted on the phase state's
+ * `pendingFeatureReviewOutputPath` field so the next primary-impl
+ * dispatch can thread the reviewer's findings into the impl prompt.
+ * Without this, FEATURE_REDO loops endlessly: impl sees no findings,
+ * makes no commit, hygiene gate rejects. See Bug A in
+ * ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
+ *
  * Exported for testability (T7 unit tests). Internal callers in cli.ts
  * still use it via the same name.
  */
 export function resetPhaseStateForRedo(
   state: BuildState,
   phaseIndex: number,
+  opts?: { featureReviewOutputPath?: string },
 ): void {
   const ps = state.phases[phaseIndex];
   if (!ps) return;
@@ -6702,6 +6711,11 @@ export function resetPhaseStateForRedo(
   delete (ps as any).error;
   delete (ps as any).redSpecAttempts;
   delete (ps as any).dualImpl;
+  if (opts?.featureReviewOutputPath) {
+    ps.pendingFeatureReviewOutputPath = opts.featureReviewOutputPath;
+  } else {
+    delete (ps as any).pendingFeatureReviewOutputPath;
+  }
 }
 
 /**
@@ -7483,7 +7497,13 @@ async function runFeatureReviewIteration(args: {
         return { verdict, action: "unclear", outputFilePath };
       }
       for (const i of targets) {
-        resetPhaseStateForRedo(args.state, i);
+        // Thread the feature-review output file into each reset phase so
+        // the next primary-impl dispatch can read the reviewer's findings
+        // and address them. Closes Bug A in
+        // ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
+        resetPhaseStateForRedo(args.state, i, {
+          featureReviewOutputPath: outputFilePath,
+        });
       }
       fr.phasesReset = targets;
       saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });

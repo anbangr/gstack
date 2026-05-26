@@ -361,6 +361,22 @@ export interface PhaseState {
    * field stays undefined and downstream consumers must tolerate that.
    */
   committedSha?: string;
+  /**
+   * Path to the feature-review output file that triggered a FEATURE_REDO
+   * reset for this phase. Set by `resetPhaseStateForRedo` when the
+   * FEATURE_REDO dispatch resets a phase; read by the next primary-impl
+   * dispatch which threads the findings into `buildGeminiPromptBody`'s
+   * `reviewFeedback` parameter. Cleared after the impl call returns
+   * (success OR failure — either way, the findings have been delivered
+   * and the field has served its purpose). Closes the FEATURE_REDO
+   * hygiene-deadlock bug class (MANUAL_INVESTIGATION:0:b335a492 /
+   * efe61aab) where impl saw no findings, made no commit, and the
+   * hygiene gate rejected "did not create a new commit".
+   *
+   * See ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md
+   * Bug A.
+   */
+  pendingFeatureReviewOutputPath?: string;
   error?: string;
   /**
    * Structured failure evidence by role name. Populated when a role subprocess
