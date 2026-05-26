@@ -6343,7 +6343,28 @@ export async function applyMutableAgentHygiene(opts: {
     ...recovery.errors,
     ...checks.flatMap((check) => check.errors),
   ];
-  if (errors.length === 0) return opts.result;
+  if (errors.length === 0) {
+    // Bug E Leg 2 — when sandbox-blocked recovery succeeded, opts.result
+    // still carries the agent's non-zero exit code (Codex itself exited
+    // non-zero because its git commit failed). Returning that unchanged
+    // would make the caller mark the phase as failed despite the recovery
+    // commit landing cleanly. Synthesize a success result that preserves
+    // the original log path and recovery's commit info, but flips
+    // exitCode to 0 so downstream phase routing treats it as a success.
+    if (sandboxBlockedCommit && recovery.recovered) {
+      return {
+        ...opts.result,
+        exitCode: 0,
+        stderr: "",
+        stdout:
+          (opts.result.stdout ?? "") +
+          (recovery.commit
+            ? `\n\n[hygiene] codex sandbox blocked commit; host-side recovery committed as ${recovery.commit}.`
+            : ""),
+      };
+    }
+    return opts.result;
+  }
   // NO_CHANGES_NEEDED sentinel — opt-in for review re-runs. When the ONLY
   // remaining hygiene error is the no-new-commit one AND the agent wrote
   // `NO_CHANGES_NEEDED` on its own line in the output summary, treat as
