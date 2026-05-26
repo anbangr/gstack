@@ -45,8 +45,12 @@ describe("extractTestCount — T1-T7 core cases", () => {
         },
       }),
     );
-    const stdout = "========================= test session starts =========================\n";
-    const result = extractTestCount({ stdout, jsonReportPath: jsonPath }, "pytest");
+    const stdout =
+      "========================= test session starts =========================\n";
+    const result = extractTestCount(
+      { stdout, jsonReportPath: jsonPath },
+      "pytest",
+    );
     expect(result.collected).toBe(7);
     expect(result.source).toBe("json");
   });
@@ -103,7 +107,7 @@ describe("extractTestCount — T1-T7 core cases", () => {
     expect(result.collected).toBeGreaterThanOrEqual(1);
   });
 
-  // T7: unrecognized runner
+  // T7: unrecognized runner with no parseable output
   test("T7: unrecognized runner → collected 0, source=stdout-fallback, warning", () => {
     const stdout = "some output";
     const warnSpy: string[] = [];
@@ -119,6 +123,63 @@ describe("extractTestCount — T1-T7 core cases", () => {
     } finally {
       console.warn = originalWarn;
     }
+  });
+
+  // T8: unrecognized runner WITH parseable vitest JSON → fallback recovers
+  test("T8: unknown runner + vitest JSON in stdout → fallback recovers, source=stdout-fallback-auto", () => {
+    const stdout = JSON.stringify({
+      numTotalTests: 14,
+      numPassedTests: 14,
+      numFailedTests: 0,
+    });
+    const result = extractTestCount({ stdout }, "unknown" as RunnerKind);
+    expect(result.collected).toBe(14);
+    expect(result.passed).toBe(14);
+    expect(result.failed).toBe(0);
+    expect(result.source).toBe("stdout-fallback-auto");
+  });
+
+  // T9: wrapper-script case — runner detected as bun, output is vitest JSON
+  test("T9: runner=bun + vitest JSON in stdout → fallback recovers count", () => {
+    const stdout = JSON.stringify({
+      numTotalTests: 14,
+      numPassedTests: 14,
+      numFailedTests: 0,
+    });
+    // Simulates `bun run test` resolving to runner="bun" but the underlying
+    // tool being vitest (bun stdout parser sees no `Ran N tests` banner).
+    const result = extractTestCount({ stdout }, "bun");
+    expect(result.collected).toBe(14);
+    expect(result.source).toBe("stdout-fallback-auto");
+  });
+
+  // T10: unknown runner with vitest summary line (no JSON) → fallback recovers
+  test("T10: unknown runner + vitest summary line → fallback recovers via stdout regex", () => {
+    const stdout = "\nTests  14 passed (14)\n";
+    const result = extractTestCount({ stdout }, "unknown" as RunnerKind);
+    expect(result.collected).toBe(14);
+    expect(result.passed).toBe(14);
+    expect(result.source).toBe("stdout-fallback-auto");
+  });
+
+  // T11: unknown runner with zero parseable signal → preserves zero return
+  test("T11: unknown runner + empty stdout → preserves zero result (no fallback recovery)", () => {
+    const stdout = "";
+    const result = extractTestCount({ stdout }, "unknown" as RunnerKind);
+    expect(result.collected).toBe(0);
+    expect(result.source).toBe("stdout-fallback");
+  });
+
+  // T12: known runner reporting zero via JSON → trust JSON, no fallback override
+  test("T12: vitest JSON with numTotalTests=0 → trust the zero, no fallback override", () => {
+    const stdout = JSON.stringify({
+      numTotalTests: 0,
+      numPassedTests: 0,
+      numFailedTests: 0,
+    });
+    const result = extractTestCount({ stdout }, "vitest");
+    expect(result.collected).toBe(0);
+    expect(result.source).toBe("json");
   });
 });
 
@@ -136,7 +197,11 @@ describe("extractTestCount — edge cases", () => {
     const stdout = [
       "some setup log",
       "console.log from test harness",
-      JSON.stringify({ numTotalTests: 5, numPassedTests: 3, numFailedTests: 2 }),
+      JSON.stringify({
+        numTotalTests: 5,
+        numPassedTests: 3,
+        numFailedTests: 2,
+      }),
     ].join("\n");
     const result = extractTestCount({ stdout }, "vitest");
     expect(result.source).toBe("json");
@@ -251,7 +316,11 @@ describe("extractTestCount — edge cases", () => {
   test("edge: vitest skips invalid brace-like stdout before JSON", () => {
     const stdout = [
       "{not valid json}",
-      JSON.stringify({ numTotalTests: 3, numPassedTests: 3, numFailedTests: 0 }),
+      JSON.stringify({
+        numTotalTests: 3,
+        numPassedTests: 3,
+        numFailedTests: 0,
+      }),
     ].join("\n");
 
     const result = extractTestCount({ stdout }, "vitest");
@@ -300,7 +369,11 @@ describe("extractTestCount — edge cases", () => {
   test("edge: malformed JSON output falls back to stdout regex", () => {
     const stdout =
       "{not valid json}\n" +
-      JSON.stringify({ numTotalTests: 3, numPassedTests: 3, numFailedTests: 0 });
+      JSON.stringify({
+        numTotalTests: 3,
+        numPassedTests: 3,
+        numFailedTests: 0,
+      });
     const result = extractTestCount({ stdout }, "vitest");
     expect(result.source).toBe("json");
     expect(result.collected).toBe(3);
@@ -362,8 +435,7 @@ describe("extractTestCount — edge cases", () => {
 
   test("edge: mixed stdout and stderr for runner summary", () => {
     const stdout = "bun test v1.3.12\n";
-    const stderr =
-      " 2 pass\n 1 fail\nRan 3 tests across 1 file. [22.00ms]\n";
+    const stderr = " 2 pass\n 1 fail\nRan 3 tests across 1 file. [22.00ms]\n";
     const result = extractTestCount({ stdout, stderr }, "bun");
     expect(result.source).toBe("stdout-fallback");
     expect(result.collected).toBe(3);

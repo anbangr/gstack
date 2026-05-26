@@ -1,18 +1,12 @@
 import * as fs from "node:fs";
 
-export type RunnerKind =
-  | "vitest"
-  | "pytest"
-  | "jest"
-  | "bun"
-  | "mocha"
-  | "go";
+export type RunnerKind = "vitest" | "pytest" | "jest" | "bun" | "mocha" | "go";
 
 export interface TestCountResult {
   collected: number;
   passed: number;
   failed: number;
-  source: "json" | "stdout-fallback";
+  source: "json" | "stdout-fallback" | "stdout-fallback-auto";
 }
 
 export interface RunnerResult {
@@ -53,8 +47,7 @@ function objectField(
 
 function countSummary(summary: Record<string, unknown>): TestCountResult {
   const passed = numberField(summary, "passed");
-  const failed =
-    numberField(summary, "failed") + numberField(summary, "error");
+  const failed = numberField(summary, "failed") + numberField(summary, "error");
   return {
     collected:
       numberField(summary, "collected") || numberField(summary, "total"),
@@ -65,7 +58,9 @@ function countSummary(summary: Record<string, unknown>): TestCountResult {
 }
 
 /** Find the first parseable line that looks like a JSON object ({...}). */
-function findJsonObjectLine(stdout: string): Record<string, unknown> | undefined {
+function findJsonObjectLine(
+  stdout: string,
+): Record<string, unknown> | undefined {
   const lines = stdout.split(/\r?\n/);
   for (const line of lines) {
     const trimmed = line.trim();
@@ -133,8 +128,10 @@ function parseBunCoverageJson(coveragePath: string): TestCountResult | null {
       (data as Record<string, unknown>).results &&
       typeof (data as Record<string, unknown>).results === "object"
     ) {
-      const results = (data as Record<string, unknown>)
-        .results as Record<string, unknown>;
+      const results = (data as Record<string, unknown>).results as Record<
+        string,
+        unknown
+      >;
       if (typeof results.numTotalTests === "number") {
         return {
           collected: results.numTotalTests,
@@ -206,7 +203,9 @@ function parsePytestStdout(stdout: string): TestCountResult {
     (failedMatch ? parseInt(failedMatch[1], 10) : 0) +
     (errorMatch ? parseInt(errorMatch[1], 10) : 0);
   return {
-    collected: collectedMatch ? parseInt(collectedMatch[1], 10) : passed + failed,
+    collected: collectedMatch
+      ? parseInt(collectedMatch[1], 10)
+      : passed + failed,
     passed,
     failed,
     source: "stdout-fallback",
@@ -262,50 +261,95 @@ function parseJestStdout(stdout: string): TestCountResult {
   return { collected: 0, passed: 0, failed: 0, source: "stdout-fallback" };
 }
 
+/**
+ * Best-effort scan over every stdout/JSON parser, returning the first
+ * non-zero result. Used in two places:
+ *   1. When the named runner is "unknown" (the keyword detector in
+ *      phase-runner.ts couldn't classify a wrapper command like
+ *      `sh scripts/test.sh`, `make test`, `npm test`).
+ *   2. When the named runner returned a zero count but its source
+ *      wasn't a strong JSON signal — covers the case where the resolved
+ *      runner is `bun` (matched `bun run test`) but the underlying tool
+ *      is actually vitest, so the bun stdout parser sees no `Ran N tests`
+ *      banner and reports zero. Vitest JSON / stdout would have caught it.
+ *
+ * Returns null when no parser recovers a non-zero count. The caller
+ * preserves its original zero result in that case (genuine "no tests ran").
+ */
+function tryFallbackParsers(output: string): TestCountResult | null {
+  const attempts: Array<() => TestCountResult | null> = [
+    () => parseVitestJson(output),
+    () => parseJestJson(output),
+    () => parseVitestStdout(output),
+    () => parseJestStdout(output),
+    () => parsePytestStdout(output),
+    () => parseBunStdout(output),
+    () => parseMochaStdout(output),
+    () => parseGoStdout(output),
+  ];
+  for (const attempt of attempts) {
+    const result = attempt();
+    if (result && result.collected > 0) {
+      return { ...result, source: "stdout-fallback-auto" };
+    }
+  }
+  return null;
+}
+
 export function extractTestCount(
   runnerResult: RunnerResult,
   runner: RunnerKind | string,
 ): TestCountResult {
   const output = combinedOutput(runnerResult);
+  let primary: TestCountResult | null = null;
   switch (runner) {
     case "vitest": {
       const json = parseVitestJson(output);
-      if (json) return json;
-      return parseVitestStdout(output);
+      primary = json ?? parseVitestStdout(output);
+      break;
     }
     case "pytest": {
       if (runnerResult.jsonReportPath) {
         try {
           const json = parsePytestJson(runnerResult.jsonReportPath);
-          if (json) return json;
+          if (json) primary = json;
         } finally {
           fs.rmSync(runnerResult.jsonReportPath, { force: true });
         }
       }
-      return parsePytestStdout(output);
+      primary = primary ?? parsePytestStdout(output);
+      break;
     }
     case "jest": {
       const json = parseJestJson(output);
-      if (json) return json;
-      return parseJestStdout(output);
+      primary = json ?? parseJestStdout(output);
+      break;
     }
     case "bun": {
       if (runnerResult.coverageJsonPath) {
         const json = parseBunCoverageJson(runnerResult.coverageJsonPath);
-        if (json) return json;
+        if (json) primary = json;
       }
-      return parseBunStdout(output);
+      primary = primary ?? parseBunStdout(output);
+      break;
     }
     case "mocha": {
-      return parseMochaStdout(output);
+      primary = parseMochaStdout(output);
+      break;
     }
     case "go": {
-      return parseGoStdout(output);
+      primary = parseGoStdout(output);
+      break;
     }
     default: {
+      // Unknown runner: don't run any single named parser. Fall through to
+      // the best-effort scan. Warn once so the diagnostic surfaces in build
+      // logs — distinguishes "we never parsed" from "we parsed and got 0".
       console.warn(
-        `[extractTestCount] unrecognized runner "${runner}"; returning zero count with stdout-fallback`,
+        `[extractTestCount] unrecognized runner "${runner}"; attempting best-effort fallback scan`,
       );
+      const fallback = tryFallbackParsers(output);
+      if (fallback) return fallback;
       return {
         collected: 0,
         passed: 0,
@@ -314,4 +358,20 @@ export function extractTestCount(
       };
     }
   }
+  // Bug A — wrapper-script case: the named parser returned a zero count
+  // from stdout (not from a strong JSON signal). Some wrappers route a
+  // different underlying runner's output through; try every parser and
+  // adopt the first non-zero recovery. If the primary parse already saw
+  // tests OR pulled a strong JSON signal (vitest/jest/pytest/bun JSON),
+  // trust it — JSON's `numTotalTests: 0` is an authoritative "no tests".
+  if (primary.source !== "json" && primary.collected === 0) {
+    const fallback = tryFallbackParsers(output);
+    if (fallback) {
+      console.warn(
+        `[extractTestCount] runner "${runner}" returned 0 from stdout; fallback parsers recovered ${fallback.collected} test(s) — check that the resolved test command matches the actual runner`,
+      );
+      return fallback;
+    }
+  }
+  return primary;
 }
