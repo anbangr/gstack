@@ -418,8 +418,18 @@ interface HeartbeatSidecar {
 }
 
 interface HeartbeatTracker {
+  /**
+   * Retained for backwards-compat with pre-fix tracker files on disk. Read
+   * but no longer compared — `stateLastUpdatedAt` is a write timestamp that
+   * gets touched on every state rewrite (including no-op rewrites from
+   * auto-resume), so it cannot be used as a progress signal. The tracker
+   * upgrades silently: pre-fix files still parse, the field is preserved
+   * on write for forward-compat, but the moved-check ignores it.
+   */
   lastSeenStateLastUpdatedAt?: string;
   lastSeenDrainProcessedCount?: number;
+  /** Phase index seen on the last sidecar tick. Phase advance = real progress. */
+  lastSeenPhase?: number;
   /** Wall-clock ms when either of the tracked signals last changed. */
   lastChangedAt: number;
 }
@@ -550,15 +560,30 @@ export function evaluateHeartbeatStall(
   const trackerPath = heartbeatTrackerPath(stateDir, run.stateSlug);
   const tracker = readHeartbeatTracker(trackerPath);
 
+  // Progress-signal selection: only `drainProcessedCount` and `phase` count as
+  // real work. `stateLastUpdatedAt` was the original signal but is a write
+  // timestamp — it ticks on every state rewrite, including the no-op rewrite
+  // performed by spawnResume when it loads saved state into a fresh process.
+  // That allowed the watchdog to be permanently reset by auto-resume cycles.
+  // The check below compares only monotonic-progress signals; the
+  // timestamp is still preserved on the tracker for diagnostic purposes.
+  //
+  // Phase comparison is gated on `tracker.lastSeenPhase !== undefined` so
+  // pre-fix tracker files (which never recorded phase) keep working — they
+  // fall back to drainProcessedCount-only comparison. Once the monitor writes
+  // a fresh tracker on disk, `lastSeenPhase` is populated and the full
+  // comparison takes effect.
   const moved =
     !tracker ||
-    sidecar.stateLastUpdatedAt !== tracker.lastSeenStateLastUpdatedAt ||
-    sidecar.drainProcessedCount !== tracker.lastSeenDrainProcessedCount;
+    sidecar.drainProcessedCount !== tracker.lastSeenDrainProcessedCount ||
+    (tracker.lastSeenPhase !== undefined &&
+      sidecar.phase !== tracker.lastSeenPhase);
 
   if (moved || !tracker) {
     writeHeartbeatTracker(trackerPath, {
       lastSeenStateLastUpdatedAt: sidecar.stateLastUpdatedAt,
       lastSeenDrainProcessedCount: sidecar.drainProcessedCount,
+      lastSeenPhase: sidecar.phase,
       lastChangedAt: nowMs,
     });
     return { sidecar, stalledMs: 0 };
@@ -837,7 +862,8 @@ export function evaluateMonitorOnce(
   const skillFaultEvents: SkillFaultEvent[] = [];
   const registryDir = opts.activeFaultRegistryDir;
   const buildStallThresholdMs =
-    opts.buildStallThresholdMs ?? readBuildStallThresholdMs(opts.gstackConfigBin);
+    opts.buildStallThresholdMs ??
+    readBuildStallThresholdMs(opts.gstackConfigBin);
   try {
     const manifest = loadMonitorManifest(opts.manifestPath);
     const events: MonitorEvent[] = [];

@@ -601,9 +601,7 @@ describe("evaluateMonitorOnce", () => {
     });
 
     expect(result.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
-    expect(result.terminalEvent.message).toContain(
-      "state has not advanced",
-    );
+    expect(result.terminalEvent.message).toContain("state has not advanced");
     void run;
   });
 
@@ -856,6 +854,172 @@ describe("evaluateMonitorOnce", () => {
       gstackConfigBin: "",
     });
     expect(over.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
+  });
+
+  it("STALL ARM: stateLastUpdatedAt advance is NOT progress (spawnResume tracker-reset regression)", () => {
+    // Regression: the original tracker `moved` check treated any change to
+    // sidecar.stateLastUpdatedAt as progress. spawnResume's resumed process
+    // loads saved state and writes a fresh `lastUpdatedAt` timestamp on
+    // bootstrap — without any actual work being done. Under the OLD code,
+    // that no-op rewrite reset the stall clock to 0. If a stall keeps
+    // triggering RUN_STALE → auto-resume cycles within the stall threshold,
+    // the watchdog could NEVER fire.
+    //
+    // After the fix: only drainProcessedCount and phase count as progress.
+    // stateLastUpdatedAt is still preserved on the tracker for diagnostics
+    // but is no longer compared.
+    const oldStateAt = "2026-05-08T00:00:00.000Z";
+    const newStateAt = "2026-05-08T00:10:00.000Z"; // 10 min later (simulating spawnResume rewrite)
+    const { data, run } = setupRunWithSidecar(
+      // Current sidecar: stateLastUpdatedAt ADVANCED, but drainProcessedCount + phase frozen.
+      { stateLastUpdatedAt: newStateAt, drainProcessedCount: 0 },
+      {
+        freshStdoutAt: new Date("2026-05-08T00:30:00.000Z"),
+        stateAt: newStateAt,
+      },
+    );
+
+    // Pre-seed tracker as if observed 20 minutes ago, with the OLD
+    // stateLastUpdatedAt value. Under the OLD code: tracker.lastSeenStateLastUpdatedAt
+    // (oldStateAt) !== sidecar.stateLastUpdatedAt (newStateAt) → moved=true → reset → stalledMs=0 → no escalation.
+    // Under the FIX: drainProcessedCount unchanged, phase unchanged → moved=false → stalledMs = 20 min → escalates.
+    const trackerPath = path.join(
+      stateDir,
+      `${run.stateSlug}.heartbeat-track.json`,
+    );
+    fs.writeFileSync(
+      trackerPath,
+      JSON.stringify({
+        lastSeenStateLastUpdatedAt: oldStateAt,
+        lastSeenDrainProcessedCount: 0,
+        lastSeenPhase: 0,
+        lastChangedAt: Date.parse("2026-05-08T00:10:00.000Z"),
+      }),
+    );
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:30:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+      buildStallThresholdMs: 15 * 60 * 1000,
+    });
+
+    expect(result.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
+    expect(result.terminalEvent.message).toContain("state has not advanced");
+    void run;
+  });
+
+  it("STALL ARM: phase advance IS progress (resets stall clock)", () => {
+    // Counter-test for the regression above. When phase actually advances
+    // (real progress, not just a state rewrite), the stall clock must reset.
+    const stateAt = "2026-05-08T00:00:00.000Z";
+    const { data, run } = setupRunWithSidecar(
+      { stateLastUpdatedAt: stateAt, drainProcessedCount: 0 },
+      {
+        freshStdoutAt: new Date("2026-05-08T00:30:00.000Z"),
+        stateAt,
+      },
+    );
+
+    // Manually upgrade the sidecar to phase 2 (the setupRunWithSidecar helper
+    // hard-codes phase: 0). Pre-seed tracker with lastSeenPhase: 1 so the
+    // current sidecar represents real phase advancement.
+    const sidecarPath = path.join(stateDir, `${run.stateSlug}.heartbeat.json`);
+    const sidecar = JSON.parse(fs.readFileSync(sidecarPath, "utf-8"));
+    sidecar.phase = 2;
+    fs.writeFileSync(sidecarPath, JSON.stringify(sidecar));
+
+    const trackerPath = path.join(
+      stateDir,
+      `${run.stateSlug}.heartbeat-track.json`,
+    );
+    fs.writeFileSync(
+      trackerPath,
+      JSON.stringify({
+        lastSeenStateLastUpdatedAt: stateAt,
+        lastSeenDrainProcessedCount: 0,
+        lastSeenPhase: 1, // Phase 1 last poll, now phase 2 → moved → reset.
+        lastChangedAt: Date.parse("2026-05-08T00:10:00.000Z"),
+      }),
+    );
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:30:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+      buildStallThresholdMs: 15 * 60 * 1000,
+    });
+
+    // Phase advanced → tracker resets → no stall → RUN_RUNNING.
+    expect(result.terminalEvent.event).toBe("MONITOR_REENTER");
+    const runEvents = result.events.filter(
+      (e) => "runId" in e && e.runId === run.runId,
+    );
+    const last = runEvents[runEvents.length - 1];
+    expect(last.event).toBe("RUN_RUNNING");
+
+    // Tracker should now have lastSeenPhase: 2.
+    const updated = JSON.parse(fs.readFileSync(trackerPath, "utf-8"));
+    expect(updated.lastSeenPhase).toBe(2);
+  });
+
+  it("STALL ARM: pre-fix tracker without lastSeenPhase still works (backwards-compat)", () => {
+    // Trackers written before this fix don't have a lastSeenPhase field.
+    // The fix must not falsely reset such trackers (which would re-introduce
+    // the pre-fix no-fire behavior for a different reason).
+    const stateAt = "2026-05-08T00:00:00.000Z";
+    const { data, run } = setupRunWithSidecar(
+      { stateLastUpdatedAt: stateAt, drainProcessedCount: 0 },
+      {
+        freshStdoutAt: new Date("2026-05-08T00:30:00.000Z"),
+        stateAt,
+      },
+    );
+
+    // Pre-seed tracker with the OLD schema: no lastSeenPhase. Sidecar has
+    // phase=0 (set by setupRunWithSidecar). Under a naive check (`phase !==
+    // undefined`), this would treat the tracker as "moved" every tick. The
+    // gated check correctly treats absent lastSeenPhase as a no-op.
+    const trackerPath = path.join(
+      stateDir,
+      `${run.stateSlug}.heartbeat-track.json`,
+    );
+    fs.writeFileSync(
+      trackerPath,
+      JSON.stringify({
+        lastSeenStateLastUpdatedAt: stateAt,
+        lastSeenDrainProcessedCount: 0,
+        // Intentionally NO lastSeenPhase.
+        lastChangedAt: Date.parse("2026-05-08T00:10:00.000Z"),
+      }),
+    );
+
+    const result = evaluateMonitorOnce({
+      manifestPath: writeManifest(data),
+      now: new Date("2026-05-08T00:30:00.000Z"),
+      pollMs: 60_000,
+      spawnResume: false,
+      buildStallThresholdMs: 15 * 60 * 1000,
+    });
+
+    // Stall accumulated 20 min on the pre-fix tracker → escalates correctly.
+    expect(result.terminalEvent.event).toBe("USER_ACTION_REQUIRED");
+    expect(result.terminalEvent.message).toContain("state has not advanced");
+
+    // The tracker has been upgraded in place to include lastSeenPhase=0
+    // (or undefined → preserved as undefined; either is acceptable so long
+    // as subsequent ticks don't false-trigger). Verify the upgrade path
+    // doesn't double-write: writeHeartbeatTracker only fires on `moved`,
+    // and we just asserted no movement happened.
+    const trackerAfter = JSON.parse(fs.readFileSync(trackerPath, "utf-8"));
+    // lastChangedAt MUST be preserved from the original 00:10 timestamp, not
+    // bumped to "now" — that would mask the stall in a follow-up tick.
+    expect(trackerAfter.lastChangedAt).toBe(
+      Date.parse("2026-05-08T00:10:00.000Z"),
+    );
+    void run;
   });
 
   it("emits MONITOR_ERROR instead of crashing when the resume executable is missing", () => {
