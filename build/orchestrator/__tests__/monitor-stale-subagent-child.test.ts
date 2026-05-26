@@ -72,6 +72,34 @@ describe("Bug B leg 1 — hasActiveSubagentChild", () => {
       } catch {}
     }
   });
+
+  it("T-B1d: substring-named processes (mycodex-wrapper, kimichi) do NOT match (regression for the FP-vector tightening)", async () => {
+    // Adversarial review caught that `comm.includes("codex")` is a
+    // false-positive vector — a user script named `mycodex-wrapper`
+    // would silently suppress the stale alarm forever. The fix tightens
+    // to exact basename equality. This test pins that tightening.
+    const tmpDir = fs.mkdtempSync("/tmp/has-subagent-fp-test-");
+    const fakeBin = path.join(tmpDir, "mycodex-wrapper");
+    fs.copyFileSync("/bin/sleep", fakeBin);
+    fs.chmodSync(fakeBin, 0o755);
+    let child: ChildProcess | null = null;
+    try {
+      child = spawn(fakeBin, ["3"], { detached: false });
+      await new Promise((r) => setTimeout(r, 250));
+      // Despite the child basename containing "codex", the exact-match
+      // tightening means this should NOT be classified as a subagent.
+      expect(hasActiveSubagentChild(process.pid)).toBe(false);
+    } finally {
+      if (child && child.pid) {
+        try {
+          process.kill(child.pid);
+        } catch {}
+      }
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {}
+    }
+  });
 });
 
 describe("Bug B static-grep wiring guards", () => {

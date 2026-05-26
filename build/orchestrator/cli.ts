@@ -7988,26 +7988,48 @@ async function runPhase(args: {
         // observes the existing worktree code looks fine, makes no commit,
         // and the hygiene gate rejects "did not create a new commit" —
         // exactly the deadlock the bug report describes. Best-effort: if
-        // the findings file is missing/unreadable, fall through to the
-        // standard prompt with a warning rather than crash. The
+        // the findings file is missing/unreadable/out-of-scope, fall through
+        // to the standard prompt with a warning rather than crash. The
         // pendingFeatureReviewOutputPath field is cleared inside applyResult
         // (RUN_GEMINI branch) so a subsequent retry without a fresh
         // FEATURE_REDO sees no stale findings.
+        //
+        // Path containment + size cap (security): state.json is operator-
+        // editable, so the stored path is untrusted input from the read site's
+        // perspective. validateLogPathInScope ensures the read is bounded to
+        // logDir(slug); a tampered state pointing at ~/.ssh/id_rsa is rejected
+        // and the field is treated as missing. A 1 MiB read cap rejects
+        // pathological huge files before they hit memory. Both defenses match
+        // the convention used at other state-derived path reads (cli.ts:7115,
+        // 7625, 8113).
         let pendingFeatureFindings: string | null = null;
+        const FINDINGS_MAX_BYTES = 1024 * 1024;
         if (phaseState.pendingFeatureReviewOutputPath) {
-          try {
-            pendingFeatureFindings = fs.readFileSync(
-              phaseState.pendingFeatureReviewOutputPath,
-              "utf8",
-            );
-            console.log(
-              `  ↻ FEATURE_REDO: threading feature-review findings from ${phaseState.pendingFeatureReviewOutputPath} into impl prompt`,
-            );
-          } catch (err) {
+          const rawPath = phaseState.pendingFeatureReviewOutputPath;
+          const safePath = validateLogPathInScope(rawPath, state.slug);
+          if (!safePath) {
             console.warn(
-              `  ⚠ FEATURE_REDO: failed to read findings at ${phaseState.pendingFeatureReviewOutputPath} (${err instanceof Error ? err.message : String(err)}); proceeding with standard prompt`,
+              `  ⚠ FEATURE_REDO: pendingFeatureReviewOutputPath ${rawPath} is out of slug scope; ignoring and proceeding with standard prompt`,
             );
-            pendingFeatureFindings = null;
+          } else {
+            try {
+              const stat = fs.statSync(safePath);
+              if (stat.size > FINDINGS_MAX_BYTES) {
+                console.warn(
+                  `  ⚠ FEATURE_REDO: findings file ${safePath} is ${stat.size} bytes, exceeds ${FINDINGS_MAX_BYTES} byte cap; ignoring and proceeding with standard prompt`,
+                );
+              } else {
+                pendingFeatureFindings = fs.readFileSync(safePath, "utf8");
+                console.log(
+                  `  ↻ FEATURE_REDO: threading feature-review findings from ${safePath} into impl prompt`,
+                );
+              }
+            } catch (err) {
+              console.warn(
+                `  ⚠ FEATURE_REDO: failed to read findings at ${safePath} (${err instanceof Error ? err.message : String(err)}); proceeding with standard prompt`,
+              );
+              pendingFeatureFindings = null;
+            }
           }
         }
         fs.writeFileSync(

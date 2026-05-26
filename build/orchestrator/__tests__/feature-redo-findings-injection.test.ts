@@ -213,9 +213,42 @@ describe("Bug A — file-read fallback graceful path", () => {
     expect(out).toContain("Missing fix for ordering bug");
   });
 
-  // The graceful fallback when the file is missing is exercised at the
-  // cli.ts dispatch site (which wraps fs.readFileSync in try/catch); the
-  // unit-test surface is the wrapping behavior, covered by T-A5 below.
+  it("T-A4b: cli.ts dispatch reads the findings file via try/catch (graceful on missing file)", () => {
+    // Static-grep wiring guard: the dispatch site MUST wrap the read in
+    // try/catch so a missing file (deleted between FEATURE_REDO and the
+    // next impl call) produces a warning, not a crash. Adversarial review
+    // flagged that T-A5 only checks the field is read, not that the read
+    // is guarded. Search from the local-variable declaration which only
+    // appears at the dispatch site.
+    const cliPath = path.resolve(import.meta.dir, "../cli.ts");
+    const content = fs.readFileSync(cliPath, "utf-8");
+    const start = content.indexOf("let pendingFeatureFindings");
+    expect(start).toBeGreaterThan(0);
+    const block = content.slice(start, start + 2500);
+    expect(block).toContain("fs.readFileSync");
+    expect(block).toMatch(/try\s*{/);
+    expect(block).toMatch(/catch\s*\(/);
+    // Warning text must name the path so operators can diagnose.
+    expect(block).toMatch(/failed to read findings/);
+  });
+
+  it("T-A4c: cli.ts dispatch validates the path is in slug scope (path-traversal guard)", () => {
+    // Adversarial review finding: state.json is operator-editable, so
+    // pendingFeatureReviewOutputPath is untrusted at read time. A
+    // tampered path like ~/.ssh/id_rsa could be slurped into the impl
+    // prompt and exfiltrated to the Gemini API. The dispatch MUST call
+    // validateLogPathInScope before reading. Search from the local
+    // variable declaration which only appears at the dispatch site
+    // (NOT at the field-declaration comment in resetPhaseStateForRedo).
+    const cliPath = path.resolve(import.meta.dir, "../cli.ts");
+    const content = fs.readFileSync(cliPath, "utf-8");
+    const start = content.indexOf("let pendingFeatureFindings");
+    expect(start).toBeGreaterThan(0);
+    const block = content.slice(start, start + 2500);
+    expect(block).toContain("validateLogPathInScope");
+    expect(block).toContain("FINDINGS_MAX_BYTES");
+    expect(block).toMatch(/out of slug scope/);
+  });
 });
 
 describe("Bug A — static-grep wiring guards", () => {

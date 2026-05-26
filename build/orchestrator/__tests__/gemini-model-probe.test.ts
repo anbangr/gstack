@@ -81,9 +81,14 @@ describe("Bug D — static-grep wiring guards", () => {
     expect(configContent).toContain("gemini-2.5-flash");
   });
 
-  it("T-D2b: runGeminiTask call site invokes assertGeminiModel after auth", () => {
-    // The fire-and-forget invocation should appear near the auth check.
-    expect(subAgentsContent).toMatch(/void\s+assertGeminiModel\(/);
+  it("T-D2b: runGeminiTask call site invokes assertGeminiModel after auth (with .catch)", () => {
+    // Adversarial review tightened this from `void assertGeminiModel(...)`
+    // (which leaks unhandled rejections) to `.catch(() => {})`. The
+    // .catch must be present so the probe can never crash a phase even
+    // if assertGeminiModel itself throws synchronously.
+    expect(subAgentsContent).toMatch(
+      /assertGeminiModel\(opts\.model\)\.catch\(/,
+    );
   });
 
   it("T-D2c: probe cache + warned-set both cleared in _resetAuthPreflightForTests", () => {

@@ -23,7 +23,10 @@ import {
   spawn as registeredSpawn,
   spawnSync as registeredSpawnSync,
 } from "./child-registry";
-import { spawnSync } from "node:child_process";
+import {
+  spawn as childProcessSpawn,
+  spawnSync,
+} from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -405,9 +408,21 @@ export function parseGeminiModelProbeStderr(stderr: string): {
   return { ok: true };
 }
 
+type GeminiModelProbeResult = {
+  ok: boolean;
+  reason?: "model-not-found";
+  model?: string;
+  skipped?: boolean;
+};
+
+// Cache the PROMISE, not the resolved result. Two concurrent
+// assertGeminiModel(model) calls (parallel features, testWriter +
+// primaryImpl backup both at the same model) MUST share one probe — caching
+// the resolved result still races because both calls miss the cache before
+// the first spawn returns.
 const _geminiModelProbeCache = new Map<
   string,
-  { ok: boolean; reason?: "model-not-found"; model?: string }
+  Promise<GeminiModelProbeResult>
 >();
 const _geminiModelWarnedSet = new Set<string>();
 
@@ -421,57 +436,75 @@ const _geminiModelWarnedSet = new Set<string>();
  * served from cache silently — the warning is informational, never
  * blocking.
  *
+ * Uses async `spawn` + accumulated stderr (NOT spawnSync) so concurrent
+ * fire-and-forget probes from different roles don't block the orchestrator
+ * event loop. spawnSync would block the main thread for up to 15s per
+ * unique model the first time it's seen — visible as a stall before phase
+ * work starts when a fresh process meets a new model.
+ *
  * Gated by `GSTACK_DISABLE_AUTH_PREFLIGHT=1` env knob (matches the
  * existing auth preflights — single off switch).
  *
  * Bug D in ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
  */
-export async function assertGeminiModel(model: string): Promise<{
-  ok: boolean;
-  reason?: "model-not-found";
-  model?: string;
-  skipped?: boolean;
-}> {
+export function assertGeminiModel(
+  model: string,
+): Promise<GeminiModelProbeResult> {
   if (process.env.GSTACK_DISABLE_AUTH_PREFLIGHT === "1") {
-    return { ok: true, skipped: true };
+    return Promise.resolve({ ok: true, skipped: true });
   }
-  if (!model) return { ok: true };
+  if (!model) return Promise.resolve({ ok: true });
   const cached = _geminiModelProbeCache.get(model);
   if (cached) return cached;
-  const bin = geminiBin();
-  let probeStderr = "";
-  try {
-    const probe = spawnSync(
-      bin,
-      ["-m", model, "--output-format", "text"],
-      {
-        input: "ping",
-        encoding: "utf8",
-        timeout: 15000,
-      },
-    );
-    probeStderr = String(probe.stderr ?? "");
-  } catch (err) {
-    // Probe itself failed (no binary, timeout, etc.). Treat as unknown
-    // and let the runtime call surface the real error — don't add noise.
-    const result = { ok: true as const };
-    _geminiModelProbeCache.set(model, result);
-    return result;
-  }
-  const parsed = parseGeminiModelProbeStderr(probeStderr);
-  _geminiModelProbeCache.set(model, parsed);
-  if (!parsed.ok && !_geminiModelWarnedSet.has(model)) {
-    _geminiModelWarnedSet.add(model);
-    const named = parsed.model ? `'${parsed.model}'` : `'${model}'`;
-    console.warn(
-      `[gstack-build] Gemini model ${named} returned 404 ModelNotFoundError on preflight probe. ` +
-        `Every primary call will burn ~10s before falling back. Fix: edit ` +
-        `build/configure.cm (or the active install at ~/.claude/skills/gstack/build/configure.cm) ` +
-        `to use a currently-valid Gemini model identifier (e.g. 'gemini-2.5-flash'). ` +
-        `See Bug D in ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.`,
-    );
-  }
-  return parsed;
+  const probePromise: Promise<GeminiModelProbeResult> = (async () => {
+    const bin = geminiBin();
+    let probeStderr = "";
+    try {
+      probeStderr = await new Promise<string>((resolve) => {
+        const stderrChunks: Buffer[] = [];
+        const proc = childProcessSpawn(
+          bin,
+          ["-m", model, "--output-format", "text"],
+          { stdio: ["pipe", "ignore", "pipe"] },
+        );
+        const timer = setTimeout(() => {
+          try {
+            proc.kill("SIGTERM");
+          } catch {}
+          resolve(Buffer.concat(stderrChunks).toString("utf8"));
+        }, 15000);
+        proc.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+        proc.on("close", () => {
+          clearTimeout(timer);
+          resolve(Buffer.concat(stderrChunks).toString("utf8"));
+        });
+        proc.on("error", () => {
+          clearTimeout(timer);
+          resolve("");
+        });
+        try {
+          proc.stdin?.end("ping");
+        } catch {}
+      });
+    } catch {
+      return { ok: true as const };
+    }
+    const parsed = parseGeminiModelProbeStderr(probeStderr);
+    if (!parsed.ok && !_geminiModelWarnedSet.has(model)) {
+      _geminiModelWarnedSet.add(model);
+      const named = parsed.model ? `'${parsed.model}'` : `'${model}'`;
+      console.warn(
+        `[gstack-build] Gemini model ${named} returned 404 ModelNotFoundError on preflight probe. ` +
+          `Every primary call will burn ~10s before falling back. Fix: edit ` +
+          `build/configure.cm (or the active install at ~/.claude/skills/gstack/build/configure.cm) ` +
+          `to use a currently-valid Gemini model identifier (e.g. 'gemini-2.5-flash'). ` +
+          `See Bug D in ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.`,
+      );
+    }
+    return parsed;
+  })().catch(() => ({ ok: true as const }));
+  _geminiModelProbeCache.set(model, probePromise);
+  return probePromise;
 }
 
 export async function assertCodexAuth(): Promise<{
@@ -2049,11 +2082,15 @@ export async function runRoleTask(opts: {
   }
   // Bug D: model validity probe. Fires once per session per model and
   // emits a one-time startup warning if the configured model 404s.
-  // Non-blocking — the actual call still runs (and will fall back to
-  // the backup provider via the existing fallback path on failure).
-  // Caches the result so we don't burn an extra probe call per phase.
+  // Non-blocking — assertGeminiModel uses async `spawn` (not spawnSync)
+  // so the orchestrator event loop stays responsive while the probe is
+  // in flight. Caches the Promise (not the resolved result) so concurrent
+  // probes for the same model share one in-flight spawn. The .catch
+  // swallows any unexpected rejection so the model probe can never crash
+  // a phase — the actual Gemini call will still run and fall back via
+  // the existing backup-provider path on real failure.
   if (opts.model) {
-    void assertGeminiModel(opts.model);
+    assertGeminiModel(opts.model).catch(() => {});
   }
 
   const {
@@ -3305,16 +3342,21 @@ export function hasPytestCov(cwd: string): boolean {
   } catch {
     // No pyproject.toml or unreadable. Fall through to signal 2.
   }
-  // Signal 2: python import probe
-  try {
-    const probe = spawnSync("python", ["-c", "import pytest_cov"], {
-      cwd,
-      stdio: "ignore",
-      timeout: 3000,
-    });
-    if (probe.status === 0) return true;
-  } catch {
-    // No python on PATH, timeout, or other failure. Treat as unavailable.
+  // Signal 2: python import probe. Try `python3` first because modern macOS
+  // (12+) and many Linux distros ship no bare `python` binary — the bare
+  // probe would ENOENT and silently fail even with pytest-cov installed via
+  // pip/conda. Fall back to `python` for older systems / venvs.
+  for (const bin of ["python3", "python"]) {
+    try {
+      const probe = spawnSync(bin, ["-c", "import pytest_cov"], {
+        cwd,
+        stdio: "ignore",
+        timeout: 3000,
+      });
+      if (probe.status === 0) return true;
+    } catch {
+      // No such binary on PATH, timeout, or other failure. Try next.
+    }
   }
   return false;
 }

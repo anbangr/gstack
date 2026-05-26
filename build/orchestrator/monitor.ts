@@ -342,7 +342,12 @@ export function hasActiveSubagentChild(orchPid: number | null): boolean {
       const comm = path
         .basename(m[2].replace(/^\(/, "").replace(/\)$/, ""))
         .toLowerCase();
-      if (SUBAGENT_PROCESS_NAMES.some((name) => comm.includes(name))) {
+      // Exact basename match — substring (`comm.includes(name)`) is a
+      // false-positive vector: a user script named `mycodex-wrapper` would
+      // silently suppress the stale alarm forever. The CLIs we care about
+      // exec the binaries by their bare name (`codex`, `claude`, etc.); the
+      // basename strip above handles the path-prefix case.
+      if (SUBAGENT_PROCESS_NAMES.includes(comm)) {
         return true;
       }
     }
