@@ -223,9 +223,13 @@ import {
   emitRecoveryBoundary,
   markFeatureFailed,
   markPhaseFailed,
+  parseRoleLogFailureEvidence,
+  recordHygieneFailure,
   recordProviderFailureVerdict,
   recordRedGateZeroTestsCollected,
+  recordRedSpecExhausted,
   recordRetryCapHit,
+  recordStallKilled,
   rewindPhase,
 } from "./halt-event-helpers";
 import {
@@ -961,23 +965,96 @@ export function resolveTestCmd(args: Args, cwd: string): string | null {
 }
 
 /**
- * Per-phase wrapper around resolveTestCmd. If the phase declares a per-phase
- * test-command via `<!-- testCmd: <cmd> -->` in its body, honor that;
- * otherwise fall through to the existing resolution priority.
+ * Per-phase wrapper around resolveTestCmd with three priority rungs:
  *
- * Why this exists: polyglot monorepos can need different runners for
- * different phases of the same plan (e.g. mitosis-prototype's Python schema
- * feature and TypeScript openclaw feature sharing a root). detectTestCmd's
- * static heuristic can only pick one. The plan author knows which runner
- * each phase needs; this lets them say so.
+ *   1. Explicit `<!-- testCmd: <cmd> -->` annotation in the phase body
+ *      (highest priority, always wins — author knows best).
+ *   2. NEW: subtree inference from `phaseState.testWriterTouchedPaths`
+ *      when the test-writer added/touched files under a common subtree
+ *      (e.g. `sidecar-v2/test/foo.test.ts`, `public-rpc-proxy/test/bar.test.ts`).
+ *      If `<prefix>/package.json` exists, infers `npm --prefix <prefix> test`.
+ *      Generalises the PR #95 Go cmd-dir pattern to TS/Python subtrees.
+ *   3. Existing static resolution: `args.testCmd` → `args.testFramework`
+ *      → `detectTestCmd(cwd)` static heuristic.
+ *
+ * Why this matters: polyglot monorepos can need different runners for
+ * different phases. detectTestCmd's static heuristic can only pick one,
+ * and root `npm test` shims often skip subtrees the test-writer
+ * intentionally targets — silent failure → red-spec retry exhausts.
+ * The phaseState rung closes that gap for the common subtree case.
+ *
+ * phaseState is optional for backward compat with call sites that don't
+ * have it in scope. When absent, the inference rung is skipped.
  */
 export function resolveTestCmdForPhase(
   args: Args,
   cwd: string,
   phase: Phase,
+  phaseState?: PhaseState,
 ): string | null {
   if (phase.testCmdOverride) return phase.testCmdOverride;
+  const touched = phaseState?.testWriterTouchedPaths;
+  if (touched && touched.length > 0) {
+    const inferred = inferTestCmdFromTouchedPaths(touched, cwd);
+    if (inferred) return inferred;
+  }
   return resolveTestCmd(args, cwd);
+}
+
+/**
+ * Given a list of test-file paths the test-writer touched and the cwd
+ * where tests run, infer a phase-local testCmd by finding the deepest
+ * directory prefix common to all paths and checking whether that prefix
+ * looks like an npm subtree (has its own package.json with a `test`
+ * script). Returns null when no useful subtree is detectable — caller
+ * falls back to static resolution.
+ *
+ * The "deepest common prefix" + "has package.json" heuristic generalises
+ * the PR #95 cmd-dir pattern: instead of requiring the synthesizer to
+ * hand-code the testCmd union for every monorepo shape, we infer at
+ * runtime from what the test-writer actually wrote. Best-effort —
+ * matching the spirit of the Go cmd-dir hint without locking in a
+ * specific path pattern.
+ */
+export function inferTestCmdFromTouchedPaths(
+  paths: string[],
+  cwd: string,
+): string | null {
+  if (paths.length === 0) return null;
+  const segmented = paths.map((p) => p.split("/").filter((seg) => seg !== ""));
+  // Find the deepest leading-segment prefix common to ALL paths.
+  let commonDepth = 0;
+  if (segmented.length > 0 && segmented[0]) {
+    const first = segmented[0];
+    outer: for (let d = 0; d < first.length - 1; d++) {
+      const seg = first[d];
+      for (const s of segmented) {
+        if (s[d] !== seg) break outer;
+      }
+      commonDepth = d + 1;
+    }
+  }
+  if (commonDepth === 0) return null;
+  const first = segmented[0]!;
+  // Walk UP from the deepest common prefix toward the root, checking each
+  // directory for a package.json with a `test` script. The shallowest
+  // matching dir is usually the npm workspace root for that subtree
+  // (e.g. `sidecar-v2/` with tests under `sidecar-v2/test/`).
+  for (let depth = commonDepth; depth >= 1; depth--) {
+    const prefixSegs = first.slice(0, depth);
+    const prefix = prefixSegs.join("/");
+    const subtreePkg = path.join(cwd, prefix, "package.json");
+    try {
+      const raw = fs.readFileSync(subtreePkg, "utf8");
+      const pkg = JSON.parse(raw) as { scripts?: Record<string, string> };
+      if (pkg.scripts && typeof pkg.scripts.test === "string") {
+        return `npm --prefix ${prefix} test`;
+      }
+    } catch {
+      // No package.json at this depth or unreadable; keep walking up.
+    }
+  }
+  return null;
 }
 
 /**
@@ -7409,16 +7486,19 @@ async function runPhase(args: {
       console.error(
         `✗ Phase ${phase.number} (${phase.name}) failed: ${action.reason}`,
       );
-      // PR1b: before counting a codex convergence failure as a retry-cap
-      // hit, see if the most-recent review iteration was actually a
-      // provider failure (capacity / quota / overloaded / transport / auth
-      // / stall). If so, emit the right halt kind instead — drain-faults
-      // and downstream consumers will route it to the right recovery
-      // playbook rather than to the "convergence failed" investigator.
-      // Kill switch: GSTACK_DISABLE_PROVIDER_CLASSIFIER=1 reverts to the
-      // pre-PR1b behavior (skip classification, always cap-hit).
+      // FAIL classifier ladder. Each rung sets `classified = true` and
+      // emits a dedicated halt kind so the investigator-bot routes to the
+      // right recovery playbook. Order matters — the most specific signals
+      // (failureRender, role-log evidence, error-prefix patterns) win
+      // before falling through to the gated catch-all.
+      //
+      // Kill switch: GSTACK_DISABLE_PROVIDER_CLASSIFIER=1 skips the
+      // provider-failure rungs (PR1b back-compat).
       let classified = false;
       if (process.env.GSTACK_DISABLE_PROVIDER_CLASSIFIER !== "1") {
+        // Rung 1: structured provider verdict stored on phaseState.failureRender
+        // by an earlier role step (any role — testWriter, primaryImpl, testFix,
+        // codexReview).
         const providerFailureEntries = Object.entries(
           phaseState.failureRender ?? {},
         )
@@ -7439,32 +7519,123 @@ async function runPhase(args: {
           );
           classified = true;
         }
-        const reviewLogs = phaseState.codexReview?.outputLogPaths ?? [];
-        const lastLog = reviewLogs[reviewLogs.length - 1];
-        if (!classified && lastLog) {
-          let text = "";
-          try {
-            text = fs.readFileSync(lastLog, "utf8");
-          } catch {
-            // Log unreadable; fall through to retry-cap-hit.
+        // Rung 2: scan ALL role logs for provider/stall evidence — not just
+        // the codex-review log. p17's Gemini primaryImpl stall-kill went
+        // unclassified pre-fix because the existing scan only looked at
+        // codexReview.outputLogPaths.
+        if (!classified) {
+          const roleLogs: Array<{ role: string; path: string }> = [];
+          if (phaseState.geminiTestSpec?.outputLogPath) {
+            roleLogs.push({
+              role: "test-spec",
+              path: phaseState.geminiTestSpec.outputLogPath,
+            });
           }
-          if (text) {
+          if (phaseState.gemini?.outputLogPath) {
+            roleLogs.push({
+              role: "primary-impl",
+              path: phaseState.gemini.outputLogPath,
+            });
+          }
+          for (const p of phaseState.testFix?.outputLogPaths ?? []) {
+            roleLogs.push({ role: "test-fix", path: p });
+          }
+          for (const p of phaseState.codexReview?.outputLogPaths ?? []) {
+            roleLogs.push({ role: "codex-review", path: p });
+          }
+          for (const { role, path: logPath } of roleLogs) {
+            let text = "";
+            try {
+              text = fs.readFileSync(logPath, "utf8");
+            } catch {
+              continue;
+            }
+            if (!text) continue;
+            // Zero-stdout stall is its own halt kind (STALL_KILLED), not a
+            // PROVIDER_TIMEOUT. Check the parsed sentinels before the
+            // generic provider classifier so the more-specific signal wins.
+            const evidence = parseRoleLogFailureEvidence(text);
+            if (
+              evidence.stallKilled &&
+              (evidence.stdoutBytes ?? -1) === 0
+            ) {
+              recordStallKilled(
+                state,
+                phaseState.index,
+                role,
+                evidence.stallSilenceMs ?? 0,
+                evidence.stdoutBytes ?? 0,
+                "stall",
+                helperCtxFor(state),
+              );
+              classified = true;
+              break;
+            }
             const verdict = classifyProviderFailure({ text });
             if (verdict) {
               recordProviderFailureVerdict(
                 state,
                 phaseState.index,
-                "codex-review",
+                role,
                 verdict,
                 helperCtxFor(state),
               );
               classified = true;
+              break;
             }
           }
         }
       }
-      if (action.reason.startsWith("RED_GATE_ZERO_TESTS_COLLECTED")) {
-        const testCmd = resolveTestCmdForPhase(args, cwd, phase) ?? "unknown";
+      // Rung 3: hygiene failure — primary impl didn't commit, post-impl
+      // recovery couldn't restore tree, pre-commit blocked the agent.
+      // Matched against action.reason and phaseState.error because hygiene
+      // checks set these synchronously before FAIL fires.
+      if (!classified) {
+        const HYGIENE_RE =
+          /hygiene\s+(?:failed|failure)|did not create a new commit|recovery FAILED|hygiene\.log/i;
+        const errText = phaseState.error ?? "";
+        const reasonMatch = action.reason.match(HYGIENE_RE);
+        const errorMatch = errText.match(HYGIENE_RE);
+        if (reasonMatch || errorMatch) {
+          const evidence = (reasonMatch ?? errorMatch)?.[0] ?? "hygiene failed";
+          // Best-effort role attribution: hygiene checks run after primary
+          // impl in the standard pipeline, so default to "primary-impl"
+          // unless the message names another role.
+          const role = /codex/i.test(action.reason + " " + errText)
+            ? "codex-review"
+            : "primary-impl";
+          recordHygieneFailure(
+            state,
+            phaseState.index,
+            role,
+            evidence,
+            helperCtxFor(state),
+          );
+          classified = true;
+        }
+      }
+      // Rung 4: red-spec exhaustion — Gemini test-writer ran the max
+      // attempts and tests still trivially passed. Distinct from
+      // RED_GATE_ZERO_TESTS_COLLECTED (which fires when the runner finds
+      // zero tests immediately).
+      if (!classified && action.reason.startsWith("RED_SPEC_EXHAUSTED")) {
+        const testCmd = resolveTestCmdForPhase(args, cwd, phase, phaseState) ?? "unknown";
+        const attempts = phaseState.redSpecAttempts ?? 0;
+        recordRedSpecExhausted(
+          state,
+          phaseState.index,
+          attempts,
+          testCmd,
+          helperCtxFor(state),
+        );
+        classified = true;
+      }
+      // Rung 5: red-gate zero tests collected (root runner found nothing).
+      if (
+        !classified &&
+        action.reason.startsWith("RED_GATE_ZERO_TESTS_COLLECTED")
+      ) {
+        const testCmd = resolveTestCmdForPhase(args, cwd, phase, phaseState) ?? "unknown";
         recordRedGateZeroTestsCollected(
           state,
           phaseState.index,
@@ -7473,14 +7644,29 @@ async function runPhase(args: {
         );
         classified = true;
       }
+      // Catch-all: only RETRY_CAP_HIT for actual codex-review cap
+      // exhaustion. Otherwise emit PHASE_FAILED with the structured
+      // reason so the investigator sees real evidence instead of a fake
+      // "codex 0 iterations" story.
       if (!classified) {
-        recordRetryCapHit(
-          state,
-          phaseState.index,
-          "codex",
-          phaseState.codexReview?.iterations ?? 0,
-          helperCtxFor(state),
-        );
+        const codexIterations = phaseState.codexReview?.iterations ?? 0;
+        const codexCap = args.maxCodexIter;
+        if (codexIterations >= codexCap) {
+          recordRetryCapHit(
+            state,
+            phaseState.index,
+            "codex",
+            codexIterations,
+            helperCtxFor(state),
+          );
+        } else {
+          markPhaseFailed(
+            state,
+            phaseState.index,
+            action.reason,
+            helperCtxFor(state),
+          );
+        }
       }
       return "failed";
     }
@@ -7933,6 +8119,41 @@ async function runPhase(args: {
         siblingRepoBaselines: siblingBaselines,
       });
       phaseState = applyResult(phaseState, action, result, { outputFilePath });
+      // Capture test-writer touched paths for subtree-aware testCmd
+      // inference. The hygiene gate above guarantees a commit per
+      // iteration on success, so HEAD~1..HEAD reflects what the
+      // test-writer actually wrote. Skip when the gate failed
+      // (phaseState.status !== "test_spec_done") — there's no fresh
+      // commit to read, and the diff against the prior unrelated commit
+      // could misattribute test files. Best-effort: any failure leaves
+      // the field empty and resolveTestCmdForPhase falls back to static
+      // resolution.
+      if (!dryRun && phaseState.status === "test_spec_done") {
+        try {
+          const diff = spawnSync(
+            "git",
+            ["-C", cwd, "diff", "--name-only", "HEAD~1..HEAD"],
+            { encoding: "utf8" },
+          );
+          if (diff.status === 0 && typeof diff.stdout === "string") {
+            const TEST_PATH_RE = /(^|\/)(__tests__|test|tests|spec|specs)\//i;
+            const TEST_FILE_RE = /\.(test|spec)\.[a-z]+$/i;
+            const touched = diff.stdout
+              .split("\n")
+              .map((p) => p.trim())
+              .filter(
+                (p) =>
+                  p.length > 0 &&
+                  (TEST_PATH_RE.test(p) || TEST_FILE_RE.test(p)),
+              );
+            if (touched.length > 0) {
+              phaseState = { ...phaseState, testWriterTouchedPaths: touched };
+            }
+          }
+        } catch {
+          // Best-effort — fall back to static testCmd resolution.
+        }
+      }
       state.phases[phase.index] = phaseState;
       saveState(state, { noGbrain, log: console.warn });
       continue;
@@ -7947,7 +8168,7 @@ async function runPhase(args: {
           stdout: "[dry-run] tests would fail (Red)",
         });
       } else {
-        const testCmd = resolveTestCmdForPhase(args, cwd, phase);
+        const testCmd = resolveTestCmdForPhase(args, cwd, phase, phaseState);
         if (!testCmd) {
           console.warn(
             "  ⚠ no test command detected; assuming Red for VERIFY_RED",
@@ -7966,7 +8187,7 @@ async function runPhase(args: {
           });
         }
       }
-      const effectiveTestCmd = resolveTestCmdForPhase(args, cwd, phase);
+      const effectiveTestCmd = resolveTestCmdForPhase(args, cwd, phase, phaseState);
       phaseState = applyResult(phaseState, action, result, {
         phaseBody: phase.body,
         testCmd: effectiveTestCmd ?? undefined,
@@ -7987,7 +8208,7 @@ async function runPhase(args: {
           stdout: "[dry-run] tests would pass (Green)",
         });
       } else {
-        effectiveTestCmd = resolveTestCmdForPhase(args, cwd, phase);
+        effectiveTestCmd = resolveTestCmdForPhase(args, cwd, phase, phaseState);
         if (!effectiveTestCmd) {
           // No test cmd: skip test verification, treat as green.
           console.warn(
@@ -8215,7 +8436,7 @@ async function runPhase(args: {
         const phaseN = phase.number;
         const it = action.iteration;
 
-        const dualTestCmd = resolveTestCmdForPhase(args, cwd, phase);
+        const dualTestCmd = resolveTestCmdForPhase(args, cwd, phase, phaseState);
 
         const runCandidate = async (candidate: DualImplCandidateKey) => {
           const opponent: DualImplCandidateKey =
@@ -8652,7 +8873,7 @@ async function runPhase(args: {
           );
           // Re-run tests inline since cached results are stale.
           // Reuse the existing testCmd detection below.
-          const testCmd = resolveTestCmdForPhase(args, cwd, phase);
+          const testCmd = resolveTestCmdForPhase(args, cwd, phase, phaseState);
           if (!testCmd) {
             console.warn(
               "  ⚠ no test command detected for dual-tests; assuming both green",
@@ -8718,7 +8939,7 @@ async function runPhase(args: {
           };
         }
       } else {
-        const testCmd = resolveTestCmdForPhase(args, cwd, phase);
+        const testCmd = resolveTestCmdForPhase(args, cwd, phase, phaseState);
         if (!testCmd) {
           // No test cmd: assume both green so judge runs.
           console.warn(
