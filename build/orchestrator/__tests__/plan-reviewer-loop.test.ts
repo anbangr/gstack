@@ -755,6 +755,60 @@ describe("runPlanReviewLoop", () => {
     expect(result.rounds).toBe(1);
   });
 
+  // ─── Fix D + E: synth_failure_stalemate outcome / Exit 3 contract ─────
+  // SKILL.md Step 5.5 contracts Exit 3 = STALEMATE. plan-review-loop's
+  // synth_failure path now distinguishes "at the round cap" (stalemate,
+  // exit 3) from "mid-loop" (transient, exit 1).
+  //
+  // NOTE: the cap-synth-failure path in plan-review-loop is defensive — in
+  // practice, `shouldBailAdaptive` at line 380 routes `round >= maxRounds`
+  // through the stalemate gate before the loop body's synth call fires, so
+  // the cap branch is rarely entered. The PRIMARY restart-storm fix lives
+  // in cli.ts (Fix B): promote `state.planReview.status === "synth_failure"`
+  // to STALEMATE on resume if retries >= 1. See cli-synth-failure-resume.test.ts.
+
+  it("Fix D+E (no false positive): mid-loop synth_failure keeps exit 1 + outcome synth_failure", async () => {
+    // Pins the OPPOSITE invariant: a transient synth_failure mid-loop must
+    // NOT be promoted to stalemate. Same shape as the H2 test above but
+    // made explicit with maxRounds=5 and a synth failure at round 1.
+    const reviewerFn = async (round: number): Promise<PlanReviewVerdict> => ({
+      verdict: "REVISE",
+      objections: [
+        {
+          severity: "CRITICAL",
+          location: "F1, P1",
+          issue: "x",
+          suggestion: "y",
+        },
+      ],
+      assessment: "",
+      reviewedBy: "stub",
+      round,
+    });
+    const synthFn = async () => ({ ok: false });
+    const out = captureWriter();
+    const result = await runPlanReviewLoop({
+      planPath,
+      historyPath: path.join(tmpDir, "history.jsonl"),
+      aggregatePath: path.join(tmpDir, "convergence.jsonl"),
+      slug: "synth-midloop",
+      branch: "feat/synth-midloop",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: false,
+      input: readableFrom(""),
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
+    });
+    expect(result.outcome).toBe("synth_failure");
+    expect(result.exitCode).toBe(1);
+    expect(result.rounds).toBe(1);
+  });
+
   it("H3: [c] Continue anyway at adaptive bail invokes synth before looping", async () => {
     // Round 1 raises objection X; user accepts; synth pretends to resolve.
     // Round 2 raises the same X (re-raise, no new objections). Adaptive bail
