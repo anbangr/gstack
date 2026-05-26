@@ -730,7 +730,23 @@ function readRunSnapshot(
     ? stateMatchesRun(state, run) && registryOk
     : registryOk;
   const committedCount = committedPhaseCount(state);
-  const staleWindowMs = Math.max(3 * pollMs, 1_000);
+  // Bug B leg 2: defense-in-depth status-aware stale threshold. When any
+  // phase is in a `*_running` status, the orchestrator is mid-subagent
+  // call and should NOT be considered stale even if `lastUpdatedAt` is
+  // old. The child-process check (leg 1) is the primary signal, but it
+  // returns false when the subagent is wrapped in a shell, sandbox, or
+  // when ps is unavailable — this status check catches those cases.
+  // 30x multiplier brings the 30s default to 15 minutes, matching the
+  // worst-case subagent timeout. Conservative: applies to ALL phases,
+  // not just the "current" one, since multiple phases could be in
+  // flight via parallel features.
+  const anyPhaseRunning = (state?.phases ?? []).some((p) =>
+    typeof p?.status === "string" && p.status.endsWith("_running"),
+  );
+  const baseStaleWindowMs = Math.max(3 * pollMs, 1_000);
+  const staleWindowMs = anyPhaseRunning
+    ? baseStaleWindowMs * 30
+    : baseStaleWindowMs;
   const contextSaveCountFile = path.join(
     path.dirname(stateFile),
     run.stateSlug,
