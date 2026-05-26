@@ -6681,12 +6681,21 @@ function countCommitsSinceBase(
  * startup `--reset-phase N` flag but operates on a single phase by
  * index for mid-run reset.
  *
+ * When `opts.featureReviewOutputPath` is set (called from FEATURE_REDO
+ * dispatch), the path is persisted on the phase state's
+ * `pendingFeatureReviewOutputPath` field so the next primary-impl
+ * dispatch can thread the reviewer's findings into the impl prompt.
+ * Without this, FEATURE_REDO loops endlessly: impl sees no findings,
+ * makes no commit, hygiene gate rejects. See Bug A in
+ * ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
+ *
  * Exported for testability (T7 unit tests). Internal callers in cli.ts
  * still use it via the same name.
  */
 export function resetPhaseStateForRedo(
   state: BuildState,
   phaseIndex: number,
+  opts?: { featureReviewOutputPath?: string },
 ): void {
   const ps = state.phases[phaseIndex];
   if (!ps) return;
@@ -6702,6 +6711,11 @@ export function resetPhaseStateForRedo(
   delete (ps as any).error;
   delete (ps as any).redSpecAttempts;
   delete (ps as any).dualImpl;
+  if (opts?.featureReviewOutputPath) {
+    ps.pendingFeatureReviewOutputPath = opts.featureReviewOutputPath;
+  } else {
+    delete (ps as any).pendingFeatureReviewOutputPath;
+  }
 }
 
 /**
@@ -7483,7 +7497,13 @@ async function runFeatureReviewIteration(args: {
         return { verdict, action: "unclear", outputFilePath };
       }
       for (const i of targets) {
-        resetPhaseStateForRedo(args.state, i);
+        // Thread the feature-review output file into each reset phase so
+        // the next primary-impl dispatch can read the reviewer's findings
+        // and address them. Closes Bug A in
+        // ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
+        resetPhaseStateForRedo(args.state, i, {
+          featureReviewOutputPath: outputFilePath,
+        });
       }
       fr.phasesReset = targets;
       saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
@@ -7961,9 +7981,65 @@ async function runPhase(args: {
           ...phase,
           body: resolvePhaseBody(phase.body, args.baseProjectRoot, cwd),
         };
+        // Bug A: when phaseState carries a pendingFeatureReviewOutputPath
+        // (set by FEATURE_REDO dispatch via resetPhaseStateForRedo), read
+        // the reviewer's findings and thread them into buildGeminiPromptBody.
+        // Without this the impl agent sees the standard phase description,
+        // observes the existing worktree code looks fine, makes no commit,
+        // and the hygiene gate rejects "did not create a new commit" —
+        // exactly the deadlock the bug report describes. Best-effort: if
+        // the findings file is missing/unreadable/out-of-scope, fall through
+        // to the standard prompt with a warning rather than crash. The
+        // pendingFeatureReviewOutputPath field is cleared inside applyResult
+        // (RUN_GEMINI branch) so a subsequent retry without a fresh
+        // FEATURE_REDO sees no stale findings.
+        //
+        // Path containment + size cap (security): state.json is operator-
+        // editable, so the stored path is untrusted input from the read site's
+        // perspective. validateLogPathInScope ensures the read is bounded to
+        // logDir(slug); a tampered state pointing at ~/.ssh/id_rsa is rejected
+        // and the field is treated as missing. A 1 MiB read cap rejects
+        // pathological huge files before they hit memory. Both defenses match
+        // the convention used at other state-derived path reads (cli.ts:7115,
+        // 7625, 8113).
+        let pendingFeatureFindings: string | null = null;
+        const FINDINGS_MAX_BYTES = 1024 * 1024;
+        if (phaseState.pendingFeatureReviewOutputPath) {
+          const rawPath = phaseState.pendingFeatureReviewOutputPath;
+          const safePath = validateLogPathInScope(rawPath, state.slug);
+          if (!safePath) {
+            console.warn(
+              `  ⚠ FEATURE_REDO: pendingFeatureReviewOutputPath ${rawPath} is out of slug scope; ignoring and proceeding with standard prompt`,
+            );
+          } else {
+            try {
+              const stat = fs.statSync(safePath);
+              if (stat.size > FINDINGS_MAX_BYTES) {
+                console.warn(
+                  `  ⚠ FEATURE_REDO: findings file ${safePath} is ${stat.size} bytes, exceeds ${FINDINGS_MAX_BYTES} byte cap; ignoring and proceeding with standard prompt`,
+                );
+              } else {
+                pendingFeatureFindings = fs.readFileSync(safePath, "utf8");
+                console.log(
+                  `  ↻ FEATURE_REDO: threading feature-review findings from ${safePath} into impl prompt`,
+                );
+              }
+            } catch (err) {
+              console.warn(
+                `  ⚠ FEATURE_REDO: failed to read findings at ${safePath} (${err instanceof Error ? err.message : String(err)}); proceeding with standard prompt`,
+              );
+              pendingFeatureFindings = null;
+            }
+          }
+        }
         fs.writeFileSync(
           inputFilePath,
-          buildGeminiPromptBody(resolvedPhase1, state.planFile, state.branch),
+          buildGeminiPromptBody(
+            resolvedPhase1,
+            state.planFile,
+            state.branch,
+            pendingFeatureFindings,
+          ),
         );
         // Pre-create empty output file so a missing-file error is unambiguous.
         fs.writeFileSync(outputFilePath, "");
@@ -8470,7 +8546,7 @@ async function runPhase(args: {
         } else {
           const testCmdForRun =
             phase.testSpecCheckboxLine !== -1
-              ? injectCoverageFlags(effectiveTestCmd)
+              ? injectCoverageFlags(effectiveTestCmd, cwd)
               : effectiveTestCmd;
           result = await runTests({
             testCmd: testCmdForRun,

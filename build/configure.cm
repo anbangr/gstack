@@ -27,7 +27,7 @@
     },
     "testWriter": {
       "provider": "gemini",
-      "model": "gemini-3.5-flash",
+      "model": "gemini-2.5-flash",
       "reasoning": "high",
       "backupProvider": "codex",
       "backupModel": "gpt-5.3-codex-spark"
@@ -37,11 +37,11 @@
       "model": "gpt-5.5",
       "reasoning": "high",
       "backupProvider": "gemini",
-      "backupModel": "gemini-3.5-flash"
+      "backupModel": "gemini-2.5-flash"
     },
     "testFixer": {
       "provider": "gemini",
-      "model": "gemini-3.5-flash",
+      "model": "gemini-2.5-flash",
       "reasoning": "high",
       "backupProvider": "codex",
       "backupModel": "gpt-5.3-codex-spark"
@@ -84,7 +84,7 @@
       "reasoning": "high",
       "command": "/ship",
       "backupProvider": "gemini",
-      "backupModel": "gemini-3.5-flash"
+      "backupModel": "gemini-2.5-flash"
     },
     "land": {
       "provider": "kimi",
@@ -92,7 +92,7 @@
       "reasoning": "high",
       "command": "/land-and-deploy",
       "backupProvider": "gemini",
-      "backupModel": "gemini-3.5-flash"
+      "backupModel": "gemini-2.5-flash"
     },
     "featureVerifier": {
       "provider": "codex",

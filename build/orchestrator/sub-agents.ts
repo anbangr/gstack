@@ -23,6 +23,10 @@ import {
   spawn as registeredSpawn,
   spawnSync as registeredSpawnSync,
 } from "./child-registry";
+import {
+  spawn as childProcessSpawn,
+  spawnSync,
+} from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -364,6 +368,143 @@ export function _resetAuthPreflightForTests(): void {
   _codexAuthPromise = undefined;
   _kimiAuthCache = undefined;
   _kimiAuthPromise = undefined;
+  _geminiModelProbeCache.clear();
+  _geminiModelWarnedSet.clear();
+}
+
+/**
+ * Parse Gemini CLI stderr for `ModelNotFoundError` / `code: 404`. Pure
+ * function — no I/O, fully testable. Used by `assertGeminiModel` to
+ * classify the probe result.
+ *
+ * Returns:
+ *   - `{ ok: true }` when the stderr shows no model-not-found signal
+ *     (either an empty stderr or unrelated warnings).
+ *   - `{ ok: false, reason: "model-not-found", model? }` when a 404 is
+ *     detected. `model` is extracted from the stderr if the Gemini CLI
+ *     named it; absent otherwise.
+ *
+ * Bug D in ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
+ */
+export function parseGeminiModelProbeStderr(stderr: string): {
+  ok: boolean;
+  reason?: "model-not-found";
+  model?: string;
+} {
+  if (!stderr) return { ok: true };
+  // Match either the canonical Gemini error type or the raw HTTP 404 code
+  // that the bundled CLI also surfaces.
+  if (
+    /ModelNotFoundError/i.test(stderr) ||
+    /code:\s*404/i.test(stderr) ||
+    /Requested entity was not found/i.test(stderr)
+  ) {
+    // Best-effort model extraction. Gemini CLI sometimes echoes the
+    // requested model in a "model: <name>" line; if not, leave undefined
+    // and the caller falls back to "the configured model".
+    const m = stderr.match(/model[:=]\s*['"]?([\w.\-/]+)['"]?/i);
+    return { ok: false, reason: "model-not-found", model: m?.[1] };
+  }
+  return { ok: true };
+}
+
+type GeminiModelProbeResult = {
+  ok: boolean;
+  reason?: "model-not-found";
+  model?: string;
+  skipped?: boolean;
+};
+
+// Cache the PROMISE, not the resolved result. Two concurrent
+// assertGeminiModel(model) calls (parallel features, testWriter +
+// primaryImpl backup both at the same model) MUST share one probe — caching
+// the resolved result still races because both calls miss the cache before
+// the first spawn returns.
+const _geminiModelProbeCache = new Map<
+  string,
+  Promise<GeminiModelProbeResult>
+>();
+const _geminiModelWarnedSet = new Set<string>();
+
+/**
+ * Probe whether the Gemini CLI accepts a given model identifier. Sends a
+ * 1-token no-op prompt with `-m <model>` and parses stderr for 404 signals.
+ * Cached per model identifier for the session.
+ *
+ * Logs ONE startup warning per invalid model the first time it's seen,
+ * with a remediation pointer to configure.cm. After that, the result is
+ * served from cache silently — the warning is informational, never
+ * blocking.
+ *
+ * Uses async `spawn` + accumulated stderr (NOT spawnSync) so concurrent
+ * fire-and-forget probes from different roles don't block the orchestrator
+ * event loop. spawnSync would block the main thread for up to 15s per
+ * unique model the first time it's seen — visible as a stall before phase
+ * work starts when a fresh process meets a new model.
+ *
+ * Gated by `GSTACK_DISABLE_AUTH_PREFLIGHT=1` env knob (matches the
+ * existing auth preflights — single off switch).
+ *
+ * Bug D in ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
+ */
+export function assertGeminiModel(
+  model: string,
+): Promise<GeminiModelProbeResult> {
+  if (process.env.GSTACK_DISABLE_AUTH_PREFLIGHT === "1") {
+    return Promise.resolve({ ok: true, skipped: true });
+  }
+  if (!model) return Promise.resolve({ ok: true });
+  const cached = _geminiModelProbeCache.get(model);
+  if (cached) return cached;
+  const probePromise: Promise<GeminiModelProbeResult> = (async () => {
+    const bin = geminiBin();
+    let probeStderr = "";
+    try {
+      probeStderr = await new Promise<string>((resolve) => {
+        const stderrChunks: Buffer[] = [];
+        const proc = childProcessSpawn(
+          bin,
+          ["-m", model, "--output-format", "text"],
+          { stdio: ["pipe", "ignore", "pipe"] },
+        );
+        const timer = setTimeout(() => {
+          try {
+            proc.kill("SIGTERM");
+          } catch {}
+          resolve(Buffer.concat(stderrChunks).toString("utf8"));
+        }, 15000);
+        proc.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+        proc.on("close", () => {
+          clearTimeout(timer);
+          resolve(Buffer.concat(stderrChunks).toString("utf8"));
+        });
+        proc.on("error", () => {
+          clearTimeout(timer);
+          resolve("");
+        });
+        try {
+          proc.stdin?.end("ping");
+        } catch {}
+      });
+    } catch {
+      return { ok: true as const };
+    }
+    const parsed = parseGeminiModelProbeStderr(probeStderr);
+    if (!parsed.ok && !_geminiModelWarnedSet.has(model)) {
+      _geminiModelWarnedSet.add(model);
+      const named = parsed.model ? `'${parsed.model}'` : `'${model}'`;
+      console.warn(
+        `[gstack-build] Gemini model ${named} returned 404 ModelNotFoundError on preflight probe. ` +
+          `Every primary call will burn ~10s before falling back. Fix: edit ` +
+          `build/configure.cm (or the active install at ~/.claude/skills/gstack/build/configure.cm) ` +
+          `to use a currently-valid Gemini model identifier (e.g. 'gemini-2.5-flash'). ` +
+          `See Bug D in ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.`,
+      );
+    }
+    return parsed;
+  })().catch(() => ({ ok: true as const }));
+  _geminiModelProbeCache.set(model, probePromise);
+  return probePromise;
 }
 
 export async function assertCodexAuth(): Promise<{
@@ -1939,6 +2080,18 @@ export async function runRoleTask(opts: {
       retries: 0,
     };
   }
+  // Bug D: model validity probe. Fires once per session per model and
+  // emits a one-time startup warning if the configured model 404s.
+  // Non-blocking — assertGeminiModel uses async `spawn` (not spawnSync)
+  // so the orchestrator event loop stays responsive while the probe is
+  // in flight. Caches the Promise (not the resolved result) so concurrent
+  // probes for the same model share one in-flight spawn. The .catch
+  // swallows any unexpected rejection so the model probe can never crash
+  // a phase — the actual Gemini call will still run and fall back via
+  // the existing backup-provider path on real failure.
+  if (opts.model) {
+    assertGeminiModel(opts.model).catch(() => {});
+  }
 
   const {
     stagedInput,
@@ -3167,11 +3320,63 @@ export function extractCoverageTarget(phaseBody: string): number {
 }
 
 /**
+ * Probe whether the project at `cwd` has pytest-cov available. Two
+ * cheap signals, either is sufficient:
+ *
+ *   1. `pyproject.toml` text mentions `pytest-cov` (catches projects
+ *      that declare it as a dev dep but haven't installed yet).
+ *   2. A subprocess `python -c "import pytest_cov"` exits 0 (catches
+ *      projects that installed via requirements.txt, conda, or a
+ *      pre-existing venv without pyproject.toml).
+ *
+ * Returns false on any error — better to skip injection than to crash
+ * pytest with `unrecognized arguments: --cov`.
+ *
+ * Bug C in ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
+ */
+export function hasPytestCov(cwd: string): boolean {
+  // Signal 1: pyproject.toml text grep
+  try {
+    const py = fs.readFileSync(path.join(cwd, "pyproject.toml"), "utf8");
+    if (/pytest-cov\b/.test(py)) return true;
+  } catch {
+    // No pyproject.toml or unreadable. Fall through to signal 2.
+  }
+  // Signal 2: python import probe. Try `python3` first because modern macOS
+  // (12+) and many Linux distros ship no bare `python` binary — the bare
+  // probe would ENOENT and silently fail even with pytest-cov installed via
+  // pip/conda. Fall back to `python` for older systems / venvs.
+  for (const bin of ["python3", "python"]) {
+    try {
+      const probe = spawnSync(bin, ["-c", "import pytest_cov"], {
+        cwd,
+        stdio: "ignore",
+        timeout: 3000,
+      });
+      if (probe.status === 0) return true;
+    } catch {
+      // No such binary on PATH, timeout, or other failure. Try next.
+    }
+  }
+  return false;
+}
+
+/**
  * Append coverage flags to a test command for the GREEN gate run.
  * Idempotent — if the flag is already present, the command is returned unchanged.
  * Returns the command unchanged for unknown frameworks (caller logs advisory).
+ *
+ * For pytest specifically, requires `pytest-cov` to be installed in the
+ * project at `cwd` before injecting `--cov` flags. Projects that
+ * intentionally disable coverage in CI (mitosis-oasis CLAUDE.md:294 is
+ * the canonical case) hit `pytest: error: unrecognized arguments: --cov`
+ * and exit 4 during argparse, before any tests run. The probe is cheap
+ * and the fallback (no injection) is safe — coverage is a quality
+ * signal, not a correctness gate.
+ *
+ * Bug C in ~/.claude/plans/fix-orchestrator-mitosis-oasis-may-26-faults.md.
  */
-export function injectCoverageFlags(testCmd: string): string {
+export function injectCoverageFlags(testCmd: string, cwd: string): string {
   const cmd = testCmd.toLowerCase();
   if (/\bvitest\b/.test(cmd)) {
     return testCmd.includes("--coverage") ? testCmd : `${testCmd} --coverage`;
@@ -3185,9 +3390,14 @@ export function injectCoverageFlags(testCmd: string): string {
     return testCmd.includes("--coverage") ? testCmd : `${testCmd} --coverage`;
   }
   if (/\bpytest\b/.test(cmd)) {
-    return testCmd.includes("--cov")
-      ? testCmd
-      : `${testCmd} --cov --cov-report term-missing`;
+    if (testCmd.includes("--cov")) return testCmd;
+    if (!hasPytestCov(cwd)) {
+      console.warn(
+        `[injectCoverageFlags] pytest-cov not installed in ${cwd}; skipping --cov injection (Bug C)`,
+      );
+      return testCmd;
+    }
+    return `${testCmd} --cov --cov-report term-missing`;
   }
   if (/\bgo\s+test\b/.test(cmd)) {
     return testCmd.includes("-cover") ? testCmd : `${testCmd} -cover`;

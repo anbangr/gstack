@@ -551,6 +551,17 @@ export function applyResult(
   const next: PhaseState = { ...phaseState };
 
   if (action.type === "RUN_GEMINI") {
+    // Bug A leg 2: clear pendingFeatureReviewOutputPath unconditionally on
+    // every RUN_GEMINI completion. The first-call dispatch in cli.ts read
+    // the file and threaded findings into the impl prompt before invoking
+    // runRoleTask; the directive has been delivered. Clearing here (rather
+    // than at the dispatch site) is centralized and survives the
+    // {...phaseState} shallow copy above. Cleared regardless of result
+    // success/failure — on failure, the orchestrator's FAIL handler runs
+    // next, and the next impl attempt comes from a fresh FEATURE_REDO
+    // cycle (which re-sets the field) or from --reset-phase (which clears
+    // it via resetPhaseStateForRedo's else branch).
+    delete (next as any).pendingFeatureReviewOutputPath;
     next.gemini = {
       startedAt:
         phaseState.gemini?.startedAt ??

@@ -383,56 +383,110 @@ describe("parseCoveragePercent", () => {
 });
 
 describe("injectCoverageFlags", () => {
+  // Bug C: pytest path is now cwd-aware (requires pytest-cov). For tests
+  // that exercise the pytest branch's "inject" outcome, build a temp dir
+  // with `pytest-cov` in pyproject.toml so hasPytestCov returns true.
+  // Other framework branches don't probe cwd, so they accept any path.
+  let pytestCovCwd: string;
+  let pytestNoCovCwd: string;
+  let nonPytestCwd: string;
+
+  beforeAll(() => {
+    pytestCovCwd = fs.mkdtempSync(path.join(os.tmpdir(), "icf-pytest-cov-"));
+    fs.writeFileSync(
+      path.join(pytestCovCwd, "pyproject.toml"),
+      '[tool.poetry.dev-dependencies]\npytest-cov = "^4.0"\n',
+    );
+    pytestNoCovCwd = fs.mkdtempSync(path.join(os.tmpdir(), "icf-pytest-nocov-"));
+    fs.writeFileSync(
+      path.join(pytestNoCovCwd, "pyproject.toml"),
+      "[tool.poetry.dev-dependencies]\npytest = '^7.0'\n",
+    );
+    nonPytestCwd = pytestNoCovCwd; // any path works for non-pytest branches
+  });
+
+  afterAll(() => {
+    try {
+      fs.rmSync(pytestCovCwd, { recursive: true, force: true });
+    } catch {}
+    try {
+      fs.rmSync(pytestNoCovCwd, { recursive: true, force: true });
+    } catch {}
+  });
+
   it("appends --coverage to jest command", () => {
-    expect(injectCoverageFlags("jest")).toBe(
+    expect(injectCoverageFlags("jest", nonPytestCwd)).toBe(
       "jest --coverage --coverageReporters text",
     );
   });
 
   it("appends --coverage to vitest command", () => {
-    expect(injectCoverageFlags("vitest run")).toBe("vitest run --coverage");
+    expect(injectCoverageFlags("vitest run", nonPytestCwd)).toBe(
+      "vitest run --coverage",
+    );
   });
 
   it("appends --coverage to bun test command", () => {
-    expect(injectCoverageFlags("bun test")).toBe("bun test --coverage");
+    expect(injectCoverageFlags("bun test", nonPytestCwd)).toBe(
+      "bun test --coverage",
+    );
   });
 
   it("appends --coverage to bun run test command", () => {
-    expect(injectCoverageFlags("bun run test")).toBe("bun run test --coverage");
+    expect(injectCoverageFlags("bun run test", nonPytestCwd)).toBe(
+      "bun run test --coverage",
+    );
   });
 
-  it("appends --cov to pytest command", () => {
-    expect(injectCoverageFlags("pytest")).toBe(
+  it("appends --cov to pytest when pytest-cov is in pyproject.toml", () => {
+    expect(injectCoverageFlags("pytest", pytestCovCwd)).toBe(
       "pytest --cov --cov-report term-missing",
     );
   });
 
+  it("skips --cov injection when pytest-cov is NOT installed (Bug C)", () => {
+    // Project without pytest-cov: orchestrator must NOT inject --cov, or
+    // pytest argparse fails with exit 4 before tests run. mitosis-oasis
+    // canonical case.
+    expect(injectCoverageFlags("pytest", pytestNoCovCwd)).toBe("pytest");
+  });
+
   it("appends -cover to go test command", () => {
-    expect(injectCoverageFlags("go test ./...")).toBe("go test ./... -cover");
+    expect(injectCoverageFlags("go test ./...", nonPytestCwd)).toBe(
+      "go test ./... -cover",
+    );
   });
 
   it("is idempotent — does not double-add --coverage for jest", () => {
-    expect(injectCoverageFlags("jest --coverage")).toBe("jest --coverage");
+    expect(injectCoverageFlags("jest --coverage", nonPytestCwd)).toBe(
+      "jest --coverage",
+    );
   });
 
   it("is idempotent — does not double-add --coverage for vitest", () => {
-    expect(injectCoverageFlags("vitest --coverage")).toBe("vitest --coverage");
+    expect(injectCoverageFlags("vitest --coverage", nonPytestCwd)).toBe(
+      "vitest --coverage",
+    );
   });
 
-  it("is idempotent — does not double-add --cov for pytest", () => {
-    expect(injectCoverageFlags("pytest --cov")).toBe("pytest --cov");
+  it("is idempotent — does not double-add --cov for pytest (skips probe entirely)", () => {
+    // Idempotent short-circuit fires BEFORE hasPytestCov is called, so
+    // pytestNoCovCwd works here too — the cmd already has --cov.
+    expect(injectCoverageFlags("pytest --cov", pytestNoCovCwd)).toBe(
+      "pytest --cov",
+    );
   });
 
   it("is idempotent — does not double-add -cover for go test", () => {
-    expect(injectCoverageFlags("go test ./... -cover")).toBe(
+    expect(injectCoverageFlags("go test ./... -cover", nonPytestCwd)).toBe(
       "go test ./... -cover",
     );
   });
 
   it("returns unknown commands unchanged", () => {
-    expect(injectCoverageFlags("make test")).toBe("make test");
-    expect(injectCoverageFlags("cargo test")).toBe("cargo test");
-    expect(injectCoverageFlags("npm test")).toBe("npm test");
+    expect(injectCoverageFlags("make test", nonPytestCwd)).toBe("make test");
+    expect(injectCoverageFlags("cargo test", nonPytestCwd)).toBe("cargo test");
+    expect(injectCoverageFlags("npm test", nonPytestCwd)).toBe("npm test");
   });
 });
 
