@@ -117,6 +117,150 @@ describe("Bug L — codex blind-execution marker false-positive", () => {
   });
 });
 
+// Bug N — operator-UX command for the SILENT_STATE_MUTATION class.
+// Ships alongside Bug L because both are small operator-tooling
+// fixes that touch only cli.ts and have no test-fixture overlap with
+// the larger Bug K/M behavioral changes.
+describe("Bug N — markFeatureShippedAfterManualRecovery", () => {
+  // Use a fresh import so the function is in scope. The function is
+  // exported alongside markPhaseCommittedAfterManualRecovery in cli.ts.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { markFeatureShippedAfterManualRecovery } = require("../cli") as {
+    markFeatureShippedAfterManualRecovery: (args: {
+      state: any;
+      featureNumber: string;
+      prNumber: number;
+      shippedCommit?: string;
+      dryRun?: boolean;
+    }) =>
+      | { ok: true; featureIndex: number }
+      | { ok: false; error: string };
+  };
+
+  function mkState(): any {
+    return {
+      features: [
+        { number: "1", name: "feature-one", status: "phases_done" },
+        { number: "5", name: "feature-five", status: "phases_done" },
+      ],
+      phases: [],
+    };
+  }
+
+  it("T-N1: atomically sets status=release_queued + shippedAt + prNumber", () => {
+    const state = mkState();
+    const result = markFeatureShippedAfterManualRecovery({
+      state,
+      featureNumber: "5",
+      prNumber: 119,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(result.featureIndex).toBe(1);
+    const f = state.features[1];
+    expect(f.status).toBe("release_queued");
+    expect(f.prNumber).toBe(119);
+    expect(f.shippedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    // Without explicit commit, shippedCommit stays unset.
+    expect(f.shippedCommit).toBeUndefined();
+  });
+
+  it("T-N2: includes shippedCommit when provided", () => {
+    const state = mkState();
+    const result = markFeatureShippedAfterManualRecovery({
+      state,
+      featureNumber: "5",
+      prNumber: 119,
+      shippedCommit: "abc1234def",
+    });
+    expect(result.ok).toBe(true);
+    expect(state.features[1].shippedCommit).toBe("abc1234def");
+  });
+
+  it("T-N3: refuses non-integer / non-positive prNumber", () => {
+    const state = mkState();
+    const r1 = markFeatureShippedAfterManualRecovery({
+      state,
+      featureNumber: "5",
+      prNumber: 0,
+    });
+    expect(r1.ok).toBe(false);
+    if (r1.ok) throw new Error("unreachable");
+    expect(r1.error).toContain("positive integer");
+    const r2 = markFeatureShippedAfterManualRecovery({
+      state,
+      featureNumber: "5",
+      prNumber: -1,
+    });
+    expect(r2.ok).toBe(false);
+  });
+
+  it("T-N4: refuses unknown feature number with descriptive error", () => {
+    const state = mkState();
+    const result = markFeatureShippedAfterManualRecovery({
+      state,
+      featureNumber: "99",
+      prNumber: 100,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.error).toContain("feature not found: 99");
+  });
+
+  it("T-N5: refuses to overwrite a feature that already shipped via real pipeline", () => {
+    const state = mkState();
+    // Simulate prior real ship: status + shippedAt + prNumber all set.
+    state.features[1].status = "release_queued";
+    state.features[1].shippedAt = "2026-05-26T12:00:00.000Z";
+    state.features[1].prNumber = 108;
+    const result = markFeatureShippedAfterManualRecovery({
+      state,
+      featureNumber: "5",
+      prNumber: 200,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.error).toContain("already shipped");
+    expect(result.error).toContain("PR #108");
+    // State must be unchanged.
+    expect(state.features[1].prNumber).toBe(108);
+  });
+
+  it("T-N6: orchestrator's SILENT_STATE_MUTATION self-heal accepts the mark-feature-shipped output", () => {
+    // Pin the contract: after markFeatureShippedAfterManualRecovery
+    // sets status=release_queued + shippedAt + prNumber, the
+    // SILENT_STATE_MUTATION classifier (cli.ts:12677 region) sees a
+    // FULLY-shipped feature and does NOT re-process. Validated by
+    // mirroring the classifier's predicate inline.
+    const state = mkState();
+    markFeatureShippedAfterManualRecovery({
+      state,
+      featureNumber: "5",
+      prNumber: 119,
+    });
+    const f = state.features[1];
+    // The classifier's predicate from cli.ts:12681-12683:
+    //   featureState.status === "release_queued" && !isFeatureTerminal(featureState)
+    // isFeatureTerminal returns true when shippedAt && prNumber both
+    // set. After our mark, the negation is FALSE → classifier skips.
+    const isTerminal = !!f.shippedAt && f.prNumber != null;
+    expect(isTerminal).toBe(true);
+  });
+});
+
+describe("Bug N — static-grep wiring guards", () => {
+  it("T-N7: cli.ts declares --mark-feature-shipped + companion flags", () => {
+    expect(cliContent).toContain('a === "--mark-feature-shipped"');
+    expect(cliContent).toContain('a === "--mark-feature-shipped-pr"');
+    expect(cliContent).toContain('a === "--mark-feature-shipped-commit"');
+  });
+
+  it("T-N8: --help mentions the new CLI command + companions", () => {
+    expect(cliContent).toMatch(/--mark-feature-shipped\s+<feature>/);
+    expect(cliContent).toMatch(/--mark-feature-shipped-pr\s+<N>/);
+  });
+});
+
 describe("Bug L — static-grep wiring guards", () => {
   it("T-L5: the legacy bare 'sandbox denied' substring is gone from BLIND_EXECUTION_MARKERS.codex", () => {
     // Pin the removal. A future refactor that re-adds the bare
