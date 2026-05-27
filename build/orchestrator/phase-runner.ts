@@ -822,7 +822,25 @@ export function applyResult(
     };
     if (result.timedOut || result.exitCode !== 0) {
       next.status = "failed";
-      next.error = renderRoleStepFailureMessage("test-fixer", result);
+      // Bug M: mirror Bug I (PR #107). When the failure is a hygiene-gate
+      // conversion (empty output, no commit, recovery refused), prefer
+      // the hygiene reason over the generic "test-fixer exited N"
+      // message. `geminiExitError` extracts the first non-header line
+      // of the hygiene body ("test fixer did not create a new commit",
+      // "test fixer left the working tree dirty", etc.) when
+      // result.hygieneFailure is true and falls through to the legacy
+      // shape otherwise. Every other dispatcher in this file
+      // (primary-impl, test-spec writer (post-Bug-I), dual-impl, judge)
+      // already uses geminiExitError; this was the lone holdout still
+      // calling renderRoleStepFailureMessage.
+      //
+      // Canonical incident: agnt2-prototype-prodl2-f3-f4-soak Phase 3.1
+      // (2026-05-27 03:34 UTC). Codex test-fixer exited 0 with no
+      // commit; applyMutableAgentHygiene wrapped as exitCode=1 with
+      // body "test fixer did not create a new commit"; the old
+      // attribution showed "test-fixer exited 1" to the operator,
+      // who had to grep the hygiene log for the actual reason.
+      next.error = geminiExitError("test-fixer", result);
       persistFailureRender(next, "test-fixer", result);
       return next;
     }
