@@ -2072,6 +2072,28 @@ export interface GitSnapshot {
    * captured contents the discard helper fails closed.
    */
   workTreeContents?: Map<string, Buffer>;
+  /**
+   * Bug K3 — sha256 of sensitive `.git/` metadata files plus a sorted
+   * directory listing of `.git/hooks/`. Populated only when
+   * `captureGitSnapshot` is called with `captureGitDirContents: true`.
+   *
+   * Why this exists: `git status --porcelain` reports worktree mutations
+   * but NOT mutations under `.git/`. Pre-Bug-J the OS read-only sandbox
+   * blocked .git writes at the syscall level; with workspace-write the
+   * new default, a reviewer can install a malicious post-merge hook
+   * (`.git/hooks/post-merge`), rewrite `.git/config` to point origin at
+   * an attacker URL, or tamper with `.git/info/exclude` to silently
+   * skip files from staging. None of those surface in `git status` so
+   * `validatePostAgentHygiene` never sees them.
+   *
+   * `validateGitDirUnchanged` (also added in this PR) compares before
+   * vs after snapshots and emits a HYGIENE_FAULT on any drift.
+   *
+   * The map is keyed by `.git/`-relative paths
+   * (`config`, `HEAD`, `info/exclude`, `hooks/post-merge`, etc.) so
+   * diffs surface the exact file the reviewer touched.
+   */
+  gitDirHashes?: Map<string, string>;
 }
 
 export interface HygieneVerdict {
@@ -2150,7 +2172,7 @@ export function classifyTestWriterCommit(allCommitted: string[]): {
 
 export function captureGitSnapshot(
   cwd: string,
-  opts?: { captureContents?: boolean },
+  opts?: { captureContents?: boolean; captureGitDirContents?: boolean },
 ): GitSnapshot {
   const headR = spawnSync("git", ["rev-parse", "HEAD"], {
     cwd,
@@ -2203,11 +2225,98 @@ export function captureGitSnapshot(
     }
   }
 
+  // Bug K3 — sensitive `.git/` metadata snapshot. Hashes are sha256 of
+  // file content; the hooks directory is captured as a sorted listing
+  // hash so adding/removing hook files (not just modifying them) is
+  // detected. All reads are best-effort: a missing file is recorded as
+  // the literal string "<absent>" so a later "file appeared" mutation
+  // surfaces as a hash mismatch.
+  let gitDirHashes: Map<string, string> | undefined;
+  if (opts?.captureGitDirContents) {
+    gitDirHashes = new Map<string, string>();
+    // Resolve the .git directory honoring linked worktrees:
+    // `git rev-parse --git-dir` returns `.git/worktrees/<name>` for a
+    // linked worktree, NOT the shared common dir. For Bug K3 the
+    // worktree-specific `.git/worktrees/<name>/` files (HEAD, index)
+    // are the right thing to watch — that's where a per-worktree
+    // commit lands. The common dir's hooks/config still matter; we
+    // watch both.
+    const gitDirRes = spawnSync("git", ["rev-parse", "--git-dir"], {
+      cwd,
+      encoding: "utf8",
+    });
+    const gitCommonDirRes = spawnSync(
+      "git",
+      ["rev-parse", "--git-common-dir"],
+      { cwd, encoding: "utf8" },
+    );
+    const gitDir =
+      gitDirRes.status === 0 ? gitDirRes.stdout.trim() || null : null;
+    const gitCommonDir =
+      gitCommonDirRes.status === 0
+        ? gitCommonDirRes.stdout.trim() || null
+        : null;
+    // Sensitive files to watch. The (dir, name) pairs cover both the
+    // per-worktree dir (HEAD, packed-refs) and the common dir
+    // (config, hooks, info/exclude).
+    const targets: Array<[string | null, string]> = [
+      [gitDir, "HEAD"],
+      [gitCommonDir, "config"],
+      [gitCommonDir, "info/exclude"],
+      [gitCommonDir, "packed-refs"],
+    ];
+    for (const [dir, rel] of targets) {
+      if (!dir) continue;
+      const abs = path.isAbsolute(dir) ? path.join(dir, rel) : path.join(cwd, dir, rel);
+      const key = `${path.basename(dir)}/${rel}`;
+      try {
+        const buf = fs.readFileSync(abs);
+        gitDirHashes.set(key, crypto.createHash("sha256").update(buf).digest("hex"));
+      } catch {
+        gitDirHashes.set(key, "<absent>");
+      }
+    }
+    // hooks/ directory — capture a hash of the sorted listing of
+    // existing executable hook files. Hook executable bit matters as
+    // much as content (a chmod +x on a previously-disarmed hook IS a
+    // hot-take security event).
+    if (gitCommonDir) {
+      const hooksDir = path.isAbsolute(gitCommonDir)
+        ? path.join(gitCommonDir, "hooks")
+        : path.join(cwd, gitCommonDir, "hooks");
+      try {
+        const entries = fs.readdirSync(hooksDir).sort();
+        const lines: string[] = [];
+        for (const name of entries) {
+          if (name.endsWith(".sample")) continue; // git ships these stubs
+          const full = path.join(hooksDir, name);
+          try {
+            const st = fs.statSync(full);
+            if (!st.isFile()) continue;
+            const buf = fs.readFileSync(full);
+            const contentHash = crypto.createHash("sha256").update(buf).digest("hex");
+            const execBit = (st.mode & 0o111) !== 0 ? "x" : "-";
+            lines.push(`${name}|${execBit}|${contentHash}`);
+          } catch {
+            lines.push(`${name}|?|<unreadable>`);
+          }
+        }
+        gitDirHashes.set(
+          "hooks/",
+          crypto.createHash("sha256").update(lines.join("\n")).digest("hex"),
+        );
+      } catch {
+        gitDirHashes.set("hooks/", "<absent>");
+      }
+    }
+  }
+
   return {
     head,
     status: statusLines,
     workTreeHashes,
     ...(workTreeContents ? { workTreeContents } : {}),
+    ...(gitDirHashes ? { gitDirHashes } : {}),
   };
 }
 
@@ -3284,6 +3393,46 @@ export function validateParentWorkspaceUnchanged(opts: {
   }
   if (afterStatus !== beforeStatus) {
     errors.push(`${opts.label} changed workspace root status`);
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+/**
+ * Bug K3 — detect mutations to sensitive `.git/` metadata files that
+ * `git status --porcelain` doesn't surface. Compares the post-spawn
+ * captureGitSnapshot result (called with `captureGitDirContents: true`)
+ * against the `before` snapshot captured the same way.
+ *
+ * The check is a no-op when either snapshot lacks `gitDirHashes` (the
+ * field is opt-in to keep `captureGitSnapshot`'s baseline cost low).
+ * Callers that care about K3 enforcement MUST capture both snapshots
+ * with `captureGitDirContents: true`.
+ *
+ * Each diff produces one error line naming the specific `.git/` path
+ * (`config`, `HEAD`, `info/exclude`, `hooks/`, etc.). The operator can
+ * grep the affected file directly.
+ */
+export function validateGitDirUnchanged(opts: {
+  before: GitSnapshot;
+  cwd: string;
+  label: string;
+}): HygieneVerdict {
+  if (!opts.before.gitDirHashes) return { ok: true, errors: [] };
+  const after = captureGitSnapshot(opts.cwd, { captureGitDirContents: true });
+  if (!after.gitDirHashes) return { ok: true, errors: [] };
+  const errors: string[] = [];
+  const allKeys = new Set<string>([
+    ...opts.before.gitDirHashes.keys(),
+    ...after.gitDirHashes.keys(),
+  ]);
+  for (const key of Array.from(allKeys).sort()) {
+    const b = opts.before.gitDirHashes.get(key);
+    const a = after.gitDirHashes.get(key);
+    if (b !== a) {
+      errors.push(
+        `${opts.label} mutated .git/${key} (${b?.slice(0, 8) ?? "<missing>"} → ${a?.slice(0, 8) ?? "<missing>"}) — review/QA roles must NOT modify git metadata`,
+      );
+    }
   }
   return { ok: errors.length === 0, errors };
 }
@@ -5708,7 +5857,16 @@ async function runReviewGates(opts: {
     // Without it, the gate's BLIND_EXECUTION_DETECTED handler refuses to
     // discard ("before.workTreeContents not captured") and the orphan
     // edits stay on the worktree. Class 2 fix.
-    const before = captureGitSnapshot(opts.cwd, { captureContents: true });
+    //
+    // captureGitDirContents:true is Bug K3: snapshot `.git/` metadata
+    // (hooks, config, HEAD, info/exclude, packed-refs) so
+    // validateGitDirUnchanged can detect mutations git-status doesn't
+    // surface. Required for the post-Bug-J workspace-write threat
+    // model where a reviewer can write under `.git/` if it tries.
+    const before = captureGitSnapshot(opts.cwd, {
+      captureContents: true,
+      captureGitDirContents: true,
+    });
     const parentBeforeGate = refreshParentWorkspaceSnapshot(
       opts.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
     );
@@ -5731,6 +5889,11 @@ async function runReviewGates(opts: {
     // reviewers don't.
     const gateAllowsSourceFixes =
       name === "qa" && phaseAllowsGateSourceFixes(opts.phase);
+    // Bug K1: review/reviewSecondary are read-only by contract — refuse
+    // HEAD advance. QA is exempt (fix-on-review is QA's job).
+    // Bug K2: review/reviewSecondary/qa get discard-on-failure so a
+    // crashed reviewer's worktree mutations don't poison the retry.
+    const gateIsReviewer = name === "review" || name === "reviewSecondary";
     result = applyGateHygiene({
       result,
       before,
@@ -5740,6 +5903,8 @@ async function runReviewGates(opts: {
       phaseRef: phaseRefForHygieneHint(opts.phase),
       inputFilePath: opts.inputFilePath,
       allowNonTestPaths: gateAllowsSourceFixes,
+      requireNoHeadAdvance: gateIsReviewer,
+      discardOnFailure: true,
     });
     outputs.push(result);
     combined.push(
@@ -5771,6 +5936,11 @@ async function runReviewGates(opts: {
         // Mirror the Bug J scope-tightening from the primary gate
         // call above: only QA may auto-commit fixes.
         allowNonTestPaths: gateAllowsSourceFixes,
+        // Mirror Bug K1/K2 scope from the primary gate call above:
+        // review/reviewSecondary refuse HEAD advance; all gate roles
+        // discard worktree mutations on failure.
+        requireNoHeadAdvance: gateIsReviewer,
+        discardOnFailure: true,
       });
       outputs.push(checkedRetryResult);
       combined.push(
@@ -6173,8 +6343,60 @@ function applyGateHygiene(opts: {
    *  the prompt body actually contains the constraint. */
   inputFilePath?: string;
   allowNonTestPaths?: boolean;
+  /**
+   * Bug K1 — when true, a HEAD advance during the gate run becomes a
+   * hygiene failure. Used for review/reviewSecondary gates after Bug J
+   * dropped the read-only sandbox: reviewers are read-only by contract,
+   * so any new commit they create (the new workspace-write default
+   * allows it) must be refused. QA stays exempt because QA's contract
+   * IS to commit fix-on-review changes. Caller sets this when
+   * `name === "review" || name === "reviewSecondary"`. Without the
+   * check, a malicious or confused reviewer can `git commit` source
+   * changes, write GATE PASS, leave the tree clean, and the gate
+   * accepts the commit silently.
+   */
+  requireNoHeadAdvance?: boolean;
+  /**
+   * Bug K2 — when true, the gate runs a `discardBlindExecutionChanges`
+   * cleanup even when the spawn timed out or exited non-zero. Used for
+   * review/reviewSecondary/qa gates: pre-Bug-J the OS read-only sandbox
+   * structurally prevented mutations on failed runs; post-Bug-J the
+   * workspace-write default means a reviewer can edit source, crash
+   * before verdict, and leave dirty work for the retry to inherit.
+   * Without this, the early-return at the top of applyGateHygiene
+   * preserves those mutations. The discard reuses
+   * `before.workTreeContents` (requires `captureContents: true` on the
+   * snapshot capture — already the case for runReviewGates).
+   */
+  discardOnFailure?: boolean;
 }): SubAgentResult {
-  if (opts.result.timedOut || opts.result.exitCode !== 0) return opts.result;
+  // Bug K2 — gate-role early-return now ALSO discards worktree
+  // mutations the failed reviewer left behind. Pre-fix the early-return
+  // preserved them, which let a timed-out reviewer poison the retry
+  // path. We only run the discard when the caller opted in
+  // (`discardOnFailure`) AND `before.workTreeContents` is available
+  // (rsync-style restore needs the pre-spawn bytes). The original
+  // result is still returned so the caller's exit-code/timeout
+  // semantics are unchanged — this is a side-effect cleanup, not a
+  // result rewrite.
+  if (opts.result.timedOut || opts.result.exitCode !== 0) {
+    if (opts.discardOnFailure && opts.before.workTreeContents) {
+      const discard = discardBlindExecutionChanges(opts.cwd, opts.before);
+      if (!discard.ok) {
+        console.warn(
+          `  ⚠ ${opts.label}: discardBlindExecutionChanges failed on failed-gate cleanup: ${discard.error}`,
+        );
+      } else if (
+        (discard.restored?.length ?? 0) > 0 ||
+        (discard.deleted?.length ?? 0) > 0
+      ) {
+        console.warn(
+          `  ↺ ${opts.label}: discarded ${(discard.restored?.length ?? 0) + (discard.deleted?.length ?? 0)} mutation(s) from failed gate run`,
+        );
+      }
+    }
+    return opts.result;
+  }
   // Review/QA gates run Codex under workspace-write and the subagent writes
   // session metadata to `.codex/`. Treat those scratch dirs as ignorable
   // for the hygiene check on review-shaped roles.
@@ -6195,7 +6417,44 @@ function applyGateHygiene(opts: {
       workspaceRoot: opts.parentWorkspace?.workspaceRoot ?? null,
       label: opts.label,
     }),
+    // Bug K3 — detect .git/ metadata mutations (hooks, config, HEAD,
+    // info/exclude). No-op unless `opts.before` was captured with
+    // `captureGitDirContents: true`. The caller (runReviewGates) flips
+    // that flag on for review/reviewSecondary gates.
+    validateGitDirUnchanged({
+      before: opts.before,
+      cwd: opts.cwd,
+      label: opts.label,
+    }),
   ];
+  // Bug K1 — review/reviewSecondary gates are read-only by contract.
+  // A new commit during the gate run (HEAD advance) means the reviewer
+  // committed source changes the new workspace-write sandbox no longer
+  // blocks. Pre-Bug-J the OS sandbox refused all writes including the
+  // commit attempt; post-Bug-J the verdict file write works (intended)
+  // but `git commit` ALSO works (unintended). The hygiene gate's only
+  // structural surface left to refuse it is HEAD-advance detection.
+  // The check fires AFTER validatePostAgentHygiene because if the
+  // reviewer ALSO left the tree dirty, the dirty-tree error stays
+  // primary — the head-advance error is additive context, not a
+  // replacement diagnostic.
+  if (opts.requireNoHeadAdvance) {
+    const afterHead = (() => {
+      const r = spawnSync("git", ["rev-parse", "HEAD"], {
+        cwd: opts.cwd,
+        encoding: "utf8",
+      });
+      return r.status === 0 ? r.stdout.trim() || null : null;
+    })();
+    if (afterHead && afterHead !== opts.before.head) {
+      checks.push({
+        ok: false,
+        errors: [
+          `${opts.label} committed during gate run (HEAD advanced ${opts.before.head?.slice(0, 8)} → ${afterHead.slice(0, 8)}) — reviewer roles are read-only; only QA may fix-on-review`,
+        ],
+      });
+    }
+  }
   let errors = checks.flatMap((check) => check.errors);
   // Bug 5: review/qa gates that left only test-path changes dirty can be
   // auto-committed instead of failing. We only attempt the auto-commit when
