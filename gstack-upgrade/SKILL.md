@@ -214,7 +214,18 @@ if [ -d "$INSTALL_DIR/.git" ]; then
   rm -rf "$INSTALL_DIR/.git"
 fi
 mkdir -p "$INSTALL_DIR"
-rsync -a --delete --exclude '.git' "$FORK_REPO/" "$INSTALL_DIR/"
+# Bug I side-fix: preserve user-filed BUGREPORT-*.md files under the
+# install dir's inbox/. Without this, the May-2026 AGNT2 incident
+# repeats: a remote-control operator filed
+# `inbox/BUGREPORT-test-writer-fixer-exit-nonzero-with-valid-work.md`
+# directly into the install dir, then the next /gstack-upgrade rsync
+# `--delete`d it because the source repo's inbox/ didn't have that
+# file. Bug reports are USER state, not skill state — they belong in
+# either ~/.gstack/inbox/ (preferred) or the install dir's inbox/
+# (legacy convenience). The exclude pattern only preserves
+# `BUGREPORT-*` files specifically; example bug reports tracked in
+# the source repo's inbox/ still sync normally.
+rsync -a --delete --exclude '.git' --exclude 'inbox/BUGREPORT-*' "$FORK_REPO/" "$INSTALL_DIR/"
 echo "Copied fork → $INSTALL_DIR"
 ```
 
