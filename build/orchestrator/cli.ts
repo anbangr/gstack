@@ -5659,10 +5659,30 @@ async function runReviewGates(opts: {
       `phase-${opts.phaseNumber}-${outputName}-${opts.iteration}-output.md`,
     );
     fs.writeFileSync(outputFilePath, "");
-    const readOnlyArtifactGate =
-      opts.phase.kind !== "code" || opts.phase.auditOnly === true;
-    const sandbox =
-      attempt?.sandbox ?? (readOnlyArtifactGate ? "read-only" : undefined);
+    // Bug J — Codex /review under `-s read-only` cannot write its own
+    // verdict file. stageCodexIO stages the output inside the worktree
+    // (so it survives the codex CLI's cwd-restricted sandbox), but
+    // read-only blocks ALL writes including the staged output. The
+    // result is a 0-byte verdict, the parser sees no GATE PASS/FAIL,
+    // the orchestrator routes through primary-impl-rerun recovery,
+    // and recovery cascades into a "blind execution — input file
+    // unreachable" failure. The earlier `readOnlyArtifactGate` heuristic
+    // (kind !== "code" || auditOnly) tried to prevent the reviewer from
+    // writing source on non-code phases by forcing read-only, but the
+    // same defense-in-depth model the feature-review path uses
+    // (sub-agents.ts:3921 onward) is what actually keeps reviewers in
+    // their lane:
+    //   1. Prompt forbids worktree edits (verdict-only output target).
+    //   2. applyGateHygiene below catches any worktree mutation
+    //      post-spawn and converts it to HYGIENE_FAULT.
+    //   3. Same-shape repeat detector halts the loop after 2 identical
+    //      HYGIENE_FAULTs (caller upstream).
+    // Drop the heuristic; let the role-specific dispatcher default to
+    // workspace-write. Explicit `attempt.sandbox` overrides
+    // (sandbox-retry path below, env GSTACK_BUILD_CODEX_REVIEW_SANDBOX)
+    // still win. Source-mutation enforcement comes from the hygiene
+    // gate, not from the sandbox forced at launch.
+    const sandbox = attempt?.sandbox;
     return runSlashCommand({
       inputFilePath: opts.inputFilePath,
       outputFilePath,
@@ -5693,6 +5713,24 @@ async function runReviewGates(opts: {
       opts.parentWorkspace ?? { workspaceRoot: null, snapshot: null },
     );
     let result = await runGate(name, role);
+    // Bug J inline hardening (security review HIGH): scope the
+    // fix-on-review escape hatch to the QA gate ONLY. `review` and
+    // `reviewSecondary` are READ-ONLY by contract — they evaluate the
+    // implementation and emit a verdict; they don't fix code. Before
+    // Bug J removed the read-only sandbox floor on non-code phases,
+    // the OS sandbox structurally blocked all reviewer writes (verdict
+    // file included). Now the verdict write works (the intended fix)
+    // but reviewer source mutations would also work — and on non-code
+    // phases (research/writing/experiment/manual) the legacy
+    // phaseAllowsGateSourceFixes() returned true unconditionally,
+    // which would have made applyGateHygiene auto-COMMIT the reviewer's
+    // source mutations instead of converting them to HYGIENE_FAULT.
+    // Net effect without this scope tightening: silent
+    // reviewer-driven commits on every non-code phase. QA keeps
+    // fix-on-review semantics (intentional — that's why QA exists);
+    // reviewers don't.
+    const gateAllowsSourceFixes =
+      name === "qa" && phaseAllowsGateSourceFixes(opts.phase);
     result = applyGateHygiene({
       result,
       before,
@@ -5701,7 +5739,7 @@ async function runReviewGates(opts: {
       parentWorkspace: parentBeforeGate,
       phaseRef: phaseRefForHygieneHint(opts.phase),
       inputFilePath: opts.inputFilePath,
-      allowNonTestPaths: phaseAllowsGateSourceFixes(opts.phase),
+      allowNonTestPaths: gateAllowsSourceFixes,
     });
     outputs.push(result);
     combined.push(
@@ -5730,7 +5768,9 @@ async function runReviewGates(opts: {
         parentWorkspace: parentBeforeGate,
         phaseRef: phaseRefForHygieneHint(opts.phase),
         inputFilePath: opts.inputFilePath,
-        allowNonTestPaths: phaseAllowsGateSourceFixes(opts.phase),
+        // Mirror the Bug J scope-tightening from the primary gate
+        // call above: only QA may auto-commit fixes.
+        allowNonTestPaths: gateAllowsSourceFixes,
       });
       outputs.push(checkedRetryResult);
       combined.push(
