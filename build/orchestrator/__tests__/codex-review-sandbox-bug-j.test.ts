@@ -115,10 +115,60 @@ describe("Bug J — Codex /review sandbox no longer forces read-only", () => {
     // Bonus: the JSDoc comment for runCodexReview already documents
     // the workspace-write default at sub-agents.ts. Make sure the
     // cli.ts caller doesn't override it with a hardcoded read-only.
+    // Widened from 2500 → 5000 chars after adversarial review (Bug J
+    // hardening commit) noted the original block was at 2249/2500
+    // chars — one new if-block away from overflowing the window and
+    // crashing the test with a non-null-assertion TypeError on the
+    // null match result. 5000 gives ~2.7KB headroom for routine
+    // additions.
     const reviewGateBlock = cliContent.match(
-      /const runGate = async[\s\S]{0,2500}return runSlashCommand/,
+      /const runGate = async[\s\S]{0,5000}return runSlashCommand/,
     );
     expect(reviewGateBlock).not.toBeNull();
     expect(reviewGateBlock![0]).not.toMatch(/"read-only"/);
+  });
+
+  it("T-J5: review/reviewSecondary gates do NOT pass phaseAllowsGateSourceFixes as allowNonTestPaths", () => {
+    // Security review HIGH finding: the original Bug J fix assumed
+    // applyGateHygiene would convert reviewer source mutations into
+    // HYGIENE_FAULT. It does NOT, because phaseAllowsGateSourceFixes()
+    // returns true for non-code phases unconditionally, which makes
+    // applyGateHygiene AUTO-COMMIT the mutation instead of rejecting
+    // it. Net effect of the unhardened Bug J: silent reviewer-driven
+    // commits on every non-code phase. The hardening introduces a
+    // `gateAllowsSourceFixes` local that ONLY returns true when the
+    // gate name is "qa" AND phaseAllowsGateSourceFixes(phase) is true.
+    // Static-grep that hardening so a future refactor that re-collapses
+    // the allowNonTestPaths source to phaseAllowsGateSourceFixes() at
+    // the runGate call site fails CI.
+    expect(cliContent).toMatch(
+      /const gateAllowsSourceFixes\s*=\s*\n?\s*name\s*===\s*"qa"\s*&&\s*phaseAllowsGateSourceFixes/,
+    );
+    // Pin that the primary applyGateHygiene call in runReviewGates
+    // uses the scoped local, not the raw helper.
+    expect(cliContent).toMatch(
+      /label:\s*`\$\{name\}\s+gate`,[\s\S]{0,400}allowNonTestPaths:\s*gateAllowsSourceFixes/,
+    );
+    // Mirror check for the sandbox-retry path (cli.ts:5745 region).
+    expect(cliContent).toMatch(
+      /label:\s*`\$\{name\}\s+sandbox retry gate`,[\s\S]{0,400}allowNonTestPaths:\s*gateAllowsSourceFixes/,
+    );
+  });
+
+  it("T-J6: the raw phaseAllowsGateSourceFixes(opts.phase) call form is gone from runGate applyGateHygiene block", () => {
+    // Stronger guard for the same invariant as T-J5 — pins the
+    // NEGATIVE: the unhardened code form must not reappear. A
+    // refactor that re-introduces
+    // `allowNonTestPaths: phaseAllowsGateSourceFixes(opts.phase)` at
+    // any applyGateHygiene call inside runReviewGates would silently
+    // restore the security regression. Match the literal call form
+    // anchored on the previous line's pattern.
+    const runReviewGatesBlock = cliContent.match(
+      /async function runReviewGates[\s\S]{0,15000}^\}/m,
+    );
+    expect(runReviewGatesBlock).not.toBeNull();
+    expect(runReviewGatesBlock![0]).not.toMatch(
+      /allowNonTestPaths:\s*phaseAllowsGateSourceFixes\(opts\.phase\)/,
+    );
   });
 });
