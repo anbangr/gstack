@@ -2710,8 +2710,38 @@ const BLIND_EXECUTION_MARKERS: Record<BlindExecutionAgent, string[]> = {
   ],
   // Speculative — refined on first observed Kimi blind failure.
   kimi: ["workspace path not allowed:", "outside --add-dir scope:"],
-  // Speculative — refined on first observed Codex blind failure.
-  codex: ["sandbox denied", "workspace-write violation:"],
+  // Bug L (2026-05-27): the original codex marker `"sandbox denied"`
+  // was a substring match that flagged false positives on every codex
+  // run where the AGENT MENTIONED sandbox issues in its own narrative
+  // output. Canonical incident: agnt2 Phase 3.5 manual phase, codex
+  // successfully worked around a Go-cache sandbox limit (re-ran with
+  // workspace-local GOCACHE), then wrote in its summary
+  // "- Initial `go test ./soak/...` without `GOCACHE` failed because
+  // the sandbox denied writes to `/Users/.../Library/Caches/go-build`;
+  // rerun with workspace-local `GOCACHE` passed". The substring match
+  // fired, discardBlindExecutionChanges threw away all the agent's
+  // real work, and the operator saw `primary implementor: blind
+  // execution — input file unreachable; changes discarded` — a
+  // misattributed false halt that took 4+ minutes of agent work
+  // with it. Filed at HYGIENE_FAIL:p4:a7235d1c.
+  //
+  // The fix tightens the codex markers to STRUCTURED ERROR LINES that
+  // codex actually emits at sandbox-violation time, not prose
+  // mentions:
+  //   - `ERROR codex_core::tools::router: error=` — codex's
+  //     structured error-log prefix (covers the Bug J `patch
+  //     rejected: writing is blocked by read-only sandbox` shape too)
+  //   - `error: sandbox denied:` — codex's CLI error format with the
+  //     trailing colon (distinguishes structured error from prose
+  //     mentions, which usually phrase it as "sandbox denied writes"
+  //     or "sandbox denied access" — no trailing colon)
+  //   - `workspace-write violation:` — kept verbatim, already specific
+  //     enough that prose-mention false positives are unlikely
+  codex: [
+    "ERROR codex_core::tools::router: error=",
+    "error: sandbox denied:",
+    "workspace-write violation:",
+  ],
 };
 
 /**
