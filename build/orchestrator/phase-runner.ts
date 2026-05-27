@@ -701,7 +701,26 @@ export function applyResult(
     };
     if (result.timedOut || result.exitCode !== 0) {
       next.status = "failed";
-      next.error = renderRoleStepFailureMessage("test-spec writer", result);
+      // Bug I: when the failure is a hygiene-gate conversion (empty
+      // output, no commit, recovery refused, etc.), prefer the hygiene
+      // reason over the generic "test-spec writer exited N" message.
+      // The legacy message hid the actual failure mode behind an exit
+      // code that the hygiene wrapper itself forged (exitCode=1 from
+      // hygieneFailureResult), so an operator seeing "exited 1" would
+      // hunt for an LLM crash that never happened. `geminiExitError`
+      // already implements the right idiom — it pulls the first
+      // non-header line of the hygiene body ("left an empty output
+      // summary", "did not create a new commit", etc.) and falls
+      // through to the legacy `exited N; see <log>` shape when no
+      // hygiene marker is present. Every other dispatcher in this file
+      // (primary-impl, test-fixer, dual-impl, etc.) already uses
+      // `geminiExitError`; test-writer was the lone holdout still
+      // calling `renderRoleStepFailureMessage` directly. The
+      // persistFailureRender call below still writes the full
+      // FailureRender shape with kind+exitCode for halt-event
+      // classifiers that match on those fields. This is the
+      // user-facing attribution fix; classifier-facing data stays as-is.
+      next.error = geminiExitError("test-spec writer", result);
       persistFailureRender(next, "test-writer", result);
       return next;
     }
