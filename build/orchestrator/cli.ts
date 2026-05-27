@@ -814,6 +814,17 @@ export interface Args {
   forceDirty?: boolean;
   /** With --mark-phase-committed, stage and commit dirty files before marking. Mutually exclusive with --force-dirty. */
   commitDirty?: boolean;
+  /**
+   * Bug N (operator UX) — mark a feature shipped without hand-editing
+   * `~/.gstack/build-state/*.json`. Requires --mark-feature-shipped-pr;
+   * --mark-feature-shipped-commit is optional. Atomically sets
+   * status=release_queued, shippedAt=<now>, prNumber, shippedCommit.
+   */
+  markFeatureShipped?: string;
+  /** With --mark-feature-shipped, the PR number that landed the feature. */
+  markFeatureShippedPr?: number;
+  /** With --mark-feature-shipped, the optional commit SHA the PR squash-merged as. */
+  markFeatureShippedCommit?: string;
   /** Stop a running gstack-build daemon by run-id. SIGTERM with 30s graceful timeout. */
   stopRun?: string;
   /**
@@ -1108,6 +1119,9 @@ export function parseArgs(argv: string[]): Args {
     markPhaseCommitted: undefined,
     forceDirty: false,
     commitDirty: false,
+    markFeatureShipped: undefined,
+    markFeatureShippedPr: undefined,
+    markFeatureShippedCommit: undefined,
     stopRun: undefined,
     skipFeatureReview: false,
     skipPreMergeVerify: false,
@@ -1267,6 +1281,32 @@ export function parseArgs(argv: string[]): Args {
         process.exit(2);
       }
       args.markPhaseCommitted = next;
+    } else if (a === "--mark-feature-shipped") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error("--mark-feature-shipped requires a feature number");
+        process.exit(2);
+      }
+      args.markFeatureShipped = next;
+    } else if (a === "--mark-feature-shipped-pr") {
+      const next = argv[++i];
+      const parsed = next ? Number.parseInt(next, 10) : NaN;
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        console.error(
+          "--mark-feature-shipped-pr requires a positive integer (the GitHub/GitLab PR number)",
+        );
+        process.exit(2);
+      }
+      args.markFeatureShippedPr = parsed;
+    } else if (a === "--mark-feature-shipped-commit") {
+      const next = argv[++i];
+      if (!next || next.startsWith("-")) {
+        console.error(
+          "--mark-feature-shipped-commit requires a commit SHA",
+        );
+        process.exit(2);
+      }
+      args.markFeatureShippedCommit = next;
     } else if (a === "--force-dirty") {
       args.forceDirty = true;
     } else if (a === "--commit-dirty") {
@@ -2710,8 +2750,38 @@ const BLIND_EXECUTION_MARKERS: Record<BlindExecutionAgent, string[]> = {
   ],
   // Speculative — refined on first observed Kimi blind failure.
   kimi: ["workspace path not allowed:", "outside --add-dir scope:"],
-  // Speculative — refined on first observed Codex blind failure.
-  codex: ["sandbox denied", "workspace-write violation:"],
+  // Bug L (2026-05-27): the original codex marker `"sandbox denied"`
+  // was a substring match that flagged false positives on every codex
+  // run where the AGENT MENTIONED sandbox issues in its own narrative
+  // output. Canonical incident: agnt2 Phase 3.5 manual phase, codex
+  // successfully worked around a Go-cache sandbox limit (re-ran with
+  // workspace-local GOCACHE), then wrote in its summary
+  // "- Initial `go test ./soak/...` without `GOCACHE` failed because
+  // the sandbox denied writes to `/Users/.../Library/Caches/go-build`;
+  // rerun with workspace-local `GOCACHE` passed". The substring match
+  // fired, discardBlindExecutionChanges threw away all the agent's
+  // real work, and the operator saw `primary implementor: blind
+  // execution — input file unreachable; changes discarded` — a
+  // misattributed false halt that took 4+ minutes of agent work
+  // with it. Filed at HYGIENE_FAIL:p4:a7235d1c.
+  //
+  // The fix tightens the codex markers to STRUCTURED ERROR LINES that
+  // codex actually emits at sandbox-violation time, not prose
+  // mentions:
+  //   - `ERROR codex_core::tools::router: error=` — codex's
+  //     structured error-log prefix (covers the Bug J `patch
+  //     rejected: writing is blocked by read-only sandbox` shape too)
+  //   - `error: sandbox denied:` — codex's CLI error format with the
+  //     trailing colon (distinguishes structured error from prose
+  //     mentions, which usually phrase it as "sandbox denied writes"
+  //     or "sandbox denied access" — no trailing colon)
+  //   - `workspace-write violation:` — kept verbatim, already specific
+  //     enough that prose-mention false positives are unlikely
+  codex: [
+    "ERROR codex_core::tools::router: error=",
+    "error: sandbox denied:",
+    "workspace-write violation:",
+  ],
 };
 
 /**
@@ -3707,6 +3777,17 @@ Flags:
   --commit-dirty       Stage + commit dirty files before marking. Pre-commit hooks
                        still run; if a hook fails, the commit fails. Mutually
                        exclusive with --force-dirty.
+  --mark-feature-shipped <feature>
+                       Atomically mark a feature shipped (status=release_queued,
+                       shippedAt=now, prNumber, optional shippedCommit) without
+                       hand-editing the state JSON. Closes the operator-UX gap
+                       that SILENT_STATE_MUTATION catches and self-heals from.
+                       Requires --mark-feature-shipped-pr <N>; optional
+                       --mark-feature-shipped-commit <sha> for the squash-merge
+                       SHA. Refuses to overwrite a feature already shipped via
+                       the real pipeline.
+  --mark-feature-shipped-pr <N>     Required with --mark-feature-shipped.
+  --mark-feature-shipped-commit <sha>  Optional commit SHA the PR landed as.
   --stop-run <run-id>  Stop a running gstack-build daemon by run-id. Reads the PID
                        from the active-runs registry, signals SIGTERM, waits up to
                        30s for graceful exit, then verifies the lock is gone.
@@ -7422,6 +7503,81 @@ export function markPhaseCommittedAfterManualRecovery(args: {
     );
   }
   return { ok: true, phaseIndex: phase.index };
+}
+
+/**
+ * Bug N (operator UX) — atomically mark a feature shipped without
+ * forcing the operator to hand-edit `~/.gstack/build-state/*.json`.
+ *
+ * Background: the orchestrator's SILENT_STATE_MUTATION classifier
+ * (cli.ts:12677 region) detects features that have
+ * `status: "release_queued"` without `shippedAt`/`prNumber` and
+ * re-processes them. This is the orchestrator's self-healing for
+ * partial manual edits — operators who hand-patched the JSON to skip
+ * the ship phase but forgot to also fill in shippedAt + prNumber.
+ *
+ * Before this command, the only "skip ship" path was hand-editing
+ * the JSON, which is exactly the failure mode SILENT_STATE_MUTATION
+ * catches. After this command, operators have a CLI that does the
+ * write atomically: validates the feature exists, sets all four
+ * fields (status, shippedAt, prNumber, optionally shippedCommit), and
+ * saves state in one call. `isFeatureTerminal()` returns true after
+ * this, so the orchestrator's next pass doesn't try to ship again.
+ *
+ * Mirrors `markPhaseCommittedAfterManualRecovery`'s shape so the CLI
+ * argparser, dispatch site, and `--dry-run` semantics all stay
+ * consistent.
+ *
+ * Canonical incident (the orchestrator self-healed but the operator
+ * had to know the magic state shape):
+ *   mitosis-oasis-phase1-part2 SILENT_STATE_MUTATION:f5:b4d10877
+ *   "Feature 5 status is 'release_queued' but shippedAt/prNumber are
+ *    missing — this indicates a manual JSON state patch that bypassed
+ *    ship. Re-processing the feature so the pipeline runs."
+ */
+export function markFeatureShippedAfterManualRecovery(args: {
+  state: BuildState;
+  featureNumber: string;
+  prNumber: number;
+  shippedCommit?: string;
+  dryRun?: boolean;
+}):
+  | { ok: true; featureIndex: number }
+  | { ok: false; error: string } {
+  if (args.prNumber == null || !Number.isInteger(args.prNumber) || args.prNumber <= 0) {
+    return {
+      ok: false,
+      error: `--mark-feature-shipped-pr requires a positive integer, got: ${args.prNumber}`,
+    };
+  }
+  const featureIndex = args.state.features.findIndex(
+    (f) => f.number === args.featureNumber,
+  );
+  if (featureIndex < 0) {
+    return { ok: false, error: `feature not found: ${args.featureNumber}` };
+  }
+  const featureState = args.state.features[featureIndex];
+  // Guard: don't silently overwrite a feature that already shipped
+  // through the real pipeline. The operator probably wanted a
+  // different feature number.
+  if (
+    featureState.status === "release_queued" &&
+    featureState.shippedAt &&
+    featureState.prNumber != null
+  ) {
+    return {
+      ok: false,
+      error: `feature ${args.featureNumber} already shipped (PR #${featureState.prNumber} at ${featureState.shippedAt}); refusing to overwrite`,
+    };
+  }
+  featureState.status = "release_queued";
+  featureState.shippedAt = new Date().toISOString();
+  featureState.prNumber = args.prNumber;
+  if (args.shippedCommit) {
+    (featureState as unknown as { shippedCommit?: string }).shippedCommit =
+      args.shippedCommit;
+  }
+  return { ok: true, featureIndex };
 }
 
 /**
@@ -12250,6 +12406,60 @@ async function main() {
           `\n✓ Marked phase ${args.markPhaseCommitted} committed after manual recovery.`,
         );
         saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+      }
+    }
+
+    // Bug N (operator UX) — `--mark-feature-shipped` atomically sets
+    // status=release_queued + shippedAt + prNumber + optional
+    // shippedCommit on a feature. Closes the operator-tooling gap that
+    // forced operators to hand-edit `~/.gstack/build-state/*.json`,
+    // which is exactly the failure mode SILENT_STATE_MUTATION
+    // (cli.ts:12677 region) catches and self-heals from.
+    if (!setupFailed && state && args.markFeatureShipped) {
+      if (args.markFeatureShippedPr == null) {
+        console.error(
+          `\n✗ --mark-feature-shipped requires --mark-feature-shipped-pr <N>\n`,
+        );
+        exitCode = 2;
+        setupFailed = true;
+      } else {
+        {
+          const ctx = helperCtxFor(state);
+          emitRecoveryBoundary({
+            runId: ctx.runId,
+            stateSlug: ctx.stateSlug,
+            message: `--mark-feature-shipped invoked for feature ${args.markFeatureShipped} (PR #${args.markFeatureShippedPr})`,
+            pointers: ctx.pointers,
+            snapshot: buildHaltSnapshot({
+              state,
+              stdoutLogPath: ctx.pointers.stdoutLog,
+              worktreePath: ctx.pointers.worktreePath,
+            }),
+          });
+        }
+        const marked = markFeatureShippedAfterManualRecovery({
+          state,
+          featureNumber: args.markFeatureShipped,
+          prNumber: args.markFeatureShippedPr,
+          shippedCommit: args.markFeatureShippedCommit,
+          dryRun: args.dryRun,
+        });
+        if (!marked.ok) {
+          console.error(
+            `\n✗ --mark-feature-shipped failed: ${marked.error}\n`,
+          );
+          exitCode = 2;
+          setupFailed = true;
+        } else if (args.dryRun) {
+          console.log(
+            `\n✓ [DRY RUN] Would mark feature ${args.markFeatureShipped} shipped at PR #${args.markFeatureShippedPr}${args.markFeatureShippedCommit ? ` (${args.markFeatureShippedCommit})` : ""} (state NOT written).`,
+          );
+        } else {
+          console.log(
+            `\n✓ Marked feature ${args.markFeatureShipped} shipped at PR #${args.markFeatureShippedPr}${args.markFeatureShippedCommit ? ` (${args.markFeatureShippedCommit})` : ""}.`,
+          );
+          saveState(state, { noGbrain: args.noGbrain, log: console.warn });
+        }
       }
     }
 
