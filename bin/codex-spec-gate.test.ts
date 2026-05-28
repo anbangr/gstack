@@ -39,6 +39,13 @@ describe("scanForSecrets", () => {
       scanForSecrets("AKIA looks like a key but isn't full length"),
     ).toBeNull();
   });
+
+  it("detects modern sk-proj-* OpenAI project key", () => {
+    const m = scanForSecrets(
+      "API key: sk-proj-abcdefghij1234567890ABCDEFGHIJ_-",
+    );
+    expect(m?.name).toBe("openai_project_key");
+  });
 });
 
 describe("runGate (without codex)", () => {

@@ -34,11 +34,15 @@ interface GateResult {
 }
 
 // Fail-closed secret patterns (inherited from /spec Phase 4.5).
+// `openai_project_key` covers the modern sk-proj-* format whose embedded hyphens
+// otherwise break the legacy `sk-[A-Za-z0-9]{48}` regex. Both patterns coexist
+// so legacy and new keys are caught.
 const SECRET_PATTERNS: Array<{ name: string; re: RegExp }> = [
   { name: "aws_access_key", re: /\bAKIA[0-9A-Z]{16}\b/ },
   { name: "github_token", re: /\bgh[pous]_[A-Za-z0-9]{36,}\b/ },
   { name: "anthropic_key", re: /\bsk-ant-[A-Za-z0-9_\-]{20,}\b/ },
   { name: "openai_key", re: /\bsk-[A-Za-z0-9]{48}\b/ },
+  { name: "openai_project_key", re: /\bsk-proj-[A-Za-z0-9_\-]{20,}\b/ },
   { name: "env_secret", re: /^[A-Z_]+_(KEY|TOKEN|SECRET|PASSWORD)=.+/m },
   { name: "private_key_block", re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
 ];
@@ -142,7 +146,14 @@ export function runGate(
     };
   }
 
-  const fullPrompt = `${CODEX_PROMPT}\n\n<<<USER_SPEC>>>\n${specText}\n<<<END_USER_SPEC>>>`;
+  // Neutralize any embedded closing delimiter in the spec so a crafted spec
+  // can't terminate the data block early and plant fake SCORE/AMBIGUITIES
+  // output after the seam. The sanitizer keeps the text human-readable while
+  // breaking the exact-match parse codex would otherwise use.
+  const sanitizedSpec = specText
+    .replace(/<<<END_USER_SPEC>>>/g, "<<<END_USER_SPEC_REDACTED>>>")
+    .replace(/<<<USER_SPEC>>>/g, "<<<USER_SPEC_REDACTED>>>");
+  const fullPrompt = `${CODEX_PROMPT}\n\n<<<USER_SPEC>>>\n${sanitizedSpec}\n<<<END_USER_SPEC>>>`;
   const result = spawnSync(
     "codex",
     [

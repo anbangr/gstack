@@ -21,6 +21,7 @@
  */
 
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import {
   extractFeatureBlocks,
@@ -422,7 +423,10 @@ function extractTableFirstColumn(text: string, sectionName: string): string[] {
   return rows;
 }
 
-/** Extract quantified acceptance lines from the spec body (under `## Acceptance Criteria`). */
+/** Extract quantified acceptance lines from the spec body (under `## Acceptance Criteria`).
+ *  Accepts both numbered (`1.`) and bullet (`-`, `*`) list formats; each line must
+ *  contain at least one digit AFTER stripping the list marker so the drift check
+ *  matches what the validator's quantified-acceptance rule requires. */
 function extractSpecAcceptanceLines(text: string): string[] {
   // Capture from the heading newline to the next ## heading or end of string.
   const m = text.match(
@@ -432,9 +436,12 @@ function extractSpecAcceptanceLines(text: string): string[] {
   return m[1]
     .split("\n")
     .map((l) => l.trim())
-    .filter(
-      (l) => /^\d+\.\s+/.test(l) && /\d/.test(l.replace(/^\d+\.\s+/, "")),
-    );
+    .filter((l) => {
+      // Accept "N. ", "- ", or "* " list markers; everything else is prose.
+      const markerMatch = l.match(/^(?:\d+\.|[-*])\s+(.*)$/);
+      if (!markerMatch) return false;
+      return /\d/.test(markerMatch[1]);
+    });
 }
 
 /** Extract code-fenced blocks under `### Schemas / Interfaces` (or `### Schemas/Interfaces`). */
@@ -452,11 +459,40 @@ function extractSpecSchemas(text: string): string[] {
   return blocks;
 }
 
+/** Resolve a Spec source: path and verify it stays inside an allowed prefix.
+ *  Allowed: ~/.gstack/, /tmp/, /var/folders/ (macOS tempdir), and os.tmpdir().
+ *  Blocks attempts like "Spec source: /etc/passwd" or "../../etc/shadow" from
+ *  triggering arbitrary file reads via the validator. Returns the resolved
+ *  absolute path on success, or null on rejection. */
+function safeSpecSourcePath(rawPath: string): string | null {
+  const expanded = rawPath.replace(/^~/, process.env.HOME || "");
+  const resolved = path.resolve(expanded);
+  const home = process.env.HOME || "";
+  const allowedPrefixes = [
+    home ? path.join(home, ".gstack") : null,
+    "/tmp",
+    "/var/folders",
+    "/private/tmp",
+    "/private/var/folders",
+    os.tmpdir(),
+  ].filter((p): p is string => !!p);
+  return allowedPrefixes.some(
+    (prefix) => resolved === prefix || resolved.startsWith(prefix + path.sep),
+  )
+    ? resolved
+    : null;
+}
+
 /** Compare spec content vs living-plan feature block. Returns drift violations. */
 function checkSpecContentPreservation(block: FeatureBlock): StaticViolation[] {
   if (!block.hasSpecSource || !block.specSourcePath) return [];
   const violations: StaticViolation[] = [];
-  const expanded = block.specSourcePath.replace(/^~/, process.env.HOME || "");
+  const expanded = safeSpecSourcePath(block.specSourcePath);
+  if (!expanded) {
+    // Rejected for untrusted path; the spec-source-not-found / sentinel checks
+    // upstream already surface "Spec source: ${path}" so we don't duplicate.
+    return [];
+  }
   let specContent: string;
   try {
     specContent = fs.readFileSync(expanded, "utf8");
@@ -480,13 +516,14 @@ function checkSpecContentPreservation(block: FeatureBlock): StaticViolation[] {
   }
 
   // 2. Quantified acceptance lines from spec — each must appear (substring match,
-  // stripping leading list numbering) in the living plan's `Acceptance:` field.
+  // stripping leading list marker — numbered or bullet) in the living plan's
+  // `Acceptance:` field.
   const specAccept = extractSpecAcceptanceLines(specContent);
   const acceptanceLineStart = block.header.search(/^Acceptance:/m);
   const planAccept =
     acceptanceLineStart >= 0 ? block.header.slice(acceptanceLineStart) : "";
   const missingAccept = specAccept.filter((line) => {
-    const bare = line.replace(/^\d+\.\s+/, "");
+    const bare = line.replace(/^(?:\d+\.|[-*])\s+/, "");
     return !planAccept.includes(bare);
   });
   if (missingAccept.length > 0) {
@@ -730,23 +767,27 @@ function validate(planPath: string): ValidationReport {
         message: `Feature ${block.number} (${block.name}): missing "Spec source:" line-anchored field. Add a line at column 0 like "Spec source: ~/.gstack/projects/<slug>/specs/<file>.md" pointing at the per-feature spec archive. See docs/spec-archive-format.md.`,
       });
     } else {
-      const expanded = block.specSourcePath.replace(
-        /^~/,
-        process.env.HOME || "",
-      );
-      try {
-        const content = fs.readFileSync(expanded, "utf8");
-        if (!content.includes("<!-- gstack-spec-complete")) {
+      const expanded = safeSpecSourcePath(block.specSourcePath);
+      if (!expanded) {
+        staticViolations.push({
+          rule: "spec-source-untrusted-path",
+          message: `Feature ${block.number} (${block.name}): "Spec source: ${block.specSourcePath}" resolves outside the allowed spec roots (~/.gstack/, /tmp/, OS tempdir). Refusing to read arbitrary filesystem paths from a living plan.`,
+        });
+      } else {
+        try {
+          const content = fs.readFileSync(expanded, "utf8");
+          if (!content.includes("<!-- gstack-spec-complete")) {
+            staticViolations.push({
+              rule: "spec-source-missing-sentinel",
+              message: `Feature ${block.number} (${block.name}): "Spec source: ${block.specSourcePath}" exists but is missing the <!-- gstack-spec-complete --> sentinel.`,
+            });
+          }
+        } catch {
           staticViolations.push({
-            rule: "spec-source-missing-sentinel",
-            message: `Feature ${block.number} (${block.name}): "Spec source: ${block.specSourcePath}" exists but is missing the <!-- gstack-spec-complete --> sentinel.`,
+            rule: "spec-source-not-found",
+            message: `Feature ${block.number} (${block.name}): "Spec source: ${block.specSourcePath}" points at a file that does not exist.`,
           });
         }
-      } catch {
-        staticViolations.push({
-          rule: "spec-source-not-found",
-          message: `Feature ${block.number} (${block.name}): "Spec source: ${block.specSourcePath}" points at a file that does not exist.`,
-        });
       }
     }
     // T9 (Increment 2) — spec-content drift: verify spec rows/acceptance/schemas

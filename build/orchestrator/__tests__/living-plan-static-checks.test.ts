@@ -1241,4 +1241,85 @@ Smoke: \`bun test\`
     const r = runValidator(plan);
     expect(r.status).toBe(0);
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // T14 — review-finding regressions (path traversal, bullet acceptance, openai key, delimiter injection)
+  // ─────────────────────────────────────────────────────────────────────────
+  it("T14: rejects Spec source that escapes allowed roots", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Path traversal
+
+Origin trace: test
+Acceptance: 1. response under 50ms
+Out of scope: nothing
+Spec source: /etc/passwd
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/x.ts\` | create |
+
+### Verification Spec
+Smoke: \`bun test\`
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/spec-source-untrusted-path/i);
+  });
+
+  it("T14-bullet-accept: drift check catches dropped bullet-format acceptance lines", () => {
+    const specFile = path.join(dir, "spec-bullet-acc.md");
+    fs.writeFileSync(
+      specFile,
+      `## Spec
+
+## Acceptance Criteria
+
+- p95 under 100ms
+- HTTP 410 on expired
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/x.ts\` | create |
+
+<!-- gstack-spec-complete
+ts: now
+-->
+`,
+    );
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Bullet drift
+
+Origin trace: test
+Acceptance: 1. p95 under 100ms
+Out of scope: nothing
+Spec source: ${specFile}
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/x.ts\` | create |
+
+### Verification Spec
+Smoke: \`bun test\`
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/spec-content-drift.*HTTP 410/i);
+  });
 });

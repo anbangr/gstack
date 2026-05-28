@@ -3756,7 +3756,7 @@ Flags:
   --ship-model <m>                 Default: ${DEFAULT_ROLE_CONFIGS.ship.model}.
   --land-model <m>                 Default: ${DEFAULT_ROLE_CONFIGS.land.model}.
   --monitor-agent-model <m>        Default: ${DEFAULT_ROLE_CONFIGS.monitorAgent.model}.
-  --plan-reviewer-model <m>        Default: ${DEFAULT_ROLE_CONFIGS.planReviewer.model}.
+  --plan-reviewer-model <m>        Default: ${DEFAULT_ROLE_CONFIGS.planReviewer?.model ?? "n/a (legacy mode disabled — set planReviewer in configure.cm)"}.
   --no-plan-review         Skip the planReviewer second-opinion pass at startup.
   --legacy-plan-review     Re-enable the legacy planReviewer loop (replaced by specQualityGate in Increment 2; default off).
   --plan-review-max-rounds <N>     Default: 5. Maximum rounds before stalemate. Bump for legit deep convergence.
