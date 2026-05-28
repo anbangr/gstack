@@ -583,7 +583,7 @@ function validate(planPath: string): ValidationReport {
 
   // Increment 1 spec-grade checks: out-of-scope, verification spec,
   // file reference table, quantified acceptance must be present per feature.
-  // Task 6 will append the final `if` to this same loop.
+  // All four checks land via Tasks 3-6 of the spec-grade living plans plan.
   for (const block of blocks) {
     if (!block.hasOutOfScope) {
       staticViolations.push({
@@ -601,6 +601,12 @@ function validate(planPath: string): ValidationReport {
       staticViolations.push({
         rule: "missing-file-reference-table",
         message: `Feature ${block.number} (${block.name}): missing "### File Reference Table" subsection. Add an H3 heading with a markdown table listing every file the feature creates or modifies (columns: File, Action, Lines, Why). See docs/spec-archive-format.md for the exact shape.`,
+      });
+    }
+    if (!block.hasQuantifiedAcceptance) {
+      staticViolations.push({
+        rule: "missing-quantified-acceptance",
+        message: `Feature ${block.number} (${block.name}): at least one acceptance criterion must contain a number (e.g. "p95 under 100ms", "0 failing tests", "HTTP 410 for all 4 roles"). Subjective phrases like "feature works" or "handles edge cases" do not count. See docs/spec-archive-format.md.`,
       });
     }
   }

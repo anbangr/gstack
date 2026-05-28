@@ -1935,7 +1935,7 @@ describe("validate-living-plan.ts CLI", () => {
     const plan = [
       "## Feature 1: Good",
       "Origin trace: Source plan Week 1",
-      "Acceptance: tests pass",
+      "Acceptance: 0 test failures, all 3 phases complete",
       "Out of scope: none",
       "",
       "### Phase 1: Setup",

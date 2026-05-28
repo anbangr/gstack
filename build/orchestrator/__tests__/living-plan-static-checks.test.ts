@@ -76,7 +76,7 @@ const x = 1;
       `## Feature 1: Bun built-in
 
 Origin trace: test
-Acceptance: passes validation
+Acceptance: 0 unused-import violations on bun built-ins
 Out of scope: none
 
 ### Phase 1: Implementation
@@ -107,7 +107,7 @@ Smoke: \`bun test\`
       `## Feature 1: Type-only usage
 
 Origin trace: test
-Acceptance: passes validation
+Acceptance: 0 unused-import violations with type-only annotation usage
 Out of scope: none
 
 ### Phase 1: Implementation
@@ -203,7 +203,7 @@ Acceptance: \`build/orchestrator/imaginary.ts\` must exist
       `## Feature 1: Planned file
 
 Origin trace: test
-Acceptance: \`build/orchestrator/__tests__/future-helper.test.ts\` must exist
+Acceptance: \`build/orchestrator/__tests__/future-helper.test.ts\` must exist, 0 validator violations
 Out of scope: none
 
 ### Phase 1: Implementation
@@ -344,7 +344,7 @@ Acceptance: \`build/orchestrator/validate-living-plan.ts:1\` contains "this is d
       `## Feature 1: Valid plan
 
 Origin trace: Source plan §test
-Acceptance: Everything is wired end-to-end
+Acceptance: 0 validator violations, all 5 static rules satisfied end-to-end
 Out of scope: none
 
 ### Phase 1: Good phase
@@ -407,7 +407,7 @@ Smoke: \`bun test\`
       `## Feature 1: Inbox path
 
 Origin trace: test
-Acceptance: \`inbox/living-plan/future-plan.md\` must exist
+Acceptance: \`inbox/living-plan/future-plan.md\` must exist, 0 path-missing violations
 Out of scope: none
 
 ### Phase 1: Implementation
@@ -854,5 +854,63 @@ Smoke: \`bun test\`
     const r = runValidator(plan);
     expect(r.status).not.toBe(0);
     expect(r.stderr).toMatch(/file reference table/i);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // T10 — Quantified acceptance required per feature block
+  // ─────────────────────────────────────────────────────────────────────────
+  it("T10: returns non-zero when no acceptance criterion contains a number", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Vague acceptance
+
+Origin trace: test
+Acceptance: feature works correctly and handles edge cases
+Out of scope: nothing
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/foo.ts\` | create |
+
+### Verification Spec
+Smoke: \`bun test\`
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/quantified/i);
+  });
+
+  it("T10-positive: accepts a quantified acceptance line", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Quantified acceptance
+
+Origin trace: test
+Acceptance: 1. response p95 under 100ms on 10K-row table
+Out of scope: nothing
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/foo.ts\` | create |
+
+### Verification Spec
+Smoke: \`bun test\`
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).toBe(0);
   });
 });
