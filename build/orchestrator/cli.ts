@@ -128,6 +128,8 @@ import {
   resolveFeatureBaseRef,
   comparePostMergeTrees,
   detectBaseBranch,
+  tryParseStructuredVerifierOutput,
+  type StructuredVerifierReport,
 } from "./feature-verifier";
 import {
   writeFeatureReviewMetrics,
@@ -5637,9 +5639,41 @@ export function buildJudgePrompt(opts: {
   ].join("\n");
 }
 
-export function buildGeminiFixPrompt(phase: Phase, planFile: string): string {
+/**
+ * Format structured probe failures from the featureVerifier into a
+ * fixer-readable block. Injected at the top of the fix prompt when the
+ * verifier emitted a structured JSON report with overall === "fail".
+ */
+function formatStructuredFailureForFixer(
+  report: StructuredVerifierReport,
+): string {
+  const failedProbes = (report.acceptance_probes ?? []).filter(
+    (p) => p.status === "fail",
+  );
+  if (failedProbes.length === 0) return "";
+  const lines = failedProbes.map(
+    (p) =>
+      `Acceptance criterion AC${p.ac} failed.\nCommand: ${p.cmd}\nExpected: ${p.expected}\nActual: ${p.actual}`,
+  );
+  const halt = report.halt_at ? `\nFailure halted at: ${report.halt_at}` : "";
+  return (
+    `STRUCTURED PROBE FAILURES (from featureVerifier):\n\n${lines.join("\n\n")}${halt}\n\n` +
+    `Fix the production code to make these probes pass without modifying the probe commands.\n\n---\n\n`
+  );
+}
+
+export function buildGeminiFixPrompt(
+  phase: Phase,
+  planFile: string,
+  structuredReport?: StructuredVerifierReport,
+): string {
+  const structuredPrefix =
+    structuredReport?.overall === "fail"
+      ? formatStructuredFailureForFixer(structuredReport)
+      : "";
   return [
-    `# Phase ${phase.number}: ${phase.name} — Fix Failing Tests`,
+    structuredPrefix +
+      `# Phase ${phase.number}: ${phase.name} — Fix Failing Tests`,
     ``,
     `Plan file: ${planFile}`,
     ``,
@@ -9259,9 +9293,26 @@ async function runPhase(args: {
           logDir(state.slug),
           `phase-${phase.number}-gemini-fix-${action.iteration}-input.md`,
         );
+        // Increment 3: read the feature verifier's structured report (if it
+        // exists and has probe failures) so the fixer knows exactly which ACs
+        // to target. The verifier output file is written by runFeatureVerifier
+        // in the same log dir; if it's absent or has no structured JSON we
+        // fall back to the legacy free-text fixer prompt.
+        let fixerStructuredReport: StructuredVerifierReport | undefined;
+        const verifierOutputPath = path.join(
+          logDir(state.slug),
+          `feature-${phase.featureNumber}-verifier-output.md`,
+        );
+        try {
+          const verifierOutputRaw = fs.readFileSync(verifierOutputPath, "utf8");
+          const parsed = tryParseStructuredVerifierOutput(verifierOutputRaw);
+          if (parsed?.overall === "fail") fixerStructuredReport = parsed;
+        } catch {
+          // Verifier output absent — pre-Increment3 feature or verifier not yet run.
+        }
         fs.writeFileSync(
           inputFilePath,
-          buildGeminiFixPrompt(phase, state.planFile),
+          buildGeminiFixPrompt(phase, state.planFile, fixerStructuredReport),
         );
         fs.writeFileSync(outputFilePath, "");
         parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);

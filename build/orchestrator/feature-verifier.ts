@@ -82,7 +82,7 @@ export interface StructuredVerifierReport {
  * Searches lines in reverse so that the last complete JSON object wins
  * (agent may emit intermediate JSON in verbose mode).
  */
-function tryParseStructuredVerifierOutput(
+export function tryParseStructuredVerifierOutput(
   stdout: string,
 ): StructuredVerifierReport | null {
   const lines = stdout.split("\n");
