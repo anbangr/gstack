@@ -1,7 +1,7 @@
 ---
 name: build
 preamble-tier: 4
-version: 1.33.0
+version: 1.34.0
 description: |
   gstack autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -446,6 +446,26 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
    Then print a one-line summary:
    `Phase 0 outline: N features across M source plans (K code, L writing, ...)`
 
+   **Cross-skill spec-archive detection (Increment 4+):** Phase 0 also detects
+   whether each outlined feature has a matching `/spec`-generated archive on
+   disk. Two modes:
+
+   1. **Explicit:** If the source plan's YAML frontmatter contains
+      `spec_archives: [/abs/path/1.md, /abs/path/2.md, ...]`, each path is
+      validated (must exist + sentinel) and matched to a feature whose
+      `spec_id` equals the archive's frontmatter `spec_id`.
+   2. **Auto-match:** For features without an explicit reference, scan
+      `~/.gstack/projects/<slug>/specs/` for sentineled archives written
+      within the last 30 days whose `spec_id` exactly matches the feature's
+      derived `spec_id` slug.
+
+   When a match is found, attach `existing_spec_path: <absolute path>` to that
+   feature's outline entry. The match is exact (not fuzzy) — no partial-slug
+   guessing.
+
+   Failures (path not found, missing sentinel, no match): silently skip; the
+   feature falls through to Phase A as usual.
+
 4.6. **Phase A (Per-Feature Spec Drafting + Codex Quality Gate)** (Increment 2+):
 
    For each feature in the outline, the parent orchestrator drafts an enriched
@@ -454,6 +474,15 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
    the shape at `docs/spec-archive-format.md`.
 
    **Per-feature loop (parent runs this directly, NOT via subagent):**
+
+   **Skip drafting when an existing spec archive matches (Increment 4+):**
+   If the feature's outline entry has `existing_spec_path: <path>`, the parent
+   SKIPS drafting AND the codex gate for this feature. Instead, the existing
+   archive is treated as if Phase A had just produced it: the parent records
+   the feature's spec record in `$BUILD_TMP_DIR/phase-a-specs.json` with
+   `spec_path` = `existing_spec_path`, `quality_score` read from the archive's
+   frontmatter, and `interrogation: "reused"`. No new sentinel is appended
+   (the existing one is preserved). Phase B reads the archive normally.
 
    1. **Draft the enriched spec inline.** Use Read/Grep against the target repo
       to ground the spec in real file:line citations. Required sections for `code`
@@ -1588,6 +1617,13 @@ To recover:
 4. Re-run the monitor: `gstack-build monitor --manifest ... --watch --supervise`
 
 **Why mark-shipped exists.** Partial JSON hand-edits (e.g. setting `prNumber` without `completedAt`) trip the detector at `cli.ts:7697`, which resets the feature to `phases_done` and tries to re-ship it — the exact failure mode of the polis-mesh incident on 2026-05-17. The `mark-shipped` subcommand writes the full canonical shape (`status=committed` + `completedAt` + `shippedAt` + `prNumber` + `mergeSha`) in one atomic gbrain put, so the detector treats it as a genuine pipeline completion.
+
+**`gstack-build spec-to-issue <archive-path>` (Increment 4+):** Promote any
+`/build`-generated spec archive into a GitHub issue. Reads the sentineled
+archive, prepends a `Promoted from /build-generated spec at <path>` note,
+calls `gh issue create --body-file`, then updates the archive's frontmatter
+with the new `spec_issue_number`. Refuses to promote: missing sentinel,
+already-filed (`spec_issue_number` set), or missing path.
 
 ### Step M3.5: Skill Fault Investigator
 
