@@ -436,6 +436,22 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
        lines that START with `Acceptance:`. Run-on prose fails the gate.
      - Both fields are REQUIRED on every `## Feature N:` block. A missing
        field rejects the plan and triggers a synthesis revision round.
+   - Every `## Feature N:` block MUST also include a line-anchored `Out of scope:`
+     field at column 0 listing explicit non-goals (write `Out of scope: none` only
+     when literally nothing was scoped out).
+   - Every `## Feature N:` block MUST include a `### File Reference Table`
+     subsection with columns `File | Action | Lines (if modify) | Why` listing
+     every file the feature creates or modifies.
+   - Every `## Feature N:` block MUST include a `### Verification Spec`
+     subsection. For `code` features: smoke run (ordered commands) + acceptance
+     probes table (one row per acceptance criterion, columns
+     `AC# | Probe command | Expected output | If fails`) + optional verification
+     artifacts list. For non-code features (`writing`/`experiment`/`research`/`manual`):
+     verification artifacts list + single-sentence pass criteria.
+   - The `Acceptance:` field MUST include at least one quantified criterion
+     containing a number (e.g. "p95 under 100ms", "0 failing tests",
+     "HTTP 410 for all 4 roles"). Subjective phrases like "feature works"
+     or "handles edge cases" are REJECTED by the validator.
 
      ### Phase X: [Phase Name]
      - [ ] **Test Specification (test-writer role)**: Implement the test cases listed in the
@@ -717,6 +733,11 @@ prior commit.
    `### Phase` (or next `## ` heading), whichever comes first:
    - a line that STARTS with `Origin trace:` exists.
    - a line that STARTS with `Acceptance:` exists.
+   - a line that STARTS with `Out of scope:` exists.
+   - a `### File Reference Table` subsection exists in the body (between the
+     feature heading and the next `## ` heading).
+   - a `### Verification Spec` subsection exists in the body.
+   - the `Acceptance:` field contains at least one digit (quantified criterion).
    If either is missing or is collapsed into run-on prose on the same line
    as another field, rewrite the offending feature block before continuing.
    Repeat until every feature passes.
@@ -745,6 +766,19 @@ prior commit.
    3. **Non-existent files in acceptance** — backtick-quoted file paths in acceptance lines must exist in the repo or be explicitly planned (e.g. "Add `path/to/file.ts`" in the same phase). Paths under `inbox/` or `~/.gstack/` are exempt.
    4. **Multi-arm split across phases** — registry additions (e.g. "Add `X` to `child-registry.ts`") must land in the **same phase** as their orchestrator wiring (e.g. "Call `X` in `phase-runner.ts`"). Splitting them across phases triggers a structural violation.
    5. **Stale file:line quotes** — if acceptance quotes a specific line (`` `path/to/file.ts:405` contains "snippet" ``), verify the on-disk file actually contains that snippet at that line. The validator reads the real file.
+   6. **Missing `Out of scope:` field** — every feature block MUST have a
+      line-anchored `Out of scope:` field at column 0. The validator rule
+      `missing-out-of-scope` rejects plans where any block lacks it.
+   7. **Missing `### File Reference Table`** — every feature block MUST list
+      its file changes in a `### File Reference Table` subsection. The
+      validator rule `missing-file-reference-table` rejects plans without it.
+   8. **Missing `### Verification Spec`** — every feature block MUST include
+      smoke commands + acceptance probes (code) or artifacts + pass criteria
+      (non-code) in a `### Verification Spec` subsection. The validator rule
+      `missing-verification-spec` rejects plans without it.
+   9. **Vague acceptance criteria** — the `Acceptance:` field MUST include at
+      least one number. The validator rule `missing-quantified-acceptance`
+      rejects plans where acceptance is purely qualitative.
 
    After writing all living plan files, write manifest v2 to $BUILD_TMP_DIR/build-run-manifest.json:
    {
