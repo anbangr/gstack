@@ -913,4 +913,47 @@ Smoke: \`bun test\`
     const r = runValidator(plan);
     expect(r.status).toBe(0);
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // T11 — multi-line acceptance blocks are captured correctly
+  // ─────────────────────────────────────────────────────────────────────────
+  it("T11: multi-line Acceptance: block with quantified content passes", async () => {
+    const { extractFeatureBlocks } = await import("../skill-fault-detector");
+    const plan = `## Feature 1: Multi-line acceptance
+
+Origin trace: source plan §1
+Acceptance:
+1. response p95 under 100ms
+2. orders older than 30 days return HTTP 410
+Out of scope: nothing
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+`;
+    const blocks = extractFeatureBlocks(plan);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].hasQuantifiedAcceptance).toBe(true);
+  });
+
+  it("T11-negative: multi-line Acceptance: block with NO digits fails the check", async () => {
+    const { extractFeatureBlocks } = await import("../skill-fault-detector");
+    const plan = `## Feature 1: Multi-line vague
+
+Origin trace: source plan §1
+Acceptance:
+- feature works correctly
+- handles edge cases
+Out of scope: nothing
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+`;
+    const blocks = extractFeatureBlocks(plan);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].hasQuantifiedAcceptance).toBe(false);
+  });
 });

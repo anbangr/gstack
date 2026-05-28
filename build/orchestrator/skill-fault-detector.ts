@@ -218,15 +218,25 @@ export function extractFeatureBlocks(planContent: string): FeatureBlock[] {
     // accepted but the leading "1." is the LIST NUMBER, not a metric, so
     // we strip leading list numbers ("1.", "2.", etc.) at line starts
     // before testing for digits.
+    //
+    // Capture the full Acceptance: block (header line + any continuation lines)
+    // up to the next blank line, next H2/H3, or end-of-string. Two-step extraction
+    // (search for line-anchored start, then match without the `m` flag) preserves
+    // multi-line acceptance bodies that the original `m` flag would have truncated
+    // to the heading line only.
     let hasQuantifiedAcceptance = false;
-    const acceptanceMatch = header.match(
-      /^Acceptance:([\s\S]*?)(?:\n\n|\n##|\n###|$)/m,
-    );
-    if (acceptanceMatch) {
-      // Strip "N. " list numbering from line starts so the bare list index
-      // doesn't count as a quantified value.
-      const stripped = acceptanceMatch[1].replace(/^\s*\d+\.\s+/gm, "");
-      hasQuantifiedAcceptance = /\d/.test(stripped);
+    const acceptanceLineStart = header.search(/^Acceptance:/m);
+    if (acceptanceLineStart >= 0) {
+      const slice = header.slice(acceptanceLineStart);
+      const blockMatch = slice.match(
+        /^Acceptance:([\s\S]*?)(?:\n\n|\n##|\n###|$)/,
+      );
+      if (blockMatch) {
+        // Strip leading list numbering ("1. ", "2. ") so bare list indices
+        // don't count as quantified values.
+        const stripped = blockMatch[1].replace(/^\s*\d+\.\s+/gm, "");
+        hasQuantifiedAcceptance = /\d/.test(stripped);
+      }
     }
 
     blocks.push({
