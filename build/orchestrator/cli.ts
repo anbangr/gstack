@@ -11986,6 +11986,85 @@ export async function runAutoDrainIfEnabled(
   }
 }
 
+async function runSpecToIssue(archivePath: string): Promise<void> {
+  if (!fs.existsSync(archivePath)) {
+    process.stderr.write(`spec archive not found: ${archivePath}\n`);
+    process.exit(2);
+  }
+  const content = fs.readFileSync(archivePath, "utf8");
+  if (!content.includes("<!-- gstack-spec-complete")) {
+    process.stderr.write(
+      `spec archive missing <!-- gstack-spec-complete --> sentinel: ${archivePath}\n` +
+        `Refusing to promote a work-in-progress spec.\n`,
+    );
+    process.exit(2);
+  }
+  const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  if (!fmMatch) {
+    process.stderr.write(`spec archive lacks frontmatter: ${archivePath}\n`);
+    process.exit(2);
+  }
+  const fm: Record<string, string> = {};
+  for (const line of fmMatch[1].split("\n")) {
+    const kv = line.match(/^([a-z_]+):\s*(.*)$/);
+    if (kv) fm[kv[1]] = kv[2].trim();
+  }
+  if (fm.spec_issue_number && fm.spec_issue_number !== "null") {
+    process.stderr.write(
+      `spec already filed as issue #${fm.spec_issue_number} (per frontmatter).\n` +
+        `Refusing to file a duplicate.\n`,
+    );
+    process.exit(0);
+  }
+  // Read body (everything after the frontmatter) and prepend a promoted-from note.
+  const body = fmMatch[2];
+  const promotionNote = `> Promoted from /build-generated spec at \`${archivePath}\`.\n\n`;
+  const issueBody = promotionNote + body;
+  const title = (fm.spec_id || path.basename(archivePath, ".md"))
+    .replace(/-/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+  const tmpBody = archivePath + ".issue-body.tmp";
+  fs.writeFileSync(tmpBody, issueBody);
+  try {
+    const result = spawnSync(
+      "gh",
+      ["issue", "create", "--title", title, "--body-file", tmpBody],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+    if (result.status !== 0) {
+      process.stderr.write(
+        `gh issue create failed: ${result.stderr || result.stdout}\n`,
+      );
+      process.exit(1);
+    }
+    const urlMatch = (result.stdout || "").match(
+      /https:\/\/github\.com\/[^\s]+\/issues\/(\d+)/,
+    );
+    if (!urlMatch) {
+      process.stderr.write(
+        `gh issue create succeeded but couldn't parse issue number from: ${result.stdout}\n`,
+      );
+      process.exit(1);
+    }
+    const issueNumber = urlMatch[1];
+    // Update the archive's frontmatter (atomic write).
+    const updated = content.replace(
+      /^spec_issue_number:\s*.+$/m,
+      `spec_issue_number: ${issueNumber}`,
+    );
+    const tmpArchive = archivePath + ".tmp." + process.pid;
+    fs.writeFileSync(tmpArchive, updated);
+    fs.renameSync(tmpArchive, archivePath);
+    process.stdout.write(`${urlMatch[0]}\n`);
+  } finally {
+    try {
+      fs.unlinkSync(tmpBody);
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
 async function main() {
   // Install SIGTERM/SIGINT/SIGHUP handlers before spawning anything so the
   // first sub-process to outlive a survivable signal still gets reaped.
@@ -12001,6 +12080,19 @@ async function main() {
   warnOnLargeStallWindows();
 
   const rawArgv = process.argv.slice(2);
+
+  if (rawArgv[0] === "spec-to-issue") {
+    const archivePath = rawArgv[1];
+    if (!archivePath) {
+      process.stderr.write(
+        "usage: gstack-build spec-to-issue <archive-path>\n",
+      );
+      process.exit(2);
+    }
+    await runSpecToIssue(archivePath);
+    return;
+  }
+
   const args = parseArgs(rawArgv);
 
   // Sweep orphan worktrees + stale active-run records at startup. Always-on,
