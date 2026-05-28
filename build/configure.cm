@@ -10,10 +10,10 @@
       "model": "claude-opus-4-7",
       "reasoning": "xhigh"
     },
-    "planReviewer": {
+    "specQualityGate": {
       "provider": "codex",
       "model": "gpt-5.5",
-      "reasoning": "high"
+      "reasoning": "medium"
     },
     "monitorAgent": {
       "provider": "codex",
@@ -115,7 +115,8 @@
     "test": 900000,
     "judge": 600000,
     "featureReview": 1200000,
-    "planReview": 300000
+    "planReview": 300000,
+    "specQualityGate": 120000
   },
   "alwaysReviewPaths": [
     "**/security/**",
