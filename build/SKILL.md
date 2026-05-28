@@ -1314,6 +1314,32 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
    Timestamp: <YYYYMMDD-HHMMSS>
    Living plan output path pattern: <$GSTACK_REPO>/inbox/living-plan/<repoSlug>-impl-plan-<sourceSlug>-<YYYYMMDD-HHMMSS>-<hash>.md
 
+   ## Input Sources (Increment 2+)
+
+   PRIMARY INPUT: Per-feature enriched specs at the paths listed in
+   $BUILD_TMP_DIR/phase-a-specs.json. Each spec follows the format at
+   docs/spec-archive-format.md. Read each spec from disk and use it as
+   the source of truth for the corresponding feature block.
+
+   SECONDARY INPUT (for origin trace only): Source plan(s) at the paths
+   in $BUILD_TMP_DIR/build-selected-source-plans.json.
+
+   Your job is to CONVERT each enriched spec into the corresponding feature
+   block in the living plan. The spec already contains: Verified Current
+   State, File Reference Table, Schemas, Acceptance Criteria, Test Spec,
+   Verification Spec, Out of Scope. Your job is to:
+
+   1. Copy these sections VERBATIM into the living plan's feature block.
+   2. Add the `Spec source:` field with the absolute path to the enriched spec.
+   3. Group the File Reference Table entries into TDD phases (following
+      existing rules: registry additions + orchestrator wiring in same phase, etc.).
+   4. Each code phase gets the matching subset of Test Spec rows in its
+      `#### Test Spec` section.
+   5. The Verification Spec block goes verbatim under the feature block.
+
+   DO NOT redesign or rephrase the spec sections. The codex gate already
+   approved them. Your job is mechanical conversion to the TDD phase shape.
+
    Read each source plan fully. Read $BUILD_TMP_DIR/build-target-repos.json. Then write comprehensive Living Implementation & Test Plans.
    If the source plan covers multiple repos, split it into one living plan per target repo. Each living plan must contain only that repo's work and must preserve origin traces to the shared source plan.
 
@@ -1646,6 +1672,8 @@ prior commit.
      feature heading and the next `## ` heading).
    - a `### Verification Spec` subsection exists in the body.
    - the `Acceptance:` field contains at least one digit (quantified criterion).
+   - a line that STARTS with `Spec source:` exists AND points at a file that
+     exists AND contains the `<!-- gstack-spec-complete -->` sentinel.
    If either is missing or is collapsed into run-on prose on the same line
    as another field, rewrite the offending feature block before continuing.
    Repeat until every feature passes.
@@ -1687,6 +1715,10 @@ prior commit.
    9. **Vague acceptance criteria** — the `Acceptance:` field MUST include at
       least one number. The validator rule `missing-quantified-acceptance`
       rejects plans where acceptance is purely qualitative.
+   10. **Dropped spec content** — every File Reference Table row, Schema code block,
+       and quantified Acceptance criterion from the per-feature spec MUST appear
+       verbatim in the living plan's feature block. The validator's
+       `spec-content-drift` check rejects plans that drop spec content.
 
    After writing all living plan files, write manifest v2 to $BUILD_TMP_DIR/build-run-manifest.json:
    {
