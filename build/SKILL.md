@@ -1102,6 +1102,202 @@ Skip source-plan synthesis in Reexamine Mode. Resume Mode must still run the sha
    }
    ```
 
+4.5. **Phase 0 (Feature Outline)** (Increment 2+):
+
+   Before the synthesizer drafts the full living plan, the parent orchestrator
+   extracts a lightweight feature outline from each selected source plan. Phase 0
+   is a parent-side step — no subagent. Output: `$BUILD_TMP_DIR/features-outline.json`.
+
+   For each source plan in `$BUILD_TMP_DIR/build-selected-source-plans.json`,
+   read the file using the Read tool. Identify feature-shaped units of work: a
+   coherent deliverable, usually a `## ...` heading section, a numbered milestone,
+   or a clearly-named subsystem in the source plan's table of contents.
+
+   For each identified feature, derive:
+   - `feature_number` — 1-indexed within this source plan
+   - `working_title` — short noun phrase
+   - `kind` — one of `code`, `writing`, `experiment`, `research`, `manual` (heuristic below)
+   - `origin_trace` — section/week/block IDs from the source plan that this feature covers
+   - `spec_id` — `lowercase(working_title).replace(/[^a-z0-9-]/g, '-').slice(0, 60)`;
+     append `-2`, `-3` on collision within the same build run
+
+   `kind` heuristic (apply in order; first match wins):
+   - Title contains "write", "draft", "document", "documentation" → `writing`
+   - Title contains "benchmark", "experiment", "ablation", "evaluate", "measure" → `experiment`
+   - Title contains "research", "survey", "investigate", "explore", "spike" → `research`
+   - Title contains "manual", "deploy to staging", "vendor setup", "approval" → `manual`
+   - Otherwise → `code`
+
+   **Cap: 20 features per source plan.** If a source plan yields more than 20
+   features, STOP and ask the user via AskUserQuestion to split the source plan
+   into multiple files first.
+
+   Write `$BUILD_TMP_DIR/features-outline.json` in this exact shape (atomic write
+   via tmp + rename):
+
+   ```json
+   {
+     "outlines": [
+       {
+         "sourcePlanPath": "<absolute>",
+         "targetRepo": "<repo slug>",
+         "features": [
+           {
+             "feature_number": 1,
+             "working_title": "Order Expiry",
+             "kind": "code",
+             "origin_trace": "source-plan §4.2, Week 3",
+             "spec_id": "order-expiry"
+           }
+         ]
+       }
+     ]
+   }
+   ```
+
+   Then print a one-line summary:
+   `Phase 0 outline: N features across M source plans (K code, L writing, ...)`
+
+4.6. **Phase A (Per-Feature Spec Drafting + Codex Quality Gate)** (Increment 2+):
+
+   For each feature in the outline, the parent orchestrator drafts an enriched
+   spec, scores it via `bin/codex-spec-gate.ts`, optionally interrogates the user
+   on critical ambiguities, and persists a sentineled spec to disk. Specs follow
+   the shape at `docs/spec-archive-format.md`.
+
+   **Per-feature loop (parent runs this directly, NOT via subagent):**
+
+   1. **Draft the enriched spec inline.** Use Read/Grep against the target repo
+      to ground the spec in real file:line citations. Required sections for `code`
+      features: Context, Verified Current State (file:line table), Proposed
+      Change, Schemas/Interfaces, File Reference Table, Acceptance Criteria
+      (at least one quantified), Test Spec, Verification Spec, Out of Scope,
+      Rollback. Lighter form for non-code: see `docs/spec-archive-format.md`.
+
+   2. **Write the spec to disk.** Use the archive path convention:
+
+      ```bash
+      eval "$(~/.claude/skills/gstack/bin/gstack-slug)"
+      SPEC_DIR="${GSTACK_HOME:-$HOME/.gstack}/projects/$SLUG/specs"
+      mkdir -p "$SPEC_DIR"
+      SPEC_TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+      SPEC_FILE="$SPEC_DIR/${SPEC_TIMESTAMP}-$$-${SPEC_ID}.md"
+      # Build the spec body and write atomically (tmp + rename).
+      cat > "$SPEC_FILE.tmp" <<EOF
+      ---
+      spec_id: $SPEC_ID
+      spec_archive_format_version: 1
+      spec_filed_via: /build
+      spec_issue_number: null
+      spec_filed_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+      feature_number: $FEATURE_NUMBER
+      source_plan: $SOURCE_PLAN
+      origin_trace: $ORIGIN_TRACE
+      target_repo: $REPO_SLUG
+      kind: $KIND
+      ---
+
+      # $WORKING_TITLE
+
+      ## Context
+      ...
+
+      ## Verified Current State
+      ...
+
+      ... (rest of the spec body — see docs/spec-archive-format.md)
+      EOF
+      mv "$SPEC_FILE.tmp" "$SPEC_FILE"
+      ```
+
+   3. **Invoke the codex quality gate:**
+
+      ```bash
+      _GATE_OUT=$(bun run ~/.claude/skills/gstack/bin/codex-spec-gate.ts "$SPEC_FILE" 2>&1)
+      _GATE_EXIT=$?
+      _SCORE=$(echo "$_GATE_OUT" | jq -r '.score // empty')
+      _AMBIGUITIES=$(echo "$_GATE_OUT" | jq -r '.ambiguities[]?')
+      _BLOCKED_REASON=$(echo "$_GATE_OUT" | jq -r '.blocked_reason // empty')
+      ```
+
+      Dispatch by exit code:
+      - **Exit 0 + score ≥ 7:** pass. Skip to step 5 (append sentinel).
+      - **Exit 0 + score < 7:** enter interrogation flow (step 4).
+      - **Exit 2 (secret blocked):** STOP. Show the user the `$_BLOCKED_REASON`.
+        Do not write the sentinel. Do not proceed. The user must redact the spec
+        and re-invoke `/build`.
+      - **Exit 3 (codex unavailable):** print a warning, skip the gate, write
+        sentinel with `quality_score: null`, `interrogation: skipped`, continue.
+      - **Exit 4 (codex timeout):** same as exit 3.
+
+   4. **Interrogation flow** (only when score < 7). Use AskUserQuestion with the
+      top 3 ambiguities:
+
+      ```
+      D<N> — Feature '${WORKING_TITLE}' scored ${_SCORE}/10. Codex flagged:
+      ${_AMBIGUITIES (first 3, one per line)}
+
+      Recommendation: A if ambiguities point at concrete missing data; B if they
+      look like style nits.
+
+      A) Address ambiguities — open editor / answer inline, then re-score (recommended)
+      B) Ship spec as-is — log interrogation: skipped, continue to Phase B
+      C) Cancel /build (halt before any code work)
+      ```
+
+      - **A:** collect user answers, edit the spec file inline, re-run gate (step 3).
+        Max 3 total rounds (initial + 2 retries) per feature.
+      - **B:** continue, set `interrogation: skipped` in the sentinel.
+      - **C:** halt the build, leave the un-sentineled spec on disk for review.
+
+      **Interrogation budget cap.** At most 3 features per `/build` invocation get
+      the interactive A round. Features 4+ with <7 scores are batched at the end
+      of Phase A into a single AskUserQuestion: "{N} more features scored <7.
+      Recommendation: accept-all-as-is unless you want to halt." Options:
+      (A) accept-all-as-is (recommended); (B) edit-and-rescore-all; (C) cancel.
+
+   5. **Append the sentinel** to the spec file:
+
+      ```html
+      <!-- gstack-spec-complete
+      ts: <ISO 8601 UTC>
+      quality_score: <_SCORE or "null">
+      gate_rounds: <_ROUNDS>
+      interrogation: <yes|no|skipped>
+      filed_via: /build
+      -->
+      ```
+
+   6. **Discharge from context.** After the sentinel is appended, the parent
+      MUST NOT keep the spec content in its working memory. Phase B reads each
+      spec back from disk feature-by-feature.
+
+   7. **Compaction recovery.** If `/build` is resumed after the parent context
+      was compacted, the parent re-scans `$SPEC_DIR` for files whose
+      `feature_number` matches features in the outline. Any feature with an
+      existing sentineled spec is SKIPPED (already drafted). The loop resumes
+      at the first un-sentineled or missing feature.
+
+   **After all features finish Phase A**, write `$BUILD_TMP_DIR/phase-a-specs.json`
+   in this shape (atomic write):
+
+   ```json
+   {
+     "specs": [
+       {
+         "feature_number": 1,
+         "spec_id": "order-expiry",
+         "spec_path": "<absolute path to sentineled spec>",
+         "quality_score": 8,
+         "interrogation": "no"
+       }
+     ]
+   }
+   ```
+
+   Print:
+   `Phase A complete: N specs drafted, M passed on first round, K required interrogation.`
+
 5. **Synthesize living plan(s) and run manifest v2 (configured subagent)**: Delegate full plan synthesis to the configured `planSynthesizer` provider so the entire origin plan document is read off the main context. The subagent reads the source plan set and target repo list, writes one living plan per target repo/source plan, writes `$BUILD_TMP_DIR/build-run-manifest.json`, and returns only a compact summary.
 
    Write `$BUILD_TMP_DIR/build-synthesis-input.md` (substitute actual values):
