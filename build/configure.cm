@@ -10,17 +10,12 @@
       "model": "claude-opus-4-7",
       "reasoning": "xhigh"
     },
-    "specQualityGate": {
-      "provider": "codex",
-      "model": "gpt-5.5",
-      "reasoning": "medium"
-    },
-    "monitorAgent": {
+    "planReviewer": {
       "provider": "codex",
       "model": "gpt-5.5",
       "reasoning": "high"
     },
-    "planReviewer": {
+    "monitorAgent": {
       "provider": "codex",
       "model": "gpt-5.5",
       "reasoning": "high"
@@ -31,8 +26,8 @@
       "reasoning": "high"
     },
     "testWriter": {
-      "provider": "gemini",
-      "model": "gemini-2.5-flash",
+      "provider": "codex",
+      "model": "gpt-5.5",
       "reasoning": "high",
       "backupProvider": "codex",
       "backupModel": "gpt-5.3-codex-spark"
@@ -41,12 +36,12 @@
       "provider": "codex",
       "model": "gpt-5.5",
       "reasoning": "high",
-      "backupProvider": "gemini",
-      "backupModel": "gemini-2.5-flash"
+      "backupProvider": "codex",
+      "backupModel": "gpt-5.5"
     },
     "testFixer": {
-      "provider": "gemini",
-      "model": "gemini-2.5-flash",
+      "provider": "codex",
+      "model": "gpt-5.5",
       "reasoning": "high",
       "backupProvider": "codex",
       "backupModel": "gpt-5.3-codex-spark"
@@ -88,16 +83,16 @@
       "model": "kimi-code/kimi-for-coding",
       "reasoning": "high",
       "command": "/ship",
-      "backupProvider": "gemini",
-      "backupModel": "gemini-2.5-flash"
+      "backupProvider": "codex",
+      "backupModel": "gpt-5.5"
     },
     "land": {
       "provider": "kimi",
       "model": "kimi-code/kimi-for-coding",
       "reasoning": "high",
       "command": "/land-and-deploy",
-      "backupProvider": "gemini",
-      "backupModel": "gemini-2.5-flash"
+      "backupProvider": "codex",
+      "backupModel": "gpt-5.5"
     },
     "featureVerifier": {
       "provider": "codex",
@@ -110,8 +105,7 @@
     "redSpecMaxIterations": 1,
     "testMaxIterations": 5,
     "originVerificationMaxIterations": 3,
-    "featureReviewMaxIterations": 3,
-    "featureVerifyMaxIterations": 3
+    "featureReviewMaxIterations": 3
   },
   "timeoutsMs": {
     "gemini": 900000,
@@ -121,9 +115,7 @@
     "test": 900000,
     "judge": 600000,
     "featureReview": 1200000,
-    "featureVerify": 1200000,
-    "planReview": 300000,
-    "specQualityGate": 120000
+    "planReview": 300000
   },
   "alwaysReviewPaths": [
     "**/security/**",
