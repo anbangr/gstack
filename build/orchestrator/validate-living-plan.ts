@@ -583,12 +583,18 @@ function validate(planPath: string): ValidationReport {
 
   // Increment 1 spec-grade checks: out-of-scope, verification spec,
   // file reference table, quantified acceptance must be present per feature.
-  // Tasks 4, 5, and 6 will each append another `if` to this same loop.
+  // Tasks 5 and 6 will each append another `if` to this same loop.
   for (const block of blocks) {
     if (!block.hasOutOfScope) {
       staticViolations.push({
         rule: "missing-out-of-scope",
         message: `Feature ${block.number} (${block.name}): missing "Out of scope:" line-anchored field. Add a line starting at column 0 like "Out of scope: none" or "Out of scope: vendor billing integration".`,
+      });
+    }
+    if (!block.hasVerificationSpec) {
+      staticViolations.push({
+        rule: "missing-verification-spec",
+        message: `Feature ${block.number} (${block.name}): missing "### Verification Spec" subsection. Add an H3 heading "### Verification Spec" with smoke commands + acceptance probes table (for code features) or verification artifacts + pass criteria (for non-code features). See docs/spec-archive-format.md for the exact shape.`,
       });
     }
   }

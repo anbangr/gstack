@@ -87,6 +87,9 @@ Out of scope: none
 import { spawn } from "bun";
 spawn(["echo", "hi"]);
 \`\`\`
+
+### Verification Spec
+Smoke: \`bun test\`
 `,
     );
     const r = runValidator(plan);
@@ -110,6 +113,9 @@ Out of scope: none
 import { FailureRender } from "./halt-event-helpers";
 function wrap(r: FailureRender): string { return r.kind; }
 \`\`\`
+
+### Verification Spec
+Smoke: \`bun test\`
 `,
     );
     const r = runValidator(plan);
@@ -195,6 +201,9 @@ Out of scope: none
 - [ ] **Review**: review
 
 Add \`build/orchestrator/__tests__/future-helper.test.ts\`.
+
+### Verification Spec
+Smoke: \`bun test\`
 `,
     );
     const r = runValidator(plan);
@@ -333,6 +342,9 @@ foo();
 \`\`\`
 
 Verify \`build/orchestrator/validate-living-plan.ts\` exists.
+
+### Verification Spec
+Smoke: \`bun test\`
 `,
     );
     const r = runValidator(plan);
@@ -355,6 +367,9 @@ Out of scope: none
 ### Phase 1: Implementation
 - [ ] **Implementation**: write code
 - [ ] **Review**: review
+
+### Verification Spec
+Smoke: \`bun test\`
 `,
     );
     const r = runValidator(plan);
@@ -373,6 +388,9 @@ Out of scope: none
 ### Phase 1: Implementation
 - [ ] **Implementation**: write code
 - [ ] **Review**: review
+
+### Verification Spec
+Smoke: \`bun test\`
 `,
     );
     const r = runValidator(plan);
@@ -752,5 +770,33 @@ Smoke: \`bun test\`
     );
     const r = runValidator(plan);
     expect(r.status).toBe(0);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // T8 — Verification Spec subsection required per feature block
+  // ─────────────────────────────────────────────────────────────────────────
+  it("T8: returns non-zero when a feature block is missing ### Verification Spec", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: No verification spec
+
+Origin trace: test
+Acceptance: 1. response time under 50ms
+Out of scope: nothing
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/foo.ts\` | create |
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/verification spec/i);
   });
 });

@@ -1939,6 +1939,9 @@ describe("validate-living-plan.ts CLI", () => {
       "Out of scope: none",
       "",
       "### Phase 1: Setup",
+      "",
+      "### Verification Spec",
+      "Smoke: `bun test`",
     ].join("\n");
     const planPath = path.join(dir, "valid.md");
     fs.writeFileSync(planPath, plan, "utf8");
