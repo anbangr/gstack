@@ -135,6 +135,14 @@ export interface FeatureBlock {
   hasOriginTrace: boolean;
   /** `^Acceptance:` matched line-anchored within `header`. */
   hasAcceptance: boolean;
+  /** `^Out of scope:` matched line-anchored within `header`. */
+  hasOutOfScope: boolean;
+  /** `^### Verification Spec` or `^## Verification Spec` matched line-anchored within `body`. */
+  hasVerificationSpec: boolean;
+  /** `^### File Reference Table` or `^## File Reference Table` matched line-anchored within `body`. */
+  hasFileReferenceTable: boolean;
+  /** True when the `Acceptance:` line(s) contain at least one digit (quantified criterion). */
+  hasQuantifiedAcceptance: boolean;
 }
 
 /**
@@ -193,6 +201,34 @@ export function extractFeatureBlocks(planContent: string): FeatureBlock[] {
     const hasOriginTrace = /^Origin trace:/m.test(header);
     const hasAcceptance = /^Acceptance:/m.test(header);
 
+    const hasOutOfScope = /^Out of scope:/m.test(header);
+    const hasVerificationSpec =
+      /^###\s+Verification Spec\s*$/m.test(body) ||
+      /^##\s+Verification Spec\s*$/m.test(body);
+    const hasFileReferenceTable =
+      /^###\s+File Reference Table\s*$/m.test(body) ||
+      /^##\s+File Reference Table\s*$/m.test(body);
+
+    // Quantified acceptance: any acceptance content that contains a digit.
+    // Capture from the "Acceptance:" line(s) until the next blank line or
+    // next heading; numbered lists (e.g. "1. response p95 < 100ms") and
+    // multi-line acceptance blocks both work because `/d/` only needs one
+    // digit somewhere in the captured range. "Acceptance: feature works"
+    // has no digit and is rejected; "Acceptance: 1. feature works" is
+    // accepted but the leading "1." is the LIST NUMBER, not a metric, so
+    // we strip leading list numbers ("1.", "2.", etc.) at line starts
+    // before testing for digits.
+    let hasQuantifiedAcceptance = false;
+    const acceptanceMatch = header.match(
+      /^Acceptance:([\s\S]*?)(?:\n\n|\n##|\n###|$)/m,
+    );
+    if (acceptanceMatch) {
+      // Strip "N. " list numbering from line starts so the bare list index
+      // doesn't count as a quantified value.
+      const stripped = acceptanceMatch[1].replace(/^\s*\d+\.\s+/gm, "");
+      hasQuantifiedAcceptance = /\d/.test(stripped);
+    }
+
     blocks.push({
       number,
       name,
@@ -200,6 +236,10 @@ export function extractFeatureBlocks(planContent: string): FeatureBlock[] {
       body,
       hasOriginTrace,
       hasAcceptance,
+      hasOutOfScope,
+      hasVerificationSpec,
+      hasFileReferenceTable,
+      hasQuantifiedAcceptance,
     });
   }
 

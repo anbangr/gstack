@@ -638,4 +638,56 @@ Wrong forms (DON'T do this):
     // Legacy phantom-row emits since plan has no real features:
     expect(r.stderr).toMatch(/"featureNumber":0,"featureName":""/);
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // T6 — FeatureBlock flags populated for new fields
+  // ─────────────────────────────────────────────────────────────────────────
+  it("T6: extractFeatureBlocks populates hasOutOfScope/hasVerificationSpec/hasFileReferenceTable/hasQuantifiedAcceptance", async () => {
+    const { extractFeatureBlocks } = await import("../skill-fault-detector");
+    const plan = `## Feature 1: Complete feature
+
+Origin trace: source plan §1
+Acceptance: 1. response time under 50ms (quantified)
+Out of scope: nothing
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/foo.ts\` | create |
+
+### Verification Spec
+Smoke: \`bun test\`
+`;
+    const blocks = extractFeatureBlocks(plan);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].hasOutOfScope).toBe(true);
+    expect(blocks[0].hasVerificationSpec).toBe(true);
+    expect(blocks[0].hasFileReferenceTable).toBe(true);
+    expect(blocks[0].hasQuantifiedAcceptance).toBe(true);
+  });
+
+  it("T6-negative: extractFeatureBlocks reports false for missing fields", async () => {
+    const { extractFeatureBlocks } = await import("../skill-fault-detector");
+    const plan = `## Feature 1: Minimal feature
+
+Origin trace: source plan §1
+Acceptance: feature works
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+`;
+    const blocks = extractFeatureBlocks(plan);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].hasOutOfScope).toBe(false);
+    expect(blocks[0].hasVerificationSpec).toBe(false);
+    expect(blocks[0].hasFileReferenceTable).toBe(false);
+    expect(blocks[0].hasQuantifiedAcceptance).toBe(false);
+  });
 });
