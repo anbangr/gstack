@@ -60,11 +60,16 @@ export interface RoleConfigs {
    */
   monitorAgent: RoleConfig;
   /**
-   * Second-opinion reviewer that runs at gstack-build startup, before Phase 1
-   * of Feature 1. Returns APPROVE/REVISE verdict; CRITICAL objections trigger
-   * exit 3 and SKILL.md re-synthesis loop.
+   * Replaced by `specQualityGate` in Increment 2. Optional in the type so the
+   * legacy plan-review loop (behind `--legacy-plan-review`) still type-checks
+   * when a user explicitly re-adds the role to configure.cm.
    */
-  planReviewer: RoleConfig;
+  planReviewer?: RoleConfig;
+  /**
+   * Per-feature spec quality gate (Increment 2). Codex scores each enriched
+   * spec 0-10 against the 7-dimension rubric in `bin/codex-spec-gate.ts`.
+   */
+  specQualityGate: RoleConfig;
 }
 
 export const ROLE_DEFINITIONS = [
@@ -81,7 +86,7 @@ export const ROLE_DEFINITIONS = [
   ["featureReview", "feature-review", "GSTACK_BUILD_FEATURE_REVIEW"],
   ["featureVerifier", "feature-verifier", "GSTACK_BUILD_FEATURE_VERIFIER"],
   ["monitorAgent", "monitor-agent", "GSTACK_BUILD_MONITOR_AGENT"],
-  ["planReviewer", "plan-reviewer", "GSTACK_BUILD_PLANREVIEWER"],
+  ["specQualityGate", "spec-quality-gate", "GSTACK_BUILD_SPEC_QUALITY_GATE"],
 ] as const satisfies readonly [keyof RoleConfigs, string, string][];
 
 export type RoleKey = (typeof ROLE_DEFINITIONS)[number][0];

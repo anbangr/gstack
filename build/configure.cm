@@ -20,6 +20,11 @@
       "model": "gpt-5.5",
       "reasoning": "high"
     },
+    "planReviewer": {
+      "provider": "codex",
+      "model": "gpt-5.5",
+      "reasoning": "high"
+    },
     "investigator": {
       "provider": "codex",
       "model": "gpt-5.5",

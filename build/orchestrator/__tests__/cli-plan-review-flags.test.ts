@@ -40,4 +40,14 @@ describe("cli args: plan-review flags", () => {
       parseArgs(["plan.md", "--plan-review-noninteractive=bogus"]),
     ).toThrow();
   });
+
+  it("--legacy-plan-review absent: default legacyPlanReview is false", () => {
+    const args = parseArgs(["plan.md"]);
+    expect((args as any).legacyPlanReview).toBe(false);
+  });
+
+  it("--legacy-plan-review parses to args.legacyPlanReview=true", () => {
+    const args = parseArgs(["plan.md", "--legacy-plan-review"]);
+    expect((args as any).legacyPlanReview).toBe(true);
+  });
 });

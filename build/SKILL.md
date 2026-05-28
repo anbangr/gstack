@@ -1661,36 +1661,13 @@ prior commit.
    _mark_manifest_claims_manifested
    ```
 
-5.5. **Second Opinion — planReviewer exit handling**: The `gstack-build` startup (Step M1/M2 below) runs the configured `planReviewer` role at startup before Phase 1 of Feature 1, looping in-process with user triage gates and an adaptive cap. Most rounds resolve inside the CLI — this step only handles three exit codes:
-
-   - **Exit 0 (APPROVED)**: The annotation header is already written to the plan file. Proceed to Phase M1.
-   - **Exit 1 (runtime error)**: Existing error path. See Step M3.
-   - **Exit 2 (test failure)**: Existing test-fix path. See Step M3.
-
-   - **Exit 3 (STALEMATE)**: One of three sub-cases:
-     - User picked `[m]anual mode` at the bail-out or stalemate gate, OR the non-TTY `fail-fast` mode fired on a CRITICAL round (`state.planReview.status === "critical_exit_pending"`).
-     - **synth_failure_stalemate**: a prior session's synthesizer returned `ok:false` and the orchestrator's stalemate guard refused to auto-retry on resume (`state.planReview.status === "synth_failure"` or `"synth_failure_stalemate"`). A stdout STALEMATE event like `{"event":"STALEMATE","reason":"synth_failure_promoted_on_resume",...}` accompanies this exit.
-
-     1. Read `~/.gstack/build-state/<stateSlug>/plan-review-report.json` (where `stateSlug` is `runs[0].stateSlug` from the manifest). Extract the `objections` array (CRITICAL severity only) and the `round` field. Also read `~/.gstack/build-state/<stateSlug>/plan-review-history.jsonl` for the full trajectory. For synth_failure_stalemate, also check the convergence aggregate at `~/.gstack/analytics/convergence.jsonl` for the `outcome` field — a value of `synth_failure` or `synth_failure_stalemate` confirms the sub-case.
-
-     2. AskUser with options:
-        - A) **Override** — proceed with the current plan as-is (re-launch `gstack-build` with `--no-plan-review`). For synth_failure_stalemate this is often the right call when the failure was caused by a known-transient provider issue (model outage, rate limit).
-        - B) **Apply suggested fixes** — read the CRITICAL objections, edit the plan file manually, then re-launch (the loop will restart from round 1 because the plan changed substantively; alternatively keep history.jsonl and the next reviewer call will see the prior rounds). For synth_failure_stalemate, also delete `state.planReview` from the build-state file so the loop starts fresh — leaving the synth_failure status would re-trigger the stalemate guard.
-        - C) **Edit manually** — open the living plan file in `$EDITOR`, resolve the objections by hand, then re-launch.
-
-     **Restart storm note** (post-fix-plan-review-loop-stalemate-restart-storm): the monitor caps auto-resumes at 3 per run (configurable via `GSTACK_MONITOR_MAX_AUTO_RESUME`). If you see `RUN_HALTED_STALEMATE` or `RUN_HALTED_RESTART_CAP` events in the monitor log, the monitor stopped trying to auto-resume — manual intervention is required.
-
-   - **Exit 4 (USER ABORT)**: User picked `[q]uit` at the triage gate or stalemate gate.
-
-     1. Print the state paths: plan file, `plan-review-report.json`, `plan-review-history.jsonl`.
-     2. Tell the user: "State left intact. When ready, run `gstack-build resume --gstack-repo <repo> --project-root <repo>` and the loop will pick up from where you stopped."
-     3. Exit without prompting further. The user resumes on their own schedule.
-
-   - **Exit 130 (SIGINT)**: User Ctrl+C'd during triage.
-
-     1. Print the resume command (same as Exit 4) and exit.
-
-   The cross-round annotation history is already in the plan file as `<!-- gstack-plan-review-history -->` and per-phase `<!-- ROUND N -->` blocks. The reviewer reads them automatically on the next launch. Manual edits to the plan should preserve these annotations so the next round's reviewer has context.
+5.5. **Plan Review (replaced by specQualityGate in Phase A)**: The legacy
+   `planReviewer` second-opinion loop has been replaced by `specQualityGate`
+   (codex 0-10 score per-feature) in Phase A. The gate runs against each
+   per-feature spec BEFORE synthesis, not against the synthesized living plan.
+   To restore the legacy planReviewer loop for emergencies, pass
+   `--legacy-plan-review` to `gstack-build`. The legacy loop is preserved
+   for one release cycle and will be removed in v2.1.
 
 5.7. **Branch Strategy Decision**: Read the living plan file (path from `build-synthesis-output.md`). Reason holistically about the features: are they tightly coupled and form one coherent deliverable, or do they have independent shipping value?
 

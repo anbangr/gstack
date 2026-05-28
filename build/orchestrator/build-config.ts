@@ -67,7 +67,7 @@ const ROLE_KEYS: RoleKey[] = [
   "featureReview",
   "featureVerifier",
   "monitorAgent",
-  "planReviewer",
+  "specQualityGate",
 ];
 
 const PROVIDERS: RoleProvider[] = ["claude", "codex", "gemini", "kimi"];
@@ -173,9 +173,7 @@ function validateAlwaysReviewPaths(value: unknown, label: string): string[] {
   for (let i = 0; i < value.length; i += 1) {
     const item = value[i];
     if (typeof item !== "string" || item.length === 0) {
-      throw new Error(
-        `${label}[${i}] must be a non-empty string glob pattern`,
-      );
+      throw new Error(`${label}[${i}] must be a non-empty string glob pattern`);
     }
     out.push(item);
   }
@@ -197,10 +195,15 @@ function withMigratedRoles(value: unknown, filePath: string): unknown {
     "featureReview",
     "featureVerifier",
     "monitorAgent",
-    "planReviewer",
+    "specQualityGate",
   ] as const) {
     if (!roles[key] && !isLoadingDefault) roles[key] = readDefaultRole(key);
   }
+  // planReviewer was removed in Increment 2; it is no longer backfilled or
+  // required. Users who run --legacy-plan-review must manually re-add the
+  // role to configure.cm. If the user-edited config still has the field, we
+  // preserve it (the field is optional in the type and the loader does not
+  // require it via ROLE_KEYS).
   return roles;
 }
 
@@ -279,7 +282,10 @@ function validateRoles(value: unknown, filePath: string): RoleConfigs {
         `${filePath}:roles.${key}.command must be a string when present`,
       );
     }
-    if (role.backupProvider != null && !PROVIDERS.includes(role.backupProvider)) {
+    if (
+      role.backupProvider != null &&
+      !PROVIDERS.includes(role.backupProvider)
+    ) {
       throw new Error(
         `${filePath}:roles.${key}.backupProvider must be one of: ${PROVIDERS.join(", ")}`,
       );

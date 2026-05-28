@@ -856,6 +856,11 @@ export interface Args {
   featureReviewMaxIter: number;
   /** Skip the planReviewer second-opinion pass at startup. */
   noPlanReview: boolean;
+  /**
+   * Re-enable the legacy planReviewer second-opinion loop (replaced by
+   * specQualityGate in Increment 2). Off by default for one release cycle.
+   */
+  legacyPlanReview: boolean;
   /** Override the planReviewer model for this run (e.g. a-provider-model). */
   planReviewerModel?: string;
   /** Max plan-review rounds before stalemate (1..20). Default 5. */
@@ -1128,6 +1133,7 @@ export function parseArgs(argv: string[]): Args {
     strictPreMergeVerify: false,
     featureReviewMaxIter: DEFAULT_FEATURE_REVIEW_MAX_ITER,
     noPlanReview: false,
+    legacyPlanReview: false,
     planReviewerModel: undefined,
     planReviewMaxRounds: 5,
     planReviewNoAdaptiveCap: false,
@@ -1214,6 +1220,7 @@ export function parseArgs(argv: string[]): Args {
     else if (a === "--strict-pre-merge-verify")
       args.strictPreMergeVerify = true;
     else if (a === "--no-plan-review") args.noPlanReview = true;
+    else if (a === "--legacy-plan-review") args.legacyPlanReview = true;
     else if (a === "--plan-reviewer-model") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
@@ -1301,9 +1308,7 @@ export function parseArgs(argv: string[]): Args {
     } else if (a === "--mark-feature-shipped-commit") {
       const next = argv[++i];
       if (!next || next.startsWith("-")) {
-        console.error(
-          "--mark-feature-shipped-commit requires a commit SHA",
-        );
+        console.error("--mark-feature-shipped-commit requires a commit SHA");
         process.exit(2);
       }
       args.markFeatureShippedCommit = next;
@@ -2307,11 +2312,16 @@ export function captureGitSnapshot(
     ];
     for (const [dir, rel] of targets) {
       if (!dir) continue;
-      const abs = path.isAbsolute(dir) ? path.join(dir, rel) : path.join(cwd, dir, rel);
+      const abs = path.isAbsolute(dir)
+        ? path.join(dir, rel)
+        : path.join(cwd, dir, rel);
       const key = `${path.basename(dir)}/${rel}`;
       try {
         const buf = fs.readFileSync(abs);
-        gitDirHashes.set(key, crypto.createHash("sha256").update(buf).digest("hex"));
+        gitDirHashes.set(
+          key,
+          crypto.createHash("sha256").update(buf).digest("hex"),
+        );
       } catch {
         gitDirHashes.set(key, "<absent>");
       }
@@ -2334,7 +2344,10 @@ export function captureGitSnapshot(
             const st = fs.statSync(full);
             if (!st.isFile()) continue;
             const buf = fs.readFileSync(full);
-            const contentHash = crypto.createHash("sha256").update(buf).digest("hex");
+            const contentHash = crypto
+              .createHash("sha256")
+              .update(buf)
+              .digest("hex");
             const execBit = (st.mode & 0o111) !== 0 ? "x" : "-";
             lines.push(`${name}|${execBit}|${contentHash}`);
           } catch {
@@ -3745,6 +3758,7 @@ Flags:
   --monitor-agent-model <m>        Default: ${DEFAULT_ROLE_CONFIGS.monitorAgent.model}.
   --plan-reviewer-model <m>        Default: ${DEFAULT_ROLE_CONFIGS.planReviewer.model}.
   --no-plan-review         Skip the planReviewer second-opinion pass at startup.
+  --legacy-plan-review     Re-enable the legacy planReviewer loop (replaced by specQualityGate in Increment 2; default off).
   --plan-review-max-rounds <N>     Default: 5. Maximum rounds before stalemate. Bump for legit deep convergence.
   --plan-review-no-adaptive-cap    Disable the no-forward-progress bail-out trigger.
   --plan-review-noninteractive <m> Default: auto-accept. CI behavior on CRITICAL objections:
@@ -7541,10 +7555,12 @@ export function markFeatureShippedAfterManualRecovery(args: {
   prNumber: number;
   shippedCommit?: string;
   dryRun?: boolean;
-}):
-  | { ok: true; featureIndex: number }
-  | { ok: false; error: string } {
-  if (args.prNumber == null || !Number.isInteger(args.prNumber) || args.prNumber <= 0) {
+}): { ok: true; featureIndex: number } | { ok: false; error: string } {
+  if (
+    args.prNumber == null ||
+    !Number.isInteger(args.prNumber) ||
+    args.prNumber <= 0
+  ) {
     return {
       ok: false,
       error: `--mark-feature-shipped-pr requires a positive integer, got: ${args.prNumber}`,
@@ -12445,9 +12461,7 @@ async function main() {
           dryRun: args.dryRun,
         });
         if (!marked.ok) {
-          console.error(
-            `\n✗ --mark-feature-shipped failed: ${marked.error}\n`,
-          );
+          console.error(`\n✗ --mark-feature-shipped failed: ${marked.error}\n`);
           exitCode = 2;
           setupFailed = true;
         } else if (args.dryRun) {
@@ -12625,6 +12639,8 @@ async function main() {
 
       // Plan review: second-opinion pass before Phase 1 of Feature 1.
       // Skipped in dry-run, when --no-plan-review is set, or on resume (already reviewed).
+      // Also skipped by default in Increment 2+ (replaced by specQualityGate).
+      // Pass --legacy-plan-review to re-enable for one release cycle.
       // Resume re-runs the loop when prior session left a pending status:
       //   - critical_exit_pending: stalemate at exit 3 → user picked manual mode
       //   - user_aborted: user picked [q] / SIGINT → docs promise resume picks up
@@ -12632,6 +12648,7 @@ async function main() {
       if (
         !args.dryRun &&
         !args.noPlanReview &&
+        args.legacyPlanReview &&
         (!state.planReview ||
           (state.planReview as any).status === "critical_exit_pending" ||
           (state.planReview as any).status === "user_aborted")
@@ -12741,7 +12758,16 @@ async function main() {
           output: process.stdout,
           reviewerName: reviewRole.model,
           synthesizerName: synthRole.model,
+          // This branch is only reached when args.legacyPlanReview is true.
+          legacyPlanReview: true,
         });
+        // Defense-in-depth: the outer gate (args.legacyPlanReview) already
+        // prevents reaching here without the flag, but guard the type union
+        // so TypeScript is satisfied.
+        if ("status" in loopResult && loopResult.status === "skipped") {
+          // Should never reach here — the outer if-gate requires legacyPlanReview.
+          return;
+        }
 
         // Persist legacy plan-review-report.json so SKILL.md.tmpl Step 5.5
         // stalemate handler keeps working until Task 16 shrinks it.

@@ -79,6 +79,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     expect(result.outcome).toBe("approved");
     expect(result.rounds).toBe(1);
@@ -163,6 +164,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     expect(result.outcome).toBe("approved");
     expect(result.rounds).toBe(4);
@@ -247,6 +249,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     const agg = JSON.parse(
       fs.readFileSync(path.join(tmpDir, "convergence.jsonl"), "utf8").trim(),
@@ -290,6 +293,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     // Non-TTY stalemate gate returns approve_as_is, so outcome is "approved".
     // But the rounds === maxRounds confirms we hit the cap.
@@ -365,6 +369,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     expect(result.outcome).toBe("user_manual");
     expect(result.exitCode).toBe(3);
@@ -423,6 +428,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     expect(result.outcome).toBe("approved");
     expect(result.rounds).toBe(1);
@@ -490,6 +496,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     expect(result.outcome).toBe("approved");
     const plan = fs.readFileSync(planPath, "utf8");
@@ -543,6 +550,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     expect(result.outcome).toBe("approved");
     const written = out.read();
@@ -621,6 +629,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     expect(result.outcome).toBe("approved");
     // result.rounds is the round number at exit; with prior entries 1+2,
@@ -694,6 +703,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     expect(result.outcome).toBe("synth_failure");
     expect(result.exitCode).toBe(1);
@@ -746,6 +756,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     expect(result.outcome).toBe("synth_failure");
     expect(result.exitCode).toBe(1);
@@ -803,6 +814,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     expect(result.outcome).toBe("synth_failure");
     expect(result.exitCode).toBe(1);
@@ -890,6 +902,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     expect(result.outcome).toBe("approved");
     expect(result.rounds).toBe(3);
@@ -968,6 +981,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     expect(result.outcome).toBe("approved");
     expect(result.exitCode).toBe(0);
@@ -1044,6 +1058,7 @@ describe("runPlanReviewLoop", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     expect(result.outcome).toBe("user_manual");
     expect(result.exitCode).toBe(3);
@@ -1190,6 +1205,7 @@ describe("disputed-resolution counting (case-insensitive)", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
     const agg = JSON.parse(
       fs.readFileSync(path.join(tmpDir, "convergence.jsonl"), "utf8").trim(),
@@ -1292,6 +1308,7 @@ describe("resume: priorRejectRationale hydration", () => {
       output: out.stream,
       reviewerName: "stub",
       synthesizerName: "stub-synth",
+      legacyPlanReview: true,
     });
 
     // The triage gate writes the prior-reject rationale into its prompt when
@@ -1300,5 +1317,45 @@ describe("resume: priorRejectRationale hydration", () => {
     const written = out.read();
     expect(written).toContain("RE-RAISED from prior round");
     expect(written).toContain("intentional design choice from round 1");
+  });
+});
+
+describe("runPlanReviewLoop: default-skip behavior (Increment 2)", () => {
+  it("skips planReviewer when legacyPlanReview is absent (default off)", async () => {
+    // Verifies that the loop returns { status: "skipped" } without calling the
+    // reviewerFn when legacyPlanReview is not set. This is the Increment 2
+    // default: planReviewer replaced by specQualityGate in Phase A.
+    let reviewerCalled = false;
+    const out = captureWriter();
+    const result = await runPlanReviewLoop({
+      planPath,
+      historyPath: path.join(tmpDir, "history.jsonl"),
+      aggregatePath: path.join(tmpDir, "convergence.jsonl"),
+      slug: "skip-test",
+      branch: "feat/test",
+      reviewerFn: async () => {
+        reviewerCalled = true;
+        return {
+          verdict: "APPROVE",
+          objections: [],
+          assessment: "",
+          reviewedBy: "stub",
+          round: 1,
+        };
+      },
+      synthFn: async () => ({ ok: true }),
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: false,
+      input: readableFrom(""),
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
+      // legacyPlanReview intentionally omitted — should default to skipped
+    });
+    expect("status" in result).toBe(true);
+    expect((result as any).status).toBe("skipped");
+    expect(reviewerCalled).toBe(false);
   });
 });

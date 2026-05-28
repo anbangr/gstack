@@ -679,6 +679,12 @@ export interface RunPlanReviewLoopInput {
   output: NodeJS.WritableStream;
   reviewerName: string;
   synthesizerName: string;
+  /**
+   * Re-enable the legacy planReviewer loop. Off by default as of Increment 2
+   * (replaced by specQualityGate in Phase A). Pass `true` when invoked via
+   * `--legacy-plan-review`. The loop is preserved for one release cycle.
+   */
+  legacyPlanReview?: boolean;
 }
 
 export type LoopOutcome = ExitReason;
@@ -689,6 +695,12 @@ export interface RunPlanReviewLoopResult {
   exitCode: 0 | 1 | 3 | 4 | 130;
   /** Final verdict for the legacy plan-review-report.json file in cli.ts. */
   finalVerdict: PlanReviewVerdict;
+}
+
+/** Returned when planReviewer is skipped (default in Increment 2+). */
+export interface RunPlanReviewLoopSkipped {
+  status: "skipped";
+  reason: string;
 }
 
 /**
@@ -709,7 +721,17 @@ export interface RunPlanReviewLoopResult {
  */
 export async function runPlanReviewLoop(
   input: RunPlanReviewLoopInput,
-): Promise<RunPlanReviewLoopResult> {
+): Promise<RunPlanReviewLoopResult | RunPlanReviewLoopSkipped> {
+  // planReviewer was replaced by specQualityGate in Phase A as of Increment 2.
+  // Code retained here for one release cycle behind --legacy-plan-review opt-in.
+  if (!input.legacyPlanReview) {
+    return {
+      status: "skipped",
+      reason:
+        "planReviewer removed in v2.0; use --legacy-plan-review to re-enable",
+    };
+  }
+
   // Single shared readline + ask function for the entire loop. The gates
   // (TTY triage + stalemate) reuse this so the input stream isn't consumed
   // and torn down between rounds — a per-call readline would drain the
