@@ -1,7 +1,7 @@
 ---
 name: build
 preamble-tier: 4
-version: 1.32.0
+version: 1.33.0
 description: |
   gstack autonomous execution skill. Reads the latest implementation plan and enters
   a strict coding loop to build the feature in phases, running tests and reviews
@@ -2197,6 +2197,13 @@ Release daemon lifecycle:
    > gate (e.g., `--skip-pre-merge-verify` was set, or the agent invoked
    > `/ship` directly without the CLI). For the default flow, this section
    > is informational — the pre-merge gate has already run.
+
+   **featureVerifier consolidation (Increment 3+):** `featureVerifier` now reads
+   the pre-designed `### Verification Spec` block from each living-plan feature
+   and runs it deterministically (no inventing probes at runtime). The legacy
+   `featureReview` role is being consolidated; `configure.cm` still accepts it
+   for back-compat. Probe failures are surfaced to the test-fixer as structured
+   `{ac, cmd, expected, actual, halt_at}` records.
 
    Resolve the landed base ref from the target repo before writing verifier input:
    ```bash
