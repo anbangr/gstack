@@ -3728,7 +3728,7 @@ Flags:
   --feature-review-max-iter N  Cap on per-feature review cycles before
                        hard-fail (F4 will swap this for an interactive
                        prompt to allow a 4th cycle).
-  --feature-review-model <m>       Default: ${DEFAULT_ROLE_CONFIGS.featureReview.model}.
+  --feature-review-model <m>       Default: ${(DEFAULT_ROLE_CONFIGS.featureReview ?? DEFAULT_ROLE_CONFIGS.featureVerifier).model}.
   --dual-impl          Tournament mode: primary and secondary implement in parallel
                        (isolated git worktrees), the configured judge picks the winner
                        is cherry-picked back. Existing TDD pipeline runs after.
@@ -7724,7 +7724,9 @@ async function runFeatureReviewIteration(args: {
   // Effective reasoning used for THIS spawn (T9 may override role default
   // to "medium" on cycle 1). Initialized to the role default; updated at
   // the spawn-dispatch site so analytics reflects what actually ran.
-  let _metricsEffectiveReasoning: string = args.roles.featureReview.reasoning;
+  const _featureReviewRole =
+    args.roles.featureReview ?? args.roles.featureVerifier;
+  let _metricsEffectiveReasoning: string = _featureReviewRole.reasoning;
   let _metricsPassEvidenceTimeout = false;
   let _metricsEndedBy: "exit0" | "watchdog" | "signal" | "exit-nonzero" =
     "exit-nonzero";
@@ -7763,14 +7765,14 @@ async function runFeatureReviewIteration(args: {
     // reasoning's label, then served back to a configured-high reviewer as
     // if it were a high-reasoning verdict — silently downgrading safety.
     const _cacheEffectiveReasoning =
-      args.roles.featureReview.provider === "codex" && args.iteration === 1
+      _featureReviewRole.provider === "codex" && args.iteration === 1
         ? "medium"
-        : args.roles.featureReview.reasoning;
+        : _featureReviewRole.reasoning;
     _cacheKey = computeCacheKey({
       feature: args.feature,
       phaseStates: args.state.phases,
       planBody: _planBody,
-      reviewerRoleLabel: `${args.roles.featureReview.provider}:${args.roles.featureReview.model}:${_cacheEffectiveReasoning}`,
+      reviewerRoleLabel: `${_featureReviewRole.provider}:${_featureReviewRole.model}:${_cacheEffectiveReasoning}`,
     });
     if (_cacheKey) {
       const hit = lookupCache(_cacheKey, slug);
@@ -7975,14 +7977,14 @@ async function runFeatureReviewIteration(args: {
       // dedicated reviewer path uses a read-only sandbox and a verdict-sentinel
       // prompt. Other providers still go through runRoleTask for now —
       // follow-up commits will give gemini/kimi/claude the same treatment.
-      if (args.roles.featureReview.provider === "codex") {
-        const resolved = resolveRoleTimeouts(args.roles.featureReview);
+      if (_featureReviewRole.provider === "codex") {
+        const resolved = resolveRoleTimeouts(_featureReviewRole);
         // Cycle 1 uses reasoning=medium; cycle 2+ uses the configured reasoning
         // (typically high). If cycle 1 returns UNCLEAR, the retry runs with
         // the configured reasoning. Cuts p50 latency on the happy path while
         // preserving full-depth review on contested cases.
         const effectiveReasoning =
-          args.iteration === 1 ? "medium" : args.roles.featureReview.reasoning;
+          args.iteration === 1 ? "medium" : _featureReviewRole.reasoning;
         _metricsEffectiveReasoning = effectiveReasoning;
         result = await runCodexFeatureReview({
           inputFilePath,
@@ -7992,12 +7994,12 @@ async function runFeatureReviewIteration(args: {
           phaseNumber: `feature-${args.feature.number}`,
           iteration: args.iteration,
           reasoning: effectiveReasoning,
-          model: args.roles.featureReview.model,
+          model: _featureReviewRole.model,
           timeoutMs: resolved.primaryMs,
         });
       } else {
         result = await runRoleTask({
-          role: args.roles.featureReview,
+          role: _featureReviewRole,
           inputFilePath,
           outputFilePath,
           cwd: args.cwd,
@@ -13294,7 +13296,7 @@ async function main() {
               featureState.status = "feature_review_running";
               saveState(state, { noGbrain: args.noGbrain, log: console.warn });
               console.log(
-                `\n▶ Feature ${featureState.number} review cycle ${currentIter}/${cap} (${roleLabel(args.roles.featureReview)})`,
+                `\n▶ Feature ${featureState.number} review cycle ${currentIter}/${cap} (${roleLabel(args.roles.featureReview ?? args.roles.featureVerifier)})`,
               );
               const out = await runFeatureReviewIteration({
                 state,

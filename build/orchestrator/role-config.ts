@@ -39,12 +39,11 @@ export interface RoleConfigs {
   land: RoleConfig;
   judge: RoleConfig;
   /**
-   * Configurable post-implementation reviewer that fires once all phases
-   * of a feature commit. Default comes from build/configure.cm — see /build skill
-   * docs for the FEATURE_PASS / FEATURE_NEEDS_PHASES / FEATURE_REDO
-   * verdict contract.
+   * Deprecated in Increment 3+: consolidated into featureVerifier. Kept
+   * optional in the type so the configure.cm entry can be removed without
+   * breaking type-checks. Existing callers should null-check before use.
    */
-  featureReview: RoleConfig;
+  featureReview?: RoleConfig;
   /**
    * Post-implementation acceptance auditor. Runs once per feature BEFORE
    * /ship triggers, comparing the feature's implementation against its
