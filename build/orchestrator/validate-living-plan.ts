@@ -609,6 +609,31 @@ function validate(planPath: string): ValidationReport {
         message: `Feature ${block.number} (${block.name}): at least one acceptance criterion must contain a number (e.g. "p95 under 100ms", "0 failing tests", "HTTP 410 for all 4 roles"). Subjective phrases like "feature works" or "handles edge cases" do not count. See docs/spec-archive-format.md.`,
       });
     }
+    if (!block.hasSpecSource) {
+      staticViolations.push({
+        rule: "missing-spec-source",
+        message: `Feature ${block.number} (${block.name}): missing "Spec source:" line-anchored field. Add a line at column 0 like "Spec source: ~/.gstack/projects/<slug>/specs/<file>.md" pointing at the per-feature spec archive. See docs/spec-archive-format.md.`,
+      });
+    } else {
+      const expanded = block.specSourcePath.replace(
+        /^~/,
+        process.env.HOME || "",
+      );
+      try {
+        const content = fs.readFileSync(expanded, "utf8");
+        if (!content.includes("<!-- gstack-spec-complete")) {
+          staticViolations.push({
+            rule: "spec-source-missing-sentinel",
+            message: `Feature ${block.number} (${block.name}): "Spec source: ${block.specSourcePath}" exists but is missing the <!-- gstack-spec-complete --> sentinel.`,
+          });
+        }
+      } catch {
+        staticViolations.push({
+          rule: "spec-source-not-found",
+          message: `Feature ${block.number} (${block.name}): "Spec source: ${block.specSourcePath}" points at a file that does not exist.`,
+        });
+      }
+    }
   }
 
   return {

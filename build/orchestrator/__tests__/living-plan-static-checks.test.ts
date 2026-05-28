@@ -71,6 +71,11 @@ const x = 1;
   });
 
   it("T1-edge: Bun built-in imports are allow-listed and do not trigger false positives", () => {
+    const specFile = path.join(dir, "spec-fixture-t1a.md");
+    fs.writeFileSync(
+      specFile,
+      "## Spec\n\n<!-- gstack-spec-complete\nts: now\n-->\n",
+    );
     const plan = tmpPlan(
       dir,
       `## Feature 1: Bun built-in
@@ -78,6 +83,7 @@ const x = 1;
 Origin trace: test
 Acceptance: 0 unused-import violations on bun built-ins
 Out of scope: none
+Spec source: ${specFile}
 
 ### Phase 1: Implementation
 - [ ] **Implementation**: write code
@@ -102,6 +108,11 @@ Smoke: \`bun test\`
   });
 
   it("T1-edge: type-only annotation counts as usage (no false positive)", () => {
+    const specFile = path.join(dir, "spec-fixture-t1b.md");
+    fs.writeFileSync(
+      specFile,
+      "## Spec\n\n<!-- gstack-spec-complete\nts: now\n-->\n",
+    );
     const plan = tmpPlan(
       dir,
       `## Feature 1: Type-only usage
@@ -109,6 +120,7 @@ Smoke: \`bun test\`
 Origin trace: test
 Acceptance: 0 unused-import violations with type-only annotation usage
 Out of scope: none
+Spec source: ${specFile}
 
 ### Phase 1: Implementation
 - [ ] **Implementation**: write code
@@ -198,6 +210,11 @@ Acceptance: \`build/orchestrator/imaginary.ts\` must exist
   });
 
   it("T3-edge: a planned new file under the same phase is allowed", () => {
+    const specFile = path.join(dir, "spec-fixture-t3.md");
+    fs.writeFileSync(
+      specFile,
+      "## Spec\n\n<!-- gstack-spec-complete\nts: now\n-->\n",
+    );
     const plan = tmpPlan(
       dir,
       `## Feature 1: Planned file
@@ -205,6 +222,7 @@ Acceptance: \`build/orchestrator/imaginary.ts\` must exist
 Origin trace: test
 Acceptance: \`build/orchestrator/__tests__/future-helper.test.ts\` must exist, 0 validator violations
 Out of scope: none
+Spec source: ${specFile}
 
 ### Phase 1: Implementation
 - [ ] **Implementation**: write code
@@ -339,6 +357,11 @@ Acceptance: \`build/orchestrator/validate-living-plan.ts:1\` contains "this is d
   // T6 — valid plan passes
   // ─────────────────────────────────────────────────────────────────────────
   it("T6: returns zero when all five rules are satisfied", () => {
+    const specFile = path.join(dir, "spec-fixture-t6.md");
+    fs.writeFileSync(
+      specFile,
+      "## Spec\n\n<!-- gstack-spec-complete\nts: now\n-->\n",
+    );
     const plan = tmpPlan(
       dir,
       `## Feature 1: Valid plan
@@ -346,6 +369,7 @@ Acceptance: \`build/orchestrator/validate-living-plan.ts:1\` contains "this is d
 Origin trace: Source plan §test
 Acceptance: 0 validator violations, all 5 static rules satisfied end-to-end
 Out of scope: none
+Spec source: ${specFile}
 
 ### Phase 1: Good phase
 - [ ] **Implementation**: write code
@@ -376,6 +400,11 @@ Smoke: \`bun test\`
   // T7 — inbox / audit path exempt
   // ─────────────────────────────────────────────────────────────────────────
   it("T7: returns zero for inbox or audit artifacts that do not yet exist", () => {
+    const specFile = path.join(dir, "spec-fixture-t7a.md");
+    fs.writeFileSync(
+      specFile,
+      "## Spec\n\n<!-- gstack-spec-complete\nts: now\n-->\n",
+    );
     const plan = tmpPlan(
       dir,
       `## Feature 1: Audit path
@@ -383,6 +412,7 @@ Smoke: \`bun test\`
 Origin trace: test
 Acceptance: \`~/.gstack/projects/anbangr-gstack/2026-05-21-autonomy-audit.md\` must exist
 Out of scope: none
+Spec source: ${specFile}
 
 ### Phase 1: Implementation
 - [ ] **Implementation**: write code
@@ -402,6 +432,11 @@ Smoke: \`bun test\`
   });
 
   it("T7: returns zero for inbox/ paths even when missing", () => {
+    const specFile = path.join(dir, "spec-fixture-t7b.md");
+    fs.writeFileSync(
+      specFile,
+      "## Spec\n\n<!-- gstack-spec-complete\nts: now\n-->\n",
+    );
     const plan = tmpPlan(
       dir,
       `## Feature 1: Inbox path
@@ -409,6 +444,7 @@ Smoke: \`bun test\`
 Origin trace: test
 Acceptance: \`inbox/living-plan/future-plan.md\` must exist, 0 path-missing violations
 Out of scope: none
+Spec source: ${specFile}
 
 ### Phase 1: Implementation
 - [ ] **Implementation**: write code
@@ -776,6 +812,11 @@ Smoke: \`bun test\`
   });
 
   it("T7-positive: accepts plans with Out of scope: line-anchored at column 0", () => {
+    const specFile = path.join(dir, "spec-fixture-t7pos.md");
+    fs.writeFileSync(
+      specFile,
+      "## Spec\n\n<!-- gstack-spec-complete\nts: now\n-->\n",
+    );
     const plan = tmpPlan(
       dir,
       `## Feature 1: Complete feature
@@ -783,6 +824,7 @@ Smoke: \`bun test\`
 Origin trace: test
 Acceptance: 1. response time under 50ms
 Out of scope: nothing
+Spec source: ${specFile}
 
 ### Phase 1.1: Build it
 - [ ] **Test Specification**: write tests
@@ -888,6 +930,11 @@ Smoke: \`bun test\`
   });
 
   it("T10-positive: accepts a quantified acceptance line", () => {
+    const specFile = path.join(dir, "spec-fixture-t10.md");
+    fs.writeFileSync(
+      specFile,
+      "## Spec\n\n<!-- gstack-spec-complete\nts: now\n-->\n",
+    );
     const plan = tmpPlan(
       dir,
       `## Feature 1: Quantified acceptance
@@ -895,6 +942,7 @@ Smoke: \`bun test\`
 Origin trace: test
 Acceptance: 1. response p95 under 100ms on 10K-row table
 Out of scope: nothing
+Spec source: ${specFile}
 
 ### Phase 1.1: Build it
 - [ ] **Test Specification**: write tests
@@ -955,5 +1003,98 @@ Out of scope: nothing
     const blocks = extractFeatureBlocks(plan);
     expect(blocks).toHaveLength(1);
     expect(blocks[0].hasQuantifiedAcceptance).toBe(false);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // T12 — Spec source: required per feature block (Increment 2)
+  // ─────────────────────────────────────────────────────────────────────────
+  it("T12: returns non-zero when a feature block is missing Spec source:", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Missing spec source
+
+Origin trace: test
+Acceptance: 1. response time under 50ms
+Out of scope: nothing
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/foo.ts\` | create |
+
+### Verification Spec
+Smoke: \`bun test\`
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/spec-source/i);
+  });
+
+  it("T12-positive: accepts a plan with Spec source: pointing at a sentineled file", () => {
+    const specFile = path.join(dir, "spec-fixture.md");
+    fs.writeFileSync(
+      specFile,
+      "## Spec fixture\n\n<!-- gstack-spec-complete\nts: now\n-->\n",
+    );
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Has spec source
+
+Origin trace: test
+Acceptance: 1. response time under 50ms
+Out of scope: nothing
+Spec source: ${specFile}
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/foo.ts\` | create |
+
+### Verification Spec
+Smoke: \`bun test\`
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).toBe(0);
+  });
+
+  it("T12-missing-file: rejects Spec source: pointing at a non-existent file", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Missing spec file
+
+Origin trace: test
+Acceptance: 1. response time under 50ms
+Out of scope: nothing
+Spec source: /tmp/definitely-does-not-exist-${Date.now()}-${process.pid}.md
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/foo.ts\` | create |
+
+### Verification Spec
+Smoke: \`bun test\`
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/spec-source-not-found/i);
   });
 });

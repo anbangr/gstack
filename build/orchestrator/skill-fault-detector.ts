@@ -143,6 +143,10 @@ export interface FeatureBlock {
   hasFileReferenceTable: boolean;
   /** True when the `Acceptance:` line(s) contain at least one digit (quantified criterion). */
   hasQuantifiedAcceptance: boolean;
+  /** `^Spec source:` matched line-anchored within `header`. */
+  hasSpecSource: boolean;
+  /** Path captured from `^Spec source: <path>$`, or "" if not matched. */
+  specSourcePath: string;
 }
 
 /**
@@ -239,6 +243,10 @@ export function extractFeatureBlocks(planContent: string): FeatureBlock[] {
       }
     }
 
+    const specSourceMatch = header.match(/^Spec source:\s*(.+?)\s*$/m);
+    const hasSpecSource = specSourceMatch !== null;
+    const specSourcePath = specSourceMatch ? specSourceMatch[1] : "";
+
     blocks.push({
       number,
       name,
@@ -250,6 +258,8 @@ export function extractFeatureBlocks(planContent: string): FeatureBlock[] {
       hasVerificationSpec,
       hasFileReferenceTable,
       hasQuantifiedAcceptance,
+      hasSpecSource,
+      specSourcePath,
     });
   }
 

@@ -1932,11 +1932,18 @@ describe("validate-living-plan.ts CLI", () => {
 
   test("exits 0 on a valid plan", () => {
     const dir = makeTmpDir();
+    const specFile = path.join(dir, "spec-fixture.md");
+    fs.writeFileSync(
+      specFile,
+      "## Spec\n\n<!-- gstack-spec-complete\nts: now\n-->\n",
+      "utf8",
+    );
     const plan = [
       "## Feature 1: Good",
       "Origin trace: Source plan Week 1",
       "Acceptance: 0 test failures, all 3 phases complete",
       "Out of scope: none",
+      `Spec source: ${specFile}`,
       "",
       "### Phase 1: Setup",
       "",
