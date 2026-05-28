@@ -31,6 +31,76 @@ export interface ParsedFeatureVerifierOutput {
   gaps: string[];
 }
 
+// ---------------------------------------------------------------------------
+// Increment 3: Verification Spec extraction + structured JSON report
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the `### Verification Spec` block from a feature body.
+ * Returns the raw text (preserves formatting) or null when missing.
+ * The block is verbatim from the Increment 2 spec-content preservation rule.
+ *
+ * Two-step pattern: find the header line first, then bound the capture
+ * at the next `###` or `##` heading (or end-of-string).
+ */
+export function extractVerificationSpec(featureBody: string): string | null {
+  const startMatch = featureBody.search(/^###\s+Verification Spec\s*$/m);
+  if (startMatch < 0) return null;
+  const slice = featureBody.slice(startMatch);
+  const bodyMatch = slice.match(
+    /^###\s+Verification Spec\s*\n([\s\S]*?)(?=\n###\s|\n##\s|$)/,
+  );
+  return bodyMatch ? bodyMatch[1].trim() : null;
+}
+
+/**
+ * Structured JSON report emitted by the verifier agent when the feature has
+ * a `### Verification Spec` block. Fields correspond to the three probe
+ * categories in the spec.
+ */
+export interface StructuredVerifierReport {
+  smoke_run?: Array<{ cmd: string; exit: number; status: "pass" | "fail" }>;
+  acceptance_probes?: Array<{
+    ac: number;
+    cmd: string;
+    expected: string;
+    actual: string;
+    status: "pass" | "fail";
+  }>;
+  verification_artifacts?: Array<{
+    path: string;
+    check: string;
+    status: "pass" | "fail";
+  }>;
+  overall: "pass" | "fail";
+  halt_at?: string | null;
+  notes?: string;
+}
+
+/**
+ * Scan verifier stdout for a structured JSON report line.
+ * Searches lines in reverse so that the last complete JSON object wins
+ * (agent may emit intermediate JSON in verbose mode).
+ */
+function tryParseStructuredVerifierOutput(
+  stdout: string,
+): StructuredVerifierReport | null {
+  const lines = stdout.split("\n");
+  for (const line of [...lines].reverse()) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) continue;
+    if (!trimmed.includes('"overall"')) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed?.overall === "string")
+        return parsed as StructuredVerifierReport;
+    } catch {
+      /* not valid JSON — keep scanning */
+    }
+  }
+  return null;
+}
+
 /**
  * Parse the verifier's output markdown into a structured verdict + gap list.
  *
@@ -246,6 +316,12 @@ export interface FeatureVerifierResult {
   logPath: string;
   /** Surfaces "couldn't detect base branch" or similar best-effort failures. */
   reason?: string;
+  /**
+   * Structured JSON report parsed from the verifier's output when the feature
+   * had a `### Verification Spec` block and the agent emitted structured JSON.
+   * Undefined when the verifier used the legacy free-text format.
+   */
+  structuredReport?: StructuredVerifierReport;
 }
 
 /**
@@ -306,7 +382,8 @@ export async function runFeatureVerifier(
       outputFilePath,
       inputFilePath,
       logPath: "",
-      reason: "could not detect base branch (no origin/HEAD, origin/main, or origin/master)",
+      reason:
+        "could not detect base branch (no origin/HEAD, origin/main, or origin/master)",
     };
   }
 
@@ -319,8 +396,27 @@ export async function runFeatureVerifier(
   const mergeBaseDisplay =
     mergeBase || `(unknown — ${baseRef} merge-base failed)`;
 
+  // Increment 3: inject the pre-designed Verification Spec when present.
+  const verificationSpec = extractVerificationSpec(args.feature.body);
+  const verificationDirective = verificationSpec
+    ? [
+        `VERIFICATION SPEC FOR THIS FEATURE (Increment 3 contract — run verbatim, do NOT invent probes):`,
+        ``,
+        verificationSpec,
+        ``,
+        `After running the smoke commands and acceptance probes in order, output a JSON object on a line by itself with the shape:`,
+        `{"smoke_run":[{"cmd":"...","exit":N,"status":"pass|fail"}], "acceptance_probes":[{"ac":N,"cmd":"...","expected":"...","actual":"...","status":"pass|fail"}], "verification_artifacts":[{"path":"...","check":"...","status":"pass|fail"}], "overall":"pass|fail", "halt_at":"...", "notes":"..."}`,
+        ``,
+        `Halt at the first probe failure. The legacy free-text format is still accepted but the structured JSON is preferred.`,
+        ``,
+        `---`,
+        ``,
+      ].join("\n")
+    : "";
+
   const prompt = [
-    `You are a feature verifier for gstack-build (PRE-MERGE).`,
+    verificationDirective +
+      `You are a feature verifier for gstack-build (PRE-MERGE).`,
     ``,
     `Source plan path: ${args.planFile}`,
     `Feature name: ${args.feature.name}`,
@@ -371,6 +467,9 @@ export async function runFeatureVerifier(
     // Output file may be missing if the dispatcher crashed before writing.
   }
 
+  // Increment 3: try structured JSON first; fall back to legacy free-text.
+  const structuredReport = tryParseStructuredVerifierOutput(output);
+
   if (result.timedOut || result.exitCode !== 0) {
     const parsed = parseFeatureVerifierOutput(output);
     return {
@@ -382,6 +481,7 @@ export async function runFeatureVerifier(
       reason: result.timedOut
         ? "verifier subprocess timed out"
         : `verifier subprocess exited ${result.exitCode}`,
+      structuredReport: structuredReport ?? undefined,
     };
   }
 
@@ -396,6 +496,7 @@ export async function runFeatureVerifier(
       parsed.verdict === "UNCLEAR"
         ? "verifier output had no VERIFICATION: line"
         : undefined,
+    structuredReport: structuredReport ?? undefined,
   };
 }
 
@@ -438,11 +539,12 @@ export function comparePostMergeTrees(
       verdict: "SKIPPED",
       preTree: pre,
       postTree: post,
-      reason: !pre && !post
-        ? "both pre-merge and post-merge tree hashes unavailable"
-        : !pre
-          ? "pre-merge tree hash unavailable"
-          : "post-merge tree hash unavailable (merge not yet landed?)",
+      reason:
+        !pre && !post
+          ? "both pre-merge and post-merge tree hashes unavailable"
+          : !pre
+            ? "pre-merge tree hash unavailable"
+            : "post-merge tree hash unavailable (merge not yet landed?)",
     };
   }
   if (pre === post) {
