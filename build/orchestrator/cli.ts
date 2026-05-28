@@ -5651,11 +5651,20 @@ function formatStructuredFailureForFixer(
     (p) => p.status === "fail",
   );
   if (failedProbes.length === 0) return "";
+  // Strip newlines + carriage returns from probe fields before interpolating
+  // into the fixer prompt. A malicious or sloppy verifier output could
+  // otherwise inject a `## Instructions` block that the fixer model treats
+  // as top-level prompt content.
+  const oneLine = (s: string): string =>
+    String(s ?? "")
+      .replace(/[\r\n]+/g, " ")
+      .trim();
+  const safeHaltAt = report.halt_at ? oneLine(report.halt_at) : null;
   const lines = failedProbes.map(
     (p) =>
-      `Acceptance criterion AC${p.ac} failed.\nCommand: ${p.cmd}\nExpected: ${p.expected}\nActual: ${p.actual}`,
+      `Acceptance criterion AC${p.ac} failed.\nCommand: ${oneLine(p.cmd)}\nExpected: ${oneLine(p.expected)}\nActual: ${oneLine(p.actual)}`,
   );
-  const halt = report.halt_at ? `\nFailure halted at: ${report.halt_at}` : "";
+  const halt = safeHaltAt ? `\nFailure halted at: ${safeHaltAt}` : "";
   return (
     `STRUCTURED PROBE FAILURES (from featureVerifier):\n\n${lines.join("\n\n")}${halt}\n\n` +
     `Fix the production code to make these probes pass without modifying the probe commands.\n\n---\n\n`

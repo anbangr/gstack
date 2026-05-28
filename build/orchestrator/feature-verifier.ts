@@ -44,13 +44,49 @@ export interface ParsedFeatureVerifierOutput {
  * at the next `###` or `##` heading (or end-of-string).
  */
 export function extractVerificationSpec(featureBody: string): string | null {
-  const startMatch = featureBody.search(/^###\s+Verification Spec\s*$/m);
+  // Normalize CRLF so probe commands captured from Windows-authored plans
+  // don't carry invisible \r characters (e.g. `bun test\r` is not `bun test`).
+  const normalized = featureBody.replace(/\r\n/g, "\n");
+  // Tolerate up to 3 leading spaces (CommonMark style) on the heading line.
+  const startMatch = normalized.search(/^ {0,3}###\s+Verification Spec\s*$/m);
   if (startMatch < 0) return null;
-  const slice = featureBody.slice(startMatch);
-  const bodyMatch = slice.match(
-    /^###\s+Verification Spec\s*\n([\s\S]*?)(?=\n###\s|\n##\s|$)/,
-  );
-  return bodyMatch ? bodyMatch[1].trim() : null;
+  const slice = normalized.slice(startMatch);
+  // Skip past the header line itself so the fence-aware scan starts on the
+  // body content.
+  const firstNewline = slice.indexOf("\n");
+  if (firstNewline < 0) return "";
+  const body = slice.slice(firstNewline + 1);
+
+  // Fence-aware termination: walk lines, track triple-backtick / triple-tilde
+  // fence depth, and stop at the first `###`/`##` heading found OUTSIDE a
+  // fenced code block. A bash example like `### something` inside a fence
+  // does NOT terminate the spec.
+  const lines = body.split("\n");
+  let openFence: { char: "`" | "~"; length: number } | null = null;
+  let endIdx = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (openFence) {
+      const closeRe = new RegExp(
+        `^ {0,3}\\${openFence.char}{${openFence.length},}\\s*$`,
+      );
+      if (closeRe.test(line)) openFence = null;
+      continue;
+    }
+    const fenceOpen = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (fenceOpen) {
+      openFence = {
+        char: fenceOpen[1][0] as "`" | "~",
+        length: fenceOpen[1].length,
+      };
+      continue;
+    }
+    if (/^ {0,3}##\s|^ {0,3}###\s/.test(line)) {
+      endIdx = i;
+      break;
+    }
+  }
+  return lines.slice(0, endIdx).join("\n").trim();
 }
 
 /**
@@ -92,8 +128,18 @@ export function tryParseStructuredVerifierOutput(
     if (!trimmed.includes('"overall"')) continue;
     try {
       const parsed = JSON.parse(trimmed);
-      if (typeof parsed?.overall === "string")
-        return parsed as StructuredVerifierReport;
+      if (typeof parsed?.overall !== "string") continue;
+      // Reject example-shaped JSON that only has `overall` (common when an
+      // agent narrates "a passing report looks like: {...}"). Require at
+      // least one domain-specific key so the real verdict wins over examples.
+      const hasDomainKey =
+        Array.isArray(parsed.smoke_run) ||
+        Array.isArray(parsed.acceptance_probes) ||
+        Array.isArray(parsed.verification_artifacts) ||
+        parsed.halt_at !== undefined ||
+        parsed.notes !== undefined;
+      if (!hasDomainKey) continue;
+      return parsed as StructuredVerifierReport;
     } catch {
       /* not valid JSON — keep scanning */
     }

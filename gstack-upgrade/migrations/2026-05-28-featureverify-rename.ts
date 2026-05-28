@@ -29,28 +29,35 @@ export function migrate(configPath: string): MigrationResult {
     };
   }
   const changes: string[] = [];
+  const srcLimitVal = config.limits?.featureReviewMaxIterations;
+  const isPositiveInt = (v: unknown): v is number =>
+    typeof v === "number" && Number.isFinite(v) && Number.isInteger(v) && v > 0;
   if (
-    config.limits?.featureReviewMaxIterations !== undefined &&
+    isPositiveInt(srcLimitVal) &&
     config.limits?.featureVerifyMaxIterations === undefined
   ) {
-    config.limits.featureVerifyMaxIterations =
-      config.limits.featureReviewMaxIterations;
+    config.limits!.featureVerifyMaxIterations = srcLimitVal;
     changes.push(
-      `limits.featureVerifyMaxIterations := ${String(config.limits.featureReviewMaxIterations)} (from featureReviewMaxIterations)`,
+      `limits.featureVerifyMaxIterations := ${String(srcLimitVal)} (from featureReviewMaxIterations)`,
     );
   }
+  const srcTimeoutVal = config.timeoutsMs?.featureReview;
   if (
-    config.timeoutsMs?.featureReview !== undefined &&
+    isPositiveInt(srcTimeoutVal) &&
     config.timeoutsMs?.featureVerify === undefined
   ) {
-    config.timeoutsMs.featureVerify = config.timeoutsMs.featureReview;
+    config.timeoutsMs!.featureVerify = srcTimeoutVal;
     changes.push(
-      `timeoutsMs.featureVerify := ${String(config.timeoutsMs.featureReview)} (from featureReview)`,
+      `timeoutsMs.featureVerify := ${String(srcTimeoutVal)} (from featureReview)`,
     );
   }
   if (changes.length === 0)
     return { migrated: false, changes: ["already current"] };
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+  // Atomic write: tmp + rename. POSIX rename is atomic; on Windows it
+  // succeeds when the destination already exists.
+  const tmp = configPath + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n");
+  fs.renameSync(tmp, configPath);
   return { migrated: true, changes };
 }
 
