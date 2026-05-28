@@ -22,7 +22,10 @@
 
 import * as fs from "fs";
 import * as path from "path";
-import { extractFeatureBlocks } from "./skill-fault-detector";
+import {
+  extractFeatureBlocks,
+  type FeatureBlock,
+} from "./skill-fault-detector";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 
@@ -397,6 +400,118 @@ function checkStaleQuotes(content: string): StaticViolation[] {
 }
 
 // ---------------------------------------------------------------------------
+// Spec-content preservation helpers (Increment 2: Task 9)
+// ---------------------------------------------------------------------------
+
+/** Extract the first-column backtick-quoted values from a markdown table under `### <sectionName>`. */
+function extractTableFirstColumn(text: string, sectionName: string): string[] {
+  // Match the section heading then capture everything until the next ### or ##
+  // heading or end of string. Avoid the \z anchor (Perl-only); instead match
+  // the newline before the next heading using a non-`m` lookahead.
+  const escaped = sectionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const sectionRe = new RegExp(
+    `(?:^|\\n)###\\s+${escaped}\\s*\\n([\\s\\S]*?)(?=\\n###\\s|\\n##\\s|$)`,
+  );
+  const m = sectionRe.exec(text);
+  if (!m) return [];
+  const rows: string[] = [];
+  for (const line of m[1].split("\n")) {
+    const rowMatch = line.match(/^\|\s*`([^`]+)`/);
+    if (rowMatch) rows.push(rowMatch[1]);
+  }
+  return rows;
+}
+
+/** Extract quantified acceptance lines from the spec body (under `## Acceptance Criteria`). */
+function extractSpecAcceptanceLines(text: string): string[] {
+  // Capture from the heading newline to the next ## heading or end of string.
+  const m = text.match(
+    /(?:^|\n)##\s+Acceptance Criteria\s*\n([\s\S]*?)(?=\n##\s|$)/,
+  );
+  if (!m) return [];
+  return m[1]
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(
+      (l) => /^\d+\.\s+/.test(l) && /\d/.test(l.replace(/^\d+\.\s+/, "")),
+    );
+}
+
+/** Extract code-fenced blocks under `### Schemas / Interfaces` (or `### Schemas/Interfaces`). */
+function extractSpecSchemas(text: string): string[] {
+  const sectionRe =
+    /(?:^|\n)###\s+Schemas\s*\/\s*Interfaces\s*\n([\s\S]*?)(?=\n###\s|\n##\s|$)/;
+  const m = sectionRe.exec(text);
+  if (!m) return [];
+  const blocks: string[] = [];
+  const codeRe = /```[A-Za-z0-9_-]*\n([\s\S]*?)```/g;
+  let cm: RegExpExecArray | null;
+  while ((cm = codeRe.exec(m[1])) !== null) {
+    blocks.push(cm[1].trim());
+  }
+  return blocks;
+}
+
+/** Compare spec content vs living-plan feature block. Returns drift violations. */
+function checkSpecContentPreservation(block: FeatureBlock): StaticViolation[] {
+  if (!block.hasSpecSource || !block.specSourcePath) return [];
+  const violations: StaticViolation[] = [];
+  const expanded = block.specSourcePath.replace(/^~/, process.env.HOME || "");
+  let specContent: string;
+  try {
+    specContent = fs.readFileSync(expanded, "utf8");
+  } catch {
+    // Missing-file is already flagged by the Task 5 check; skip silently here.
+    return [];
+  }
+
+  // 1. File Reference Table rows
+  const specFiles = extractTableFirstColumn(
+    specContent,
+    "File Reference Table",
+  );
+  const planFiles = extractTableFirstColumn(block.body, "File Reference Table");
+  const missingFiles = specFiles.filter((f) => !planFiles.includes(f));
+  if (missingFiles.length > 0) {
+    violations.push({
+      rule: "spec-content-drift",
+      message: `Feature ${block.number} (${block.name}): File Reference Table rows missing from living plan: ${missingFiles.join(", ")}. Spec source: ${block.specSourcePath}.`,
+    });
+  }
+
+  // 2. Quantified acceptance lines from spec — each must appear (substring match,
+  // stripping leading list numbering) in the living plan's `Acceptance:` field.
+  const specAccept = extractSpecAcceptanceLines(specContent);
+  const acceptanceLineStart = block.header.search(/^Acceptance:/m);
+  const planAccept =
+    acceptanceLineStart >= 0 ? block.header.slice(acceptanceLineStart) : "";
+  const missingAccept = specAccept.filter((line) => {
+    const bare = line.replace(/^\d+\.\s+/, "");
+    return !planAccept.includes(bare);
+  });
+  if (missingAccept.length > 0) {
+    violations.push({
+      rule: "spec-content-drift",
+      message: `Feature ${block.number} (${block.name}): Acceptance criteria from spec dropped: ${missingAccept.join("; ")}. Spec source: ${block.specSourcePath}.`,
+    });
+  }
+
+  // 3. Schema code blocks — each must appear verbatim (after trim) in the body.
+  const specSchemas = extractSpecSchemas(specContent);
+  for (const schema of specSchemas) {
+    if (!block.body.includes(schema)) {
+      const preview = schema.split("\n")[0].slice(0, 60);
+      violations.push({
+        rule: "spec-content-drift",
+        message: `Feature ${block.number} (${block.name}): Schema block dropped: "${preview}...". Spec source: ${block.specSourcePath}.`,
+      });
+    }
+  }
+
+  return violations;
+}
+
+// ---------------------------------------------------------------------------
 // Main validation
 // ---------------------------------------------------------------------------
 
@@ -633,6 +748,11 @@ function validate(planPath: string): ValidationReport {
           message: `Feature ${block.number} (${block.name}): "Spec source: ${block.specSourcePath}" points at a file that does not exist.`,
         });
       }
+    }
+    // T9 (Increment 2) — spec-content drift: verify spec rows/acceptance/schemas
+    // were preserved during expansion into the living plan.
+    if (block.hasSpecSource) {
+      staticViolations.push(...checkSpecContentPreservation(block));
     }
   }
 

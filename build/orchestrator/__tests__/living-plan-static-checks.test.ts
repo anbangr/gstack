@@ -1097,4 +1097,148 @@ Smoke: \`bun test\`
     expect(r.status).not.toBe(0);
     expect(r.stderr).toMatch(/spec-source-not-found/i);
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // T13 — Spec content preservation (drift detection)
+  // ─────────────────────────────────────────────────────────────────────────
+  it("T13: rejects plan that dropped a File Reference Table row from the spec", () => {
+    const specFile = path.join(dir, "spec-drift-frt.md");
+    fs.writeFileSync(
+      specFile,
+      `## Spec
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/critical.ts\` | create |
+| \`src/dropped.ts\` | create |
+
+<!-- gstack-spec-complete
+ts: now
+-->
+`,
+    );
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Dropped row
+
+Origin trace: test
+Acceptance: 1. under 50ms
+Out of scope: nothing
+Spec source: ${specFile}
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/critical.ts\` | create |
+
+### Verification Spec
+Smoke: \`bun test\`
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/spec-content-drift.*dropped\.ts/i);
+  });
+
+  it("T13-acceptance: rejects plan that dropped a quantified acceptance line", () => {
+    const specFile = path.join(dir, "spec-drift-acc.md");
+    fs.writeFileSync(
+      specFile,
+      `## Spec
+
+## Acceptance Criteria
+
+1. p95 under 100ms
+2. HTTP 410 on expired
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/x.ts\` | create |
+
+<!-- gstack-spec-complete
+ts: now
+-->
+`,
+    );
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Acceptance drift
+
+Origin trace: test
+Acceptance: 1. p95 under 100ms
+Out of scope: nothing
+Spec source: ${specFile}
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/x.ts\` | create |
+
+### Verification Spec
+Smoke: \`bun test\`
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/spec-content-drift.*HTTP 410/i);
+  });
+
+  it("T13-positive: accepts a plan that preserved all spec content", () => {
+    const specFile = path.join(dir, "spec-preserved.md");
+    fs.writeFileSync(
+      specFile,
+      `## Spec
+
+## Acceptance Criteria
+
+1. p95 under 100ms
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/critical.ts\` | create |
+
+<!-- gstack-spec-complete
+ts: now
+-->
+`,
+    );
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Preserved
+
+Origin trace: test
+Acceptance: 1. p95 under 100ms
+Out of scope: nothing
+Spec source: ${specFile}
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/critical.ts\` | create |
+
+### Verification Spec
+Smoke: \`bun test\`
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).toBe(0);
+  });
 });
