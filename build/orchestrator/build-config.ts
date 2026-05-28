@@ -18,6 +18,11 @@ export interface BuildLimits {
    * fail the feature and write BLOCKED-feature-N.md.
    */
   featureReviewMaxIterations: number;
+  /**
+   * Cap on per-feature verifier iterations (Increment 3+). Mirror of
+   * featureReviewMaxIterations during the consolidation transition.
+   */
+  featureVerifyMaxIterations: number;
 }
 
 export interface BuildTimeoutsMs {
@@ -29,6 +34,8 @@ export interface BuildTimeoutsMs {
   judge: number;
   /** Per-invocation timeout for the configurable feature-level reviewer. */
   featureReview: number;
+  /** Per-invocation timeout for the consolidated featureVerifier (Increment 3+). */
+  featureVerify: number;
   /** Per-invocation timeout for the plan-level second-opinion reviewer. */
   planReview: number;
 }
@@ -96,7 +103,7 @@ export function loadBuildDefaults(
     withMigratedNumberSection(
       config.limits,
       "limits",
-      ["featureReviewMaxIterations"],
+      ["featureReviewMaxIterations", "featureVerifyMaxIterations"],
       filePath,
     ),
     [
@@ -105,6 +112,7 @@ export function loadBuildDefaults(
       "testMaxIterations",
       "originVerificationMaxIterations",
       "featureReviewMaxIterations",
+      "featureVerifyMaxIterations",
     ],
     `${filePath}:limits`,
   ) as unknown as BuildLimits;
@@ -112,7 +120,7 @@ export function loadBuildDefaults(
     withMigratedNumberSection(
       config.timeoutsMs,
       "timeoutsMs",
-      ["kimi", "featureReview", "planReview"],
+      ["kimi", "featureReview", "featureVerify", "planReview"],
       filePath,
     ),
     [
@@ -123,6 +131,7 @@ export function loadBuildDefaults(
       "test",
       "judge",
       "featureReview",
+      "featureVerify",
       "planReview",
     ],
     `${filePath}:timeoutsMs`,
