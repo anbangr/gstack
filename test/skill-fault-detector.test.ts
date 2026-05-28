@@ -1940,6 +1940,11 @@ describe("validate-living-plan.ts CLI", () => {
       "",
       "### Phase 1: Setup",
       "",
+      "### File Reference Table",
+      "| File | Action | Lines | Why |",
+      "|---|---|---|---|",
+      "| `src/good.ts` | create | 5 | new file |",
+      "",
       "### Verification Spec",
       "Smoke: `bun test`",
     ].join("\n");

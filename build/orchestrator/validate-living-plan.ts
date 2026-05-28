@@ -583,7 +583,7 @@ function validate(planPath: string): ValidationReport {
 
   // Increment 1 spec-grade checks: out-of-scope, verification spec,
   // file reference table, quantified acceptance must be present per feature.
-  // Tasks 5 and 6 will each append another `if` to this same loop.
+  // Task 6 will append the final `if` to this same loop.
   for (const block of blocks) {
     if (!block.hasOutOfScope) {
       staticViolations.push({
@@ -595,6 +595,12 @@ function validate(planPath: string): ValidationReport {
       staticViolations.push({
         rule: "missing-verification-spec",
         message: `Feature ${block.number} (${block.name}): missing "### Verification Spec" subsection. Add an H3 heading "### Verification Spec" with smoke commands + acceptance probes table (for code features) or verification artifacts + pass criteria (for non-code features). See docs/spec-archive-format.md for the exact shape.`,
+      });
+    }
+    if (!block.hasFileReferenceTable) {
+      staticViolations.push({
+        rule: "missing-file-reference-table",
+        message: `Feature ${block.number} (${block.name}): missing "### File Reference Table" subsection. Add an H3 heading with a markdown table listing every file the feature creates or modifies (columns: File, Action, Lines, Why). See docs/spec-archive-format.md for the exact shape.`,
       });
     }
   }

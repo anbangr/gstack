@@ -88,6 +88,11 @@ import { spawn } from "bun";
 spawn(["echo", "hi"]);
 \`\`\`
 
+### File Reference Table
+| File | Action | Lines | Why |
+|---|---|---|---|
+| \`src/example.ts\` | modify | 5 | add spawn call |
+
 ### Verification Spec
 Smoke: \`bun test\`
 `,
@@ -113,6 +118,11 @@ Out of scope: none
 import { FailureRender } from "./halt-event-helpers";
 function wrap(r: FailureRender): string { return r.kind; }
 \`\`\`
+
+### File Reference Table
+| File | Action | Lines | Why |
+|---|---|---|---|
+| \`src/example.ts\` | modify | 3 | add wrap function |
 
 ### Verification Spec
 Smoke: \`bun test\`
@@ -201,6 +211,11 @@ Out of scope: none
 - [ ] **Review**: review
 
 Add \`build/orchestrator/__tests__/future-helper.test.ts\`.
+
+### File Reference Table
+| File | Action | Lines | Why |
+|---|---|---|---|
+| \`build/orchestrator/__tests__/future-helper.test.ts\` | create | 20 | new test helper |
 
 ### Verification Spec
 Smoke: \`bun test\`
@@ -343,6 +358,11 @@ foo();
 
 Verify \`build/orchestrator/validate-living-plan.ts\` exists.
 
+### File Reference Table
+| File | Action | Lines | Why |
+|---|---|---|---|
+| \`build/orchestrator/validate-living-plan.ts\` | modify | 10 | add new check |
+
 ### Verification Spec
 Smoke: \`bun test\`
 `,
@@ -368,6 +388,11 @@ Out of scope: none
 - [ ] **Implementation**: write code
 - [ ] **Review**: review
 
+### File Reference Table
+| File | Action | Lines | Why |
+|---|---|---|---|
+| \`src/audit.ts\` | create | 5 | audit writer |
+
 ### Verification Spec
 Smoke: \`bun test\`
 `,
@@ -388,6 +413,11 @@ Out of scope: none
 ### Phase 1: Implementation
 - [ ] **Implementation**: write code
 - [ ] **Review**: review
+
+### File Reference Table
+| File | Action | Lines | Why |
+|---|---|---|---|
+| \`src/inbox.ts\` | create | 5 | inbox writer |
 
 ### Verification Spec
 Smoke: \`bun test\`
@@ -798,5 +828,31 @@ Out of scope: nothing
     const r = runValidator(plan);
     expect(r.status).not.toBe(0);
     expect(r.stderr).toMatch(/verification spec/i);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // T9 — File Reference Table required per feature block
+  // ─────────────────────────────────────────────────────────────────────────
+  it("T9: returns non-zero when a feature block is missing ### File Reference Table", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: No file reference table
+
+Origin trace: test
+Acceptance: 1. response time under 50ms
+Out of scope: nothing
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### Verification Spec
+Smoke: \`bun test\`
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/file reference table/i);
   });
 });
