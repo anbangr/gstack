@@ -104,4 +104,32 @@ describe("spec-archive-discovery", () => {
     ]);
     expect(out).toHaveLength(0);
   });
+
+  it("rejects a spec where the sentinel lives INSIDE the frontmatter (review fix CRIT#3)", () => {
+    const p = path.join(specDir, "sentinel-in-fm.md");
+    fs.writeFileSync(
+      p,
+      "---\nspec_id: tricky\ndescription: <!-- gstack-spec-complete embedded\n---\n\nBody without real sentinel.\n",
+    );
+    const out = discoverArchives({
+      projectSlug: "test-slug",
+      gstackHome: tmpHome,
+    });
+    expect(out.find((c) => c.spec_id === "tricky")).toBeUndefined();
+  });
+
+  it("skips symlinks in the specs dir (review fix INFO#4)", () => {
+    const realTarget = path.join(tmpHome, "elsewhere.md");
+    fs.writeFileSync(
+      realTarget,
+      "---\nspec_id: linked\n---\n\nBody\n\n<!-- gstack-spec-complete\nts: now\n-->\n",
+    );
+    const linkPath = path.join(specDir, "symlink.md");
+    fs.symlinkSync(realTarget, linkPath);
+    const out = discoverArchives({
+      projectSlug: "test-slug",
+      gstackHome: tmpHome,
+    });
+    expect(out.find((c) => c.spec_id === "linked")).toBeUndefined();
+  });
 });

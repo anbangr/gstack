@@ -8,6 +8,14 @@
  *   2. Auto-match: scan ~/.gstack/projects/<slug>/specs/ for files
  *      whose frontmatter spec_id matches the requested slug, written
  *      within the last 30 days, and ending with the sentinel.
+ *
+ * **Integration status (Increment 4):** This helper exists as a callable
+ * library + CLI (`bun run spec-archive-discovery.ts <slug> [spec-id]`),
+ * but is NOT yet wired into the parent orchestrator's Phase 0 prose flow.
+ * The orchestrator template (`build/SKILL.md.tmpl` Phase 0 section)
+ * documents the intended behavior — the parent Claude agent reads that
+ * prose and is expected to invoke this helper when scanning the outline.
+ * Direct TypeScript invocation from `cli.ts` orchestration is a follow-up.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -34,9 +42,12 @@ export interface DiscoverOpts {
 function readFrontmatter(filePath: string): Record<string, string> | null {
   try {
     const content = fs.readFileSync(filePath, "utf8");
-    if (!content.includes(SENTINEL)) return null;
-    const m = content.match(/^---\n([\s\S]*?)\n---/);
+    // CRITICAL #3: the sentinel must appear AFTER the closing `---` delimiter,
+    // not anywhere in the file. Otherwise a frontmatter value containing the
+    // sentinel string would falsely mark a work-in-progress spec as complete.
+    const m = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
     if (!m) return null;
+    if (!m[2].includes(SENTINEL)) return null;
     const out: Record<string, string> = {};
     for (const line of m[1].split("\n")) {
       const kv = line.match(/^([a-z_]+):\s*(.*)$/);
@@ -75,10 +86,14 @@ export function discoverArchives(opts: DiscoverOpts): SpecArchiveCandidate[] {
     const full = path.join(specDir, name);
     let stat: fs.Stats;
     try {
-      stat = fs.statSync(full);
+      // INFO #4: lstatSync (not statSync) so we can skip symlinks. A symlink
+      // in the specs dir pointing outside the project's archive root would
+      // otherwise be followed and read by readFrontmatter.
+      stat = fs.lstatSync(full);
     } catch {
       continue;
     }
+    if (stat.isSymbolicLink()) continue;
     if (now - stat.mtimeMs > maxAgeMs) continue;
     const fm = readFrontmatter(full);
     if (!fm || !fm.spec_id) continue;

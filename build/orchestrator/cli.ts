@@ -11992,16 +11992,19 @@ async function runSpecToIssue(archivePath: string): Promise<void> {
     process.exit(2);
   }
   const content = fs.readFileSync(archivePath, "utf8");
-  if (!content.includes("<!-- gstack-spec-complete")) {
-    process.stderr.write(
-      `spec archive missing <!-- gstack-spec-complete --> sentinel: ${archivePath}\n` +
-        `Refusing to promote a work-in-progress spec.\n`,
-    );
-    process.exit(2);
-  }
+  // CRITICAL #3: sentinel must appear AFTER the closing `---` frontmatter delimiter.
+  // A bare includes() check would accept a sentinel string embedded in a frontmatter
+  // value (e.g. `description: <!-- gstack-spec-complete -->`) on an incomplete spec.
   const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
   if (!fmMatch) {
     process.stderr.write(`spec archive lacks frontmatter: ${archivePath}\n`);
+    process.exit(2);
+  }
+  if (!fmMatch[2].includes("<!-- gstack-spec-complete")) {
+    process.stderr.write(
+      `spec archive missing <!-- gstack-spec-complete --> sentinel (must appear AFTER the closing --- delimiter): ${archivePath}\n` +
+        `Refusing to promote a work-in-progress spec.\n`,
+    );
     process.exit(2);
   }
   const fm: Record<string, string> = {};
@@ -12020,11 +12023,29 @@ async function runSpecToIssue(archivePath: string): Promise<void> {
   const body = fmMatch[2];
   const promotionNote = `> Promoted from /build-generated spec at \`${archivePath}\`.\n\n`;
   const issueBody = promotionNote + body;
-  const title = (fm.spec_id || path.basename(archivePath, ".md"))
+  // Sanitize title: strip newlines + backticks that could affect gh's argv parsing
+  // or look weird in the issue list.
+  const rawTitle = fm.spec_id || path.basename(archivePath, ".md");
+  const title = rawTitle
+    .replace(/[`\r\n]/g, "")
     .replace(/-/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    .slice(0, 200);
   const tmpBody = archivePath + ".issue-body.tmp";
+  const tmpArchive = archivePath + ".tmp." + process.pid;
   fs.writeFileSync(tmpBody, issueBody);
+  const cleanup = (): void => {
+    try {
+      fs.unlinkSync(tmpBody);
+    } catch {
+      /* best-effort */
+    }
+    try {
+      if (fs.existsSync(tmpArchive)) fs.unlinkSync(tmpArchive);
+    } catch {
+      /* best-effort */
+    }
+  };
   try {
     const result = spawnSync(
       "gh",
@@ -12035,6 +12056,7 @@ async function runSpecToIssue(archivePath: string): Promise<void> {
       process.stderr.write(
         `gh issue create failed: ${result.stderr || result.stdout}\n`,
       );
+      cleanup();
       process.exit(1);
     }
     const urlMatch = (result.stdout || "").match(
@@ -12044,24 +12066,40 @@ async function runSpecToIssue(archivePath: string): Promise<void> {
       process.stderr.write(
         `gh issue create succeeded but couldn't parse issue number from: ${result.stdout}\n`,
       );
+      cleanup();
       process.exit(1);
     }
     const issueNumber = urlMatch[1];
-    // Update the archive's frontmatter (atomic write).
-    const updated = content.replace(
+    // CRITICAL #2: ensure write-back actually replaced the spec_issue_number line.
+    // If the original frontmatter didn't have the key, the regex returns content
+    // unchanged and we'd silently lose the issue number → on re-run, the duplicate
+    // guard would still pass and we'd file the issue twice.
+    let updated = content.replace(
       /^spec_issue_number:\s*.+$/m,
       `spec_issue_number: ${issueNumber}`,
     );
-    const tmpArchive = archivePath + ".tmp." + process.pid;
+    if (updated === content) {
+      // Key was absent or matched zero chars after the colon. Insert it into the
+      // frontmatter block right before the closing --- delimiter.
+      const insertRe = /^(---\n[\s\S]*?)(\n---\n)/;
+      updated = content.replace(
+        insertRe,
+        `$1\nspec_issue_number: ${issueNumber}$2`,
+      );
+      if (updated === content) {
+        process.stderr.write(
+          `ISSUE FILED at ${urlMatch[0]} but could NOT update archive frontmatter at ${archivePath}\n` +
+            `Manually edit the file to add: spec_issue_number: ${issueNumber}\n`,
+        );
+        cleanup();
+        process.exit(1);
+      }
+    }
     fs.writeFileSync(tmpArchive, updated);
     fs.renameSync(tmpArchive, archivePath);
     process.stdout.write(`${urlMatch[0]}\n`);
   } finally {
-    try {
-      fs.unlinkSync(tmpBody);
-    } catch {
-      /* best-effort */
-    }
+    cleanup();
   }
 }
 
