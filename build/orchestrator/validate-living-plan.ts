@@ -581,6 +581,18 @@ function validate(planPath: string): ValidationReport {
   // T5 — stale file:line quotes
   staticViolations.push(...checkStaleQuotes(content));
 
+  // Increment 1 spec-grade checks: out-of-scope, verification spec,
+  // file reference table, quantified acceptance must be present per feature.
+  // Tasks 4, 5, and 6 will each append another `if` to this same loop.
+  for (const block of blocks) {
+    if (!block.hasOutOfScope) {
+      staticViolations.push({
+        rule: "missing-out-of-scope",
+        message: `Feature ${block.number} (${block.name}): missing "Out of scope:" line-anchored field. Add a line starting at column 0 like "Out of scope: none" or "Out of scope: vendor billing integration".`,
+      });
+    }
+  }
+
   return {
     planPath,
     ok: structuralViolations.length === 0 && staticViolations.length === 0,

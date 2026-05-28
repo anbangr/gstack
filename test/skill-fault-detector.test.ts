@@ -1936,6 +1936,7 @@ describe("validate-living-plan.ts CLI", () => {
       "## Feature 1: Good",
       "Origin trace: Source plan Week 1",
       "Acceptance: tests pass",
+      "Out of scope: none",
       "",
       "### Phase 1: Setup",
     ].join("\n");

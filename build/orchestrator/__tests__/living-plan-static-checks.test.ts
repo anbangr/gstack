@@ -77,6 +77,7 @@ const x = 1;
 
 Origin trace: test
 Acceptance: passes validation
+Out of scope: none
 
 ### Phase 1: Implementation
 - [ ] **Implementation**: write code
@@ -99,6 +100,7 @@ spawn(["echo", "hi"]);
 
 Origin trace: test
 Acceptance: passes validation
+Out of scope: none
 
 ### Phase 1: Implementation
 - [ ] **Implementation**: write code
@@ -186,6 +188,7 @@ Acceptance: \`build/orchestrator/imaginary.ts\` must exist
 
 Origin trace: test
 Acceptance: \`build/orchestrator/__tests__/future-helper.test.ts\` must exist
+Out of scope: none
 
 ### Phase 1: Implementation
 - [ ] **Implementation**: write code
@@ -318,6 +321,7 @@ Acceptance: \`build/orchestrator/validate-living-plan.ts:1\` contains "this is d
 
 Origin trace: Source plan §test
 Acceptance: Everything is wired end-to-end
+Out of scope: none
 
 ### Phase 1: Good phase
 - [ ] **Implementation**: write code
@@ -346,6 +350,7 @@ Verify \`build/orchestrator/validate-living-plan.ts\` exists.
 
 Origin trace: test
 Acceptance: \`~/.gstack/projects/anbangr-gstack/2026-05-21-autonomy-audit.md\` must exist
+Out of scope: none
 
 ### Phase 1: Implementation
 - [ ] **Implementation**: write code
@@ -363,6 +368,7 @@ Acceptance: \`~/.gstack/projects/anbangr-gstack/2026-05-21-autonomy-audit.md\` m
 
 Origin trace: test
 Acceptance: \`inbox/living-plan/future-plan.md\` must exist
+Out of scope: none
 
 ### Phase 1: Implementation
 - [ ] **Implementation**: write code
@@ -689,5 +695,62 @@ Acceptance: feature works
     expect(blocks[0].hasVerificationSpec).toBe(false);
     expect(blocks[0].hasFileReferenceTable).toBe(false);
     expect(blocks[0].hasQuantifiedAcceptance).toBe(false);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // T7 — Out of scope: required per feature block
+  // ─────────────────────────────────────────────────────────────────────────
+  it("T7: returns non-zero when a feature block is missing Out of scope:", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Missing out-of-scope
+
+Origin trace: test
+Acceptance: 1. response time under 50ms
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/foo.ts\` | create |
+
+### Verification Spec
+Smoke: \`bun test\`
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/out-of-scope/i);
+  });
+
+  it("T7-positive: accepts plans with Out of scope: line-anchored at column 0", () => {
+    const plan = tmpPlan(
+      dir,
+      `## Feature 1: Complete feature
+
+Origin trace: test
+Acceptance: 1. response time under 50ms
+Out of scope: nothing
+
+### Phase 1.1: Build it
+- [ ] **Test Specification**: write tests
+- [ ] **Implementation**: code it
+- [ ] **Review**: review
+
+### File Reference Table
+| File | Action |
+|---|---|
+| \`src/foo.ts\` | create |
+
+### Verification Spec
+Smoke: \`bun test\`
+`,
+    );
+    const r = runValidator(plan);
+    expect(r.status).toBe(0);
   });
 });
