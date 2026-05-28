@@ -410,6 +410,15 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     "test/fixtures/forcing-finding-seeds.ts",
     "test/skill-e2e-plan-eng-multi-finding-batching.test.ts",
   ],
+  "plan-ceo-split-overflow": [
+    "plan-ceo-review/**",
+    "scripts/resolvers/preamble.ts",
+    "scripts/resolvers/preamble/generate-ask-user-format.ts",
+    "bin/gstack-question-preference",
+    "test/helpers/claude-pty-runner.ts",
+    "test/fixtures/forcing-finding-seeds.ts",
+    "test/skill-e2e-plan-ceo-split-overflow.test.ts",
+  ],
   "brain-privacy-gate": [
     "scripts/resolvers/preamble/generate-brain-sync-block.ts",
     "scripts/resolvers/preamble.ts",
@@ -1019,6 +1028,10 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     "test/fixtures/ios-qa/FixtureApp/**",
     "test/skill-e2e-ios-device.test.ts",
   ],
+
+  // /spec end-to-end via PTY — exercises the full Phase 1→5 pipeline
+  // including --execute spawn. Periodic-tier — paid + non-deterministic.
+  "spec-execute": ["spec/**", "test/skill-e2e-spec-execute.test.ts"],
 };
 
 /**
@@ -1121,6 +1134,7 @@ export const E2E_TIERS: Record<string, "gate" | "periodic"> = {
   "plan-design-finding-floor": "gate",
   "plan-devex-finding-floor": "gate",
   "plan-eng-multi-finding-batching": "periodic",
+  "plan-ceo-split-overflow": "periodic",
 
   // Privacy gate for gstack-brain-sync — periodic (non-deterministic LLM call,
   // costs ~$0.30-$0.50 per run, not needed on every commit)
@@ -1310,6 +1324,8 @@ export const E2E_TIERS: Record<string, "gate" | "periodic"> = {
   "ios-qa-swift-build": "periodic",
   // Requires a real connected + paired iPhone. Manual-trigger only.
   "ios-qa-device": "periodic",
+  // /spec end-to-end PTY pipeline (paid, non-deterministic — periodic-tier).
+  "spec-execute": "periodic",
 };
 
 /**
@@ -1376,6 +1392,13 @@ export const LLM_JUDGE_TOUCHFILES: Record<string, string[]> = {
   "plan-eng-review/SKILL.md sections": [
     "plan-eng-review/SKILL.md",
     "plan-eng-review/SKILL.md.tmpl",
+  ],
+
+  // /spec authored-spec quality (paid LLM-judge — periodic-tier).
+  "spec authored quality": [
+    "spec/SKILL.md",
+    "spec/SKILL.md.tmpl",
+    "test/fixtures/spec/**",
   ],
   "plan-design-review/SKILL.md passes": [
     "plan-design-review/SKILL.md",

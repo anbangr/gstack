@@ -5,6 +5,7 @@ Detailed guides for every gstack skill — philosophy, workflow, and examples.
 | Skill | Your specialist | What they do |
 |-------|----------------|--------------|
 | [`/office-hours`](#office-hours) | **YC Office Hours** | Start here. Six forcing questions that reframe your product before you write code. Pushes back on your framing, challenges premises, generates implementation alternatives. Design doc feeds into every downstream skill. |
+| [`/spec`](#spec) | **Spec Author** | Turn vague intent into a precise, executable spec in five phases. Backlog-ready output that downstream skills can pick up. Optional agent spawn at the end. |
 | [`/plan-ceo-review`](#plan-ceo-review) | **CEO / Founder** | Rethink the problem. Find the 10-star product hiding inside the request. Four modes: Expansion, Selective Expansion, Hold Scope, Reduction. |
 | [`/plan-domain-review`](#plan-domain-review) | **Domain Architect** | Interactive domain-model review. Clarifies glossary, bounded contexts, ownership seams, state transitions, and domain events for workflow-heavy plans. |
 | [`/plan-api-review`](#plan-api-review) | **API Designer** | Interactive API contract review. Locks in interface style, compatibility, versioning, error models, idempotency, pagination, and rate limits. |
