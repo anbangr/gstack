@@ -1,12 +1,16 @@
 ---
 name: plan-arch-review
-description: |
-  gstack advisory second-pass software architecture review for plans after /plan-eng-review.
-  Use when you want ADR-lite decisions, C4-lite diagrams, domain boundaries,
-  async/distributed systems checks, backpressure analysis, and operational readiness.
+description: gstack advisory second-pass software architecture review for plans after /plan-eng-review.
+
 ---
 <!-- AUTO-GENERATED from SKILL.md.tmpl — do not edit directly -->
 <!-- Regenerate: bun run gen:skill-docs -->
+
+
+## When to invoke this skill
+
+Use when you want ADR-lite decisions, C4-lite diagrams, domain boundaries,
+async/distributed systems checks, backpressure analysis, and operational readiness.
 
 # Plan Arch Review
 

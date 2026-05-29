@@ -23,6 +23,11 @@
       "routing": "Navigate any URL, interact with\nelements, verify page state, diff before/after actions, take annotated screenshots, check\nresponsive layouts, test forms and uploads, handle dialogs, and assert element states.\n~100ms per command. Use when you need to test a feature, verify a deployment, dogfood a\nuser flow, or file a bug with evidence. Use when asked to \"open in browser\", \"test the\nsite\", \"take a screenshot\", or \"dogfood this\".",
       "voice_line": null
     },
+    "build": {
+      "lead": "gstack autonomous execution skill.",
+      "routing": "Reads the latest implementation plan and enters\na strict coding loop to build the feature in phases, running tests and reviews\nautomatically.\nUse when asked to \"build the feature\", \"build the plan\", or \"start coding\".",
+      "voice_line": null
+    },
     "canary": {
       "lead": "Post-deploy canary monitoring.",
       "routing": "Watches the live app for console errors,\nperformance regressions, and page failures using the browse daemon. Takes\nperiodic screenshots, compares against pre-deploy baselines, and alerts\non anomalies. Use when: \"monitor deploy\", \"canary\", \"post-deploy check\",\n\"watch production\", \"verify deploy\".",
@@ -178,6 +183,16 @@
       "routing": "One command generates a setup key and\nprints instructions the other agent can follow to connect. Works with OpenClaw,\nHermes, Codex, Cursor, or any agent that can make HTTP requests. The remote agent\ngets its own tab with scoped access (read+write by default, admin on request).\nUse when asked to \"pair agent\", \"connect agent\", \"share browser\", \"remote browser\",\n\"let another agent use my browser\", or \"give browser access\".",
       "voice_line": "Voice triggers (speech-to-text aliases): \"pair agent\", \"connect agent\", \"share my browser\", \"remote browser access\"."
     },
+    "plan-api-review": {
+      "lead": "Interactive API contract plan review.",
+      "routing": "Tightens REST, gRPC, and lightweight\nasync/event contracts before implementation by clarifying versioning,\ncompatibility, idempotency, error models, pagination, and rate limits.\nUse when asked to \"review the API\", \"API design review\", \"contract review\",\nor when a plan introduces endpoints, services, webhooks, or event payloads.\nProactively suggest when a plan changes public interfaces.",
+      "voice_line": "Voice triggers (speech-to-text aliases): \"api review\", \"api design review\", \"contract review\", \"grpc review\"."
+    },
+    "plan-arch-review": {
+      "lead": "gstack advisory second-pass software architecture review for plans after /plan-eng-review.",
+      "routing": "Use when you want ADR-lite decisions, C4-lite diagrams, domain boundaries,\nasync/distributed systems checks, backpressure analysis, and operational readiness.",
+      "voice_line": null
+    },
     "plan-ceo-review": {
       "lead": "CEO/founder-mode plan review.",
       "routing": "Rethink the problem, find the 10-star product,\nchallenge premises, expand scope when it creates a better product. Four modes:\nSCOPE EXPANSION (dream big), SELECTIVE EXPANSION (hold scope + cherry-pick\nexpansions), HOLD SCOPE (maximum rigor), SCOPE REDUCTION (strip to essentials).\nUse when asked to \"think bigger\", \"expand scope\", \"strategy review\", \"rethink this\",\nor \"is this ambitious enough\".\nProactively suggest when the user is questioning scope or ambition of a plan,\nor when the plan feels like it could be thinking bigger.",
@@ -193,10 +208,20 @@
       "routing": "Explores developer personas,\nbenchmarks against competitors, designs magical moments, and traces friction\npoints before scoring. Three modes: DX EXPANSION (competitive advantage),\nDX POLISH (bulletproof every touchpoint), DX TRIAGE (critical gaps only).\nUse when asked to \"DX review\", \"developer experience audit\", \"devex review\",\nor \"API design review\".\nProactively suggest when the user has a plan for developer-facing products\n(APIs, CLIs, SDKs, libraries, platforms, docs).",
       "voice_line": "Voice triggers (speech-to-text aliases): \"dx review\", \"developer experience review\", \"devex review\", \"devex audit\", \"API design review\", \"onboarding review\"."
     },
+    "plan-domain-review": {
+      "lead": "Interactive domain-model plan review.",
+      "routing": "Clarifies bounded contexts, ownership,\nstate transitions, domain events, and source-of-truth decisions for workflow-heavy\nfeatures. Adds focused DDD rigor without defaulting to CQRS or event sourcing.\nUse when asked to \"review the domain model\", \"bounded contexts\", \"event storm\",\nor when a plan feels conceptually muddy. Proactively suggest when the user has a\nworkflow-heavy feature with unclear business terms or ownership.",
+      "voice_line": "Voice triggers (speech-to-text aliases): \"domain review\", \"domain model review\", \"bounded context review\", \"event storming\"."
+    },
     "plan-eng-review": {
       "lead": "Eng manager-mode plan review.",
       "routing": "Lock in the execution plan — architecture,\ndata flow, diagrams, edge cases, test coverage, performance. Walks through\nissues interactively with opinionated recommendations. Use when asked to\n\"review the architecture\", \"engineering review\", or \"lock in the plan\".\nProactively suggest when the user has a plan or design doc and is about to\nstart coding — to catch architecture issues before implementation.",
       "voice_line": "Voice triggers (speech-to-text aliases): \"tech review\", \"technical review\", \"plan engineering review\"."
+    },
+    "plan-modernization-review": {
+      "lead": "Interactive modernization plan review for modularization, monolith cleanup, service extraction, and strangler-style migrations.",
+      "routing": "Clarifies current state,\ntarget state, rollout sequencing, rollback points, and migration hazards.\nUse when asked to \"review the migration plan\", \"modernization review\",\n\"service extraction review\", or when a plan changes architecture shape over\ntime. Proactively suggest when a refactor smells like a rewrite.",
+      "voice_line": "Voice triggers (speech-to-text aliases): \"modernization review\", \"migration review\", \"strangler fig\", \"service extraction review\"."
     },
     "plan-tune": {
       "lead": "Self-tuning question sensitivity + developer psychographic for gstack (v1: observational).",
