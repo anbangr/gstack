@@ -39,6 +39,7 @@
     "eval:select": "bun run scripts/eval-select.ts",
     "analytics": "bun run scripts/analytics.ts",
     "test:audit": "bun test test/audit-compliance.test.ts",
+    "test:build-skill": "bun test build/orchestrator/__tests__ test/gen-skill-docs.test.ts",
     "slop": "npx slop-scan scan . 2>/dev/null || echo 'slop-scan not available (install with: npm i -g slop-scan)'",
     "slop:diff": "bun run scripts/slop-diff.ts"
   },
