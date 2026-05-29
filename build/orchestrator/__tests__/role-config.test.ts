@@ -42,6 +42,40 @@ describe("role config defaults", () => {
     }
   });
 
+  it("default config and template self-contain every loader-required key", () => {
+    // Regression for the gstack-build total-crash class: the migration backfill
+    // in withMigratedRoles / withMigratedNumberSection is SKIPPED when loading
+    // the in-tree default file (isLoadingDefault === true). So the tracked
+    // build/configure.cm AND build/configure.cm.template MUST self-contain every
+    // key the loader requires — they have no backfill safety net.
+    //
+    // When a stash-restore (commit a176e16d) reverted configure.cm to a
+    // pre-upgrade state, it dropped roles.specQualityGate,
+    // limits.featureVerifyMaxIterations, and timeoutsMs.featureVerify. That made
+    // `BUILD_DEFAULTS = loadBuildDefaults()` throw at module load, crashing every
+    // gstack-build invocation — including `--help`. This test loads both files
+    // directly (no backfill) and asserts the full required-key contract.
+    const templatePath = path.join(
+      path.dirname(DEFAULT_BUILD_CONFIG_FILE),
+      "configure.cm.template",
+    );
+    for (const file of [DEFAULT_BUILD_CONFIG_FILE, templatePath]) {
+      const loaded = loadBuildDefaults(file);
+      for (const [key] of ROLE_DEFINITIONS) {
+        expect(loaded.roles[key], `${file}: roles.${key}`).toBeDefined();
+        expect(loaded.roles[key].model.trim()).not.toBe("");
+      }
+      // The three keys the stash-restore dropped — explicit so a future drop
+      // names the exact culprit instead of a generic "must be an object".
+      expect(
+        loaded.roles.specQualityGate,
+        `${file}: specQualityGate`,
+      ).toBeDefined();
+      expect(loaded.limits.featureVerifyMaxIterations).toBeGreaterThan(0);
+      expect(loaded.timeoutsMs.featureVerify).toBeGreaterThan(0);
+    }
+  });
+
   it("loads template-only plan location from configure.cm", () => {
     const loaded = loadBuildDefaults(DEFAULT_BUILD_CONFIG_FILE);
     const planLocator = (loaded.roles as any).planLocator;
@@ -223,18 +257,20 @@ describe("role config precedence helpers", () => {
   });
 
   it("configure.cm sets the expected per-role backup providers and models", () => {
-    // Pinned to the configure.cm defaults as of commit 8f604299
-    // ("chore(build): swap testWriter/primaryImpl/testFixer providers in configure.cm").
-    // testFixer + testWriter now use codex/gpt-5.3-codex-spark as backup (not gemini),
-    // so the previous loop-over-roles shape no longer fits — backups are role-specific.
+    // Pinned to the configure.cm defaults as of commit a176e16d
+    // ("chore(build): restore prior role customizations in configure.cm"),
+    // which dropped Gemini from the default role assignments per prior tuning:
+    // primaryImpl/ship/land backups moved gemini -> codex/gpt-5.5. testFixer +
+    // testWriter keep codex/gpt-5.3-codex-spark. Backups are role-specific, so
+    // the previous loop-over-roles shape no longer fits.
     const defaults = loadBuildDefaults(DEFAULT_BUILD_CONFIG_FILE);
     const expected: Record<
       "primaryImpl" | "testFixer" | "testWriter" | "ship" | "land",
       { backupProvider: "gemini" | "codex"; backupModel: string }
     > = {
       primaryImpl: {
-        backupProvider: "gemini",
-        backupModel: "gemini-3.5-flash",
+        backupProvider: "codex",
+        backupModel: "gpt-5.5",
       },
       testFixer: {
         backupProvider: "codex",
@@ -244,8 +280,8 @@ describe("role config precedence helpers", () => {
         backupProvider: "codex",
         backupModel: "gpt-5.3-codex-spark",
       },
-      ship: { backupProvider: "gemini", backupModel: "gemini-3.5-flash" },
-      land: { backupProvider: "gemini", backupModel: "gemini-3.5-flash" },
+      ship: { backupProvider: "codex", backupModel: "gpt-5.5" },
+      land: { backupProvider: "codex", backupModel: "gpt-5.5" },
     };
     for (const [role, want] of Object.entries(expected) as Array<
       [keyof typeof expected, (typeof expected)[keyof typeof expected]]

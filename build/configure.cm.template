@@ -78,6 +78,11 @@
       "provider": "claude",
       "model": "claude-opus-4-7",
       "reasoning": "xhigh"
+    },
+    "specQualityGate": {
+      "provider": "codex",
+      "model": "gpt-5.5",
+      "reasoning": "medium"
     }
   },
   "limits": {
@@ -85,7 +90,8 @@
     "redSpecMaxIterations": 1,
     "testMaxIterations": 5,
     "originVerificationMaxIterations": 3,
-    "featureReviewMaxIterations": 3
+    "featureReviewMaxIterations": 3,
+    "featureVerifyMaxIterations": 3
   },
   "timeoutsMs": {
     "gemini": 600000,
@@ -94,6 +100,8 @@
     "ship": 1800000,
     "test": 300000,
     "judge": 600000,
-    "featureReview": 1200000
+    "featureReview": 1200000,
+    "featureVerify": 1200000,
+    "planReview": 300000
   }
 }
