@@ -121,7 +121,13 @@ function geminiExitError(prefix: string, result: SubAgentResult): string {
   if (hygieneLine) {
     return `${prefix} hygiene failed: ${hygieneLine}; see ${result.logPath}`;
   }
-  return `${prefix} exited ${result.exitCode}; see ${result.logPath}`;
+  // A bare `exited null` message hid the real cause for stall kills,
+  // auth-prompt kills, timeouts, and signal kills (the R4 cluster).
+  // renderRoleStepFailureMessage surfaces "stalled" / "authentication
+  // required" / "timed out" / "killed by signal N" and falls back to
+  // "exited N" for plain non-zero exits, so the failure attribution in
+  // state.error stays accurate. Keep the "; see <log>" suffix.
+  return `${renderRoleStepFailureMessage(prefix, result)}; see ${result.logPath}`;
 }
 
 export type Action =
