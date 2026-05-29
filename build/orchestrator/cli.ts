@@ -3231,7 +3231,13 @@ export async function recoverMutableAgentCommit(opts: {
   // line 3002 stays authoritative — agents that wrote nothing get no
   // fallback recovery. See
   // ~/.claude/plans/fix-recovery-path-extraction-prose-summaries.md.
-  if (files.length === 0 && trackedChangePaths.size > 0) {
+  // A7: an agent that declared NO_CHANGES_NEEDED must NOT have host-side
+  // recovery commit changes it never named. Skipping the tracked-changes
+  // fallback for the sentinel lets a tampered/dirty tree surface as a
+  // hygiene failure ("left the working tree dirty") instead of being
+  // silently auto-committed into a clean HEAD.
+  const claimsNoChanges = /^NO_CHANGES_NEEDED\b/m.test(summary);
+  if (files.length === 0 && trackedChangePaths.size > 0 && !claimsNoChanges) {
     files = Array.from(trackedChangePaths)
       .filter((filePath) => {
         const abs = path.join(opts.cwd, filePath);
@@ -9042,7 +9048,7 @@ async function runPhase(args: {
           iteration: action.iteration,
           logPrefix: "test-writer",
           // Bug H: drives the role-shaped codex prompt switch in
-          // buildCodexImplArgv. Without this, a codex/gpt-5.5 test-writer
+          // buildCodexImplArgv. Without this, a codex test-writer
           // receives the implementor prompt and over-reaches into
           // production code; PR #102 then refuses the output. See
           // .claude/worktrees/fix-codex-test-writer-role-confusion-prompt
