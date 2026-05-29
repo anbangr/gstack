@@ -64,9 +64,9 @@ describe("Bug D — parseGeminiModelProbeStderr", () => {
   });
 
   it("T-D1h: case-insensitive matching for ModelNotFoundError", () => {
-    expect(
-      parseGeminiModelProbeStderr("modelnotfounderror occurred").ok,
-    ).toBe(false);
+    expect(parseGeminiModelProbeStderr("modelnotfounderror occurred").ok).toBe(
+      false,
+    );
   });
 });
 
@@ -74,11 +74,15 @@ describe("Bug D — static-grep wiring guards", () => {
   const subAgentsPath = path.resolve(import.meta.dir, "../sub-agents.ts");
   const subAgentsContent = fs.readFileSync(subAgentsPath, "utf-8");
 
-  it("T-D2a: configure.cm uses gemini-2.5-flash (no stale 3.5-flash refs)", () => {
+  it("T-D2a: configure.cm has no gemini model assignments (gemini dropped per prior tuning, commit a176e16d); never reintroduces the stale gemini-3.5-flash name", () => {
     const configPath = path.resolve(import.meta.dir, "../../configure.cm");
     const configContent = fs.readFileSync(configPath, "utf-8");
+    // Gemini was intentionally removed from the default role assignments. This
+    // tripwire keeps it dropped: no role may route to a gemini-* model, and the
+    // historically-bad gemini-3.5-flash name must never come back. (The
+    // "gemini" timeoutsMs key is a provider budget, not a model, so it stays.)
     expect(configContent).not.toContain("gemini-3.5-flash");
-    expect(configContent).toContain("gemini-2.5-flash");
+    expect(configContent).not.toMatch(/"model":\s*"gemini-/);
   });
 
   it("T-D2b: runGeminiTask call site invokes assertGeminiModel after auth (with .catch)", () => {
@@ -92,9 +96,7 @@ describe("Bug D — static-grep wiring guards", () => {
   });
 
   it("T-D2c: probe cache + warned-set both cleared in _resetAuthPreflightForTests", () => {
-    const start = subAgentsContent.indexOf(
-      "_resetAuthPreflightForTests",
-    );
+    const start = subAgentsContent.indexOf("_resetAuthPreflightForTests");
     expect(start).toBeGreaterThan(0);
     // Function body is small — slice a generous window
     const block = subAgentsContent.slice(start, start + 800);
