@@ -32,7 +32,10 @@ function captureWriter() {
   let buf = "";
   return {
     stream: new Writable({
-      write(c, _e, cb) { buf += c.toString(); cb(); },
+      write(c, _e, cb) {
+        buf += c.toString();
+        cb();
+      },
     }),
     read: () => buf,
   };
@@ -55,12 +58,34 @@ describe("integration: adaptive bail on re-raises-only", () => {
 
   it("fires adaptive bail at round 2 when all are re-raises", async () => {
     const objs = [
-      { severity: "CRITICAL" as const, location: "Feature 1, Phase 1", issue: "x", suggestion: "y" },
-      { severity: "CRITICAL" as const, location: "Feature 1, Phase 2", issue: "x", suggestion: "y" },
+      {
+        severity: "CRITICAL" as const,
+        location: "Feature 1, Phase 1",
+        issue: "x",
+        suggestion: "y",
+      },
+      {
+        severity: "CRITICAL" as const,
+        location: "Feature 1, Phase 2",
+        issue: "x",
+        suggestion: "y",
+      },
     ];
     const verdicts: PlanReviewVerdict[] = [
-      { verdict: "REVISE", objections: objs, assessment: "", reviewedBy: "stub", round: 1 },
-      { verdict: "REVISE", objections: objs, assessment: "", reviewedBy: "stub", round: 2 },
+      {
+        verdict: "REVISE",
+        objections: objs,
+        assessment: "",
+        reviewedBy: "stub",
+        round: 1,
+      },
+      {
+        verdict: "REVISE",
+        objections: objs,
+        assessment: "",
+        reviewedBy: "stub",
+        round: 2,
+      },
     ];
     let rIdx = 0;
     const reviewerFn = async () => verdicts[rIdx++];
@@ -85,15 +110,22 @@ describe("integration: adaptive bail on re-raises-only", () => {
     const input = readableFrom("a\nok\na\nok\na\nok\na\nok\nm\n");
     const out = captureWriter();
     const result = await runPlanReviewLoop({
+      legacyPlanReview: true,
       planPath,
       historyPath: path.join(tmpDir, "history.jsonl"),
       aggregatePath: path.join(tmpDir, "convergence.jsonl"),
-      slug: "bail-test", branch: "feat/bail",
-      reviewerFn, synthFn,
-      maxRounds: 5, adaptiveEnabled: true,
-      nonInteractiveMode: "auto-accept", isTTY: true,
-      input, output: out.stream,
-      reviewerName: "stub", synthesizerName: "stub-synth",
+      slug: "bail-test",
+      branch: "feat/bail",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: true,
+      input,
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
     });
 
     expect(result.outcome).toBe("user_manual");

@@ -30,7 +30,12 @@ function readableFrom(text: string): NodeJS.ReadableStream {
 function captureWriter() {
   let buf = "";
   return {
-    stream: new Writable({ write(c, _e, cb) { buf += c.toString(); cb(); } }),
+    stream: new Writable({
+      write(c, _e, cb) {
+        buf += c.toString();
+        cb();
+      },
+    }),
     read: () => buf,
   };
 }
@@ -42,7 +47,10 @@ describe("integration: synth disputes a user accept", () => {
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dispute-"));
     planPath = path.join(tmpDir, "plan.md");
-    fs.writeFileSync(planPath, `# Plan\n## Feature 1\n### Phase 1: setup\n- [ ] x\n`);
+    fs.writeFileSync(
+      planPath,
+      `# Plan\n## Feature 1\n### Phase 1: setup\n- [ ] x\n`,
+    );
   });
   afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
 
@@ -50,13 +58,25 @@ describe("integration: synth disputes a user accept", () => {
     const verdicts: PlanReviewVerdict[] = [
       {
         verdict: "REVISE",
-        objections: [{
-          severity: "CRITICAL", location: "Feature 1, Phase 1",
-          issue: "use bcrypt", suggestion: "switch from sha256 to bcrypt",
-        }],
-        assessment: "", reviewedBy: "stub", round: 1,
+        objections: [
+          {
+            severity: "CRITICAL",
+            location: "Feature 1, Phase 1",
+            issue: "use bcrypt",
+            suggestion: "switch from sha256 to bcrypt",
+          },
+        ],
+        assessment: "",
+        reviewedBy: "stub",
+        round: 1,
       },
-      { verdict: "APPROVE", objections: [], assessment: "", reviewedBy: "stub", round: 2 },
+      {
+        verdict: "APPROVE",
+        objections: [],
+        assessment: "",
+        reviewedBy: "stub",
+        round: 2,
+      },
     ];
     let rIdx = 0;
     const reviewerFn = async () => verdicts[rIdx++];
@@ -77,15 +97,22 @@ describe("integration: synth disputes a user accept", () => {
     const input = readableFrom("a\nok\n");
     const out = captureWriter();
     const result = await runPlanReviewLoop({
+      legacyPlanReview: true,
       planPath,
       historyPath: path.join(tmpDir, "history.jsonl"),
       aggregatePath: path.join(tmpDir, "convergence.jsonl"),
-      slug: "dispute", branch: "feat/dispute",
-      reviewerFn, synthFn,
-      maxRounds: 5, adaptiveEnabled: true,
-      nonInteractiveMode: "auto-accept", isTTY: true,
-      input, output: out.stream,
-      reviewerName: "stub", synthesizerName: "stub-synth",
+      slug: "dispute",
+      branch: "feat/dispute",
+      reviewerFn,
+      synthFn,
+      maxRounds: 5,
+      adaptiveEnabled: true,
+      nonInteractiveMode: "auto-accept",
+      isTTY: true,
+      input,
+      output: out.stream,
+      reviewerName: "stub",
+      synthesizerName: "stub-synth",
     });
     expect(result.outcome).toBe("approved");
     const agg = JSON.parse(

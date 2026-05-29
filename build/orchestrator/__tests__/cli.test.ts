@@ -5720,14 +5720,22 @@ describe("ship failure sets state.failureReason at paused paths", () => {
 
     const fakeKimi = path.join(tmpDir!, "kimi");
     const fakeGemini = path.join(tmpDir!, "gemini");
+    const fakeCodex = path.join(tmpDir!, "codex");
     fs.writeFileSync(fakeKimi, "#!/bin/sh\nexit 1\n");
     fs.chmodSync(fakeKimi, 0o755);
     fs.writeFileSync(fakeGemini, "#!/bin/sh\nexit 1\n");
     fs.chmodSync(fakeGemini, 0o755);
+    // ship.backupProvider is codex (configure.cm), so the failing kimi
+    // primary routes to the codex backup. Without a stub that runs the real
+    // codex under ship's 30-min window, blowing the 30s test timeout
+    // (status 130 instead of the expected 1).
+    fs.writeFileSync(fakeCodex, "#!/bin/sh\nexit 1\n");
+    fs.chmodSync(fakeCodex, 0o755);
 
     const result = runShipCli(planFile, repo, runId, {
       KIMI_BIN: fakeKimi,
       GEMINI_BIN: fakeGemini,
+      CODEX_BIN: fakeCodex,
     });
 
     expect(result.status).toBe(1);
@@ -7027,9 +7035,9 @@ describe("phaseAllowsGateSourceFixes", () => {
   }
 
   it("code phase WITHOUT fix-on-review → false (test-only contract stays default)", () => {
-    expect(phaseAllowsGateSourceFixes(p({ kind: "code", body: "do work" }))).toBe(
-      false,
-    );
+    expect(
+      phaseAllowsGateSourceFixes(p({ kind: "code", body: "do work" })),
+    ).toBe(false);
   });
 
   it("code phase WITH fix-on-review marker → true (existing behavior preserved)", () => {
@@ -7041,9 +7049,9 @@ describe("phaseAllowsGateSourceFixes", () => {
   });
 
   it("research phase → true (deliverable is a non-test artifact)", () => {
-    expect(
-      phaseAllowsGateSourceFixes(p({ kind: "research", body: "" })),
-    ).toBe(true);
+    expect(phaseAllowsGateSourceFixes(p({ kind: "research", body: "" }))).toBe(
+      true,
+    );
   });
 
   it("writing phase → true (paper sections, drafts)", () => {

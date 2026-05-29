@@ -25,7 +25,9 @@ describe("plan-review CRITICAL → re-synth RESOLVED pairing (class 5)", () => {
       "utf8",
     );
     // Helper exists so cli.ts can compute the same faultId wrap-console will
-    expect(planReviewerSrc).toMatch(/export\s+function\s+buildPlanReviewCriticalMessage/);
+    expect(planReviewerSrc).toMatch(
+      /export\s+function\s+buildPlanReviewCriticalMessage/,
+    );
   });
 
   test("T9 (post-merge): cli.ts no longer wires Class 5 around reconcilePlanReview — PR #63's in-process plan-review-loop replaced that call path", () => {
@@ -71,9 +73,12 @@ describe("plan-review CRITICAL → re-synth RESOLVED pairing (class 5)", () => {
     cliSrc =
       cliSrc ??
       fs.readFileSync(path.resolve(import.meta.dir, "..", "cli.ts"), "utf8");
-    // Find the PERSISTENCE site (status: "critical_exit_pending"), not the
-    // gate-entry READ site (state.planReview.status === ...).
-    const persistIdx = cliSrc.indexOf('status: "critical_exit_pending"');
+    // Find the PERSISTENCE site (status: stalemateStatus), not the
+    // gate-entry READ site (state.planReview.status === ...). Refactor
+    // dcd3d7b2 replaced the inline "critical_exit_pending" literal with a
+    // stalemateStatus variable (synth_failure_stalemate vs critical_exit_pending);
+    // the persistence assignment is now `status: stalemateStatus`.
+    const persistIdx = cliSrc.indexOf("status: stalemateStatus");
     expect(persistIdx).toBeGreaterThan(-1);
     const window = cliSrc.slice(
       Math.max(0, persistIdx - 300),

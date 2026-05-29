@@ -32,13 +32,19 @@ function captureWriter() {
   let buf = "";
   return {
     stream: new Writable({
-      write(c, _e, cb) { buf += c.toString(); cb(); },
+      write(c, _e, cb) {
+        buf += c.toString();
+        cb();
+      },
     }),
     read: () => buf,
   };
 }
 
-const FIXTURE_DIR = path.resolve(__dirname, "../../../../test/fixtures/build-convergence");
+const FIXTURE_DIR = path.resolve(
+  __dirname,
+  "../../../../test/fixtures/build-convergence",
+);
 
 describe("integration: bundle-1 trajectory 5→3→2→0", () => {
   let tmpDir: string;
@@ -56,7 +62,10 @@ describe("integration: bundle-1 trajectory 5→3→2→0", () => {
 
   it("converges in 4 rounds, three synth invocations, exits APPROVE", async () => {
     const stub = JSON.parse(
-      fs.readFileSync(path.join(FIXTURE_DIR, "bundle-1-reviewer-stub.json"), "utf8"),
+      fs.readFileSync(
+        path.join(FIXTURE_DIR, "bundle-1-reviewer-stub.json"),
+        "utf8",
+      ),
     );
     let rIdx = 0;
     const reviewerFn = async (): Promise<PlanReviewVerdict> => {
@@ -84,6 +93,7 @@ describe("integration: bundle-1 trajectory 5→3→2→0", () => {
     const input = readableFrom("A\nA\nA\n");
     const out = captureWriter();
     const result = await runPlanReviewLoop({
+      legacyPlanReview: true,
       planPath,
       historyPath: path.join(tmpDir, "history.jsonl"),
       aggregatePath: path.join(tmpDir, "convergence.jsonl"),
@@ -117,14 +127,18 @@ describe("integration: bundle-1 trajectory 5→3→2→0", () => {
     expect(agg.finalVerdict).toBe("APPROVE");
 
     // Verify history JSONL has 4 lines.
-    const histLines = fs.readFileSync(path.join(tmpDir, "history.jsonl"), "utf8")
-      .trim().split("\n");
+    const histLines = fs
+      .readFileSync(path.join(tmpDir, "history.jsonl"), "utf8")
+      .trim()
+      .split("\n");
     expect(histLines).toHaveLength(4);
 
     // Verify plan file has annotations from all 3 revising rounds.
     const planText = fs.readFileSync(planPath, "utf8");
     expect(planText).toContain("<!-- gstack-plan-review-history");
-    expect(planText).toContain("ROUND 1 CRITICAL [Feature 1, Phase 2]: EIP-712");
+    expect(planText).toContain(
+      "ROUND 1 CRITICAL [Feature 1, Phase 2]: EIP-712",
+    );
     expect(planText).toContain("ROUND 2 CRITICAL");
     expect(planText).toContain("ROUND 3 CRITICAL");
 
@@ -140,8 +154,8 @@ describe("integration: bundle-1 trajectory 5→3→2→0", () => {
     );
     // Round 1 objections are at Phases 1-3 which exist, so they should be
     // inserted at (or near) the matching Phase heading, not prepended.
-    expect(planText.indexOf("ROUND 1 CRITICAL [Feature 1, Phase 2]: EIP-712")).toBeGreaterThan(
-      planText.indexOf("# Living Plan"),
-    );
+    expect(
+      planText.indexOf("ROUND 1 CRITICAL [Feature 1, Phase 2]: EIP-712"),
+    ).toBeGreaterThan(planText.indexOf("# Living Plan"));
   });
 });
