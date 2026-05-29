@@ -23,7 +23,6 @@ import {
   spawn as registeredSpawn,
   spawnSync as registeredSpawnSync,
 } from "./child-registry";
-import { spawn as childProcessSpawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -466,7 +465,7 @@ export function assertGeminiModel(
     try {
       probeStderr = await new Promise<string>((resolve) => {
         const stderrChunks: Buffer[] = [];
-        const proc = childProcessSpawn(
+        const proc = registeredSpawn(
           bin,
           ["-m", model, "--output-format", "text"],
           { stdio: ["pipe", "ignore", "pipe"] },
@@ -545,9 +544,9 @@ export function computeCodexWritableRoots(cwd: string): string[] {
   const roots = new Set<string>();
   const cwdResolved = path.resolve(cwd);
   for (const flag of ["--git-dir", "--git-common-dir"]) {
-    let probeResult: ReturnType<typeof spawnSync> | null = null;
+    let probeResult: ReturnType<typeof registeredSpawnSync> | null = null;
     try {
-      probeResult = spawnSync("git", ["-C", cwd, "rev-parse", flag], {
+      probeResult = registeredSpawnSync("git", ["-C", cwd, "rev-parse", flag], {
         encoding: "utf8",
         timeout: 3000,
       });
@@ -3490,7 +3489,7 @@ export function hasPytestCov(cwd: string): boolean {
   // pip/conda. Fall back to `python` for older systems / venvs.
   for (const bin of ["python3", "python"]) {
     try {
-      const probe = spawnSync(bin, ["-c", "import pytest_cov"], {
+      const probe = registeredSpawnSync(bin, ["-c", "import pytest_cov"], {
         cwd,
         stdio: "ignore",
         timeout: 3000,
