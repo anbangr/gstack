@@ -38,6 +38,7 @@ import { describe, it, expect } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { buildCodexImplArgv } from "../sub-agents";
+import { isTestWriterPath } from "../cli";
 
 const cliPath = path.resolve(import.meta.dir, "../cli.ts");
 const cliContent = fs.readFileSync(cliPath, "utf-8");
@@ -194,7 +195,16 @@ describe("Bug H — prompt-enforcer drift guard", () => {
     expect(prompt).toMatch(/\*\.test\.\*|\*\.spec\.\*/);
   });
 
-  it("T-H6b: test-writer prompt does NOT promise patterns the enforcer rejects", () => {
+  it("T-H6b: every co-located convention the prompt promises is backed by an enforcer pattern", () => {
+    // Red-team rule (still load-bearing): prompt ⊆ enforcer. The prompt must
+    // never name a convention the enforcer would refuse — else the agent
+    // follows the prompt, commits, and gets refused (the original Go bug).
+    // The enforcer was widened to accept co-located test files (Go, etc.), so
+    // the prompt may now name them; this guard pins that the prompt only
+    // promises conventions the enforcer actually matches, by checking each
+    // promised convention against a real test path through isTestWriterPath's
+    // pattern set in cli.ts. Future conventions added to the prompt without a
+    // matching enforcer pattern fail here.
     const argv = buildCodexImplArgv({
       inputFilePath: "/tmp/in.md",
       outputFilePath: "/tmp/out.md",
@@ -202,13 +212,27 @@ describe("Bug H — prompt-enforcer drift guard", () => {
       roleId: "test-writer",
     });
     const prompt = extractPrompt(argv);
-    // Go's `*_test.go` basename is NOT matched by either enforcer regex:
-    // it has no `__tests__|test|tests|spec|specs/` directory prefix AND
-    // the suffix regex is `\.(test|spec)\.[a-z]+$`, not `_test\.`. Until
-    // the enforcer is widened (separate concern), the prompt must NOT
-    // promise this pattern.
-    expect(prompt).not.toMatch(/\*_test\.\*/);
-    expect(prompt).not.toMatch(/_test\.go/);
+    // Map each convention the prompt may advertise to a sample path the enforcer
+    // must accept. Assert against the REAL exported predicate (isTestWriterPath),
+    // not a source-text grep — so the guard exercises the actual enforcer and a
+    // regression in the predicate (or a prompt token with no backing pattern)
+    // fails CI, with no hand-maintained literal table to fall out of sync.
+    const conventionProbes: { promptToken: string; samplePath: string }[] = [
+      { promptToken: "_test.go", samplePath: "pkg/foo_test.go" },
+      { promptToken: "test_*.py", samplePath: "test_foo.py" },
+      { promptToken: "_test.py", samplePath: "foo_test.py" },
+      { promptToken: "Test.kt", samplePath: "src/FooTest.kt" },
+      { promptToken: "Test.swift", samplePath: "Tests/FooTests.swift" },
+      { promptToken: "Test.cs", samplePath: "FooTests.cs" },
+      { promptToken: "Test.php", samplePath: "tests/FooTest.php" },
+      { promptToken: "_test.exs", samplePath: "test/foo_test.exs" },
+      { promptToken: "Spec.scala", samplePath: "FooSpec.scala" },
+    ];
+    for (const { promptToken, samplePath } of conventionProbes) {
+      if (prompt.includes(promptToken)) {
+        expect(isTestWriterPath(samplePath)).toBe(true);
+      }
+    }
   });
 
   it("T-H6c: test-writer prompt clarifies 'add new tests' vs 'break existing ones'", () => {
@@ -225,19 +249,21 @@ describe("Bug H — prompt-enforcer drift guard", () => {
     });
     const prompt = extractPrompt(argv);
     expect(prompt).toMatch(/NEW FAILING tests|ADD new failing tests/i);
-    expect(prompt).toMatch(/leave existing ones untouched|do not modify existing passing tests/i);
+    expect(prompt).toMatch(
+      /leave existing ones untouched|do not modify existing passing tests/i,
+    );
   });
 
-  it("T-H6d: test-writer prompt and classifyTestWriterCommit enforcer use the same dir-prefix list", () => {
-    // Read the enforcer regex literal from cli.ts and verify the prompt
+  it("T-H6d: test-writer prompt and isTestWriterPath enforcer use the same dir-prefix list", () => {
+    // Read the enforcer's directory list from cli.ts and verify the prompt
     // mentions every directory the enforcer would accept. A divergence
-    // in either direction (prompt adds a dir not in enforcer, or
-    // enforcer adds a dir not in prompt) fails CI and forces both sides
-    // to be updated together. The enforcer literal is:
-    //   const TEST_PATH_RE = /(^|\/)(__tests__|test|tests|spec|specs)\//i;
+    // (prompt names a dir the enforcer rejects, or the enforcer adds a dir
+    // the prompt omits) fails CI and forces both sides to move together.
+    // The directory list is a NAMED const so this guard has a stable anchor:
+    //   const TEST_WRITER_DIR_RE = /(^|\/)(__tests__|test|tests|spec|specs)\//i;
     // Match the inner `(__tests__|...)` alternation group.
     const enforcerMatch = cliContent.match(
-      /TEST_PATH_RE\s*=\s*\/\(\^\|\\\/\)\(([^)]+)\)\\\//,
+      /TEST_WRITER_DIR_RE\s*=\s*\/\(\^\|\\\/\)\(([^)]+)\)\\\//,
     );
     expect(enforcerMatch).not.toBeNull();
     const enforcerDirs = (enforcerMatch![1] ?? "").split("|");
@@ -252,5 +278,27 @@ describe("Bug H — prompt-enforcer drift guard", () => {
     for (const dir of enforcerDirs) {
       expect(prompt).toContain(`${dir}/`);
     }
+  });
+
+  it("T-H6e: when the enforcer accepts Go *_test.go, the test-writer prompt names it", () => {
+    // Regression guard for the Go bug: `*_test.go` is co-located with source
+    // (not under a test/ dir), so a Go test-writer needs the prompt to
+    // explicitly sanction it — otherwise the agent has no compliant path and
+    // every Go /build aborts at the test-writer phase. The red-team rule is
+    // "prompt ⊆ enforcer": this asserts the specific co-located conventions
+    // the enforcer accepts are also offered to the agent. Only assert a
+    // convention in the prompt if the enforcer actually accepts it (read from
+    // TEST_WRITER_PATH_PATTERNS), so the prompt can never claim more than the
+    // enforcer allows.
+    const argv = buildCodexImplArgv({
+      inputFilePath: "/tmp/in.md",
+      outputFilePath: "/tmp/out.md",
+      cwd: "/tmp/cwd",
+      roleId: "test-writer",
+    });
+    const prompt = extractPrompt(argv);
+    // Go is THE bug this whole fix exists for — assert it unconditionally.
+    expect(cliContent).toContain("/_test\\.go$/i");
+    expect(prompt).toContain("_test.go");
   });
 });

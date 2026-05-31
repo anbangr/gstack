@@ -3792,21 +3792,25 @@ export function buildCodexImplArgv(opts: {
   let codexPrompt: string;
   if (opts.roleId === "test-writer") {
     // Path patterns below MUST stay in sync with classifyTestWriterCommit
-    // (cli.ts:2133), which is what PR #102 uses to refuse non-test paths
-    // post-commit. The enforcer recognises two forms only:
+    // The enforcer (cli.ts `isTestWriterPath` / `TEST_WRITER_PATH_PATTERNS`,
+    // used by classifyTestWriterCommit + recoverMutableAgentCommit) recognises:
     //   1. paths UNDER `__tests__/`, `test/`, `tests/`, `spec/`, `specs/`
     //      subtrees (directory-based)
     //   2. basenames matching `*.test.*` or `*.spec.*` (suffix-based)
-    // Earlier red-team review caught that the prompt previously claimed
-    // Go's `*_test.go` was allowed, but the enforcer regex doesn't match
-    // basename-suffix `_test.go` files at repo root — the agent would
-    // follow the prompt, commit, then get refused. Same Bug H symptom,
-    // different cause. Keep the prompt narrower than the enforcer, never
-    // wider.
+    //   3. language-native co-located test files: `*_test.go` (Go),
+    //      `*_test.py`/`test_*.py` (Python), `*Test.kt`, `*Test.swift`,
+    //      `*Test.cs`, `*Test.php`, `*_test.exs`, `*Spec.scala`/`*Test.scala`
+    // Red-team rule (still load-bearing): keep the prompt a SUBSET of what the
+    // enforcer accepts, never wider — if the prompt names a convention the
+    // enforcer rejects, the agent follows the prompt, commits, then gets
+    // refused. The Go `*_test.go` case was previously dropped from the prompt
+    // because the enforcer didn't match it; form (3) now closes that gap so the
+    // prompt can name it. The drift guard `codex-role-prompt.test.ts T-H6d`
+    // fails CI if the prompt and enforcer diverge.
     codexPrompt = [
       `Read test-spec instructions at ${opts.inputFilePath}.`,
       `You are the TEST WRITER. Your job is to write NEW FAILING tests that pin the described behavior.`,
-      `Touch ONLY test files under these directories: __tests__/, test/, tests/, spec/, specs/. Files matching *.test.* or *.spec.* (any extension) are also accepted.`,
+      `Touch ONLY test files. Accepted: files under __tests__/, test/, tests/, spec/, specs/ directories; basenames matching *.test.* or *.spec.* (any extension); and language-native co-located test files — *_test.go (Go), *_test.py or test_*.py (Python), *Test.kt (Kotlin), *Test.swift (Swift), *Test.cs (C#), *Test.php (PHP), *_test.exs (Elixir), *Spec.scala or *Test.scala (Scala). Use your repo's native convention (e.g. foo_test.go next to foo.go in a Go repo).`,
       `Do NOT write production code. Do NOT implement helpers, modules, or fixtures outside test paths.`,
       `Do NOT modify existing passing tests to make them fail. ADD new failing tests; leave existing ones untouched.`,
       `The phase EXPECTS a RED test run after you commit — that means YOUR newly added tests fail because the production code does not exist yet.`,

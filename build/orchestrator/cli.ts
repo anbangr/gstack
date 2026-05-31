@@ -2179,12 +2179,77 @@ export type RoleHygieneId =
   | "other";
 
 /**
+ * Directory conventions the test-writer role may write under. Kept as a
+ * NAMED const (not inlined in the array below) so the prompt/enforcer drift
+ * guard `codex-role-prompt.test.ts T-H6d` can parse the exact directory list
+ * out of this file and assert the test-writer agent prompt names each one.
+ * If you edit this list, edit the test-writer prompt in
+ * `sub-agents.ts` (buildCodexImplArgv) too — the guard fails CI on drift.
+ */
+const TEST_WRITER_DIR_RE = /(^|\/)(__tests__|test|tests|spec|specs)\//i;
+
+/**
+ * Single source of truth for "is this path a test file the test-writer role
+ * may touch?". Both `classifyTestWriterCommit` (leg 3 post-commit detection)
+ * and `recoverMutableAgentCommit`'s test-writer block (leg 2 recovery refusal)
+ * route through `isTestWriterPath` so the convention table cannot drift between
+ * the two sites or be lost on an upstream upgrade (the v1.51→v1.52 regression).
+ *
+ * Recognizes:
+ *   - Directory conventions (TEST_WRITER_DIR_RE): `__tests__/`, `test/`,
+ *     `tests/`, `spec/`, `specs/`
+ *   - Dotted-suffix basenames: `*.test.*` / `*.spec.*` (JS/TS, etc.)
+ *   - Language-native CO-LOCATED test files that live next to source (no
+ *     `test/` dir) and so match none of the above:
+ *       Go        `foo_test.go`           (go test REQUIRES the _test.go suffix)
+ *       Python    `test_foo.py` / `foo_test.py`
+ *       Kotlin    `FooTest.kt` / `FooTests.kt`
+ *       Swift     `FooTests.swift` / `FooTest.swift`
+ *       C#/.NET   `FooTest.cs` / `FooTests.cs`
+ *       PHP       `FooTest.php`
+ *       Elixir    `foo_test.exs`
+ *       Scala     `FooSpec.scala` / `FooTest.scala`
+ *
+ * The failure direction is asymmetric: a FALSE NEGATIVE (a real test file not
+ * recognized) makes the hygiene gate refuse the commit as "role drift" and
+ * discard real test-writer work — severe, and the exact Go bug this fixes
+ * (`*_test.go` lived next to source, matched nothing, so every Go-repo /build
+ * aborted at the test-writer phase). A FALSE POSITIVE (a non-test counted as a
+ * test) merely lets the gate pass — low harm. Production source (`main.go`,
+ * `soak_runner.go`) still classifies as non-test because the patterns are
+ * suffix/convention-anchored, not extension-wide. Soften further (e.g.
+ * fixtures under production paths) via a call-site override, not by widening
+ * this table.
+ */
+const TEST_WRITER_PATH_PATTERNS: RegExp[] = [
+  TEST_WRITER_DIR_RE, // directory conventions
+  /\.(test|spec)\.[a-z]+$/i, // *.test.* / *.spec.*
+  /_test\.go$/i, // Go
+  /(^|\/)test_[^/]+\.py$/i, // Python test_foo.py
+  /_test\.py$/i, // Python foo_test.py
+  /Test[s]?\.kt$/, // Kotlin
+  /Test[s]?\.swift$/, // Swift
+  /Test[s]?\.cs$/, // C#/.NET
+  /Test\.php$/, // PHP
+  /_test\.exs$/i, // Elixir
+  /(Spec|Test)\.scala$/, // Scala
+];
+
+/**
+ * True iff `p` matches any recognized test-file convention. Shared by the
+ * leg 2 and leg 3 test-writer hygiene gates (see TEST_WRITER_PATH_PATTERNS).
+ */
+export function isTestWriterPath(p: string): boolean {
+  return TEST_WRITER_PATH_PATTERNS.some((re) => re.test(p));
+}
+
+/**
  * Classify a list of committed paths against the test-writer role boundary.
  *
  * Used by leg 3 of the test-writer role-drift structural fix (post-commit
  * detection in the RUN_GEMINI_TEST_SPEC dispatch). The test-writer role is
- * authorized to touch test paths only — `__tests__/`, `test/`, `tests/`,
- * `spec/`, `specs/` directories AND `*.test.*` / `*.spec.*` file basenames.
+ * authorized to touch test paths only — the directory + co-located file
+ * conventions enumerated in `TEST_WRITER_PATH_PATTERNS`.
  *
  * `ok` is true ONLY when at least one path was committed AND every path is
  * a test path. A mixed commit (test paths + production paths) is role drift
@@ -2193,10 +2258,6 @@ export type RoleHygieneId =
  * test-writer block — if it would be refused at recovery time, it must
  * also be detected here when the agent commits directly via `git commit`.
  *
- * Same regex contract as the leg 2 refusal block above and the existing
- * `testWriterTouchedPaths` inference at the top of the file. Soften
- * through an override option rather than relaxing the regex.
- *
  * See ~/.claude/plans/fix-test-writer-role-drift-structural.md leg 3.
  */
 export function classifyTestWriterCommit(allCommitted: string[]): {
@@ -2204,12 +2265,8 @@ export function classifyTestWriterCommit(allCommitted: string[]): {
   testPaths: string[];
   nonTestPaths: string[];
 } {
-  const TEST_PATH_RE = /(^|\/)(__tests__|test|tests|spec|specs)\//i;
-  const TEST_FILE_RE = /\.(test|spec)\.[a-z]+$/i;
-  const isTestPath = (p: string) =>
-    TEST_PATH_RE.test(p) || TEST_FILE_RE.test(p);
-  const testPaths = allCommitted.filter(isTestPath);
-  const nonTestPaths = allCommitted.filter((p) => !isTestPath(p));
+  const testPaths = allCommitted.filter(isTestWriterPath);
+  const nonTestPaths = allCommitted.filter((p) => !isTestWriterPath(p));
   return {
     ok: allCommitted.length > 0 && nonTestPaths.length === 0,
     testPaths,
@@ -3413,11 +3470,7 @@ export async function recoverMutableAgentCommit(opts: {
   //
   // See ~/.claude/plans/fix-test-writer-role-drift-structural.md leg 2.
   if (opts.roleId === "test-writer") {
-    const TEST_PATH_RE = /(^|\/)(__tests__|test|tests|spec|specs)\//i;
-    const TEST_FILE_RE = /\.(test|spec)\.[a-z]+$/i;
-    const isTestPath = (p: string) =>
-      TEST_PATH_RE.test(p) || TEST_FILE_RE.test(p);
-    const nonTestPaths = stagedPaths.filter((p) => !isTestPath(p));
+    const nonTestPaths = stagedPaths.filter((p) => !isTestWriterPath(p));
     if (nonTestPaths.length > 0) {
       const sample = nonTestPaths.slice(0, 5).join(", ");
       const moreSuffix =
@@ -3427,8 +3480,11 @@ export async function recoverMutableAgentCommit(opts: {
         errors: [
           `test-writer recovery REFUSED: agent's output summary listed ` +
             `${nonTestPaths.length} non-test file(s): ${sample}${moreSuffix}. ` +
-            `The test-writer role may ONLY edit files under __tests__/, test/, ` +
-            `tests/, spec/, specs/, or matching *.test.* / *.spec.*. This is ` +
+            `The test-writer role may ONLY edit test files: under __tests__/, ` +
+            `test/, tests/, spec/, specs/; matching *.test.* / *.spec.*; or a ` +
+            `language-native co-located test file (*_test.go, *_test.py, ` +
+            `test_*.py, *Test.kt, *Test.swift, *Test.cs, *Test.php, *_test.exs, ` +
+            `*Spec.scala, *Test.scala). This is ` +
             `role drift — the agent wrote a production-code implementation ` +
             `instead of failing tests. Phase aborted; the working tree is left ` +
             `as-is so you can inspect what the agent produced.\n\n` +
@@ -9347,7 +9403,9 @@ async function runPhase(args: {
                 `${errorCode} at iteration ${action.iteration}: the ` +
                 `test-writer ${describe} ` +
                 `(allowed: __tests__/, test/, tests/, spec/, specs/, ` +
-                `*.test.*, *.spec.*).\n` +
+                `*.test.*, *.spec.*, and co-located *_test.go / *_test.py / ` +
+                `test_*.py / *Test.kt / *Test.swift / *Test.cs / *Test.php / ` +
+                `*_test.exs / *Spec.scala / *Test.scala).\n` +
                 `Drifted files: ${sample}${moreSuffix}\n` +
                 `This is role drift — the agent committed production code ` +
                 `directly (bypassing the recovery path) instead of writing ` +
