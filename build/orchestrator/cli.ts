@@ -2815,13 +2815,24 @@ const BLIND_EXECUTION_MARKERS: Record<BlindExecutionAgent, string[]> = {
  * AFFIRMATIVE sandbox/write-rejection signal on the SAME line. Allowlist (not
  * denylist) so future benign router errors don't reintroduce the false halt.
  * The genuine sandbox shapes all carry one of these tokens:
- *   - "patch rejected" / "read-only sandbox" (Bug J / T-L2)
- *   - "sandbox" ("...blocked by read-only sandbox", "sandbox denied")
+ *   - "sandbox" ("...blocked by read-only sandbox", "sandbox denied") — also
+ *     covers the Bug J / T-L2 "patch rejected: ...blocked by read-only sandbox"
  *   - "workspace-write violation"
+ *   - "read-only file system" / "EROFS" — kernel write-block to a RO mount
+ *
+ * Deliberately NOT matched (cross-model review, 2026-05-31): a bare
+ * `patch rejected` (a stale-hunk / context mismatch is a normal failed edit
+ * codex often recovers from, not a sandbox block — matching it discarded
+ * recovered work), and generic OS read-denials (`EPERM` / `operation not
+ * permitted` / `permission denied`), which a benign recovered tool call can
+ * emit. A real write-block worded only that way is backstopped by the
+ * `error: sandbox denied:` / `workspace-write violation:` markers, a non-zero
+ * exit, and downstream phase gates — accepted as a bounded false negative
+ * rather than re-open the false-positive discard this guard exists to close.
  */
 const CODEX_ROUTER_ERROR_MARKER = "ERROR codex_core::tools::router: error=";
 const CODEX_ROUTER_SANDBOX_RE =
-  /sandbox|patch rejected|workspace-write violation/i;
+  /sandbox|workspace-write violation|read-only file system|EROFS/i;
 
 function codexRouterErrorIsSandboxViolation(content: string): boolean {
   return content

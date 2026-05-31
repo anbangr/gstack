@@ -50,6 +50,9 @@
  *   T-L6: benign `write_stdin failed: stdin is closed` router error → ok=true
  *   T-L7: a genuine `patch rejected ... read-only sandbox` router error still → ok=false
  *   T-L8: a benign router error + a SEPARATE real sandbox line still → ok=false
+ *   T-L9: a bare non-sandbox `patch rejected` router error → ok=true (the
+ *         cross-model-review FP fix: `patch rejected` dropped from the regex)
+ *   T-L10: a `read-only file system` / EROFS write-block router error → ok=false
  */
 
 import { describe, it, expect } from "bun:test";
@@ -164,6 +167,33 @@ describe("Bug L — codex blind-execution marker false-positive", () => {
     const result = detectBlindExecution(logPath);
     expect(result.ok).toBe(false);
     expect(result.agent).toBe("codex");
+  });
+
+  // Cross-model review follow-up (2026-05-31): the affirmative regex must NOT
+  // match a bare `patch rejected`. A stale-hunk / context-mismatch patch
+  // failure is a normal failed edit codex routinely recovers from; matching it
+  // re-opened the same discard-real-work false positive this guard closes. The
+  // genuine sandbox case (Bug J / T-L2) still halts because it also says
+  // "...blocked by read-only sandbox".
+  it("T-L9: a non-sandbox `patch rejected` router error does NOT trigger blind-execution", () => {
+    const log = [
+      "[ERR] ERROR codex_core::tools::router: error=patch rejected: failed to find expected lines in file; context mismatch",
+      "[ERR] (re-applied with fresh context; wrote files)",
+    ].join("\n");
+    const logPath = writeLog(log);
+    const result = detectBlindExecution(logPath);
+    expect(result.ok).toBe(true);
+    expect(result.violation).toBeUndefined();
+  });
+
+  it("T-L10: a `read-only file system` write-block router error STILL triggers", () => {
+    const log =
+      "[ERR] ERROR codex_core::tools::router: error=apply_patch failed: failed to write file: Read-only file system (os error 30)";
+    const logPath = writeLog(log);
+    const result = detectBlindExecution(logPath);
+    expect(result.ok).toBe(false);
+    expect(result.agent).toBe("codex");
+    expect(result.violation).toContain("ERROR codex_core::tools::router");
   });
 });
 
