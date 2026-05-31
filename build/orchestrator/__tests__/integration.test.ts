@@ -879,29 +879,29 @@ test("normal resume ships origin-verified features before starting later feature
       [
         "#!/bin/sh",
         'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then',
-        '  has_jq=0',
-        '  has_json=0',
+        "  has_jq=0",
+        "  has_json=0",
         '  for arg in "$@"; do',
         '    [ "$arg" = "--jq" ] && has_jq=1',
         '    [ "$arg" = "--json" ] && has_json=1',
-        '  done',
-        '  # --jq path (verifyPostShip): scalar count, regardless of --json.',
+        "  done",
+        "  # --jq path (verifyPostShip): scalar count, regardless of --json.",
         '  if [ "$has_jq" = "1" ]; then',
-        '    echo 0',
-        '    exit 0',
-        '  fi',
-        '  # --json without --jq (post-merge validator): JSON array shape.',
+        "    echo 0",
+        "    exit 0",
+        "  fi",
+        "  # --json without --jq (post-merge validator): JSON array shape.",
         '  if [ "$has_json" = "1" ]; then',
         '    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")',
         '    while [ "$#" -gt 0 ]; do',
         '      if [ "$1" = "--head" ]; then shift; branch="$1"; fi',
-        '      shift || true',
-        '    done',
+        "      shift || true",
+        "    done",
         '    printf \'[{"number":1,"state":"MERGED","headRefName":"%s","url":"https://github.com/foo/bar/pull/1"}]\\n\' "$branch"',
-        '    exit 0',
-        '  fi',
-        '  echo 0',
-        '  exit 0',
+        "    exit 0",
+        "  fi",
+        "  echo 0",
+        "  exit 0",
         "fi",
         'echo unexpected gh "$@" >&2',
         "exit 1",
@@ -1192,7 +1192,12 @@ test("release_queued without shippedAt/prNumber is detected as manual patch and 
           GSTACK_DISABLE_AUTH_PREFLIGHT: "1",
         },
         encoding: "utf8",
-        timeout: 30_000,
+        // This dry-run spawns a real `bun run cli.ts`; in isolation it lands at
+        // ~28-30s, so a 30s subprocess kill races the work under full-suite
+        // concurrent load. Give the child 60s (the file's heavy-test budget,
+        // cf. line ~1056) so it always completes; the test deadline below is
+        // larger still.
+        timeout: 60_000,
       },
     );
 
@@ -1207,7 +1212,11 @@ test("release_queued without shippedAt/prNumber is detected as manual patch and 
   } finally {
     fs.rmSync(patchedDir, { recursive: true, force: true });
   }
-}, 30_000);
+  // Pre-existing load-sensitive flake fix: the body lands at ~28-30s in
+  // isolation (a real `bun run cli.ts` dry-run), so a 30s test deadline tripped
+  // under full-suite concurrent load. 120s gives headroom above the 60s child
+  // timeout without masking a genuine hang.
+}, 120_000);
 
 test("two same-basename plans with run ids cannot load each other's state", () => {
   const runDir = fs.mkdtempSync(
