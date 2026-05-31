@@ -6118,6 +6118,56 @@ async function runReviewGates(opts: {
       `## ${name} (${roleLabel(role)})\n${result.stdout}\n${result.stderr}`,
     );
     let verdict = parseVerdict(result.stdout + "\n" + result.stderr);
+    // Inbox 2a0574: the Claude /review subprocess intermittently dies on an
+    // API 400 ("thinking ... blocks in the latest assistant message cannot be
+    // modified") with NO verdict written, which used to hard-fail the phase.
+    // Retry (bounded) ONLY when the gate produced no parseable verdict AND the
+    // failure log carries the 400 marker. CONTENT-AWARE: a real GATE FAIL parses
+    // as verdict "fail" (not "unclear"), so a legitimate failed review is never
+    // retried — only the verdict-less tooling 400 is.
+    let thinkingRetries = 0;
+    while (
+      // Scope to claude: this is an Anthropic Messages API 400. codex/gemini/kimi
+      // gates can't emit it, so a codex reviewer that merely quotes the error
+      // string in its findings must never trigger the retry.
+      role.provider === "claude" &&
+      result.exitCode !== 0 &&
+      verdict === "unclear" &&
+      isThinkingBlock400(result.stdout + "\n" + result.stderr) &&
+      thinkingRetries < THINKING_BLOCK_400_MAX_RETRIES
+    ) {
+      thinkingRetries += 1;
+      console.warn(
+        `  ↻ ${name} gate hit the Claude thinking-block API 400 with no verdict; ` +
+          `retrying (${thinkingRetries}/${THINKING_BLOCK_400_MAX_RETRIES})`,
+      );
+      const retryResult = await runGate(name, role, {
+        suffix: `thinking-retry-${thinkingRetries}`,
+      });
+      const checkedRetryResult = applyGateHygiene({
+        result: retryResult,
+        before,
+        cwd: opts.cwd,
+        label: `${name} thinking-retry gate`,
+        parentWorkspace: parentBeforeGate,
+        phaseRef: phaseRefForHygieneHint(opts.phase),
+        inputFilePath: opts.inputFilePath,
+        allowNonTestPaths: gateAllowsSourceFixes,
+        requireNoHeadAdvance: gateIsReviewer,
+        discardOnFailure: true,
+      });
+      outputs.push(checkedRetryResult);
+      combined.push(
+        [
+          `## ${name} thinking-block retry ${thinkingRetries}`,
+          "The previous gate attempt died on the Claude thinking-block API 400 with no verdict, so gstack-build reran it.",
+          checkedRetryResult.stdout,
+          checkedRetryResult.stderr,
+        ].join("\n"),
+      );
+      result = checkedRetryResult;
+      verdict = parseVerdict(result.stdout + "\n" + result.stderr);
+    }
     if (
       isFailedGateResult(result, verdict) &&
       shouldRetryCodexGateWithDangerFullAccess({
@@ -6187,6 +6237,46 @@ type Verdict = ReturnType<typeof parseVerdict>;
 function isFailedGateResult(result: SubAgentResult, verdict: Verdict): boolean {
   return result.timedOut || result.exitCode !== 0 || verdict !== "pass";
 }
+
+/**
+ * Review-gate thinking-block 400 detector (inbox 2a0574).
+ *
+ * The review gate spawns the Claude CLI as a long multi-turn agentic `/review`
+ * session with extended thinking on (configure.cm review role reasoning:"xhigh";
+ * buildClaudeTaskArgv prompt "Use xhigh thinking. Run /review."). The Anthropic
+ * Messages API requires the latest assistant message's thinking/redacted_thinking
+ * blocks to be returned byte-identical on the next turn (they are signed). Across
+ * /review's many tool-use turns the CLI intermittently re-serializes a prior
+ * thinking block, producing a 400:
+ *   "thinking or redacted_thinking blocks in the latest assistant message
+ *    cannot be modified"
+ * That is a transient tooling fault, not a real GATE FAIL. Confirmed from run
+ * logs: review iter 1 exited 0 with a real verdict (281s); iter 2 hit this 400
+ * and exited 1 with NO verdict, which hard-failed the phase because the gate
+ * loop had no classifier/retry for it.
+ */
+export function isThinkingBlock400(text: string): boolean {
+  // Anchor to a real API-error line, not the bare phrase. The actual failure
+  // is logged as "API Error: 400 ... `thinking` ... blocks in the latest
+  // assistant message cannot be modified". Requiring an error/400 indicator
+  // within a short window before the phrase stops a reviewer that merely
+  // QUOTES the error text (e.g. reviewing this commit or the inbox report)
+  // from tripping the retry on its own benign findings output.
+  return /(?:API Error|HTTP 400|status[:\s]+400|:\s*400\b)[\s\S]{0,200}thinking.{0,40}blocks in the latest assistant message cannot be modified/i.test(
+    text || "",
+  );
+}
+
+/**
+ * Max extra attempts when a review/qa gate dies on the thinking-block 400 with
+ * no parseable verdict. Bounded so a genuinely stuck gate still fails fast.
+ * Env override: GSTACK_BUILD_REVIEW_THINKING_RETRY_MAX (default 2).
+ */
+const THINKING_BLOCK_400_MAX_RETRIES = (() => {
+  const raw = process.env.GSTACK_BUILD_REVIEW_THINKING_RETRY_MAX;
+  const n = raw == null ? NaN : Number.parseInt(raw, 10);
+  return Number.isInteger(n) && n >= 0 ? n : 2;
+})();
 
 /**
  * Default glob patterns identifying paths that should be safe to auto-commit
