@@ -2800,6 +2800,37 @@ const BLIND_EXECUTION_MARKERS: Record<BlindExecutionAgent, string[]> = {
 };
 
 /**
+ * Bug L follow-up (2026-05-31): the codex router-error PREFIX
+ * `"ERROR codex_core::tools::router: error="` is emitted for MANY error kinds,
+ * not just sandbox violations. Codex is spawned with stdin closed
+ * (`< /dev/null`), so an agent's interactive `exec_command` tool call logs
+ * `error=write_stdin failed: stdin is closed for this session; rerun
+ * exec_command with tty=true to keep stdin open` — a benign error codex
+ * recovers from and exits 0. The bare-prefix match treated that as a sandbox
+ * blind-execution and discardBlindExecutionChanges threw away the agent's real
+ * work (agnt2 wave-1 Phase 1 test-writer; mislabeled "input file unreachable").
+ *
+ * Bug L's prefix tightening (from `"sandbox denied"`) narrowed the
+ * false-positive surface but did not close it. Gate the prefix on an
+ * AFFIRMATIVE sandbox/write-rejection signal on the SAME line. Allowlist (not
+ * denylist) so future benign router errors don't reintroduce the false halt.
+ * The genuine sandbox shapes all carry one of these tokens:
+ *   - "patch rejected" / "read-only sandbox" (Bug J / T-L2)
+ *   - "sandbox" ("...blocked by read-only sandbox", "sandbox denied")
+ *   - "workspace-write violation"
+ */
+const CODEX_ROUTER_ERROR_MARKER = "ERROR codex_core::tools::router: error=";
+const CODEX_ROUTER_SANDBOX_RE =
+  /sandbox|patch rejected|workspace-write violation/i;
+
+function codexRouterErrorIsSandboxViolation(content: string): boolean {
+  return content
+    .split("\n")
+    .filter((line) => line.includes(CODEX_ROUTER_ERROR_MARKER))
+    .some((line) => CODEX_ROUTER_SANDBOX_RE.test(line));
+}
+
+/**
  * Scan a captured agent log for sandbox-violation markers. Returns
  * `{ok: false, violation, agent}` if any marker matches, else `{ok: true}`.
  * Missing log files are treated as ok (probe shouldn't escalate on missing
@@ -2818,13 +2849,21 @@ export function detectBlindExecution(logPath: string): {
   }
   for (const [agent, markers] of Object.entries(BLIND_EXECUTION_MARKERS)) {
     for (const marker of markers) {
-      if (content.includes(marker)) {
-        return {
-          ok: false,
-          violation: marker,
-          agent: agent as BlindExecutionAgent,
-        };
+      if (!content.includes(marker)) continue;
+      // Content-aware guard for the broad codex router-error prefix: a
+      // router error counts as blind execution ONLY when it names a real
+      // sandbox/write rejection, not a benign stdin/tty router error.
+      if (
+        marker === CODEX_ROUTER_ERROR_MARKER &&
+        !codexRouterErrorIsSandboxViolation(content)
+      ) {
+        continue;
       }
+      return {
+        ok: false,
+        violation: marker,
+        agent: agent as BlindExecutionAgent,
+      };
     }
   }
   return { ok: true };

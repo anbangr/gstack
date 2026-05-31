@@ -39,6 +39,17 @@
  *         violation:` (existing marker preserved)
  *   T-L5: static-grep — the legacy "sandbox denied" substring (no
  *         qualifier) is gone from BLIND_EXECUTION_MARKERS.codex
+ *
+ * Bug L follow-up (2026-05-31): the router-error PREFIX
+ * `"ERROR codex_core::tools::router: error="` is too broad — codex emits it
+ * for non-sandbox errors too (notably `write_stdin failed: stdin is closed`
+ * because codex is spawned with stdin closed). That false-positive discarded
+ * the agnt2 wave-1 Phase 1 test-writer's real tests, mislabeled "input file
+ * unreachable". detectBlindExecution now gates the prefix on a per-line
+ * sandbox/write-rejection signal.
+ *   T-L6: benign `write_stdin failed: stdin is closed` router error → ok=true
+ *   T-L7: a genuine `patch rejected ... read-only sandbox` router error still → ok=false
+ *   T-L8: a benign router error + a SEPARATE real sandbox line still → ok=false
  */
 
 import { describe, it, expect } from "bun:test";
@@ -115,6 +126,45 @@ describe("Bug L — codex blind-execution marker false-positive", () => {
     expect(result.agent).toBe("codex");
     expect(result.violation).toBe("workspace-write violation:");
   });
+
+  // Bug L follow-up (2026-05-31): the router-error prefix is too broad. Codex
+  // is spawned with stdin closed, so an agent's interactive exec_command logs a
+  // benign `write_stdin failed: stdin is closed` router error and exits 0. That
+  // must NOT count as blind execution. Canonical incident: agnt2 wave-1 Phase 1
+  // test-writer — real tests generated, then discarded as "input file
+  // unreachable". See INVESTIGATION-2026-05-31-wave1-blind-execution-input-unreachable.md.
+  it("T-L6: benign `write_stdin failed: stdin is closed` router error does NOT trigger blind-execution", () => {
+    const log = [
+      "[ERR] OpenAI Codex running test-writer...",
+      "[ERR] 2026-05-31T07:19:29Z ERROR codex_core::tools::router: error=write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open",
+      "[ERR] (recovered; wrote test files)",
+    ].join("\n");
+    const logPath = writeLog(log);
+    const result = detectBlindExecution(logPath);
+    expect(result.ok).toBe(true);
+    expect(result.violation).toBeUndefined();
+  });
+
+  it("T-L7: a genuine sandbox/patch-rejection router error STILL triggers (T-L2 preserved)", () => {
+    const log =
+      "[ERR] ERROR codex_core::tools::router: error=patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings";
+    const logPath = writeLog(log);
+    const result = detectBlindExecution(logPath);
+    expect(result.ok).toBe(false);
+    expect(result.agent).toBe("codex");
+    expect(result.violation).toContain("ERROR codex_core::tools::router");
+  });
+
+  it("T-L8: a benign router error alongside a SEPARATE real sandbox line still triggers", () => {
+    const log = [
+      "[ERR] ERROR codex_core::tools::router: error=write_stdin failed: stdin is closed for this session",
+      "[ERR] error: sandbox denied: /etc/passwd: read access blocked",
+    ].join("\n");
+    const logPath = writeLog(log);
+    const result = detectBlindExecution(logPath);
+    expect(result.ok).toBe(false);
+    expect(result.agent).toBe("codex");
+  });
 });
 
 // Bug N — operator-UX command for the SILENT_STATE_MUTATION class.
@@ -132,9 +182,7 @@ describe("Bug N — markFeatureShippedAfterManualRecovery", () => {
       prNumber: number;
       shippedCommit?: string;
       dryRun?: boolean;
-    }) =>
-      | { ok: true; featureIndex: number }
-      | { ok: false; error: string };
+    }) => { ok: true; featureIndex: number } | { ok: false; error: string };
   };
 
   function mkState(): any {
@@ -268,9 +316,7 @@ describe("Bug L — static-grep wiring guards", () => {
     // structured forms (`ERROR codex_core...`, `error: sandbox
     // denied:` with colon, `workspace-write violation:`) are
     // intentional and the test allows them.
-    const codexBlock = cliContent.match(
-      /codex:\s*\[[\s\S]{0,500}?\]/,
-    );
+    const codexBlock = cliContent.match(/codex:\s*\[[\s\S]{0,500}?\]/);
     expect(codexBlock).not.toBeNull();
     const codexBlockText = codexBlock![0];
     // Forbid the bare-substring form: `"sandbox denied"` immediately
