@@ -4318,10 +4318,7 @@ export function ensureFeatureBranch(args: {
     console.log(`[sync] quarantined ${q.quarantined} malformed ref(s)`);
   }
 
-  const fetchBase = spawnSync("git", ["fetch", "origin", base], {
-    cwd: args.cwd,
-    encoding: "utf8",
-  });
+  const fetchBase = gitFetchWithRetry(args.cwd, ["fetch", "origin", base]);
   if (fetchBase.status !== 0) {
     const fetchErr = fetchBase.stderr || fetchBase.stdout || "";
     const renderedErr = isCorruptRepoError(fetchErr)
@@ -4365,6 +4362,77 @@ export function ensureFeatureBranch(args: {
   args.state.branch = branch;
   saveState(args.state, { noGbrain: args.noGbrain, log: console.warn });
   return true;
+}
+
+// NOTE: deliberately does NOT include a bare "unable to access" alternative.
+// Git prefixes BOTH transient and permanent HTTP failures with
+// "fatal: unable to access '<url>': ..." — including auth failures
+// ("The requested URL returned error: 403/401"). Matching the bare prefix
+// would retry permanent auth/permission errors 3x. Every genuinely transient
+// case carries its own explicit reason below (Could not resolve host, Failed
+// to connect, Connection timed out, 5xx, ...), so dropping the prefix loses
+// no true positives while letting 401/403 fail fast.
+const TRANSIENT_GIT_NETWORK_RE =
+  /SSL_ERROR_SYSCALL|SSL_connect|Could not resolve host|Connection (?:refused|reset|timed out)|Failed to connect|early EOF|RPC failed|gnutls_handshake|Operation timed out|Temporary failure in name resolution|The requested URL returned error: 5\d\d/i;
+
+/** RC1: true when a git fetch failure reads as a transient network blip (TLS
+ *  reset, DNS hiccup, 5xx) rather than a real, non-retryable error (auth,
+ *  corrupt repo, bad ref). */
+export function isTransientGitNetworkError(stderr: string): boolean {
+  return TRANSIENT_GIT_NETWORK_RE.test(stderr || "");
+}
+
+/** RC1: run `git <fetchArgs>` with retry + exponential backoff on transient
+ *  network errors. Before this, a single SSL_ERROR_SYSCALL at feature-start
+ *  marked the whole feature failed with no retry, stranding multi-feature
+ *  dependency-chain runs (polis-mesh reputation-ema-decay, 2026-05-29).
+ *  Non-transient failures and the final attempt return immediately, so
+ *  downstream handling (isCorruptRepoError, markFeatureFailed) is unchanged.
+ *  `sleepMs` is injectable so tests don't wait on real time. */
+type FetchResult = { status: number | null; stdout: string; stderr: string };
+
+export function gitFetchWithRetry(
+  cwd: string,
+  fetchArgs: string[],
+  opts: {
+    attempts?: number;
+    sleepMs?: (ms: number) => void;
+    runFetch?: () => FetchResult;
+  } = {},
+): FetchResult {
+  const attempts = Math.max(1, opts.attempts ?? 3);
+  const sleep = opts.sleepMs ?? ((ms: number) => Bun.sleepSync(ms));
+  const runFetch =
+    opts.runFetch ??
+    (() => {
+      const r = spawnSync("git", fetchArgs, { cwd, encoding: "utf8" });
+      // spawnSync sets `.error` (and leaves status null + stderr empty) when
+      // git can't be launched at all — ENOENT, EPERM, or the child was killed.
+      // Surface that message so downstream callers don't build an empty
+      // "failed to fetch origin/<base>: " line with no cause.
+      const stderr =
+        String(r.stderr ?? "") ||
+        (r.error ? `git fetch failed to spawn: ${r.error.message}` : "");
+      return {
+        status: r.status,
+        stdout: String(r.stdout ?? ""),
+        stderr,
+      };
+    });
+  let result = runFetch();
+  for (let attempt = 2; attempt <= attempts; attempt += 1) {
+    if (result.status === 0) return result;
+    const err = result.stderr || result.stdout || "";
+    if (!isTransientGitNetworkError(err)) return result;
+    const backoffMs = 1000 * 2 ** (attempt - 2);
+    console.log(
+      `[sync] transient git fetch error (attempt ${attempt - 1}/${attempts}); ` +
+        `retrying in ${backoffMs}ms: ${err.trim().split("\n").pop()}`,
+    );
+    sleep(backoffMs);
+    result = runFetch();
+  }
+  return result;
 }
 
 function isCorruptRepoError(stderr: string): boolean {
@@ -4560,10 +4628,7 @@ export function syncLandedBase(cwd: string): {
   // Worktree-safe: only fetch, never checkout. A linked worktree cannot check
   // out a branch that is already checked out in the primary clone. Fetching
   // updates origin/<base> so callers can branch from that tracking ref directly.
-  const fetch = spawnSync("git", ["fetch", "origin"], {
-    cwd,
-    encoding: "utf8",
-  });
+  const fetch = gitFetchWithRetry(cwd, ["fetch", "origin"]);
   if (fetch.status !== 0) {
     const err = fetch.stderr || fetch.stdout || "";
     if (isCorruptRepoError(err)) {
@@ -4591,10 +4656,7 @@ export function syncFeatureBranchWithBase(
     console.log(`[sync] quarantined ${q.quarantined} malformed ref(s)`);
   }
 
-  const fetch = spawnSync("git", ["fetch", "origin"], {
-    cwd,
-    encoding: "utf8",
-  });
+  const fetch = gitFetchWithRetry(cwd, ["fetch", "origin"]);
   if (fetch.status !== 0) {
     const err = fetch.stderr || fetch.stdout || "";
     if (isCorruptRepoError(err)) {
@@ -4745,6 +4807,7 @@ function buildLaunchOptions(
     ...(args.originPlan && { originPlan: args.originPlan }),
     dryRun: args.dryRun,
     skipShip: args.skipShip,
+    singleBranch: args.singleBranch,
     skipFeatureReview: args.skipFeatureReview,
     launchedAt: new Date().toISOString(),
   };

@@ -522,6 +522,15 @@ export interface BuildLaunchOptions {
   dryRun: boolean;
   /** True only when --skip-ship was explicitly passed. */
   skipShip: boolean;
+  /** RC3: mirror Args.singleBranch into persisted launch state. The original
+   *  misdiagnosis came from an LLM investigator reading the state JSON and
+   *  seeing no singleBranch flag, so it assumed multi-branch ("re-points each
+   *  feature to origin"). Persisting it means anything that inspects the state
+   *  JSON (the monitor/investigator/halt-event subagents) can read the real
+   *  mode. NOTE: no in-tree code consumes this yet — it is advisory state for
+   *  those JSON readers, not a control flag. Populated by buildLaunchOptions()
+   *  from args.singleBranch. */
+  singleBranch?: boolean;
   /** True only when --skip-feature-review was explicitly passed. */
   skipFeatureReview: boolean;
   /** ISO timestamp for this specific launch/resume attempt. */
