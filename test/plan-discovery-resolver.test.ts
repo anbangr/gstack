@@ -10,12 +10,17 @@ describe("generatePlanFileDiscovery — explicit/structured, no fuzzy search", (
   });
 
   it("uses the structured spec_branch exact-match binding", () => {
-    expect(block).toContain("^spec_branch: $BRANCH$");
+    // Fixed-string, whole-line match — branch names with regex metachars
+    // (e.g. release/v1.2) must not loosen the binding.
+    expect(block).toContain('grep -lxF "spec_branch: $BRANCH"');
     expect(block).toContain("projects/${SLUG:-unknown}/specs");
   });
 
   it("delegates /build living plans to the deterministic resolver", () => {
     expect(block).toContain("gstack-build plan-status");
+    // Must use the real CLI flag (--resume), never the rejected --resume-only.
+    expect(block).toContain("--resume --json");
+    expect(block).not.toContain("--resume-only");
   });
 
   it("STOPS instead of fuzzy-guessing — no content-grep / mtime / extra dirs", () => {
