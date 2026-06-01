@@ -44,9 +44,11 @@ describe("plan-review CRITICAL → re-synth RESOLVED pairing (class 5)", () => {
       path.resolve(import.meta.dir, "..", "cli.ts"),
       "utf8",
     );
-    // The new path uses runPlanReviewLoop, not reconcilePlanReview.
-    expect(cliSrc).toContain("runPlanReviewLoop");
-    // critical_exit_pending state still gets persisted on loopResult.exitCode === 3,
+    // The path now uses runPlanReviewSingle (single-round), not
+    // reconcilePlanReview and not the deleted runPlanReviewLoop.
+    expect(cliSrc).toContain("runPlanReviewSingle");
+    expect(cliSrc).not.toContain("runPlanReviewLoop");
+    // critical_exit_pending state still gets persisted on exitCode === 3,
     // but without the faultId/stateSlug fields (no DETECTED to pair with).
     expect(cliSrc).toContain('"critical_exit_pending"');
   });
@@ -73,21 +75,20 @@ describe("plan-review CRITICAL → re-synth RESOLVED pairing (class 5)", () => {
     cliSrc =
       cliSrc ??
       fs.readFileSync(path.resolve(import.meta.dir, "..", "cli.ts"), "utf8");
-    // Find the PERSISTENCE site (status: stalemateStatus), not the
-    // gate-entry READ site (state.planReview.status === ...). Refactor
-    // dcd3d7b2 replaced the inline "critical_exit_pending" literal with a
-    // stalemateStatus variable (synth_failure_stalemate vs critical_exit_pending);
-    // the persistence assignment is now `status: stalemateStatus`.
-    const persistIdx = cliSrc.indexOf("status: stalemateStatus");
-    expect(persistIdx).toBeGreaterThan(-1);
-    const window = cliSrc.slice(
-      Math.max(0, persistIdx - 300),
-      persistIdx + 200,
+    // Find the PERSISTENCE site in the single-round exit-3 handler, not the
+    // gate-entry READ site. The single-round model records the inline
+    // "critical_exit_pending" literal (no stalemateStatus variable — that was
+    // the deleted multi-round loop) next to reviewResult.finalVerdict.
+    const exitThreeStart = cliSrc.indexOf("if (reviewResult.exitCode === 3)");
+    expect(exitThreeStart).toBeGreaterThan(-1);
+    const block = cliSrc.slice(
+      exitThreeStart,
+      cliSrc.indexOf("if (reviewResult.exitCode === 4)"),
     );
-    expect(window).toMatch(/loopResult\.finalVerdict/);
-    // Field should NOT carry faultId/stateSlug anymore (the Class 5 wiring
-    // was removed during the PR #63 merge).
-    expect(window).not.toMatch(/\bfaultId:\s*criticalFaultId/);
+    expect(block).toContain('"critical_exit_pending"');
+    expect(block).toMatch(/reviewResult\.finalVerdict/);
+    // Field should NOT carry faultId/stateSlug (Class 5 wiring stays removed).
+    expect(block).not.toMatch(/\bfaultId:\s*criticalFaultId/);
   });
 
   test("T11b: per-objection bullets use console.log, NOT console.error (no orphan DETECTED rows)", () => {

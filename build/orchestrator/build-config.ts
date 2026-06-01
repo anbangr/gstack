@@ -75,6 +75,7 @@ const ROLE_KEYS: RoleKey[] = [
   "featureVerifier",
   "monitorAgent",
   "specQualityGate",
+  "planReviewer",
 ];
 
 const PROVIDERS: RoleProvider[] = ["claude", "codex", "gemini", "kimi"];
@@ -205,14 +206,13 @@ function withMigratedRoles(value: unknown, filePath: string): unknown {
     "featureVerifier",
     "monitorAgent",
     "specQualityGate",
+    // planReviewer is required again (single-round plan review runs by
+    // default). Backfill it from the in-tree default so older user-edited
+    // configure.cm files that predate its re-introduction don't throw.
+    "planReviewer",
   ] as const) {
     if (!roles[key] && !isLoadingDefault) roles[key] = readDefaultRole(key);
   }
-  // planReviewer was removed in Increment 2; it is no longer backfilled or
-  // required. Users who run --legacy-plan-review must manually re-add the
-  // role to configure.cm. If the user-edited config still has the field, we
-  // preserve it (the field is optional in the type and the loader does not
-  // require it via ROLE_KEYS).
   return roles;
 }
 

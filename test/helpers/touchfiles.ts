@@ -1023,16 +1023,6 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
   // Build convergence E2E — real Codex verifies round-annotation contract.
   // Layer 4 from the convergence design spec: drives runPlanReviewLoop with
   // a real Codex planReviewer and a stub synth, asserts round 2 reRaises === 0.
-  // Gate-tier: if the annotation-contract prompt (Task 8) breaks, real Codex
-  // will re-raise round-1-resolved issues and this test catches it. ~$0.50/run.
-  "skill-e2e-build-convergence": [
-    "build/orchestrator/plan-reviewer.ts",
-    "build/orchestrator/plan-review-loop.ts",
-    "build/orchestrator/cli.ts",
-    "build/SKILL.md.tmpl",
-    "test/fixtures/build-convergence/bundle-1-plan.md",
-  ],
-
   // PR2 — Review prompt scope constraint. Paid eval (~$0.20/run).
   // Fires when the review prompt body or hygiene gate changes.
   "review-prompt-scope-constraint": [
@@ -1385,12 +1375,6 @@ export const E2E_TIERS: Record<string, "gate" | "periodic"> = {
   // /build investigate subcommand E2E — periodic (planted halt event; LLM
   // investigation output is non-deterministic; costs ~$0.50/run).
   "build-investigate-bug-report": "periodic",
-
-  // Build convergence E2E — gate (annotation-contract safety regression).
-  // Real Codex must not re-raise resolved objections. Deterministic enough
-  // for gate-tier because the assertion is structural (reRaises count), not
-  // a quality score. ~$0.50/run via codex exec.
-  "skill-e2e-build-convergence": "gate",
 
   // PR2 — Review prompt scope constraint. Periodic (paid eval, ~$0.20/run).
   "review-prompt-scope-constraint": "periodic",

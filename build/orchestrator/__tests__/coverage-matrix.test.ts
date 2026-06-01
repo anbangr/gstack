@@ -74,17 +74,7 @@ const MODULE_TEST_OWNERS: Record<string, string[]> = {
   "parser.ts": ["parser.test.ts"],
   "phase-runner.ts": ["phase-runner.test.ts"],
   "plan-mutator.ts": ["plan-mutator.test.ts"],
-  "plan-review-loop.ts": [
-    "plan-review-history-jsonl.test.ts",
-    "convergence-jsonl.test.ts",
-    "adaptive-cap-set-aware.test.ts",
-    "plan-reviewer-triage-tty.test.ts",
-    "plan-reviewer-triage-non-tty.test.ts",
-    "plan-reviewer-loop.test.ts",
-    "integration/loop-converge-bundle-1.test.ts",
-    "integration/loop-bail-no-progress.test.ts",
-    "integration/loop-synth-disputes.test.ts",
-  ],
+  "plan-review-single.ts": ["plan-review-single.test.ts"],
   "plan-reviewer.ts": [
     "cli.test.ts",
     "plan-review-prompts.test.ts",
