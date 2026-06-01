@@ -734,7 +734,7 @@ SOURCE = "codex" if Codex ran, "claude" if subagent ran.
 
 // ─── Plan File Discovery (shared helper) ──────────────────────────────
 
-function generatePlanFileDiscovery(): string {
+export function generatePlanFileDiscovery(): string {
   return `### Plan File Discovery
 
 1. **Conversation context (primary):** Check if there is an active plan file in this conversation. The host agent's system messages include plan file paths when in plan mode. If found, use it directly — this is the most reliable signal.
