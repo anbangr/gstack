@@ -74,7 +74,13 @@ import { generateInvokeSkill } from "./composition";
 import { generateReviewArmy } from "./review-army";
 import { generateDxFramework } from "./dx";
 import { generateModelOverlay } from "./model-overlay";
-import { generateGBrainContextLoad, generateGBrainSaveResults } from "./gbrain";
+import {
+  generateGBrainContextLoad,
+  generateGBrainSaveResults,
+  generateBrainPreflight,
+  generateBrainCacheRefresh,
+  generateBrainWriteBack,
+} from "./gbrain";
 import {
   generateQuestionPreferenceCheck,
   generateQuestionLog,
@@ -85,11 +91,18 @@ import {
   generateTasksSectionEmit,
   generateTasksSectionAggregate,
 } from "./tasks-section";
+import { SECTION, SECTION_INDEX } from "./sections";
+import {
+  generateRedactTaxonomyTable,
+  generateRedactInvocationBlock,
+} from "./redact-doc";
 
 export const RESOLVERS: Record<string, ResolverValue> = {
   SLUG_EVAL: generateSlugEval,
   SLUG_SETUP: generateSlugSetup,
   BUILD_CLI_CANDIDATES: generateBuildCliCandidates,
+  REDACT_TAXONOMY_TABLE: generateRedactTaxonomyTable,
+  REDACT_INVOCATION_BLOCK: generateRedactInvocationBlock,
   COMMAND_REFERENCE: generateCommandReference,
   SNAPSHOT_FLAGS: generateSnapshotFlags,
   PREAMBLE: generatePreamble,
@@ -138,10 +151,15 @@ export const RESOLVERS: Record<string, ResolverValue> = {
   BIN_DIR: (ctx) => ctx.paths.binDir,
   GBRAIN_CONTEXT_LOAD: generateGBrainContextLoad,
   GBRAIN_SAVE_RESULTS: generateGBrainSaveResults,
+  BRAIN_PREFLIGHT: generateBrainPreflight,
+  BRAIN_CACHE_REFRESH: generateBrainCacheRefresh,
+  BRAIN_WRITE_BACK: generateBrainWriteBack,
   QUESTION_PREFERENCE_CHECK: generateQuestionPreferenceCheck,
   QUESTION_LOG: generateQuestionLog,
   INLINE_TUNE_FEEDBACK: generateInlineTuneFeedback,
   MAKE_PDF_SETUP: generateMakePdfSetup,
   TASKS_SECTION_EMIT: generateTasksSectionEmit,
   TASKS_SECTION_AGGREGATE: generateTasksSectionAggregate,
+  SECTION,
+  SECTION_INDEX,
 };
