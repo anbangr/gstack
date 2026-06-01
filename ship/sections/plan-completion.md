@@ -35,8 +35,8 @@ PLAN=""
 # (a) Exact branch->plan binding: spec_branch frontmatter (written by /spec).
 SPEC_DIR="${GSTACK_STATE_ROOT:-$HOME/.gstack}/projects/${SLUG:-unknown}/specs"
 if [ -d "$SPEC_DIR" ]; then
-  MATCHES=$(grep -l "^spec_branch: $BRANCH$" "$SPEC_DIR"/*.md 2>/dev/null || true)
-  N=$(printf '%s' "$MATCHES" | grep -c . 2>/dev/null || echo 0)
+  MATCHES=$(grep -lxF "spec_branch: $BRANCH" "$SPEC_DIR"/*.md 2>/dev/null || true)
+  N=$(printf '%s' "$MATCHES" | grep -c . 2>/dev/null); [ -n "$N" ] || N=0
   if [ "$N" = "1" ]; then PLAN="$MATCHES"; fi
   if [ "$N" -gt 1 ] 2>/dev/null; then
     echo "PLAN_AMBIGUOUS: $N specs bound to branch '$BRANCH':"; printf '%s\n' "$MATCHES"
@@ -45,7 +45,7 @@ fi
 # (b) /build living plan: ask the deterministic resolver (knows inbox/living-plan
 #     + run claims). Only when a gstack repo is known and the CLI is available.
 if [ -z "$PLAN" ] && [ -n "${GSTACK_REPO:-}" ] && command -v gstack-build >/dev/null 2>&1; then
-  SEL=$(gstack-build plan-status --gstack-repo "$GSTACK_REPO" --resume-only --json 2>/dev/null || echo '{}')
+  SEL=$(gstack-build plan-status --gstack-repo "$GSTACK_REPO" --resume --json 2>/dev/null || echo '{}')
   case "$(echo "$SEL" | jq -r '.result // "none"' 2>/dev/null)" in
     selected) PLAN=$(echo "$SEL" | jq -r '.selected.livingPlanPath // .selected.path // empty' 2>/dev/null) ;;
     ambiguous|blocked) echo "PLAN_AMBIGUOUS: gstack-build plan-status is ambiguous/blocked — run: gstack-build plan-status --gstack-repo \"$GSTACK_REPO\"" ;;
