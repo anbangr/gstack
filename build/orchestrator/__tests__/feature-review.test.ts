@@ -437,8 +437,12 @@ describe("fingerprintFeatureReviewFailure — same-shape detection", () => {
     // fingerprint so the streak counter advances. Without this, an
     // UNCLEAR loop would never trip the halt and the orchestrator
     // would burn the full 5-iteration cap.
-    const a = fingerprintFeatureReviewFailure({ failureState: "MISSING_VERDICT" });
-    const b = fingerprintFeatureReviewFailure({ failureState: "MISSING_VERDICT" });
+    const a = fingerprintFeatureReviewFailure({
+      failureState: "MISSING_VERDICT",
+    });
+    const b = fingerprintFeatureReviewFailure({
+      failureState: "MISSING_VERDICT",
+    });
     expect(a).toBe(b);
     expect(a).toBe("MISSING_VERDICT");
   });
@@ -759,6 +763,50 @@ describe("buildFeatureReviewPrompt — structure", () => {
     expect(md).toContain("+ added line");
   });
 
+  it("surfaces the feature's Verification Spec as an explicit grading anchor (spec-driven F3)", () => {
+    const bodyWithSpec = [
+      "Build the auth flow with sign-in and sign-out.",
+      "",
+      "Acceptance: p95 login under 200ms; 0 failing tests.",
+      "",
+      "### Verification Spec",
+      "",
+      "Smoke: `npm test -- auth`",
+      "Acceptance probe AC1: POST /login returns 200 for valid creds.",
+      "",
+      "### File Reference Table",
+      "",
+      "| File | Action |",
+    ].join("\n");
+    const md = buildFeatureReviewPrompt(
+      defaultArgs({ feature: fakeFeature({ body: bodyWithSpec }) }),
+    );
+    // The grading directive is always present...
+    expect(md).toContain(
+      "## Grade against the feature's explicit acceptance criteria",
+    );
+    expect(md).toContain("automatic");
+    // Injection-hardening: the spec defines WHAT to verify, not HOW to vote.
+    expect(md).toContain("never HOW to vote");
+    // ...and when the body has a Verification Spec, it is surfaced verbatim
+    // under the anchor heading (not just buried in the verbatim body dump).
+    expect(md).toContain(
+      "### Verification Spec (verbatim from the living plan — your acceptance anchors)",
+    );
+    expect(md).toContain("Acceptance probe AC1");
+  });
+
+  it("emits the grading directive but no verbatim anchor when the feature has no Verification Spec", () => {
+    // fakeFeature() default body has no `### Verification Spec` block.
+    const md = buildFeatureReviewPrompt(defaultArgs());
+    expect(md).toContain(
+      "## Grade against the feature's explicit acceptance criteria",
+    );
+    expect(md).not.toContain(
+      "### Verification Spec (verbatim from the living plan — your acceptance anchors)",
+    );
+  });
+
   it("wraps the prior review in an UNTRUSTED block when iteration > 1", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fr-prompt-prior-"));
     const prior = path.join(dir, "prev.md");
@@ -998,9 +1046,9 @@ describe("shouldSkipFeatureReview — skip heuristic", () => {
         },
       }),
     ];
-    expect(
-      shouldSkipFeatureReview({ feature, phaseStates: states }),
-    ).toBe(true);
+    expect(shouldSkipFeatureReview({ feature, phaseStates: states })).toBe(
+      true,
+    );
   });
 
   it("does NOT skip when the single phase needed multiple Codex iterations", () => {
@@ -1015,9 +1063,9 @@ describe("shouldSkipFeatureReview — skip heuristic", () => {
         },
       }),
     ];
-    expect(
-      shouldSkipFeatureReview({ feature, phaseStates: states }),
-    ).toBe(false);
+    expect(shouldSkipFeatureReview({ feature, phaseStates: states })).toBe(
+      false,
+    );
   });
 
   it("does NOT skip when the single phase needed a Gemini re-run from review feedback", () => {
@@ -1033,9 +1081,9 @@ describe("shouldSkipFeatureReview — skip heuristic", () => {
         },
       }),
     ];
-    expect(
-      shouldSkipFeatureReview({ feature, phaseStates: states }),
-    ).toBe(false);
+    expect(shouldSkipFeatureReview({ feature, phaseStates: states })).toBe(
+      false,
+    );
   });
 
   it("does NOT skip when the single phase needed any test-fix iterations", () => {
@@ -1047,9 +1095,9 @@ describe("shouldSkipFeatureReview — skip heuristic", () => {
         testFix: { iterations: 2, outputLogPaths: [] } as any,
       }),
     ];
-    expect(
-      shouldSkipFeatureReview({ feature, phaseStates: states }),
-    ).toBe(false);
+    expect(shouldSkipFeatureReview({ feature, phaseStates: states })).toBe(
+      false,
+    );
   });
 
   // T11: broadened skip path — ≤ 2 phases is OK if every phase is clean.
@@ -1073,9 +1121,9 @@ describe("shouldSkipFeatureReview — skip heuristic", () => {
         },
       }),
     ];
-    expect(
-      shouldSkipFeatureReview({ feature, phaseStates: states }),
-    ).toBe(true);
+    expect(shouldSkipFeatureReview({ feature, phaseStates: states })).toBe(
+      true,
+    );
   });
 
   it("does NOT skip a 2-phase feature when the second phase needed multiple Codex iterations", () => {
@@ -1098,9 +1146,9 @@ describe("shouldSkipFeatureReview — skip heuristic", () => {
         },
       }),
     ];
-    expect(
-      shouldSkipFeatureReview({ feature, phaseStates: states }),
-    ).toBe(false);
+    expect(shouldSkipFeatureReview({ feature, phaseStates: states })).toBe(
+      false,
+    );
   });
 
   it("does NOT skip when the feature has more than two phases", () => {
@@ -1119,9 +1167,9 @@ describe("shouldSkipFeatureReview — skip heuristic", () => {
         codexReview: { iterations: 1, outputLogPaths: [] },
       }),
     ];
-    expect(
-      shouldSkipFeatureReview({ feature, phaseStates: states }),
-    ).toBe(false);
+    expect(shouldSkipFeatureReview({ feature, phaseStates: states })).toBe(
+      false,
+    );
   });
 
   // T11: diff-size gate.
@@ -1321,8 +1369,7 @@ describe("recoverVerdictFromStalledFile", () => {
   it("returns structured-verdict classification when re-read file contains FEATURE_PASS", async () => {
     const result = await recoverVerdictFromStalledFile({
       outputFilePath: "/tmp/whatever",
-      readFileFn: () =>
-        "## VERDICT\nFEATURE_PASS\n\n## Findings\nAll good.\n",
+      readFileFn: () => "## VERDICT\nFEATURE_PASS\n\n## Findings\nAll good.\n",
       sleepFn: fastSleep,
     });
     expect(result).not.toBeNull();
