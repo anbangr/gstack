@@ -534,6 +534,49 @@ what you changed.
 `;
 
 /**
+ * Single-round plan review: the synthesizer evaluates each reviewer objection
+ * and takes a stance. Only disputes escalate to the user. cli.ts appends the
+ * numbered objection list and the plan path after this prompt.
+ */
+export const SYNTH_CHECK_PROMPT = `You synthesized a living implementation plan. A second-opinion reviewer
+raised the objections listed below. For EACH objection, decide whether you
+agree it is a real problem you should fix, or whether you dispute it.
+
+Read the plan file before deciding. Judge on the merits, not deference: a
+reviewer can be wrong, and a reviewer can catch something you missed.
+
+Output EXACTLY one line per objection, in order, nothing else:
+
+  - STANCE <N>: ACCEPT
+  - STANCE <N>: DISPUTE — <one concrete sentence on why the objection is wrong or unnecessary>
+
+where <N> is the objection number. ACCEPT means you agree and will fix it on
+the next step. DISPUTE means you disagree; the user will adjudicate, so make
+the reason specific and checkable (cite the plan section or the contradicting
+constraint). Do NOT edit the plan now. Do NOT output anything but the STANCE
+lines.
+`;
+
+/**
+ * Single-round revision: apply ONLY the objections resolved as to-fix (listed
+ * below). cli.ts appends the numbered to-fix list and the plan path. Unlike
+ * SYNTH_REVISION_PROMPT this does not depend on in-plan annotation blocks —
+ * the objections are passed inline.
+ */
+export const SYNTH_REVISE_SINGLE_PROMPT = `You synthesized a living implementation plan. A second-opinion reviewer
+raised objections and they were resolved as to-fix (listed below). Revise the
+plan to address ONLY these objections. Do NOT touch sections unrelated to
+them. Apply the suggested fix, or a better fix you can defend.
+
+Edit the plan file in place. Keep the phase-shape contract intact:
+- Do NOT split a non-code phase into separate draft/action and review phases.
+- Each executable phase keeps both required checkboxes for its kind.
+
+Return only the path of the updated plan and a single-line summary of what
+you changed.
+`;
+
+/**
  * Invoke the configured planReviewer role and return a structured verdict.
  *
  * Single automatic retry on timeout or transport failure. On double-failure,
@@ -831,7 +874,9 @@ export function parseRoundAnnotations(planText: string): RoundAnnotation[] {
       entry.reviewerOutcome = decodeAnnField(v[2].trim());
     }
 
-    const rounds = Array.from(byRound.values()).sort((a, b) => a.round - b.round);
+    const rounds = Array.from(byRound.values()).sort(
+      (a, b) => a.round - b.round,
+    );
     results.push({ location, severity, issue, suggestion, rounds });
   }
   return results;
@@ -953,8 +998,7 @@ export function writeRoundAnnotation(
   // current downstream and writer cannot distinguish them anyway.
   const hit = matches.find(
     (mt) =>
-      mt.ann.location === ann.location &&
-      mt.ann.severity === ann.severity,
+      mt.ann.location === ann.location && mt.ann.severity === ann.severity,
   );
   if (hit) {
     const merged: RoundAnnotation = {
@@ -974,7 +1018,10 @@ export function writeRoundAnnotation(
       "m",
     );
     if (phaseRe.test(planText)) {
-      return planText.replace(phaseRe, (_match, heading) => `${newBlock}\n${heading}`);
+      return planText.replace(
+        phaseRe,
+        (_match, heading) => `${newBlock}\n${heading}`,
+      );
     }
   }
   // Fallback: prepend.

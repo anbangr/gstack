@@ -59,11 +59,13 @@ export interface RoleConfigs {
    */
   monitorAgent: RoleConfig;
   /**
-   * Replaced by `specQualityGate` in Increment 2. Optional in the type so the
-   * legacy plan-review loop (behind `--legacy-plan-review`) still type-checks
-   * when a user explicitly re-adds the role to configure.cm.
+   * Single-round plan reviewer. Runs once before Phase 1 and returns
+   * objections; the synthesizer then checks each, and only genuine
+   * disagreements escalate to the user. Complementary to specQualityGate
+   * (whole-plan consistency vs per-feature spec quality). Default from
+   * build/configure.cm.
    */
-  planReviewer?: RoleConfig;
+  planReviewer: RoleConfig;
   /**
    * Per-feature spec quality gate (Increment 2). Codex scores each enriched
    * spec 0-10 against the 7-dimension rubric in `bin/codex-spec-gate.ts`.
@@ -86,6 +88,7 @@ export const ROLE_DEFINITIONS = [
   ["featureVerifier", "feature-verifier", "GSTACK_BUILD_FEATURE_VERIFIER"],
   ["monitorAgent", "monitor-agent", "GSTACK_BUILD_MONITOR_AGENT"],
   ["specQualityGate", "spec-quality-gate", "GSTACK_BUILD_SPEC_QUALITY_GATE"],
+  ["planReviewer", "plan-reviewer", "GSTACK_BUILD_PLAN_REVIEWER"],
 ] as const satisfies readonly [keyof RoleConfigs, string, string][];
 
 export type RoleKey = (typeof ROLE_DEFINITIONS)[number][0];

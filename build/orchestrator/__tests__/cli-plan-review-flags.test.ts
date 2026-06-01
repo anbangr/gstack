@@ -1,22 +1,7 @@
 import { describe, it, expect } from "bun:test";
 import { parseArgs } from "../cli";
 
-describe("cli args: plan-review flags", () => {
-  it("--plan-review-max-rounds=5 parses to args.planReviewMaxRounds=5", () => {
-    const args = parseArgs(["plan.md", "--plan-review-max-rounds=5"]);
-    expect((args as any).planReviewMaxRounds).toBe(5);
-  });
-
-  it("--plan-review-max-rounds 3 (space form) parses identically", () => {
-    const args = parseArgs(["plan.md", "--plan-review-max-rounds", "3"]);
-    expect((args as any).planReviewMaxRounds).toBe(3);
-  });
-
-  it("--plan-review-no-adaptive-cap parses to args.planReviewNoAdaptiveCap=true", () => {
-    const args = parseArgs(["plan.md", "--plan-review-no-adaptive-cap"]);
-    expect((args as any).planReviewNoAdaptiveCap).toBe(true);
-  });
-
+describe("cli args: plan-review flags (single-round)", () => {
   it("--plan-review-noninteractive=auto-reject parses to that mode", () => {
     const args = parseArgs([
       "plan.md",
@@ -25,14 +10,28 @@ describe("cli args: plan-review flags", () => {
     expect((args as any).planReviewNoninteractive).toBe("auto-reject");
   });
 
-  it("default planReviewMaxRounds is 5", () => {
-    const args = parseArgs(["plan.md"]);
-    expect((args as any).planReviewMaxRounds).toBe(5);
+  it("--plan-review-noninteractive fail-fast (space form) parses identically", () => {
+    const args = parseArgs([
+      "plan.md",
+      "--plan-review-noninteractive",
+      "fail-fast",
+    ]);
+    expect((args as any).planReviewNoninteractive).toBe("fail-fast");
   });
 
   it("default planReviewNoninteractive is 'auto-accept'", () => {
     const args = parseArgs(["plan.md"]);
     expect((args as any).planReviewNoninteractive).toBe("auto-accept");
+  });
+
+  it("default noPlanReview is false (plan review runs by default)", () => {
+    const args = parseArgs(["plan.md"]);
+    expect((args as any).noPlanReview).toBe(false);
+  });
+
+  it("--no-plan-review parses to args.noPlanReview=true", () => {
+    const args = parseArgs(["plan.md", "--no-plan-review"]);
+    expect((args as any).noPlanReview).toBe(true);
   });
 
   it("rejects invalid noninteractive mode", () => {
@@ -41,13 +40,14 @@ describe("cli args: plan-review flags", () => {
     ).toThrow();
   });
 
-  it("--legacy-plan-review absent: default legacyPlanReview is false", () => {
+  it("removed multi-round flags no longer set fields", () => {
+    // --legacy-plan-review / --plan-review-max-rounds / --plan-review-no-adaptive-cap
+    // were removed when plan review became single-round. They no longer parse
+    // into recognized args (treated as unknown flags, ignored or surfaced by
+    // the generic handler — never set the old fields).
     const args = parseArgs(["plan.md"]);
-    expect((args as any).legacyPlanReview).toBe(false);
-  });
-
-  it("--legacy-plan-review parses to args.legacyPlanReview=true", () => {
-    const args = parseArgs(["plan.md", "--legacy-plan-review"]);
-    expect((args as any).legacyPlanReview).toBe(true);
+    expect((args as any).legacyPlanReview).toBeUndefined();
+    expect((args as any).planReviewMaxRounds).toBeUndefined();
+    expect((args as any).planReviewNoAdaptiveCap).toBeUndefined();
   });
 });

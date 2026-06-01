@@ -1,7 +1,7 @@
 ---
 name: build
 preamble-tier: 4
-version: 1.34.0
+version: 1.35.0
 description: gstack autonomous execution skill.
 allowed-tools:
   - Bash
@@ -1922,13 +1922,34 @@ prior commit.
    _mark_manifest_claims_manifested
    ```
 
-5.5. **Plan Review (replaced by specQualityGate in Phase A)**: The legacy
-   `planReviewer` second-opinion loop has been replaced by `specQualityGate`
-   (codex 0-10 score per-feature) in Phase A. The gate runs against each
-   per-feature spec BEFORE synthesis, not against the synthesized living plan.
-   To restore the legacy planReviewer loop for emergencies, pass
-   `--legacy-plan-review` to `gstack-build`. The legacy loop is preserved
-   for one release cycle and will be removed in v2.1.
+5.5. **Plan Review (single-round, runs by default)**: Before Phase 1 of
+   Feature 1, `gstack-build` runs a single-round whole-plan review. It is
+   complementary to `specQualityGate` (which scores each per-feature spec 0-10
+   in Phase A): the gate checks per-feature spec quality before synthesis, this
+   checks whole-plan consistency after synthesis.
+
+   The flow is one pass, not a loop:
+   1. The `planReviewer` role reviews the synthesized living plan once and
+      returns objections (CRITICAL / IMPORTANT / SUGGESTION).
+   2. The synthesizer (`planSynthesizer` role, falling back to `planReviewer`)
+      checks each CRITICAL/IMPORTANT objection and takes a stance: ACCEPT
+      (agrees, will fix) or DISPUTE (disagrees, with a reason).
+   3. ACCEPTs are applied in one synthesizer revision. SUGGESTIONs are
+      annotated, never prompted.
+   4. Only genuine reviewer-vs-synthesizer DISAGREEMENTS escalate to you, at a
+      readline gate: `[r]` side with reviewer (apply the fix), `[s]` side with
+      synthesizer (drop it), `[d]` defer, `[q]` abort.
+
+   Controls:
+   - `--no-plan-review` skips the pass entirely.
+   - `--plan-review-noninteractive <mode>` sets CI behavior on a dispute with
+     no TTY: `auto-accept` (default, side with reviewer), `auto-reject` (side
+     with synthesizer), `fail-fast` (exit 3 on a CRITICAL dispute).
+   - `--plan-reviewer-model <m>` overrides the reviewer model for one run.
+
+   On a synth-check / revision failure the run exits 1 and persists a
+   `synth_failure` marker; a resume hits the stalemate guard (exit 3, operator
+   intervention) rather than silently bypassing the gate or restart-storming.
 
 5.7. **Branch Strategy Decision**: Read the living plan file (path from `build-synthesis-output.md`). Reason holistically about the features: are they tightly coupled and form one coherent deliverable, or do they have independent shipping value?
 
