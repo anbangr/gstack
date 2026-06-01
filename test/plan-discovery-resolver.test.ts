@@ -11,7 +11,7 @@ describe("generatePlanFileDiscovery — explicit/structured, no fuzzy search", (
 
   it("uses the structured spec_branch exact-match binding", () => {
     expect(block).toContain("^spec_branch: $BRANCH$");
-    expect(block).toContain("projects/$SLUG/specs");
+    expect(block).toContain("projects/${SLUG:-unknown}/specs");
   });
 
   it("delegates /build living plans to the deterministic resolver", () => {
