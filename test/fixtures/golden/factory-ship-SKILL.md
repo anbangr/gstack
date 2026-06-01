@@ -1561,33 +1561,59 @@ Repo: {owner/repo}
 >
 > ### Plan File Discovery
 
-1. **Conversation context (primary):** Check if there is an active plan file in this conversation. The host agent's system messages include plan file paths when in plan mode. If found, use it directly — this is the most reliable signal.
+A plan is located by EXPLICIT signal or STRUCTURED binding — never by fuzzy
+content search. Resolve in this order; first hit wins. NEVER fall back to
+scanning directories by recency or grepping for the branch/repo name.
 
-2. **Content-based search (fallback):** If no plan file is referenced in conversation context, search by content:
+1. **Explicit (highest priority):** If this skill was invoked with a plan path
+   (e.g. `--plan <path>`) or the user named a plan file in their message, use
+   that path verbatim. If the path does not exist, STOP and tell the user the
+   path is missing — do not guess an alternative.
+
+2. **Conversation context:** If the host agent's system messages reference an
+   active plan file (plan mode includes the path), use it directly.
+
+3. **Structured binding (no fuzzy match):** Resolve the branch's bound plan via
+   the `spec_branch` frontmatter that `/spec` writes, then the deterministic
+   build resolver for `/build` living plans:
 
 ```bash
-setopt +o nomatch 2>/dev/null || true  # zsh compat
-BRANCH=$(git branch --show-current 2>/dev/null | tr '/' '-')
-REPO=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)")
-# Compute project slug for ~/.gstack/projects/ lookup
-_PLAN_SLUG=$(git remote get-url origin 2>/dev/null | sed 's|.*[:/]\([^/]*/[^/]*\)\.git$|\1|;s|.*[:/]\([^/]*/[^/]*\)$|\1|' | tr '/' '-' | tr -cd 'a-zA-Z0-9._-') || true
-_PLAN_SLUG="${_PLAN_SLUG:-$(basename "$PWD" | tr -cd 'a-zA-Z0-9._-')}"
-# Search common plan file locations (project designs first, then personal/local)
-for PLAN_DIR in "$HOME/.gstack/projects/$_PLAN_SLUG" "$HOME/.claude/plans" "$HOME/.codex/plans" ".gstack/plans"; do
-  [ -d "$PLAN_DIR" ] || continue
-  PLAN=$(ls -t "$PLAN_DIR"/*.md 2>/dev/null | xargs grep -l "$BRANCH" 2>/dev/null | head -1)
-  [ -z "$PLAN" ] && PLAN=$(ls -t "$PLAN_DIR"/*.md 2>/dev/null | xargs grep -l "$REPO" 2>/dev/null | head -1)
-  [ -z "$PLAN" ] && PLAN=$(find "$PLAN_DIR" -name '*.md' -mmin -1440 -maxdepth 1 2>/dev/null | xargs ls -t 2>/dev/null | head -1)
-  [ -n "$PLAN" ] && break
-done
+setopt +o nomatch 2>/dev/null || true  # zsh compat (the *.md glob below)
+eval "$($GSTACK_ROOT/bin/gstack-paths 2>/dev/null)" 2>/dev/null || true
+eval "$($GSTACK_ROOT/bin/gstack-slug 2>/dev/null)" 2>/dev/null || true
+BRANCH=$(git branch --show-current 2>/dev/null || echo unknown)
+PLAN=""
+# (a) Exact branch->plan binding: spec_branch frontmatter (written by /spec).
+SPEC_DIR="${GSTACK_STATE_ROOT:-$HOME/.gstack}/projects/${SLUG:-unknown}/specs"
+if [ -d "$SPEC_DIR" ]; then
+  MATCHES=$(grep -l "^spec_branch: $BRANCH$" "$SPEC_DIR"/*.md 2>/dev/null || true)
+  N=$(printf '%s' "$MATCHES" | grep -c . 2>/dev/null || echo 0)
+  if [ "$N" = "1" ]; then PLAN="$MATCHES"; fi
+  if [ "$N" -gt 1 ] 2>/dev/null; then
+    echo "PLAN_AMBIGUOUS: $N specs bound to branch '$BRANCH':"; printf '%s\n' "$MATCHES"
+  fi
+fi
+# (b) /build living plan: ask the deterministic resolver (knows inbox/living-plan
+#     + run claims). Only when a gstack repo is known and the CLI is available.
+if [ -z "$PLAN" ] && [ -n "${GSTACK_REPO:-}" ] && command -v gstack-build >/dev/null 2>&1; then
+  SEL=$(gstack-build plan-status --gstack-repo "$GSTACK_REPO" --resume-only --json 2>/dev/null || echo '{}')
+  case "$(echo "$SEL" | jq -r '.result // "none"' 2>/dev/null)" in
+    selected) PLAN=$(echo "$SEL" | jq -r '.selected.livingPlanPath // .selected.path // empty' 2>/dev/null) ;;
+    ambiguous|blocked) echo "PLAN_AMBIGUOUS: gstack-build plan-status is ambiguous/blocked — run: gstack-build plan-status --gstack-repo \"$GSTACK_REPO\"" ;;
+  esac
+fi
 [ -n "$PLAN" ] && echo "PLAN_FILE: $PLAN" || echo "NO_PLAN_FILE"
 ```
 
-3. **Validation:** If a plan file was found via content-based search (not conversation context), read the first 20 lines and verify it is relevant to the current branch's work. If it appears to be from a different project or feature, treat as "no plan file found."
+4. **Do NOT guess.** If the block prints `NO_PLAN_FILE` or `PLAN_AMBIGUOUS`,
+   stop the fuzzy instinct: there is no reliable plan binding. For an audit
+   (e.g. /ship Step 8, /review completion), skip with "No plan file detected —
+   skipping the completion audit." For a workflow that requires a plan, ask the
+   user to pass `--plan <path>` or to run from plan mode.
 
-**Error handling:**
-- No plan file found → skip with "No plan file detected — skipping."
-- Plan file found but unreadable (permissions, encoding) → skip with "Plan file found but unreadable — skipping."
+**Validation:** Once a path is chosen by ANY step above, read its first 20 lines
+to confirm it is a real plan (phase/feature headings or checkbox items). If
+unreadable, treat as `NO_PLAN_FILE` — never substitute a different file.
 
 ### Actionable Item Extraction
 

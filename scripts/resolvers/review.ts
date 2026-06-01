@@ -754,6 +754,7 @@ scanning directories by recency or grepping for the branch/repo name.
    build resolver for \`/build\` living plans:
 
 \`\`\`bash
+setopt +o nomatch 2>/dev/null || true  # zsh compat (the *.md glob below)
 eval "$(~/.claude/skills/gstack/bin/gstack-paths 2>/dev/null)" 2>/dev/null || true
 eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" 2>/dev/null || true
 BRANCH=$(git branch --show-current 2>/dev/null || echo unknown)
