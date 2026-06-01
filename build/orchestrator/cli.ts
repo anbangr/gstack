@@ -135,6 +135,7 @@ import {
   writeFeatureReviewMetrics,
   watchFirstWrite,
 } from "./feature-review-metrics";
+import { writeFeatureVerifierMetrics } from "./feature-verifier-metrics";
 import {
   computeCacheKey,
   lookupCache,
@@ -13995,6 +13996,7 @@ async function main() {
               console.log(
                 `\n▶ Feature ${featureState.number} pre-merge verify (${roleLabel(args.roles.featureVerifier)})`,
               );
+              const _verifyStart = Date.now();
               const verifierResult = await runFeatureVerifier({
                 feature: featureDef,
                 featureState,
@@ -14005,6 +14007,42 @@ async function main() {
                 dryRun: args.dryRun,
                 dispatcher: (opts) => runRoleTask(opts),
               });
+              // T12 instrumentation. Emit before the verdict branching so
+              // every verdict (PASS/GAPS/UNCLEAR) is recorded. The
+              // featureReviewVerdict correlation answers whether T12 ever
+              // catches a feature F3 already passed — the keep-vs-demote
+              // signal. Best-effort; never blocks the ship path.
+              {
+                let _verifyOutBytes = 0;
+                try {
+                  _verifyOutBytes = fs.statSync(
+                    verifierResult.outputFilePath,
+                  ).size;
+                } catch {
+                  // Output file may be missing if the dispatcher crashed.
+                }
+                writeFeatureVerifierMetrics({
+                  ts: new Date().toISOString(),
+                  feature: String(featureState.number),
+                  // Run-level slug (not the per-feature verifier sub-slug) so
+                  // all of a run's feature rows group under one key. The
+                  // feature number lives in the `feature` field.
+                  slug,
+                  verdict: verifierResult.verdict,
+                  gapsCount: verifierResult.gaps.length,
+                  // F3 ran iff it recorded a featureReview block. !ran means
+                  // F3 was skipped (heuristic / --skip-feature-review / not
+                  // configured) — distinct from "ran and passed".
+                  featureReviewRan: featureState.featureReview != null,
+                  featureReviewVerdict:
+                    featureState.featureReview?.finalVerdict ?? null,
+                  structured: verifierResult.structuredReport != null,
+                  strictMode: !!args.strictPreMergeVerify,
+                  reason: verifierResult.reason ?? null,
+                  wallMs: Date.now() - _verifyStart,
+                  outputBytes: _verifyOutBytes,
+                });
+              }
               if (verifierResult.verdict === "GAPS") {
                 featureState.status = "paused";
                 const gapsList =

@@ -32,6 +32,7 @@ const MODULE_TEST_OWNERS: Record<string, string[]> = {
   "feature-review-prompt.ts": ["feature-review-prompt.test.ts"],
   "feature-review.ts": ["feature-review.test.ts"],
   "feature-verifier.ts": ["feature-verifier-pre-merge.test.ts"],
+  "feature-verifier-metrics.ts": ["feature-verifier-metrics.test.ts"],
   "gbrain.ts": ["gbrain.test.ts"],
   "halt-event-helpers.ts": ["halt-event-helpers.test.ts"],
   "halt-events.ts": ["halt-events.test.ts"],
