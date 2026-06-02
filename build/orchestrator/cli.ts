@@ -3277,9 +3277,7 @@ export async function recoverMutableAgentCommit(opts: {
       };
     }
   }
-  if (summary.trim() === "") {
-    return { recovered: false, errors: [], cleaned: [] };
-  }
+  const summaryEmpty = summary.trim() === "";
 
   const dirtyPaths = new Set(after.status.map(parsePorcelainPath));
   // Bug F fallback (next block) gates on TRACKED changes only — collect
@@ -3299,6 +3297,20 @@ export async function recoverMutableAgentCommit(opts: {
       .filter((line) => !/^[?!]/.test(line) && line.length >= 3)
       .map(parsePorcelainPath),
   );
+  // Empty-summary recovery: a blank output summary used to be an
+  // unconditional no-op — recovery refused and the dirty tree then failed
+  // the hygiene gate (the old "intended semantic" pinned by test T-F5). But
+  // Codex in some environments writes correct, fully-tracked changes and
+  // emits a blank summary, which wedged the phase on otherwise shippable
+  // work. When real TRACKED work exists, recover it via the Bug-F fallback
+  // below and synthesize a summary at the commit site (see `summaryEmpty`
+  // writeback) so the downstream requireNonEmptyOutput gate has content.
+  // When the only dirty state is untracked scratch (no tracked changes),
+  // keep the clean no-op: there is nothing safe to recover, and the hygiene
+  // gate above this function still fails the dirty tree as designed.
+  if (summaryEmpty && trackedChangePaths.size === 0) {
+    return { recovered: false, errors: [], cleaned: [] };
+  }
   let files = extractSummaryFilePaths(summary, opts.cwd).filter((filePath) => {
     const abs = path.join(opts.cwd, filePath);
     return fs.existsSync(abs) || dirtyPaths.has(filePath);
@@ -3311,9 +3323,11 @@ export async function recoverMutableAgentCommit(opts: {
   // git status (NOT untracked/ignored — agents leave scratch artifacts
   // that the hygiene gate correctly rejects). The downstream role-id
   // refusal (test-writer non-test boundary from PR #102) still applies,
-  // so this can't bypass the role boundary. The empty-summary gate at
-  // line 3002 stays authoritative — agents that wrote nothing get no
-  // fallback recovery. See
+  // so this can't bypass the role boundary. An empty summary no longer
+  // blocks this fallback: when tracked work exists the agent's changes are
+  // recovered and a summary is synthesized at the commit site; only an
+  // untracked-only / no-meaningful-change tree stays a no-op (handled by
+  // the `summaryEmpty && trackedChangePaths.size === 0` gate above). See
   // ~/.claude/plans/fix-recovery-path-extraction-prose-summaries.md.
   // A7: an agent that declared NO_CHANGES_NEEDED must NOT have host-side
   // recovery commit changes it never named. Skipping the tracked-changes
@@ -3544,9 +3558,40 @@ export async function recoverMutableAgentCommit(opts: {
     encoding: "utf8",
   });
   const cleaned = cleanupGeneratedCacheChanges(opts.cwd);
+  const recoveredCommit = head.status === 0 ? head.stdout.trim() : undefined;
+  // Empty-summary recovery: the agent produced no output summary, so the
+  // downstream requireNonEmptyOutput hygiene check would fail the phase even
+  // though we just committed correct, tracked work. Synthesize a summary
+  // from the recovery commit (git show --stat) and write it back to the
+  // agent's output file so the gate has content and the reviewer /
+  // feature-verifier can grade against the actual diff. Best-effort: a write
+  // failure here is non-fatal — the commit already landed, and the
+  // empty-output error is a far smaller problem than losing the work.
+  if (summaryEmpty && opts.outputFilePath) {
+    const stat = spawnSync(
+      "git",
+      ["show", "--stat", "--format=%h %s%n%n%b", "HEAD"],
+      { cwd: opts.cwd, encoding: "utf8" },
+    );
+    const fileList = stagedPaths.map((p) => `- ${p}`).join("\n");
+    const synthesized =
+      `# Recovered summary (agent emitted no output)\n\n` +
+      `The ${opts.label} produced no output summary. gstack-build reconstructed ` +
+      `this summary from the recovery commit so downstream review has content. ` +
+      `The work below was committed from the worktree's tracked changes.\n\n` +
+      `## Files committed\n\n${fileList || "- (none)"}\n\n` +
+      `## Recovery commit\n\n\`\`\`\n${(stat.stdout || "").trim()}\n\`\`\`\n`;
+    try {
+      fs.writeFileSync(opts.outputFilePath, synthesized);
+    } catch (err) {
+      console.warn(
+        `[${opts.label}] could not write synthesized recovery summary to ${opts.outputFilePath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
   return {
     recovered: true,
-    commit: head.status === 0 ? head.stdout.trim() : undefined,
+    commit: recoveredCommit,
     errors: [],
     cleaned,
   };

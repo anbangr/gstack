@@ -15,7 +15,10 @@
  *           (PR #102 role boundary wins after fallback)
  *   - T-F3: prose summary + modified test path + roleId=test-writer → accepted
  *   - T-F4: backtick summary path → existing behavior preserved, no fallback fires
- *   - T-F5: empty summary + modified path → still no-op (summary.trim() === "" wins)
+ *   - T-F5: empty summary + modified TRACKED path → recovers, commits, synthesizes a summary
+ *           (build-empty-summary-recovery — inverts the old "intended no-op")
+ *   - T-F5b: empty summary + UNTRACKED-only → clean no-op (no scratch commit, errors: [])
+ *   - T-F5c: empty summary + modified NON-test path + roleId=test-writer → still REFUSED
  *   - T-F6 (static-grep): cli.ts contains the fallback wiring + warning string
  *   - T-F7 (regression for the dev-time bug): untracked-only dirty tree → fallback does NOT fire
  *           (prevents the hygiene-sibling-repos `STILL FAILS` test from regressing)
@@ -187,11 +190,17 @@ describe("Bug F — prose-summary fallback behavior", () => {
     expect(head.stdout.trim()).not.toBe(before.head);
   });
 
-  it("T-F5: empty summary + modified path → no-op (summary.trim() === '' gate wins)", async () => {
+  it("T-F5: empty summary + modified TRACKED path → recovers, commits, synthesizes a summary", async () => {
+    // Empty-summary recovery (build-empty-summary-recovery): inverts the old
+    // T-F5 "intended no-op". Codex sometimes writes correct, fully-tracked
+    // changes and emits a blank summary; that used to wedge the phase on
+    // shippable work. Recovery now commits the tracked work and writes a
+    // synthesized summary back so the downstream requireNonEmptyOutput gate
+    // has content.
     const before = captureGitSnapshot(cwd);
     fs.writeFileSync(
       path.join(cwd, "test", "feature.test.ts"),
-      "// agent edits but didn't bother writing summary\n",
+      "// agent edits but didn't bother writing summary\nit('x', () => {});\n",
     );
     const outputFilePath = path.join(tmpDir, "agent-output.md");
     fs.writeFileSync(outputFilePath, "   \n\n");
@@ -201,11 +210,69 @@ describe("Bug F — prose-summary fallback behavior", () => {
       outputFilePath,
       label: "primary implementor",
     });
-    // Empty summary → no recovery. The hygiene gate above this function
-    // will still see the dirty tree and fail — that's the intended
-    // semantic.
+    expect(result.recovered).toBe(true);
+    expect(result.commit).toBeDefined();
+    expect(result.errors).toEqual([]);
+    // The recovery commit actually contains the agent's tracked work.
+    const log = spawnSync(
+      "git",
+      ["log", "-1", "--name-only", "--format="],
+      { cwd, encoding: "utf8" },
+    );
+    expect(log.stdout).toContain("test/feature.test.ts");
+    // The blank output file is replaced by a synthesized, non-empty summary
+    // that names the committed files — exactly what the empty-output hygiene
+    // check reads.
+    const synthesized = fs.readFileSync(outputFilePath, "utf8");
+    expect(synthesized.trim()).not.toBe("");
+    expect(synthesized).toContain("Recovered summary");
+    expect(synthesized).toContain("test/feature.test.ts");
+  });
+
+  it("T-F5b: empty summary + UNTRACKED-only dirty tree → clean no-op (no scratch commit)", async () => {
+    // The relaxed empty-summary gate must still refuse when the only dirty
+    // state is untracked scratch — there is nothing safe to recover, and the
+    // hygiene gate above this function fails the dirty tree as designed.
+    // Returns the clean no-op shape (errors: []), not a failure error.
+    const before = captureGitSnapshot(cwd);
+    fs.writeFileSync(path.join(cwd, "stray.txt"), "scratch from agent\n");
+    const outputFilePath = path.join(tmpDir, "agent-output.md");
+    fs.writeFileSync(outputFilePath, "   \n\n");
+    const result = await recoverMutableAgentCommit({
+      cwd,
+      before,
+      outputFilePath,
+      label: "primary implementor",
+    });
     expect(result.recovered).toBe(false);
     expect(result.errors).toEqual([]);
+    // HEAD must not have moved — no scratch was committed.
+    const after = captureGitSnapshot(cwd);
+    expect(after.head).toBe(before.head);
+  });
+
+  it("T-F5c: empty summary + modified NON-test path + roleId=test-writer → still REFUSED", async () => {
+    // The test-writer role-drift boundary (PR #102) wins even when the
+    // summary is blank: an empty-summary test-writer that touched production
+    // source is refused, not silently committed.
+    const before = captureGitSnapshot(cwd);
+    fs.writeFileSync(
+      path.join(cwd, "src", "feature.ts"),
+      "export const x = 2;\n",
+    );
+    const outputFilePath = path.join(tmpDir, "agent-output.md");
+    fs.writeFileSync(outputFilePath, "   \n\n");
+    const result = await recoverMutableAgentCommit({
+      cwd,
+      before,
+      outputFilePath,
+      label: "test-writer",
+      roleId: "test-writer",
+    });
+    expect(result.recovered).toBe(false);
+    expect(result.errors.join("\n")).toContain("test-writer recovery REFUSED");
+    const after = captureGitSnapshot(cwd);
+    expect(after.head).toBe(before.head);
   });
 
   it("T-F8: prose summary + NEW test file (status `A`) via `git add` + roleId=test-writer → accepted", async () => {
