@@ -350,7 +350,7 @@ describe("Bug F — static-grep wiring guards", () => {
     // regress to the untracked-files-get-committed bug class.
     expect(cliContent).toContain("trackedChangePaths");
     expect(cliContent).toMatch(
-      /trackedChangePaths\.size\s*>\s*0/,
+      /fallbackSource\.size\s*>\s*0/,
     );
     expect(cliContent).toMatch(
       /falling back to.*tracked change\(s\) from git status/,
@@ -381,7 +381,23 @@ describe("Bug F — static-grep wiring guards", () => {
     // non-ASCII filenames. extractSummaryFilePaths already sorts;
     // the fallback must match for cross-run reproducibility.
     expect(cliContent).toMatch(
-      /Array\.from\(trackedChangePaths\)[\s\S]{0,400}\.sort\(\)/,
+      /Array\.from\(fallbackSource\)[\s\S]{0,500}\.sort\(\)/,
+    );
+  });
+
+  it("T-F6d: empty-summary recovery gates + stages on contentHashDelta (agent-attributable, NOT raw dirt)", () => {
+    // Critical guard (cross-model review): a blank summary must NOT let
+    // recovery commit pre-existing dirty tracked files. The empty-summary
+    // path computes agent-attributable changes via contentHashDelta and
+    // stages `fallbackSource` (which is agentTrackedChangePaths when the
+    // summary is empty). A refactor that gates the empty-summary case on raw
+    // `trackedChangePaths` again would re-introduce the dirt-laundering bug.
+    expect(cliContent).toMatch(
+      /if\s*\(summaryEmpty\)\s*\{[\s\S]{0,400}contentHashDelta\(/,
+    );
+    expect(cliContent).toMatch(/agentTrackedChangePaths/);
+    expect(cliContent).toMatch(
+      /summaryEmpty\s*&&\s*agentTrackedChangePaths\s*\n?\s*\?\s*agentTrackedChangePaths/,
     );
   });
 });

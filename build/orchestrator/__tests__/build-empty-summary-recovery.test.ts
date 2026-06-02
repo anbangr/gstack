@@ -33,7 +33,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
-import { applyMutableAgentHygiene, captureGitSnapshot } from "../cli";
+import {
+  applyMutableAgentHygiene,
+  captureGitSnapshot,
+  recoverMutableAgentCommit,
+} from "../cli";
 import type { SubAgentResult } from "../sub-agents";
 
 const cliPath = path.resolve(import.meta.dir, "../cli.ts");
@@ -114,6 +118,16 @@ describe("empty-summary recovery — applyMutableAgentHygiene no-wedge", () => {
     expect(synthesized.trim()).not.toBe("");
     expect(synthesized).toContain("Recovered summary");
     expect(synthesized).toContain("src.ts");
+    // The synthesized summary must actually embed the `git show --stat` block
+    // (not just the file list) so downstream review sees the real diffstat.
+    expect(synthesized).toContain("## Recovery commit");
+    expect(synthesized).toMatch(/src\.ts\s*\|\s*\d+/);
+    // The recovery commit carries an attribution trailer in git log.
+    const body = spawnSync("git", ["log", "-1", "--format=%B"], {
+      cwd,
+      encoding: "utf8",
+    });
+    expect(body.stdout).toContain("Recovery-Reason: empty agent summary");
   });
 
   it("T-EMPTY-2: empty output + UNTRACKED-only dirty + exit 0 → still wedges (no scratch commit)", async () => {
@@ -144,15 +158,85 @@ describe("empty-summary recovery — applyMutableAgentHygiene no-wedge", () => {
     });
     expect(head.stdout.trim()).toBe(before.head);
   });
+
+  it("T-EMPTY-5: empty summary + PRE-EXISTING dirt + agent did nothing → dirt NOT committed", async () => {
+    // Critical cross-model finding: a blank-summary run must not launder
+    // pre-existing dirty tracked files into a recovery commit. Here the file
+    // is dirty BEFORE `before` is captured and the agent makes no further
+    // change. contentHashDelta sees the same bytes in before and after
+    // (idempotent) → no agent-attributable change → recovery no-ops, HEAD
+    // does not move, and the pre-existing edit stays uncommitted.
+    fs.writeFileSync(path.join(cwd, "src.ts"), "export const x = 999;\n"); // pre-existing dirt
+    const before = captureGitSnapshot(cwd); // dirt is already present in `before`
+    const outputFilePath = path.join(tmpRoot, "agent-output.md");
+    fs.writeFileSync(outputFilePath, "   \n\n");
+
+    const result = await recoverMutableAgentCommit({
+      cwd,
+      before,
+      outputFilePath,
+      label: "primary implementor",
+      roleId: "primary-impl",
+    });
+
+    expect(result.recovered).toBe(false);
+    const head = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd,
+      encoding: "utf8",
+    });
+    expect(head.stdout.trim()).toBe(before.head); // HEAD did not move
+    // The pre-existing edit is still dirty/uncommitted — not laundered.
+    const status = spawnSync("git", ["status", "--porcelain"], {
+      cwd,
+      encoding: "utf8",
+    });
+    expect(status.stdout).toContain("src.ts");
+  });
+
+  it("T-EMPTY-6: empty summary + DELETION of a tracked file → recovers and commits the deletion", async () => {
+    // Deletion gap (cross-model review): deleted tracked files don't exist on
+    // disk, but they're legitimate agent work. contentHashDelta counts the
+    // deletion and the fallback admits `D`-status paths so `git add` stages
+    // the removal instead of dropping it.
+    const before = captureGitSnapshot(cwd);
+    fs.unlinkSync(path.join(cwd, "src.ts")); // tracked deletion (` D src.ts`)
+    const outputFilePath = path.join(tmpRoot, "agent-output.md");
+    fs.writeFileSync(outputFilePath, "   \n\n");
+
+    const result = await recoverMutableAgentCommit({
+      cwd,
+      before,
+      outputFilePath,
+      label: "primary implementor",
+      roleId: "primary-impl",
+    });
+
+    expect(result.recovered).toBe(true);
+    expect(result.commit).toBeDefined();
+    // The recovery commit records the deletion, and the tree is clean after.
+    const show = spawnSync("git", ["show", "--stat", "--format=", "HEAD"], {
+      cwd,
+      encoding: "utf8",
+    });
+    expect(show.stdout).toContain("src.ts");
+    const status = spawnSync("git", ["status", "--porcelain"], {
+      cwd,
+      encoding: "utf8",
+    });
+    expect(status.stdout.trim()).toBe("");
+  });
 });
 
 describe("empty-summary recovery — static-grep wiring guards", () => {
   it("T-EMPTY-3: cli.ts has the empty-summary recovery gate + synthesized-summary writeback", () => {
     // A refactor that drops these would silently re-introduce the wedge.
     expect(cliContent).toContain('const summaryEmpty = summary.trim() === "";');
-    expect(cliContent).toMatch(
-      /summaryEmpty\s*&&\s*trackedChangePaths\.size\s*===\s*0/,
-    );
+    // The gate must be agent-attributable (contentHashDelta), never raw dirt —
+    // see the critical cross-model finding. agentTrackedChangePaths is built
+    // from contentHashDelta and the no-op fires when it is empty.
+    expect(cliContent).toMatch(/agentTrackedChangePaths\.size\s*===\s*0/);
     expect(cliContent).toContain("Recovered summary (agent emitted no output)");
+    // Empty-summary recovery commits get an attribution trailer in git log.
+    expect(cliContent).toContain('"empty agent summary"');
   });
 });

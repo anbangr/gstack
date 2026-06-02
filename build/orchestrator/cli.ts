@@ -3297,19 +3297,38 @@ export async function recoverMutableAgentCommit(opts: {
       .filter((line) => !/^[?!]/.test(line) && line.length >= 3)
       .map(parsePorcelainPath),
   );
-  // Empty-summary recovery: a blank output summary used to be an
-  // unconditional no-op — recovery refused and the dirty tree then failed
-  // the hygiene gate (the old "intended semantic" pinned by test T-F5). But
-  // Codex in some environments writes correct, fully-tracked changes and
-  // emits a blank summary, which wedged the phase on otherwise shippable
-  // work. When real TRACKED work exists, recover it via the Bug-F fallback
-  // below and synthesize a summary at the commit site (see `summaryEmpty`
-  // writeback) so the downstream requireNonEmptyOutput gate has content.
-  // When the only dirty state is untracked scratch (no tracked changes),
-  // keep the clean no-op: there is nothing safe to recover, and the hygiene
+  // Empty-summary recovery (build-empty-summary-recovery): a blank output
+  // summary used to be an unconditional no-op — recovery refused and the
+  // dirty tree then failed the hygiene gate (the old "intended semantic"
+  // pinned by test T-F5). But Codex in some environments writes correct,
+  // fully-tracked changes and emits a blank summary, which wedged the phase
+  // on otherwise shippable work. When real AGENT-ATTRIBUTABLE tracked work
+  // exists, recover it via the Bug-F fallback below and synthesize a summary
+  // at the commit site (see `summaryEmpty` writeback) so the downstream
+  // requireNonEmptyOutput gate has content.
+  //
+  // Critical guard (cross-model review): with a blank summary there are NO
+  // agent-named files to cross-check, so we must NOT gate or stage on the raw
+  // `trackedChangePaths` dirty set — that would let a blank-summary run commit
+  // PRE-EXISTING dirty tracked files the agent never touched (a prior partial
+  // phase, a stale edit, a checkout artifact) into a clean HEAD under a
+  // generic message. Use `contentHashDelta` instead — the same agent-
+  // attribution filter `validatePostAgentHygiene` trusts: it subtracts
+  // pre-existing dirt and idempotent rewrites, and counts deletions. When the
+  // attributable set is empty (untracked-only scratch, or only pre-existing
+  // dirt), keep the clean no-op: nothing is safe to recover, and the hygiene
   // gate above this function still fails the dirty tree as designed.
-  if (summaryEmpty && trackedChangePaths.size === 0) {
-    return { recovered: false, errors: [], cleaned: [] };
+  let agentTrackedChangePaths: Set<string> | null = null;
+  if (summaryEmpty) {
+    agentTrackedChangePaths = new Set(
+      contentHashDelta(opts.before, after, opts.cwd)
+        .filter((line) => !/^[?!]/.test(line) && line.length >= 3)
+        .map(parsePorcelainPath)
+        .filter((p): p is string => !!p),
+    );
+    if (agentTrackedChangePaths.size === 0) {
+      return { recovered: false, errors: [], cleaned: [] };
+    }
   }
   let files = extractSummaryFilePaths(summary, opts.cwd).filter((filePath) => {
     const abs = path.join(opts.cwd, filePath);
@@ -3324,10 +3343,10 @@ export async function recoverMutableAgentCommit(opts: {
   // that the hygiene gate correctly rejects). The downstream role-id
   // refusal (test-writer non-test boundary from PR #102) still applies,
   // so this can't bypass the role boundary. An empty summary no longer
-  // blocks this fallback: when tracked work exists the agent's changes are
-  // recovered and a summary is synthesized at the commit site; only an
-  // untracked-only / no-meaningful-change tree stays a no-op (handled by
-  // the `summaryEmpty && trackedChangePaths.size === 0` gate above). See
+  // blocks this fallback: when agent-attributable tracked work exists the
+  // agent's changes are recovered and a summary is synthesized at the commit
+  // site; only an untracked-only / no-meaningful-change tree stays a no-op
+  // (handled by the `contentHashDelta` gate above). See
   // ~/.claude/plans/fix-recovery-path-extraction-prose-summaries.md.
   // A7: an agent that declared NO_CHANGES_NEEDED must NOT have host-side
   // recovery commit changes it never named. Skipping the tracked-changes
@@ -3335,11 +3354,28 @@ export async function recoverMutableAgentCommit(opts: {
   // hygiene failure ("left the working tree dirty") instead of being
   // silently auto-committed into a clean HEAD.
   const claimsNoChanges = /^NO_CHANGES_NEEDED\b/m.test(summary);
-  if (files.length === 0 && trackedChangePaths.size > 0 && !claimsNoChanges) {
-    files = Array.from(trackedChangePaths)
+  // For a blank summary, stage ONLY the agent-attributable tracked changes
+  // computed above — never the raw dirty set (see the critical guard). The
+  // non-empty path keeps its existing raw `trackedChangePaths` behavior.
+  const fallbackSource =
+    summaryEmpty && agentTrackedChangePaths
+      ? agentTrackedChangePaths
+      : trackedChangePaths;
+  if (files.length === 0 && fallbackSource.size > 0 && !claimsNoChanges) {
+    // Deleted tracked files (porcelain `D` in either column) don't exist on
+    // disk but are legitimate agent work — `git add -- <path>` stages a
+    // deletion. Admit them alongside still-existing paths so deletion-only
+    // and modify+delete recovery isn't silently dropped (cross-model review).
+    const deletedPaths = new Set(
+      after.status
+        .filter((line) => line.length >= 2 && line.slice(0, 2).includes("D"))
+        .map(parsePorcelainPath)
+        .filter((p): p is string => !!p),
+    );
+    files = Array.from(fallbackSource)
       .filter((filePath) => {
         const abs = path.join(opts.cwd, filePath);
-        return fs.existsSync(abs);
+        return fs.existsSync(abs) || deletedPaths.has(filePath);
       })
       .sort();
     if (files.length > 0) {
@@ -3521,7 +3557,13 @@ export async function recoverMutableAgentCommit(opts: {
   }
 
   let message = extractCommitMessage(summary, opts.label);
-  if (opts.recoveryReason) {
+  // Empty-summary recovery gets an attribution trailer too, mirroring the
+  // sandbox-blocked path: `git log` is the durable audit record, and an
+  // operator should see WHY a host-side recovery commit exists (the agent
+  // emitted nothing and the host reconstructed the summary).
+  const effectiveRecoveryReason =
+    opts.recoveryReason ?? (summaryEmpty ? "empty agent summary" : undefined);
+  if (effectiveRecoveryReason) {
     // Append a structured trailer naming why host-side recovery ran. Keeps
     // the original message body intact (operators see the agent's summary
     // first) and adds the attribution at the end where `git log` consumers
@@ -3537,7 +3579,7 @@ export async function recoverMutableAgentCommit(opts: {
       .filter((line) => !/^Recovery-Reason:/i.test(line.trim()))
       .join("\n")
       .replace(/\n+$/, "");
-    message = `${stripped}\n\nRecovery-Reason: ${opts.recoveryReason}`;
+    message = `${stripped}\n\nRecovery-Reason: ${effectiveRecoveryReason}`;
   }
   const commit = spawnSync("git", ["commit", "-m", message], {
     cwd: opts.cwd,
@@ -3568,9 +3610,12 @@ export async function recoverMutableAgentCommit(opts: {
   // failure here is non-fatal — the commit already landed, and the
   // empty-output error is a far smaller problem than losing the work.
   if (summaryEmpty && opts.outputFilePath) {
+    // Pin to the SHA recovery just created, not moving HEAD: a concurrent
+    // gstack-build process on the same worktree could advance HEAD between
+    // our commit and this read, which would embed the wrong commit's stat.
     const stat = spawnSync(
       "git",
-      ["show", "--stat", "--format=%h %s%n%n%b", "HEAD"],
+      ["show", "--stat", "--format=%h %s%n%n%b", recoveredCommit ?? "HEAD"],
       { cwd: opts.cwd, encoding: "utf8" },
     );
     const fileList = stagedPaths.map((p) => `- ${p}`).join("\n");
