@@ -6477,6 +6477,45 @@ const DEFAULT_QA_TEST_PATH_GLOBS = [
  */
 const DEFAULT_DATA_OUTPUT_GLOBS = ["**/data/**/*", "**/corpus/**/*"];
 
+/**
+ * Build artifacts regenerated as a SIDE EFFECT of running tests during a
+ * review/QA gate (Foundry gas snapshots under `snapshots/`, `forge` broadcast
+ * logs, the `.gas-snapshot` file). A reviewer that re-runs `forge test` (or any
+ * test command) to evaluate the code regenerates these with new numbers; that
+ * is NOT "reviewer edited production source", but the hygiene gate used to fail
+ * the phase on them (observed 2026-06-02, agnt2-prototype-g3 review gate left
+ * `snapshots/ComposeTypedVmTest.json` + `contracts/deployments/*.json` dirty).
+ *
+ * These are RESTORED (not committed) before the gate hygiene check so the
+ * canonical impl-phase-committed version survives — the reviewer's incidental
+ * regeneration is discarded, not baked into the branch.
+ *
+ * Defaults cover the universal-by-convention generated paths. Projects whose
+ * generated artifacts live elsewhere (e.g. `contracts/deployments/`) add globs
+ * via `GSTACK_REVIEW_GENERATED_GLOBS` (comma-separated). A `dir/**` suffix is
+ * normalized to `dir/**\/*` so a bare directory glob matches files inside it.
+ */
+const DEFAULT_REVIEW_GENERATED_GLOBS = [
+  "**/snapshots/**/*",
+  "**/broadcast/**/*",
+  "**/.gas-snapshot",
+];
+
+export function resolveReviewGeneratedGlobs(): string[] {
+  const raw = process.env.GSTACK_REVIEW_GENERATED_GLOBS;
+  const extra = raw
+    ? raw
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        // A bare `dir/**` glob doesn't match files directly under `dir/`
+        // through globToRegExp (which needs a trailing `/*`); normalize so
+        // users can write the intuitive `**/contracts/deployments/**`.
+        .map((g) => (/\/\*\*$/.test(g) ? `${g}/*` : g))
+    : [];
+  return [...DEFAULT_REVIEW_GENERATED_GLOBS, ...extra];
+}
+
 /** Convert a git-porcelain status line ("M path", " D path", "?? path") to
  *  just the path portion. Handles rename arrows (" -> ") and quoted paths. */
 function porcelainStatusToPath(line: string): string {
@@ -6501,6 +6540,41 @@ function globToRegExp(glob: string): RegExp {
 
 function isTestOnlyPath(filePath: string, globs: string[]): boolean {
   return globs.some((g) => globToRegExp(g).test(filePath));
+}
+
+/**
+ * Restore review/QA-gate-regenerated build artifacts (paths matching the
+ * review generated-globs) to their committed version BEFORE the gate hygiene
+ * check, so a reviewer that re-ran tests doesn't fail the gate on regenerated
+ * snapshots / deployment logs. Tracked dirty matches are `git restore`d back
+ * to the canonical HEAD/index version; untracked matches are removed. Returns
+ * the list of cleaned paths for logging (no silent allow). See
+ * `DEFAULT_REVIEW_GENERATED_GLOBS`.
+ */
+export function cleanupReviewGeneratedArtifacts(cwd: string): string[] {
+  const globs = resolveReviewGeneratedGlobs();
+  const status = captureGitSnapshot(cwd).status;
+  const cleaned: string[] = [];
+  for (const line of status) {
+    const filePath = porcelainStatusToPath(line);
+    if (!filePath || !isTestOnlyPath(filePath, globs)) continue;
+    if (line.startsWith("?? ")) {
+      try {
+        fs.rmSync(path.join(cwd, filePath), { recursive: true, force: true });
+        cleaned.push(filePath);
+      } catch {
+        // Best-effort: a path we can't remove will surface as dirty in the
+        // hygiene check, which is the correct fail-loud behavior.
+      }
+    } else {
+      const r = spawnSync("git", ["restore", "--", filePath], {
+        cwd,
+        encoding: "utf8",
+      });
+      if (r.status === 0) cleaned.push(filePath);
+    }
+  }
+  return cleaned;
 }
 
 /**
@@ -6872,6 +6946,20 @@ function applyGateHygiene(opts: {
     opts.label.startsWith("qa") ||
     opts.label.startsWith("review") ||
     opts.label.startsWith("reviewSecondary");
+  // Restore review/QA-gate-regenerated build artifacts (Foundry snapshots,
+  // broadcast logs, project-configured generated paths) BEFORE the hygiene
+  // check. A reviewer that re-runs tests regenerates these as a side effect;
+  // without this the gate fails on "reviewer edited production paths" even
+  // though no source was touched. Restored to the canonical committed version,
+  // not committed. See cleanupReviewGeneratedArtifacts / DEFAULT_REVIEW_GENERATED_GLOBS.
+  if (isGateRole) {
+    const restored = cleanupReviewGeneratedArtifacts(opts.cwd);
+    if (restored.length > 0) {
+      console.warn(
+        `  ↺ ${opts.label}: restored ${restored.length} review-regenerated artifact(s) before hygiene check (not flagged as production edits): ${restored.join(", ")}`,
+      );
+    }
+  }
   let checks = [
     validatePostAgentHygiene({
       cwd: opts.cwd,
