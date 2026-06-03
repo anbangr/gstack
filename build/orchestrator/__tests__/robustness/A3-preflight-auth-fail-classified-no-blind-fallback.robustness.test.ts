@@ -115,7 +115,7 @@ function setUpAuthFailFixture(): {
   return { inputFilePath, outputFilePath, backupCounterFile };
 }
 
-describe.skip("[RED] A3 preflight-auth-fail-classified-no-blind-fallback — UNSKIP WHEN A3 IS FIXED", () => {
+describe("[RED→FIXED] A3 preflight-auth-fail-classified-no-blind-fallback", () => {
   it("classifies the auth root cause as {kind:'auth'} (not a generic null verdict)", async () => {
     const { inputFilePath, outputFilePath } = setUpAuthFailFixture();
 

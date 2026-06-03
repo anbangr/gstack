@@ -58,7 +58,10 @@ import {
   type Provider,
 } from "./stall-watchdog";
 import { computeFaultId, emitHaltEventResolved } from "./halt-events";
-import { countSubprocessRetryAttempts } from "./halt-event-helpers";
+import {
+  countSubprocessRetryAttempts,
+  classifyProviderFailure,
+} from "./halt-event-helpers";
 
 export type CodexSandbox =
   | "read-only"
@@ -2678,6 +2681,25 @@ export async function runConfiguredRoleTask(
   // internal phase dispatcher and this slash-command dispatcher accept
   // different opt shapes (codexDefaultCommand, sandbox).
   if ((result.timedOut || result.exitCode !== 0) && opts.role.backupProvider) {
+    // A3: do NOT blindly fan out to the backup on a PRIMARY auth failure.
+    // Classify the primary's failure first. An auth failure won't self-resolve
+    // by retrying, the backup spawn would overwrite the primary's auth stderr
+    // (erasing the root cause from forensics), and it burns budget per affected
+    // phase. Return the primary result with its auth reason intact so a
+    // downstream classifier reaches a kind:"auth" verdict, and skip the backup.
+    if (
+      classifyProviderFailure({
+        text: `${result.stdout}\n${result.stderr}`,
+        timedOut: result.timedOut,
+        stallKilled: result.stallKilled,
+      })?.kind === "auth"
+    ) {
+      console.warn(
+        `[gstack-build] ${opts.logPrefix}: primary ${opts.role.provider} auth failure; ` +
+          `not fanning out to backup ${opts.role.backupProvider} (auth won't self-resolve) — surfacing the auth verdict.`,
+      );
+      return result;
+    }
     // F3: budget-aware fallback. On primary.timedOut, re-check scope with
     // a stricter threshold. If the input is too big, surface phase_oversized
     // directly instead of letting Gemini run on half-budget and produce

@@ -506,7 +506,11 @@ const PROVIDER_QUOTA_RE =
 const PROVIDER_TRANSPORT_RE =
   /ECONNRESET|ECONNREFUSED|EHOSTUNREACH|EAI_AGAIN|socket hang up|read ECONNRESET|HTTP\/2 stream .* refused/i;
 const PROVIDER_AUTH_RE =
-  /authentication required|please (?:authenticate|log in|sign in|re-?authenticate)|invalid (?:api )?key|401 Unauthorized|token expired/i;
+  // Kept in sync with sub-agents.ts AUTH_REQUIRED_RE so a preflight auth-fail
+  // the spawn path detects also classifies as kind:"auth" here (A3) — the two
+  // diverging (e.g. "not authenticated" matched there but not here) let an auth
+  // root cause surface as a generic null verdict in forensics.
+  /authentication required|please (?:authenticate|log ?in|sign ?in|re-?authenticate)|not (?:authenticated|logged ?in|signed ?in)|invalid (?:api )?key|401 Unauthorized|token expired|access denied|api key (?:is )?required|credentials (?:are )?required/i;
 const PROVIDER_RESET_AT_RE =
   /resets? at ([0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?)/i;
 
