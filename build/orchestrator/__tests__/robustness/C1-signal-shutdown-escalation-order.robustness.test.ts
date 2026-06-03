@@ -1,43 +1,49 @@
 /**
- * C1 — signal-shutdown-escalation-order  [RED]  (integration)
+ * C1 — signal-shutdown-escalation-order  [RED→FIXED]  (integration)
  *
- * Crash/shutdown failure mode: the orchestrator installs TWO competing
- * signal handlers for the SAME SIGINT/SIGTERM signal.
+ * Crash/shutdown failure mode (the bug this fix closes): the orchestrator used
+ * to install TWO competing signal handlers for the SAME SIGINT/SIGTERM signal.
  *
- *   Site 1 (child-registry.ts:62 `installSignalHandlers`, wired at
- *           cli.ts:12533): on signal, runs `shutdownAndExit(signal)` which
- *           does `killAllChildren("SIGTERM")` -> `await sleep(2000)` ->
+ *   Site 1 (child-registry.ts `installSignalHandlers`, wired at cli.ts main()):
+ *           on signal, runs `shutdownAndExit(signal)` which does
+ *           `killAllChildren("SIGTERM")` -> `await sleep(2000)` ->
  *           `killAllChildren("SIGKILL")` -> `process.exit(143/130)`. This is
  *           the escalation path that reaps a SIGTERM-IGNORING sub-agent group.
  *
- *   Site 2 (cli.ts:13142 `onSignal`): on the same signal, synchronously
- *           `saveState`s, releases the lock, and calls `process.exit(130)`
- *           IMMEDIATELY — no await of the 2s grace.
+ *   Site 2 (cli.ts `onSignal`): on the same signal, synchronously `saveState`s,
+ *           released the lock, and called `process.exit(130)` IMMEDIATELY — no
+ *           await of the 2s grace.
  *
- * Both fire on one signal. Site 2's synchronous `process.exit(130)` pre-empts
- * Site 1's `await sleep(2000)`, so the SIGKILL escalation NEVER runs. A
+ * Both fired on one signal. Site 2's synchronous `process.exit(130)` pre-empted
+ * Site 1's `await sleep(2000)`, so the SIGKILL escalation NEVER ran. A
  * sub-agent process group that ignores SIGTERM (the realistic case: a
- * shell-wrapped CLI that traps TERM) is orphaned to init — leaked LLM
+ * shell-wrapped CLI that traps TERM) was orphaned to init — leaked LLM
  * sub-processes on every interrupt, compounding across restarts.
  *
- * DESIRED INVARIANT (this spec, asserted against a forked harness that
- * reproduces BOTH handler sites verbatim):
- *   (1) state file written AND lock removed (Site 2's cleanup still happens), AND
+ * ── The fix (was [RED] / .skip; now green) ──
+ * child-registry.ts grows a `registerShutdownHook(fn)` seam; `shutdownAndExit`
+ * runs the hooks (caller cleanup) FIRST, then the SIGTERM→sleep→SIGKILL→exit
+ * escalation. cli.ts replaces its racing `onSignal` pair with a shutdown HOOK
+ * that saves state + releases the lock and does NOT call `process.exit` — so a
+ * single signal path owns the exit, AFTER the SIGKILL leg. Cleanup AND the
+ * child reap both complete on every interrupt.
+ *
+ * INVARIANT (this spec, asserted against a forked harness that reproduces the
+ * POST-FIX single-path shape — installSignalHandlers + registerShutdownHook,
+ * importing the REAL child-registry + state modules):
+ *   (1) state file written AND lock removed (the cleanup hook ran), AND
  *   (2) the trapped `sh -c "trap '' TERM; sleep 60"` process GROUP is dead
- *       within a bounded window after SIGTERM (Site 1's SIGKILL escalation
- *       reached it).
+ *       within a bounded window after SIGTERM (the SIGKILL escalation reached
+ *       it because no early exit pre-empted the 2s grace).
  *
- * Today (1) holds but (2) FAILS — the trapped group survives because exit(130)
- * wins the race. That is the confirmed gap from the audit
- * (BUILD_ROBUSTNESS_SUITE.md §C1), committed as `describe.skip` with the
- * UNSKIP banner. The fix PR makes the cleanup handler defer to (or sequence
- * after) the escalation grace, removes `.skip`, and this goes green.
+ * Pre-fix, (1) held but (2) FAILED — the trapped group survived because
+ * exit(130) won the race. (BUILD_ROBUSTNESS_SUITE.md §C1.)
  *
- * Real-process integration: there is no pure-unit way to reproduce two
- * competing OS signal handlers racing on a real `process.exit`. The harness
- * forks a real short-lived `bun` process and spawns a real `/bin/sh`+`sleep`
- * grandchild; every wait is bounded and the grandchild's process group is
- * reaped in afterEach so nothing leaks past the test.
+ * Real-process integration: there is no pure-unit way to reproduce competing
+ * OS signal handlers racing on a real `process.exit`. The harness forks a real
+ * short-lived `bun` process and spawns a real `/bin/sh`+`sleep` grandchild;
+ * every wait is bounded and the grandchild's process group is reaped in
+ * afterEach so nothing leaks past the test.
  *
  * See ./README.md for the PIN/RED protocol and
  * docs/designs/BUILD_ROBUSTNESS_SUITE.md §C1 for full context.
@@ -63,6 +69,11 @@ const statePath = path.resolve(
   "..",
   "..",
   "state.ts",
+);
+// cli.ts source for the production-wiring grep (same idiom A1 RED #1 uses).
+const cliSource = fs.readFileSync(
+  path.resolve(new URL(".", import.meta.url).pathname, "..", "..", "cli.ts"),
+  "utf-8",
 );
 
 /** Liveness check for a process group (negative pid) or a pid. */
@@ -92,7 +103,7 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-describe.skip("[RED] C1 signal-shutdown-escalation-order — UNSKIP WHEN C1 IS FIXED", () => {
+describe("[RED→FIXED] C1 signal-shutdown-escalation-order", () => {
   let tmpDir: string;
   let stateDirPath: string;
   const slug = "build-c1-shutdown-race";
@@ -168,26 +179,30 @@ describe.skip("[RED] C1 signal-shutdown-escalation-order — UNSKIP WHEN C1 IS F
     fs.writeFileSync(
       harnessScript,
       `
-import { installSignalHandlers, spawn } from ${JSON.stringify(childRegistryPath)};
+import { installSignalHandlers, spawn, registerShutdownHook } from ${JSON.stringify(childRegistryPath)};
 import { saveState, acquireLock, releaseLock } from ${JSON.stringify(statePath)};
 
 const slug = ${JSON.stringify(slug)};
 const state = { slug, phases: [], schemaVersion: 1, planFile: "/tmp/c1-plan.md" };
 
-// --- Site 1: child-registry handlers (SIGTERM children -> sleep 2s -> SIGKILL -> exit) ---
+// --- Single signal path (post-fix shape from cli.ts) ---
+// installSignalHandlers wires the ONLY SIGINT/SIGTERM/SIGHUP handler. On a
+// signal it runs shutdownAndExit: caller cleanup hooks FIRST, then
+// killAllChildren("SIGTERM") -> sleep(2000) -> killAllChildren("SIGKILL") ->
+// process.exit. The orchestrator's interrupt cleanup is a shutdown HOOK (not a
+// second handler that exits early), so the graceful save/release AND the
+// SIGKILL escalation both complete. This mirrors cli.ts exactly: register a
+// hook that saves state + releases the lock and does NOT call process.exit.
 installSignalHandlers();
 
-// --- Site 2: cli.ts onSignal pair (verbatim shape from cli.ts:13142) ---
 let interrupted = false;
-const onSignal = () => {
+registerShutdownHook(() => {
   if (interrupted) return;
   interrupted = true;
   try { saveState(state, { noGbrain: true }); } catch {}
   releaseLock(slug);
-  process.exit(130);
-};
-process.on("SIGINT", onSignal);
-process.on("SIGTERM", onSignal);
+  // No process.exit here — shutdownAndExit owns the exit AFTER the SIGKILL leg.
+});
 
 // Acquire the lock + seed initial state, exactly as the orchestrator does
 // before the run loop, so the test can observe the cleanup transition.
@@ -285,5 +300,31 @@ setInterval(() => {}, 60_000);
     }
 
     expect(groupAlive(childPid)).toBe(false);
+  });
+});
+
+// Production-wiring grep: the integration harness above reconstructs the
+// post-fix single-path shape, but it carries its OWN copy of that shape — so a
+// regression that reverted cli.ts to the racing onSignal pair would NOT fail
+// the harness. These static-grep assertions pin that cli.ts itself routes its
+// interrupt cleanup through the shutdown-hook seam and no longer exits early
+// from a competing signal handler. Same idiom as A1 RED #1 / feature-start-
+// network-retry.test.ts.
+describe("[RED→FIXED] C1 cli.ts wires interrupt cleanup as a shutdown hook", () => {
+  it("cli.ts registers a child-registry shutdown hook (not a second exit-ing signal handler)", () => {
+    expect(cliSource).toMatch(/registerShutdownHook\(/);
+  });
+
+  it("cli.ts no longer installs the racing onSignal SIGINT/SIGTERM pair", () => {
+    // The pre-fix bug was a second handler: process.on("SIGINT", onSignal) /
+    // process.on("SIGTERM", onSignal) whose body called process.exit(130).
+    // The single signal path is installSignalHandlers() in main(); the
+    // interrupt cleanup is now a hook, so no `onSignal` handler pair remains.
+    expect(cliSource).not.toMatch(
+      /process\.on\(\s*["']SIGINT["']\s*,\s*onSignal/,
+    );
+    expect(cliSource).not.toMatch(
+      /process\.on\(\s*["']SIGTERM["']\s*,\s*onSignal/,
+    );
   });
 });

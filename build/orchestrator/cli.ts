@@ -28,7 +28,11 @@
  *   130 user interrupt (SIGINT)
  */
 
-import { installSignalHandlers, spawnSync } from "./child-registry";
+import {
+  installSignalHandlers,
+  registerShutdownHook,
+  spawnSync,
+} from "./child-registry";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -13267,7 +13271,17 @@ async function main() {
           // Best-effort: never block exit on registry write failure.
         }
       };
-      const onSignal = () => {
+      // C1 fix: register interrupt cleanup as a child-registry shutdown hook
+      // instead of a SECOND SIGINT/SIGTERM handler. The old onSignal pair
+      // called `process.exit(130)` synchronously, which pre-empted
+      // installSignalHandlers()'s `await sleep(2000)` SIGKILL-escalation grace
+      // (child-registry.ts shutdownAndExit) — so a SIGTERM-ignoring sub-agent
+      // process group was orphaned to init on every interrupt. The hook runs
+      // inside that SAME single signal path, BEFORE the escalation, and does
+      // NOT exit: shutdownAndExit owns the exit AFTER the SIGKILL leg, so the
+      // graceful cleanup AND the child reap both complete. `interrupted` still
+      // guards the process.on("exit") normal-exit path below.
+      registerShutdownHook(() => {
         if (interrupted) return;
         interrupted = true;
         console.error("\n[interrupted] saving state and releasing lock...");
@@ -13278,15 +13292,13 @@ async function main() {
         }
         markActiveRunPaused();
         releaseLock(slug);
-        process.exit(130);
-      };
-      process.on("SIGINT", onSignal);
-      process.on("SIGTERM", onSignal);
+      });
       // process.on("exit") must run synchronously — no async APIs. Both
       // saveState and writeActiveRunRecord use writeFileSync internally so
-      // they are safe to call here.
+      // they are safe to call here. Covers normal (non-signal) exits; the
+      // shutdown hook above covers SIGINT/SIGTERM/SIGHUP.
       process.on("exit", () => {
-        if (interrupted) return; // already handled by onSignal
+        if (interrupted) return; // already handled by the shutdown hook
         markActiveRunPaused();
       });
 

@@ -46,6 +46,17 @@ const livePids = new Set<number>();
 
 let signalHandlersInstalled = false;
 
+// Caller-registered cleanup hooks run inside `shutdownAndExit` (synchronously,
+// before the child SIGTERM→SIGKILL escalation). This is the C1 fix: the
+// orchestrator's interrupt cleanup (save state, release the build lock, mark
+// the active run paused) used to live in a SECOND SIGINT/SIGTERM handler that
+// called `process.exit(130)` synchronously — which pre-empted this module's
+// `await sleep(2000)` grace, so the SIGKILL escalation never ran and a
+// SIGTERM-ignoring sub-agent process group was orphaned to init. Registering
+// the cleanup as a hook here folds it into the SINGLE signal path that owns
+// the exit, so cleanup AND the escalation both complete on every interrupt.
+const shutdownHooks: Array<() => void> = [];
+
 /**
  * Install SIGTERM / SIGINT / SIGHUP handlers that reap every live child
  * before exiting. Idempotent — safe to call multiple times.
@@ -73,12 +84,37 @@ export function installSignalHandlers(): void {
 }
 
 /**
- * Cleanly shut down: SIGTERM all live children, wait briefly, SIGKILL
- * survivors, then exit with a signal-appropriate code. Exported for tests
- * and for callers that want explicit cleanup without going through the
- * signal-handler path.
+ * Register a synchronous cleanup hook to run inside `shutdownAndExit` BEFORE
+ * the child SIGTERM→SIGKILL escalation. Use this for caller-owned interrupt
+ * cleanup (e.g. the orchestrator's save-state / release-lock / mark-paused)
+ * so it shares the SINGLE signal path that owns the process exit, instead of
+ * racing the escalation with a competing handler that exits early. Hooks run
+ * in registration order; each is best-effort (a throwing hook is swallowed so
+ * it can't abort a later hook or the escalation). The hook MUST NOT call
+ * `process.exit` — `shutdownAndExit` owns the exit after the SIGKILL leg.
+ */
+export function registerShutdownHook(hook: () => void): void {
+  shutdownHooks.push(hook);
+}
+
+/**
+ * Cleanly shut down: run caller cleanup hooks, SIGTERM all live children, wait
+ * briefly, SIGKILL survivors, then exit with a signal-appropriate code.
+ * Exported for tests and for callers that want explicit cleanup without going
+ * through the signal-handler path.
  */
 export async function shutdownAndExit(signal: NodeJS.Signals): Promise<void> {
+  // Run caller cleanup FIRST so state/lock are durable even if the escalation
+  // below is slow. Swallow per-hook throws on purpose: this is a shutdown
+  // path, so one failing hook must NOT abort the remaining hooks or the
+  // SIGKILL escalation that reaps orphan-prone sub-agent groups.
+  for (const hook of shutdownHooks) {
+    try {
+      hook();
+    } catch {
+      // best-effort shutdown cleanup — continue to the next hook + escalation
+    }
+  }
   killAllChildren("SIGTERM");
   await sleep(2000);
   killAllChildren("SIGKILL");
@@ -156,6 +192,7 @@ export function _liveChildPids(): number[] {
 export function _resetForTest(): void {
   livePids.clear();
   signalHandlersInstalled = false;
+  shutdownHooks.length = 0;
 }
 
 // Internal helpers ------------------------------------------------------------
