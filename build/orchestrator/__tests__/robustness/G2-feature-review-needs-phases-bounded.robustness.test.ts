@@ -13,37 +13,30 @@
  * actually fires) and the count of appended phases (`fr.phasesAdded`) never
  * exceeds that cap.
  *
- * ── Why this is committed as [RED] / .skip (deviation from the design's
- *    literal "drive runFeatureReviewIteration with a fake dispatcher" plan) ──
+ * ── The fix (was [RED] / .skip; now green) ──
  *
- * The design assumed `runFeatureReviewIteration` exposes the dry-run / stub
- * dispatcher seam that `runFeatureVerifier` does (see
- * feature-verifier-pre-merge.test.ts). It does not. In cli.ts today:
- *   1. `runFeatureReviewIteration` is an INTERNAL `async function` — it is not
- *      exported, so it cannot be imported and driven from a test.
- *   2. It has NO injectable dispatcher. It spawns the reviewer internally via
- *      `runCodexFeatureReview` / `runRoleTask` (cli.ts ~8407-8438) — there is
- *      no `dispatcher` arg to substitute a fake the way `runFeatureVerifier`
- *      accepts one.
- *   3. The cap-FIRING decision (`currentIter > cap`, where
- *      `cap = args.featureReviewMaxIter`) does NOT live inside
- *      `runFeatureReviewIteration`. It lives inline in the giant `run()`
- *      outer loop (cli.ts ~13744-13957), which reads
- *      `featureState.featureReview.iterations`. That loop is not extractable
- *      into a tested unit.
+ * The cap-FIRING decision (`currentIter > cap`, where
+ * `cap = args.featureReviewMaxIter`) used to live ONLY inline in the giant
+ * `run()` outer loop (cli.ts), reading `featureState.featureReview.iterations`,
+ * with no importable home — so the bounded-loop invariant could only be
+ * reconstructed, never tested against production. The G2 fix extracts that
+ * comparison into a pure, exported `featureReviewCapReached({ iterationsConsumed,
+ * cap })` in phase-runner.ts, and rewires cli.ts run() to call it. This spec now
+ * drives the REAL `featureReviewCapReached` (not a re-implementation) through a
+ * faithful FEATURE_NEEDS_PHASES cycle built from the other real exported helpers
+ * — `parseFeatureReviewVerdict` (feature-review.ts), `appendFeaturePhases`
+ * (plan-mutator.ts), `parsePlan` (parser.ts), and the real cap constant
+ * `DEFAULT_FEATURE_REVIEW_MAX_ITER` (phase-runner.ts) — driven by an
+ * always-NEEDS_PHASES fake dispatcher, and asserts the bound the cap-firing
+ * logic guarantees. An off-by-one or `>=`/`>` regression in the bound now fails
+ * HERE instead of only surfacing as an unbounded mid-build plan explosion.
  *
- * So the bounded-loop invariant has no importable home today. This spec
- * reconstructs the production FEATURE_NEEDS_PHASES branch faithfully out of
- * the REAL exported helpers it does export — `parseFeatureReviewVerdict`
- * (feature-review.ts), `appendFeaturePhases` (plan-mutator.ts), `parsePlan`
- * (parser.ts), and the real cap constant `DEFAULT_FEATURE_REVIEW_MAX_ITER`
- * (phase-runner.ts) — driven by an always-NEEDS_PHASES fake dispatcher (the
- * design's intent), and asserts the bound the cap-firing logic MUST guarantee.
- * It stays `.skip` until the cap-firing loop is refactored into an importable,
- * unit-testable seam; the unskip lands with that refactor.
- *
- * The file LOADS cleanly today (only existing symbols imported; all setup in
- * beforeEach/it; no throwing top-level code), so the gate stays green.
+ * Why not "drive runFeatureReviewIteration with a fake dispatcher" (the
+ * design's literal plan)? That function is an internal `async function` with no
+ * injectable dispatcher (it spawns the reviewer via `runCodexFeatureReview` /
+ * `runRoleTask`), and the cap decision never lived inside it — it lived in the
+ * run() loop. Extracting the pure decision is the minimal, behavior-preserving
+ * seam that makes the bound testable without refactoring the whole run() loop.
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import * as fs from "node:fs";
@@ -54,7 +47,10 @@ import {
 } from "../../feature-review";
 import { appendFeaturePhases } from "../../plan-mutator";
 import { parsePlan } from "../../parser";
-import { DEFAULT_FEATURE_REVIEW_MAX_ITER } from "../../phase-runner";
+import {
+  DEFAULT_FEATURE_REVIEW_MAX_ITER,
+  featureReviewCapReached,
+} from "../../phase-runner";
 
 // Minimal stand-in for the slice of FeatureState.featureReview the loop
 // mutates. Mirrors the real fields (types.ts FeatureReview) that the
@@ -150,7 +146,7 @@ describe("[PIN] G2 feature-review NEEDS_PHASES helpers compose (sanity)", () => 
   });
 });
 
-describe.skip("[RED] G2 feature-review-needs-phases-bounded — UNSKIP WHEN G2 IS FIXED", () => {
+describe("[RED→FIXED] G2 feature-review-needs-phases-bounded", () => {
   let tmp: string;
   let planFile: string;
 
@@ -191,14 +187,20 @@ describe.skip("[RED] G2 feature-review-needs-phases-bounded — UNSKIP WHEN G2 I
     const fr: FeatureReviewCounters = { iterations: 0, phasesAdded: 0 };
     let stoppedBy: "cap" | "ceiling" = "ceiling";
     for (let guard = 0; guard < hardCeiling; guard++) {
-      const currentIter = fr.iterations + 1;
-      if (currentIter > cap) {
+      // Drive the SAME cap-firing decision production uses (cli.ts run()
+      // routes its `if (currentIter > cap)` check through this exported pure
+      // function). Testing the real seam — not a re-implementation — is the
+      // point of the G2 fix: an off-by-one regression in the bound now fails
+      // here instead of silently growing the plan mid-build.
+      if (featureReviewCapReached({ iterationsConsumed: fr.iterations, cap })) {
         // The cap fired: production declines the extension on a non-TTY run
         // (CI / piped stdin) and writes BLOCKED-feature-N.md — the loop ends.
         stoppedBy = "cap";
         break;
       }
-      // Reviewer subprocess "ran" this cycle.
+      // Reviewer subprocess "ran" this cycle. The cycle number production
+      // logs is `iterations + 1`; mirror it for the dispatcher's fresh K.
+      const currentIter = fr.iterations + 1;
       const raw = alwaysNeedsPhasesDispatcher(currentIter);
       const verdict = parseFeatureReviewVerdict(raw);
       // fr.iterations is consumed each cycle (cli.ts ~8467 — unconditional

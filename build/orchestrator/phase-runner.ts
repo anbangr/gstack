@@ -75,6 +75,31 @@ export const DEFAULT_FEATURE_REVIEW_MAX_ITER = envNumberOrDefault(
 );
 
 /**
+ * The feature-review loop's cap-firing decision, extracted as a pure function
+ * so the bound can be unit-tested. The run() outer loop (cli.ts) computes the
+ * cycle it is ABOUT to run as `iterationsConsumed + 1` and stops when that
+ * exceeds the per-feature cap. A flapping reviewer that keeps returning
+ * FEATURE_NEEDS_PHASES (each cycle appending real phases that then get
+ * implemented + reviewed) would otherwise grow the plan without bound and burn
+ * a long autonomous run's budget — so this comparison is the only thing that
+ * stops it. Keeping it pure means a regression in the bound (off-by-one, `>=`
+ * vs `>`) is caught by build/orchestrator/__tests__/robustness/G2-*.test.ts
+ * instead of only surfacing as an unbounded mid-build plan explosion.
+ *
+ * `iterationsConsumed` is `featureState.featureReview?.iterations ?? 0` — the
+ * count of cycles already run; `cap` is `args.featureReviewMaxIter`. Returns
+ * true when the next cycle would exceed the cap (the loop must stop or prompt
+ * for a user-approved extension).
+ */
+export function featureReviewCapReached(opts: {
+  iterationsConsumed: number;
+  cap: number;
+}): boolean {
+  const currentIter = opts.iterationsConsumed + 1;
+  return currentIter > opts.cap;
+}
+
+/**
  * Stable prefix the FAIL action's `reason` carries when convergence is the
  * cause. Consumers (cli.ts BLOCKED.md handler) match on this prefix instead
  * of substring-matching against the human-readable error message — the

@@ -75,6 +75,7 @@ import {
   DEFAULT_MAX_RED_SPEC_ITERATIONS,
   DEFAULT_CODEX_GEMINI_RERUN_FREQ,
   DEFAULT_FEATURE_REVIEW_MAX_ITER,
+  featureReviewCapReached,
   isCodexConvergenceFailure,
   type Action,
 } from "./phase-runner";
@@ -13869,9 +13870,10 @@ async function main() {
             let reviewLoopAction: "ship" | "phases_added" | "redo" | "blocked" =
               "ship";
             while (true) {
-              const currentIter =
-                (featureState.featureReview?.iterations ?? 0) + 1;
-              if (currentIter > cap) {
+              const iterationsConsumed =
+                featureState.featureReview?.iterations ?? 0;
+              const currentIter = iterationsConsumed + 1;
+              if (featureReviewCapReached({ iterationsConsumed, cap })) {
                 // F4: ask the user once whether to allow another cycle.
                 // userApprovedExtension is set after a yes so we don't
                 // re-prompt every additional cycle in a long extension.
