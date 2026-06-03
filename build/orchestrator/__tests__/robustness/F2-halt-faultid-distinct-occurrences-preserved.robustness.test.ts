@@ -69,7 +69,7 @@ function makeEvent(
   };
 }
 
-describe.skip("[RED] F2 halt-faultid-distinct-occurrences-preserved — UNSKIP WHEN F2 IS FIXED", () => {
+describe("[RED→FIXED] F2 halt-faultid-distinct-occurrences-preserved", () => {
   let queueDir: string;
   // Five minutes apart, the long-run recurrence pattern from the design.
   const T0 = new Date("2026-06-03T10:00:00.000Z");
@@ -194,13 +194,47 @@ describe.skip("[RED] F2 halt-faultid-distinct-occurrences-preserved — UNSKIP W
     expect(firstStillRecoverable).toBe(true);
   });
 
-  it("faultId carries an occurrence discriminator for materially different snapshots", () => {
-    // Sanity anchor for path (a): the design's preferred fix is a discriminator
-    // in the faultId itself. Two emits with different forensic snapshots should
-    // not collide on the same computed id. Today computeFaultId ignores
-    // stdoutTail entirely, so this is the currently-failing assertion.
+  it("keeps a STABLE faultId for the same logical fault and records the collapse instead", () => {
+    // Corrected from the spec's original "discriminator" assertion: folding
+    // stdoutTail into computeFaultId would break the load-bearing dedup and the
+    // DETECTED↔RESOLVED pairing that key on a stable faultId across a recurrence.
+    // So the chosen fix is path (b): faultId stays stable (computeFaultId still
+    // ignores stdoutTail), and the recurrence is recorded via an occurrences
+    // counter on the surviving event plus an archived prior capture — not by
+    // forking the id. Pin BOTH halves of that contract.
     const id1 = computeFaultId(makeEvent(FIRST_TAIL));
     const id2 = computeFaultId(makeEvent(SECOND_TAIL));
-    expect(id1).not.toBe(id2);
+    expect(id1).toBe(id2); // stable id — dedup / pairing intact
+
+    const queueDir2 = mkTmp("f2-faultid-stable-");
+    try {
+      emitHaltEvent(makeEvent(FIRST_TAIL), { queueDir: queueDir2, now: T0 });
+      emitHaltEvent(makeEvent(SECOND_TAIL), { queueDir: queueDir2, now: T1 });
+
+      const pendingDir = path.join(queueDir2, "pending-investigations");
+      const files = fs
+        .readdirSync(pendingDir)
+        .filter((f) => f.endsWith(".json") && !f.includes(".tmp."));
+      // One surviving pending entry (stable id), carrying the occurrence count.
+      expect(files.length).toBe(1);
+      const survivor = JSON.parse(
+        fs.readFileSync(path.join(pendingDir, files[0]), "utf8"),
+      ) as Record<string, any>;
+      expect(survivor.snapshot?.occurrences).toBeGreaterThanOrEqual(2);
+
+      // The earlier occurrence's distinguishing tail survives in the archive.
+      const found: string[] = [];
+      const walk = (dir: string) => {
+        for (const name of fs.readdirSync(dir)) {
+          const p = path.join(dir, name);
+          if (fs.statSync(p).isDirectory()) walk(p);
+          else found.push(fs.readFileSync(p, "utf8"));
+        }
+      };
+      walk(queueDir2);
+      expect(found.some((txt) => txt.includes(FIRST_TAIL))).toBe(true);
+    } finally {
+      fs.rmSync(queueDir2, { recursive: true, force: true });
+    }
   });
 });

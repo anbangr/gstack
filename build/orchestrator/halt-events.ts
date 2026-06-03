@@ -85,6 +85,14 @@ export interface HaltEvent {
      * PROVIDER_QUOTA_EXHAUSTED halts that carried a parseable reset time (A4).
      */
     resetAt?: string;
+    /**
+     * How many times this logical fault (stable faultId) has been emitted with
+     * a MATERIALLY DIFFERENT snapshot. Set (>= 2) only on such a recurrence; the
+     * prior occurrence's full capture is archived under `<queueDir>/collapsed/`
+     * so an earlier forensic snapshot is never silently clobbered (F2). Absent
+     * on a first/only occurrence and on identical re-emits.
+     */
+    occurrences?: number;
   };
 }
 
@@ -160,11 +168,44 @@ export function emitHaltEvent(
 ): string {
   const faultId = computeFaultId(event);
   const timestamp = (opts?.now ?? new Date()).toISOString();
-  const full: HaltEvent = { ...event, faultId, timestamp };
   const dir = pendingInvestigationsDir(opts);
   fs.mkdirSync(dir, { recursive: true });
   const safeRun = safeRegistryRunId(event.runId);
   const finalPath = path.join(dir, `${safeRun}-${faultId}.json`);
+
+  // F2: faultId is intentionally STABLE (it's the dedup + DETECTED/RESOLVED
+  // pairing key), so a recurrence of the same logical fault writes the same
+  // filename. If that recurrence carries a MATERIALLY DIFFERENT forensic
+  // snapshot (a different stdoutTail captured minutes apart on a long run), a
+  // bare overwrite would silently destroy the earlier evidence. Archive the
+  // prior capture to a sibling `collapsed/` dir (NOT under pending-investigations,
+  // so the drain queue never re-investigates it) and carry an occurrences
+  // count. Identical re-emits stay a pure overwrite (today's behavior).
+  let snapshot = event.snapshot;
+  if (fs.existsSync(finalPath)) {
+    try {
+      const prior = JSON.parse(fs.readFileSync(finalPath, "utf8")) as HaltEvent;
+      if (prior?.snapshot?.stdoutTail !== event.snapshot?.stdoutTail) {
+        const priorOcc =
+          typeof prior?.snapshot?.occurrences === "number"
+            ? prior.snapshot.occurrences
+            : 1;
+        const collapsedDir = path.join(path.dirname(dir), "collapsed");
+        fs.mkdirSync(collapsedDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(collapsedDir, `${safeRun}-${faultId}-${priorOcc}.json`),
+          JSON.stringify(prior, null, 2) + "\n",
+          { mode: 0o600 },
+        );
+        snapshot = { ...event.snapshot, occurrences: priorOcc + 1 };
+      }
+    } catch {
+      // Prior file unreadable — proceed with a plain write rather than block
+      // the emit; the new capture still lands.
+    }
+  }
+
+  const full: HaltEvent = { ...event, faultId, timestamp, snapshot };
   const tmpPath = `${finalPath}.tmp.${process.pid}`;
   fs.writeFileSync(tmpPath, JSON.stringify(full, null, 2) + "\n", {
     mode: 0o600,
