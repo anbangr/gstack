@@ -61,6 +61,9 @@ import { computeFaultId, emitHaltEventResolved } from "./halt-events";
 import {
   countSubprocessRetryAttempts,
   classifyProviderFailure,
+  planProviderRetry,
+  PROVIDER_RETRY_SESSION_CAP,
+  PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS,
 } from "./halt-event-helpers";
 
 export type CodexSandbox =
@@ -1033,6 +1036,203 @@ export interface SubAgentResult {
    * Optional for back-compat; populated by spawnCaptured.
    */
   subprocessRetryAttempts?: number;
+}
+
+/**
+ * Observable outcome of {@link runRoleStepWithProviderRetry}. The orchestrator
+ * consumes `result` exactly as it would a bare role result; the rest is for
+ * threading the session budget and for tests.
+ */
+export interface ProviderRetryOutcome {
+  /**
+   * The final role result: a clean PASS once recovery succeeds, or the last
+   * failure handed straight back to the normal FAIL path (so existing
+   * classification/halt behavior is unchanged when the seam can't recover).
+   */
+  result: SubAgentResult;
+  /** Capacity/overloaded retries actually performed in THIS step (slept + re-spawned). */
+  retries: number;
+  /**
+   * Session-budget units to add to `phaseState.providerRetryAttempts`. Equal to
+   * `retries` — the per-phase budget tracks actual backoff churn, so a step that
+   * slept twice consumes 2 of the phase's PROVIDER_RETRY_SESSION_CAP units.
+   */
+  sessionAttemptsConsumed: number;
+  /** Backoff sleeps performed, in ms, in order (for observability + tests). */
+  sleptMs: number[];
+  /** False when a clean PASS was reached; true when the seam stopped retrying. */
+  halted: boolean;
+  /**
+   * Why the loop stopped: "completed" (PASS), "non-provider failure" (a real red
+   * — hand back to FAIL), "capacity-retry disabled" (kill switch), or a
+   * planProviderRetry reason (per-attempt backoff exhausted / session cap / a
+   * non-capacity provider verdict like auth/quota/stall/transport).
+   */
+  haltReason: string;
+}
+
+/**
+ * A1 — orchestrator-level capacity/overloaded backoff+retry around a single
+ * role step. This is the THIRD and outermost provider-retry layer, sitting
+ * above two inner layers: the sub-agent CLI's own `retryWithBackoff` (Gemini) /
+ * transport retry (Codex), and `runCodexImpl`'s one-shot 429/transport re-spawn
+ * (its `noVerdict` path also fires on a capacity exit). A persistent
+ * `529 Overloaded` / `RESOURCE_EXHAUSTED` means the provider is genuinely
+ * saturated, so an escalating backoff (30s → 60s → 120s) beats dead-halting a
+ * multi-hour build on a transient capacity blip.
+ *
+ * What this seam bounds is the OUTER backoff schedule, NOT the absolute
+ * subprocess count. `spawnRoleStep` is re-invoked from scratch on each retry, so
+ * every re-spawn re-runs the full `runRoleTask` primary→backup ladder, and each
+ * leg may one-shot-retry inside `runCodexImpl`. Worst case for a codex+codex
+ * role under a SUSTAINED outage is several subprocess spawns per outer attempt;
+ * that churn is bounded (the caps below) and spread across the backoff windows,
+ * never a tight hammer. Suppressing the inner one-shot on a classified capacity
+ * verdict (so the layers don't both retry the same transient) is a documented
+ * follow-up — see docs/designs/BUILD_ROBUSTNESS_SUITE.md §A1.
+ *
+ * Policy is delegated entirely to the pure `planProviderRetry`:
+ *   - kind=capacity|overloaded → backoff+respawn, bounded TWO ways:
+ *       • per-step: `nextCapacityBackoffMs` halts after
+ *         PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS (3) escalating sleeps, so one
+ *         step can't churn forever on a persistent overload; and
+ *       • per-phase: `sessionAttempts` (threaded from
+ *         `phaseState.providerRetryAttempts`) halts at PROVIDER_RETRY_SESSION_CAP
+ *         (6) across ALL role steps in the phase, bounding cumulative churn.
+ *   - kind=auth|quota|transport|stall → planProviderRetry returns halt, so the
+ *     seam NEVER re-spawns on those (auth/quota won't self-resolve; transport/
+ *     stall already had their one-shot inner retry). NOTE this does NOT confer
+ *     runConfiguredRoleTask's A3 primary→backup auth-fanout suppression onto the
+ *     wrapped `runRoleTask`: runRoleTask still runs its own internal backup
+ *     fallback BEFORE the seam classifies, so on a primary auth failure the
+ *     seam's auth-halt acts on the backup's result. (That runRoleTask asymmetry
+ *     predates A1 and is out of scope here.)
+ *   - a non-provider failure (real convergence red, gate fail) → no verdict →
+ *     handed straight back so the FAIL ladder classifies + halts as today.
+ *
+ * Purely additive and side-effect free w.r.t. phase state: it spawns, inspects,
+ * sleeps, re-spawns, and returns. The caller threads the session budget by
+ * adding `sessionAttemptsConsumed` to `phaseState.providerRetryAttempts`.
+ *
+ * `sleep` and `rng` are injected so the loop is deterministically unit-testable
+ * (see A1 robustness spec) with zero real sleeping and fixed jitter.
+ *
+ * Kill switch: pass `disabled` (wired to GSTACK_DISABLE_CAPACITY_RETRY) to skip
+ * the loop entirely — the first failure is returned unretried, restoring the
+ * pre-A1 dead-halt behavior for operators in a degraded-provider scenario.
+ */
+export async function runRoleStepWithProviderRetry(
+  spawnRoleStep: () => Promise<SubAgentResult>,
+  opts: {
+    /** Starting per-phase budget, i.e. phaseState.providerRetryAttempts ?? 0. */
+    sessionAttempts: number;
+    /** Awaited between attempts. Production passes a real async sleep; tests a spy. */
+    sleep?: (ms: number) => void | Promise<void>;
+    /** Jitter source for nextCapacityBackoffMs. Defaults to Math.random. */
+    rng?: () => number;
+    /** Kill switch (GSTACK_DISABLE_CAPACITY_RETRY): skip retry, return first failure. */
+    disabled?: boolean;
+    /** Hard guard so a wiring bug can't spin forever. Default: session cap + 5. */
+    maxCalls?: number;
+    /** Optional progress logger for the backoff notices. */
+    log?: (msg: string) => void;
+  },
+): Promise<ProviderRetryOutcome> {
+  const slept: number[] = [];
+  let capacityAttempt = 0;
+  let sessionAttempts = opts.sessionAttempts;
+  const startSession = sessionAttempts;
+  const maxCalls = opts.maxCalls ?? PROVIDER_RETRY_SESSION_CAP + 5;
+
+  let last: SubAgentResult | undefined;
+  for (let call = 0; call < maxCalls; call++) {
+    const result = await spawnRoleStep();
+    last = result;
+
+    // Clean PASS → done. (A stall kill / timeout is a failure, not a PASS.)
+    if (result.exitCode === 0 && !result.timedOut && !result.stallKilled) {
+      return {
+        result,
+        retries: capacityAttempt,
+        sessionAttemptsConsumed: sessionAttempts - startSession,
+        sleptMs: slept,
+        halted: false,
+        haltReason: "completed",
+      };
+    }
+
+    // Kill switch: hand the failure straight back to the normal FAIL path.
+    if (opts.disabled) {
+      return {
+        result,
+        retries: capacityAttempt,
+        sessionAttemptsConsumed: sessionAttempts - startSession,
+        sleptMs: slept,
+        halted: true,
+        haltReason: "capacity-retry disabled",
+      };
+    }
+
+    // Classify. A non-provider failure (genuine red, gate fail) is NOT a
+    // capacity retry — return it so the FAIL ladder runs unchanged.
+    const verdict = classifyProviderFailure({
+      text: `${result.stdout ?? ""}\n${result.stderr ?? ""}`,
+      stallKilled: result.stallKilled,
+      timedOut: result.timedOut,
+    });
+    if (!verdict) {
+      return {
+        result,
+        retries: capacityAttempt,
+        sessionAttemptsConsumed: sessionAttempts - startSession,
+        sleptMs: slept,
+        halted: true,
+        haltReason: "non-provider failure",
+      };
+    }
+
+    // Provider verdict present. Ask the planner what to do. capacityAttempt is
+    // per-step (1-based); sessionAttempts is the running per-phase budget.
+    capacityAttempt += 1;
+    const plan = planProviderRetry({
+      verdict,
+      capacityAttempt,
+      sessionAttempts,
+      rng: opts.rng,
+    });
+    if (plan.halt) {
+      // auth/quota/transport/stall, per-step backoff exhausted, or session cap.
+      // Hand the failure back to the FAIL path; it already records the verdict.
+      return {
+        result,
+        retries: capacityAttempt - 1,
+        sessionAttemptsConsumed: sessionAttempts - startSession,
+        sleptMs: slept,
+        halted: true,
+        haltReason: plan.reason,
+      };
+    }
+    // Recoverable capacity/overloaded: sleep the backoff, consume one session
+    // unit, and re-spawn the SAME step.
+    sessionAttempts += 1;
+    opts.log?.(
+      `provider capacity/overload — backoff ${plan.sleepMs}ms then retry ` +
+        `(step attempt ${capacityAttempt}/${PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS}, ` +
+        `phase budget ${sessionAttempts}/${PROVIDER_RETRY_SESSION_CAP})`,
+    );
+    await opts.sleep?.(plan.sleepMs);
+    slept.push(plan.sleepMs);
+  }
+
+  // maxCalls guard tripped — should be unreachable given the planner's caps.
+  return {
+    result: last as SubAgentResult,
+    retries: capacityAttempt,
+    sessionAttemptsConsumed: sessionAttempts - startSession,
+    sleptMs: slept,
+    halted: true,
+    haltReason: "max-calls guard",
+  };
 }
 
 /**

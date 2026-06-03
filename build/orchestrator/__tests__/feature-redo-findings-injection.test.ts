@@ -28,10 +28,7 @@ import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-  buildGeminiPromptBody,
-  resetPhaseStateForRedo,
-} from "../cli";
+import { buildGeminiPromptBody, resetPhaseStateForRedo } from "../cli";
 import { applyResult } from "../phase-runner";
 import type { BuildState, Phase, PhaseState } from "../types";
 
@@ -93,6 +90,22 @@ describe("Bug A — resetPhaseStateForRedo persists feature-review path", () => 
     const state = mkState([ps]);
     resetPhaseStateForRedo(state, 0, {});
     expect(state.phases[0].pendingFeatureReviewOutputPath).toBeUndefined();
+  });
+
+  it("T-A1d: clears providerRetryAttempts so a redone phase gets a fresh capacity-retry budget (A1)", () => {
+    // A1 regression: a phase that exhausted PROVIDER_RETRY_SESSION_CAP on its
+    // first attempt must NOT be permanently denied provider-capacity backoff
+    // on redo. resetPhaseStateForRedo clears the per-phase budget; the next
+    // loadState backfills it to 0.
+    const ps = mkPhaseState({
+      status: "committed",
+      providerRetryAttempts: 6,
+    });
+    const state = mkState([ps]);
+    resetPhaseStateForRedo(state, 0, {
+      featureReviewOutputPath: "/tmp/feature-1-review-1-output.md",
+    });
+    expect(state.phases[0].providerRetryAttempts).toBeUndefined();
   });
 });
 
@@ -263,10 +276,7 @@ describe("Bug A — static-grep wiring guards", () => {
     // Find the FEATURE_REDO branch.
     const start = cliContent.indexOf('verdict.verdict === "FEATURE_REDO"');
     expect(start).toBeGreaterThan(0);
-    const end = cliContent.indexOf(
-      "FEATURE_NEEDS_PHASES",
-      start,
-    );
+    const end = cliContent.indexOf("FEATURE_NEEDS_PHASES", start);
     expect(end).toBeGreaterThan(start);
     const block = cliContent.slice(start, end);
     expect(block).toMatch(/resetPhaseStateForRedo\([^)]*,\s*i\s*,/);
@@ -289,21 +299,17 @@ describe("Bug A — static-grep wiring guards", () => {
     expect(block).toContain("pendingFeatureFindings");
     // The findings must be threaded into buildGeminiPromptBody as the
     // 4th argument — not just read and discarded.
-    expect(block).toMatch(/buildGeminiPromptBody\([^)]*pendingFeatureFindings/s);
+    expect(block).toMatch(
+      /buildGeminiPromptBody\([^)]*pendingFeatureFindings/s,
+    );
   });
 
   it("T-A5c: applyResult RUN_GEMINI branch deletes pendingFeatureReviewOutputPath", () => {
-    const phaseRunnerPath = path.resolve(
-      import.meta.dir,
-      "../phase-runner.ts",
-    );
+    const phaseRunnerPath = path.resolve(import.meta.dir, "../phase-runner.ts");
     const content = fs.readFileSync(phaseRunnerPath, "utf-8");
     const start = content.indexOf('action.type === "RUN_GEMINI"');
     expect(start).toBeGreaterThan(0);
-    const end = content.indexOf(
-      'action.type === "RUN_CODEX_REVIEW"',
-      start,
-    );
+    const end = content.indexOf('action.type === "RUN_CODEX_REVIEW"', start);
     expect(end).toBeGreaterThan(start);
     const block = content.slice(start, end);
     expect(block).toContain("pendingFeatureReviewOutputPath");

@@ -100,6 +100,7 @@ import {
   runCodexImpl,
   runCodexReview,
   runCodexFeatureReview,
+  runRoleStepWithProviderRetry,
   parseVerdict,
   parseFailureCount,
   parseJudgeVerdict,
@@ -5987,6 +5988,23 @@ function summarizePhase(
   console.log(`\n[${marker}] Phase ${phaseNumber}: ${phaseName}`);
 }
 
+/**
+ * A1: build the {@link runRoleStepWithProviderRetry} options for a phase role
+ * step. `sessionAttempts` is the running per-phase budget read from
+ * `phaseState.providerRetryAttempts`; production uses a real async sleep (so a
+ * 30–120s capacity backoff yields the event loop instead of blocking it) and
+ * Math.random jitter. The kill switch mirrors GSTACK_DISABLE_PROVIDER_CLASSIFIER.
+ */
+function capacityRetryOpts(sessionAttempts: number, label: string) {
+  return {
+    sessionAttempts,
+    sleep: (ms: number) => new Promise<void>((r) => setTimeout(r, ms)),
+    rng: Math.random,
+    disabled: process.env.GSTACK_DISABLE_CAPACITY_RETRY === "1",
+    log: (m: string) => console.log(`  → ${label}: ${m}`),
+  };
+}
+
 export async function runRoleTask(opts: {
   role: RoleConfig;
   inputFilePath: string;
@@ -7769,6 +7787,11 @@ export function resetPhaseStateForRedo(
   delete (ps as any).committedSha;
   delete (ps as any).error;
   delete (ps as any).redSpecAttempts;
+  // A1: a redone phase starts with a fresh per-phase capacity-retry budget.
+  // Without this, a phase that exhausted PROVIDER_RETRY_SESSION_CAP on its
+  // first attempt would be permanently denied provider-capacity backoff on
+  // every redo (the next loadState re-seeds it to 0 via the state.ts backfill).
+  delete (ps as any).providerRetryAttempts;
   delete (ps as any).dualImpl;
   if (opts?.featureReviewOutputPath) {
     ps.pendingFeatureReviewOutputPath = opts.featureReviewOutputPath;
@@ -9181,16 +9204,33 @@ async function runPhase(args: {
         // Pre-create empty output file so a missing-file error is unambiguous.
         fs.writeFileSync(outputFilePath, "");
         parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);
-        result = await runRoleTask({
-          role: args.roles.primaryImpl,
-          inputFilePath,
-          outputFilePath,
-          cwd,
-          slug: state.slug,
-          phaseNumber: phase.number,
-          iteration: action.iteration,
-          logPrefix: "primary-impl",
-        });
+        {
+          // A1: a transient provider 529/overload on the primary implementor
+          // backs off and re-spawns (bounded by the phase budget) instead of
+          // dead-halting a long build. Non-capacity verdicts fall straight
+          // through to the existing FAIL path.
+          const _cap = await runRoleStepWithProviderRetry(
+            () =>
+              runRoleTask({
+                role: args.roles.primaryImpl,
+                inputFilePath,
+                outputFilePath,
+                cwd,
+                slug: state.slug,
+                phaseNumber: phase.number,
+                iteration: action.iteration,
+                logPrefix: "primary-impl",
+              }),
+            capacityRetryOpts(
+              phaseState.providerRetryAttempts ?? 0,
+              "primary-impl",
+            ),
+          );
+          result = _cap.result;
+          phaseState.providerRetryAttempts =
+            (phaseState.providerRetryAttempts ?? 0) +
+            _cap.sessionAttemptsConsumed;
+        }
         if (
           shouldRetryPrimaryImplWithSecondary({
             primaryRole: args.roles.primaryImpl,
@@ -9306,16 +9346,30 @@ async function runPhase(args: {
         );
         fs.writeFileSync(outputFilePath, "");
         parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);
-        result = await runRoleTask({
-          role: args.roles.primaryImpl,
-          inputFilePath,
-          outputFilePath,
-          cwd,
-          slug: state.slug,
-          phaseNumber: phase.number,
-          iteration: action.iteration,
-          logPrefix: "primary-impl-rerun",
-        });
+        {
+          // A1: capacity backoff+retry on the post-review re-implementation.
+          const _cap = await runRoleStepWithProviderRetry(
+            () =>
+              runRoleTask({
+                role: args.roles.primaryImpl,
+                inputFilePath,
+                outputFilePath,
+                cwd,
+                slug: state.slug,
+                phaseNumber: phase.number,
+                iteration: action.iteration,
+                logPrefix: "primary-impl-rerun",
+              }),
+            capacityRetryOpts(
+              phaseState.providerRetryAttempts ?? 0,
+              "primary-impl-rerun",
+            ),
+          );
+          result = _cap.result;
+          phaseState.providerRetryAttempts =
+            (phaseState.providerRetryAttempts ?? 0) +
+            _cap.sessionAttemptsConsumed;
+        }
         if (
           shouldRetryPrimaryImplWithSecondary({
             primaryRole: args.roles.primaryImpl,
@@ -9493,23 +9547,37 @@ async function runPhase(args: {
         );
         fs.writeFileSync(outputFilePath, "");
         parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);
-        result = await runRoleTask({
-          role: args.roles.testWriter,
-          inputFilePath,
-          outputFilePath,
-          cwd,
-          slug: state.slug,
-          phaseNumber: phase.number,
-          iteration: action.iteration,
-          logPrefix: "test-writer",
-          // Bug H: drives the role-shaped codex prompt switch in
-          // buildCodexImplArgv. Without this, a codex test-writer
-          // receives the implementor prompt and over-reaches into
-          // production code; PR #102 then refuses the output. See
-          // .claude/worktrees/fix-codex-test-writer-role-confusion-prompt
-          // for the canonical polis-mesh F5 evidence.
-          roleId: "test-writer",
-        });
+        {
+          // A1: capacity backoff+retry on the test-writer step.
+          const _cap = await runRoleStepWithProviderRetry(
+            () =>
+              runRoleTask({
+                role: args.roles.testWriter,
+                inputFilePath,
+                outputFilePath,
+                cwd,
+                slug: state.slug,
+                phaseNumber: phase.number,
+                iteration: action.iteration,
+                logPrefix: "test-writer",
+                // Bug H: drives the role-shaped codex prompt switch in
+                // buildCodexImplArgv. Without this, a codex test-writer
+                // receives the implementor prompt and over-reaches into
+                // production code; PR #102 then refuses the output. See
+                // .claude/worktrees/fix-codex-test-writer-role-confusion-prompt
+                // for the canonical polis-mesh F5 evidence.
+                roleId: "test-writer",
+              }),
+            capacityRetryOpts(
+              phaseState.providerRetryAttempts ?? 0,
+              "test-writer",
+            ),
+          );
+          result = _cap.result;
+          phaseState.providerRetryAttempts =
+            (phaseState.providerRetryAttempts ?? 0) +
+            _cap.sessionAttemptsConsumed;
+        }
       }
       // Test-writer must commit failing tests. A drifting sub-agent that
       // returns exit 0 with a summary but no commits used to silently
@@ -9790,16 +9858,30 @@ async function runPhase(args: {
         );
         fs.writeFileSync(outputFilePath, "");
         parentBeforeRole = refreshParentWorkspaceSnapshot(parentWorkspace);
-        result = await runRoleTask({
-          role: args.roles.testFixer,
-          inputFilePath,
-          outputFilePath,
-          cwd,
-          slug: state.slug,
-          phaseNumber: phase.number,
-          iteration: action.iteration,
-          logPrefix: "gemini-fix",
-        });
+        {
+          // A1: capacity backoff+retry on the test-fixer step.
+          const _cap = await runRoleStepWithProviderRetry(
+            () =>
+              runRoleTask({
+                role: args.roles.testFixer,
+                inputFilePath,
+                outputFilePath,
+                cwd,
+                slug: state.slug,
+                phaseNumber: phase.number,
+                iteration: action.iteration,
+                logPrefix: "gemini-fix",
+              }),
+            capacityRetryOpts(
+              phaseState.providerRetryAttempts ?? 0,
+              "gemini-fix",
+            ),
+          );
+          result = _cap.result;
+          phaseState.providerRetryAttempts =
+            (phaseState.providerRetryAttempts ?? 0) +
+            _cap.sessionAttemptsConsumed;
+        }
       }
       result = await applyMutableAgentHygiene({
         result,

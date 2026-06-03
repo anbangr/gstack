@@ -1,96 +1,69 @@
 /**
- * A1 — provider-capacity-retry-wired (build-robustness suite)
+ * A1 — provider-capacity-retry-wired  [RED→FIXED]  (build-robustness suite)
  *
- * Group A (provider failures), tier: smoke. Intended mode: RED.
+ * Group A (provider failures), tier: smoke.
  *
  * THE GAP (confirmed by reading the production code 2026-06-03):
  *   A transient `API Error: 529 Overloaded` / `RESOURCE_EXHAUSTED` mid-build
- *   must drive backoff+retry via `planProviderRetry`, bounded by
- *   `PROVIDER_RETRY_SESSION_CAP` (6) — NOT an immediate halt.
+ *   used to dead-halt a multi-hour build. `planProviderRetry` /
+ *   `nextCapacityBackoffMs` were a fully-tested but UNWIRED recovery subsystem
+ *   (zero production call sites), and `phaseState.providerRetryAttempts` was a
+ *   declared-but-never-written session budget.
  *
- *   But `planProviderRetry` / `nextCapacityBackoffMs` have ZERO production
- *   call sites today (dead code, halt-event-helpers.ts:717,744). The FAIL
- *   path in cli.ts (~8800-8978) classifies the verdict
- *   (`recordProviderFailureVerdict`) and then unconditionally `return
- *   "failed"` — no sleep, no re-spawn, no consultation of the backoff
- *   planner, no `PROVIDER_RETRY_SESSION_CAP` budget. cli.ts does not even
- *   import `planProviderRetry`. A single transient 529 kills a multi-hour
- *   build.
+ * THE FIX:
+ *   `runRoleStepWithProviderRetry(spawnRoleStep, opts)` (sub-agents.ts) is the
+ *   third, OUTERMOST provider-retry layer — composed on top of the sub-agent
+ *   CLI's own retryWithBackoff/transport retry and runCodexImpl's one-shot
+ *   429/403 re-spawn, NOT replacing them. By the time a capacity banner reaches
+ *   this seam those inner retries are exhausted, so a persistent overload earns
+ *   an escalating backoff (30s → 60s → 120s) instead of killing the build.
+ *   Policy is delegated entirely to the pure `planProviderRetry`:
+ *     - capacity/overloaded → backoff+respawn, bounded TWO ways:
+ *         • per-step: nextCapacityBackoffMs halts after
+ *           PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS (3) escalating sleeps; and
+ *         • per-phase: sessionAttempts (threaded from
+ *           phaseState.providerRetryAttempts) halts at
+ *           PROVIDER_RETRY_SESSION_CAP (6) across ALL role steps in the phase.
+ *     - auth/quota/transport/stall → halt (no retry): auth/quota won't
+ *       self-resolve; transport/stall already had their one-shot inner retry.
+ *     - a non-provider failure (real red / gate fail) → handed straight back so
+ *       the existing FAIL ladder classifies + halts unchanged.
+ *   cli.ts routes the four single-impl LLM dispatch sites (RUN_GEMINI primary,
+ *   RUN_GEMINI_FROM_REVIEW re-impl, RUN_GEMINI_TEST_SPEC, RUN_GEMINI_FIX)
+ *   through the seam via `capacityRetryOpts(...)`, threading
+ *   phaseState.providerRetryAttempts as the running per-phase budget. The seam
+ *   is purely additive: on a clean PASS the FAIL path never fires; on any
+ *   non-recoverable verdict the failed result is returned and today's behavior
+ *   is preserved. A `GSTACK_DISABLE_CAPACITY_RETRY=1` kill switch restores the
+ *   pre-fix dead-halt (mirrors GSTACK_DISABLE_PROVIDER_CLASSIFIER).
  *
- * WHAT THIS FILE PINS (the DESIRED, currently-failing invariant):
- *   1. The FAIL path consults `planProviderRetry` for a capacity/overloaded
- *      verdict and acts on its `{ halt, sleepMs }` decision (sleep+respawn
- *      vs halt) instead of dead-halting. Asserted as production wiring on
- *      the cli.ts FAIL-classification source — the same static-grep idiom
- *      `feature-start-network-retry.test.ts` uses for "route through the
- *      retry helper" invariants. Fails today because the symbol is absent.
+ *   Deliberately NOT wired in this pass (documented follow-up): the dual-impl
+ *   candidates (Promise.all racing a shared session counter + per-iteration
+ *   output-path collisions) — dual-impl already has winner-takes-all resilience
+ *   so a single 529 doesn't kill it; and the codex-review gates / codex
+ *   feature-review paths (lower frequency, separate dispatch fns).
  *
- *   2. The OBSERVABLE recovery contract the wiring must satisfy, driven
- *      against the REAL `planProviderRetry` with a `sleepMs` spy, a
- *      deterministic rng, and a canned `SubAgentResult` whose log contains
- *      "API Error: 529 Overloaded" + exitCode:1 on the first N calls then a
- *      clean PASS:
- *        - a clean PASS within budget completes the phase (no halt);
- *        - each capacity retry sleeps a positive backoff;
- *        - `providerRetryAttempts` increments once per attempt;
- *        - the halt fires only AFTER `PROVIDER_RETRY_SESSION_CAP` failures,
- *          not before.
- *      This block asserts that a real respawn loop wired around
- *      `planProviderRetry` produces that contract. It is RED because no
- *      production loop calls `planProviderRetry`, so the contract is
- *      currently unreachable from the orchestrator.
+ * WHAT THIS FILE PINS:
+ *   RED #1 — the production wiring: the seam exists and calls planProviderRetry
+ *     (sub-agents.ts), and cli.ts dispatch sites route through it + thread the
+ *     providerRetryAttempts budget + honor the kill switch. (Static-grep idiom,
+ *     same as feature-start-network-retry.test.ts.)
+ *   RED #2 — the observable recovery contract, driven against the REAL
+ *     `runRoleStepWithProviderRetry` with a fake spawn thunk (canned 529s then a
+ *     PASS), a sleepMs spy, and zero-jitter rng. This is now a true unit test of
+ *     the production seam, not a test-local reconstruction.
  *
- * Both invariants live in `describe.skip("[RED] ...")` blocks: the fix PR
- * wires `planProviderRetry` into the cli.ts FAIL path and removes `.skip`.
+ * Note on a corrected assumption: an earlier draft of RED #2 asserted that a
+ * single always-529 step halts at PROVIDER_RETRY_SESSION_CAP (6). Reading the
+ * real planProviderRetry shows that is wrong — a SINGLE step is bounded first
+ * by the per-step backoff cap (3); the session cap (6) governs ACROSS steps in
+ * a phase. The tests below pin both bounds correctly (single-step → halts at 3;
+ * a step that starts with the budget near the cap → halts at 6).
  *
- * ── DEFERRAL RATIONALE (kept [RED]/.skip; G2 + C1 of this suite shipped) ──
- *
- * Unlike G2 (a behavior-preserving seam extraction) and C1 (verified by a
- * real forked-process integration repro), A1 has NO airtight cli-level
- * verification path within this suite's scope, and the fix is a layered-retry
- * POLICY decision, not a wiring:
- *
- *   1. Two provider-retry layers ALREADY exist below the orchestrator FAIL
- *      path: the sub-agent CLI's own `retryWithBackoff` (Gemini) / transport
- *      retry (Codex) — see sub-agents.ts ~1029-1032 — and a one-shot Codex
- *      429/403 transport re-spawn in `runCodexImpl` (sub-agents.ts ~2085-2121).
- *      Wiring `planProviderRetry` into the FAIL path adds a THIRD,
- *      orchestrator-level capacity backoff on top of those. The code comment
- *      at sub-agents.ts:1029-1032 explicitly warns against conflating
- *      subprocess capacity-stall with the outer convergence retry-cap; a third
- *      layer composed wrongly produces very long DOOMED builds (3 layers ×
- *      backoff) — the opposite of the robustness this gap targets.
- *
- *   2. A capacity 529 reaches the FAIL handler only AFTER the failure is
- *      recorded on phaseState. For a retry to actually RE-RUN the role (not
- *      just re-classify stale state and burn backoff sleeps before halting),
- *      the failing role's phaseState must be reset so `decideNextAction`
- *      re-issues it. That reset is role-specific (RUN_GEMINI /
- *      RUN_CODEX_REVIEW / RUN_GEMINI_TEST_SPEC / RUN_DUAL_IMPL / RUN_TESTS …
- *      each carry distinct counters) and is the genuinely risky edit to the
- *      orchestrator's hot loop.
- *
- *   3. RED #1 is a static-grep on cli.ts; RED #2 drives the REAL planner
- *      through a TEST-LOCAL loop (it does not touch cli.ts). Neither exercises
- *      the actual orchestrator respawn-on-529 behavior — that needs a
- *      build-forking integration harness that injects transient 529s and
- *      asserts the role is re-dispatched then converges. No such harness
- *      exists here, so "full suite green" is NOT airtight verification for A1.
- *
- * The correct fix is a focused follow-up: a single shared
- * `runRoleStepWithProviderRetry(spawnFn)` seam at the dispatch boundary that
- * composes with (does not duplicate) the existing CLI/transport retries, plus
- * an integration test that injects 529s. Per the suite's discipline — ship
- * what is verifiable airtight, leave the rest a documented RED — A1 stays
- * skipped with this rationale rather than shipping an unverified hot-loop
- * change. See docs/designs/BUILD_ROBUSTNESS_SUITE.md §7 / §A1.
- *
- * Imports only symbols that exist today (the production dead code +
- * `classifyProviderFailure` + the `SubAgentResult` type + the cli.ts
- * source). No real LLM, no network, no spawn. Fake clock via the
- * shared sleepMs spy. See ./README.md for the PIN/RED protocol.
+ * No real LLM, no network, no spawn. Fake clock via the injected sleep spy.
+ * See ./README.md for the PIN/RED protocol.
  */
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
@@ -99,137 +72,102 @@ import {
   nextCapacityBackoffMs,
   PROVIDER_RETRY_SESSION_CAP,
   PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS,
-  type ProviderFailureVerdict,
 } from "../../halt-event-helpers";
-import type { SubAgentResult } from "../../sub-agents";
-import { mkTmp } from "./helpers";
+import {
+  runRoleStepWithProviderRetry,
+  type SubAgentResult,
+} from "../../sub-agents";
 
 // ---------------------------------------------------------------------------
 // Deterministic fixtures — no LLM, no network, no spawn.
 // ---------------------------------------------------------------------------
 
-/** The canned 529 failure log the FAIL classifier sees on a transient overload. */
+/** A 529 capacity banner (classifies as kind="capacity"). */
 const OVERLOAD_LOG = "API Error: 529 Overloaded\nplease retry shortly.";
+/** An auth banner (classifies as kind="auth" — must NOT retry, A3 guard). */
+const AUTH_LOG = "authentication required: please run /login";
+/** A non-provider failure (no banner → null verdict → hand back to FAIL ladder). */
+const GATE_FAIL_LOG =
+  "GATE FAIL\nThe test pins behavior that is not implemented.";
 
-/**
- * Build a canned SubAgentResult shaped like the orchestrator's role-step
- * output: a 529-overload log + exitCode:1 for a FAIL, or a clean exitCode:0
- * PASS. Mirrors the SubAgentResult fields used by the FAIL path
- * (stdout/exitCode/timedOut/stallKilled/logPath).
- */
-function cannedResult(
-  kind: "overload" | "pass",
-  logPath: string,
-): SubAgentResult {
-  const fail = kind === "overload";
-  return {
-    stdout: fail ? OVERLOAD_LOG : "",
+type CannedKind = "overload" | "auth" | "gatefail" | "stall" | "pass";
+
+/** Build a canned SubAgentResult shaped like a role-step output. */
+function cannedResult(kind: CannedKind): SubAgentResult {
+  const base = {
     stderr: "",
-    exitCode: fail ? 1 : 0,
     timedOut: false,
     stallKilled: false,
     stallSilenceMs: 0,
     exitSignal: null,
-    logPath,
+    logPath: "/tmp/a1-role.log",
     durationMs: 1,
     retries: 0,
-  } as SubAgentResult;
+  };
+  switch (kind) {
+    case "pass":
+      return { ...base, stdout: "", exitCode: 0 } as SubAgentResult;
+    case "overload":
+      return { ...base, stdout: OVERLOAD_LOG, exitCode: 1 } as SubAgentResult;
+    case "auth":
+      return { ...base, stdout: AUTH_LOG, exitCode: 1 } as SubAgentResult;
+    case "gatefail":
+      return { ...base, stdout: GATE_FAIL_LOG, exitCode: 1 } as SubAgentResult;
+    case "stall":
+      // A stall kill: watchdog fired (kind="stall" → planProviderRetry halts).
+      return {
+        ...base,
+        stdout: "",
+        exitCode: null,
+        timedOut: true,
+        stallKilled: true,
+        stallSilenceMs: 120_000,
+      } as SubAgentResult;
+  }
 }
 
 /**
- * Deterministic, monotone rng so `nextCapacityBackoffMs` jitter is fixed:
- * 0.5 → zero jitter → backoff is exactly base * 2^(attempt-1).
+ * A spawn thunk that returns the next kind in `seq`, holding the LAST element
+ * once the sequence is exhausted (so [overload,overload,pass] passes on call 3,
+ * and [overload] stays overloaded forever).
  */
-const zeroJitterRng = () => 0.5;
-
-/**
- * A faithful model of the DESIRED FAIL-path retry loop: spawn the role,
- * on a capacity/overloaded verdict consult `planProviderRetry`, sleep the
- * returned backoff and re-spawn until PASS or until the planner says halt.
- * This is the loop the production FAIL path must contain; A1 is RED because
- * cli.ts does NOT contain it (it dead-halts after classifying).
- *
- * Returns the observable contract: outcome, the per-attempt sleeps, and the
- * final providerRetryAttempts counter.
- */
-function runDesiredRetryLoop(opts: {
-  /** Per-call role result; call index is 0-based. */
-  spawn: (call: number) => SubAgentResult;
-  sleepMs: (ms: number) => void;
-  rng?: () => number;
-  /** Hard guard so a wiring bug can't infinite-loop the test. */
-  maxCalls?: number;
-}): {
-  outcome: "completed" | "halted";
-  sleeps: number[];
-  providerRetryAttempts: number;
-  haltReason?: string;
-} {
-  const sleeps: number[] = [];
-  let providerRetryAttempts = 0;
-  let capacityAttempt = 0;
-  const maxCalls = opts.maxCalls ?? PROVIDER_RETRY_SESSION_CAP + 5;
-
-  for (let call = 0; call < maxCalls; call++) {
-    const result = opts.spawn(call);
-    // PASS within budget → phase completes.
-    if (result.exitCode === 0 && !result.timedOut && !result.stallKilled) {
-      return { outcome: "completed", sleeps, providerRetryAttempts };
-    }
-    // FAIL → classify. A genuine convergence failure (null verdict) is not a
-    // provider retry; halt immediately. Capacity/overloaded → consult planner.
-    const verdict: ProviderFailureVerdict | null = classifyProviderFailure({
-      text: result.stdout + "\n" + result.stderr,
-      stallKilled: result.stallKilled,
-      timedOut: result.timedOut,
-    });
-    if (!verdict) {
-      return {
-        outcome: "halted",
-        sleeps,
-        providerRetryAttempts,
-        haltReason: "convergence",
-      };
-    }
-    capacityAttempt += 1;
-    const plan = planProviderRetry({
-      verdict,
-      capacityAttempt,
-      sessionAttempts: providerRetryAttempts,
-      rng: opts.rng ?? zeroJitterRng,
-    });
-    providerRetryAttempts += 1;
-    if (plan.halt) {
-      return {
-        outcome: "halted",
-        sleeps,
-        providerRetryAttempts,
-        haltReason: plan.reason,
-      };
-    }
-    opts.sleepMs(plan.sleepMs);
-    sleeps.push(plan.sleepMs);
-  }
-  return {
-    outcome: "halted",
-    sleeps,
-    providerRetryAttempts,
-    haltReason: "maxCalls guard",
+function sequenceSpawn(seq: CannedKind[]): () => Promise<SubAgentResult> {
+  let i = 0;
+  return async () => {
+    const kind = seq[Math.min(i, seq.length - 1)];
+    i += 1;
+    return cannedResult(kind);
   };
 }
 
-// cli.ts FAIL-path source — read once for the wiring grep (same pattern as
-// feature-start-network-retry.test.ts reads ../cli.ts).
+/** Zero-jitter rng so nextCapacityBackoffMs is exactly base * 2^(attempt-1). */
+const zeroJitterRng = () => 0.5;
+
+/** Standard test opts: sleep spy + zero jitter. `slept` captures backoff ms. */
+function retryOpts(slept: number[], over: Record<string, unknown> = {}) {
+  return {
+    sessionAttempts: 0,
+    sleep: (ms: number) => {
+      slept.push(ms);
+    },
+    rng: zeroJitterRng,
+    ...over,
+  };
+}
+
+// Production sources for the wiring greps.
 const cliSource = fs.readFileSync(
   path.resolve(import.meta.dir, "../../cli.ts"),
   "utf-8",
 );
+const subAgentsSource = fs.readFileSync(
+  path.resolve(import.meta.dir, "../../sub-agents.ts"),
+  "utf-8",
+);
 
 // ---------------------------------------------------------------------------
-// Sanity (runs live): the production planner + classifier exist and behave as
-// the pure building blocks the wiring needs. These are NOT the gap — they pin
-// the seams the fix must consume so a refactor that breaks the planner is
-// caught even before the wiring lands. (No assertion here about cli.ts.)
+// Sanity (runs live): the pure planner + classifier building blocks the seam
+// consumes. A refactor that breaks them is caught even before the seam tests.
 // ---------------------------------------------------------------------------
 describe("[PIN] A1 provider-retry building blocks (planner + classifier exist)", () => {
   it("classifies a 529 Overloaded log as a capacity verdict", () => {
@@ -246,7 +184,6 @@ describe("[PIN] A1 provider-retry building blocks (planner + classifier exist)",
     });
     expect(plan.halt).toBe(false);
     expect(plan.sleepMs).toBeGreaterThan(0);
-    // base * 2^0 with zero jitter.
     expect(plan.sleepMs).toBe(nextCapacityBackoffMs(1, zeroJitterRng));
   });
 
@@ -264,153 +201,232 @@ describe("[PIN] A1 provider-retry building blocks (planner + classifier exist)",
 });
 
 // ---------------------------------------------------------------------------
-// RED #1 — the production wiring. The cli.ts FAIL classification path must
-// consult planProviderRetry for a capacity/overloaded verdict and act on its
-// decision, instead of dead-halting after recordProviderFailureVerdict.
-//
-// Today cli.ts does NOT import or call planProviderRetry — the FAIL path runs
-// the classifier ladder and then `return "failed"`. This block is RED until
-// the planner is wired in. UNSKIP WHEN A1 IS FIXED.
+// RED #1 — the production wiring. The capacity-recovery boundary must route
+// through planProviderRetry (in the seam) and cli.ts dispatch sites must call
+// the seam, thread phaseState.providerRetryAttempts, and honor the kill switch.
 // ---------------------------------------------------------------------------
-describe.skip("[RED] A1 provider-capacity-retry-wired (cli FAIL path) — UNSKIP WHEN A1 IS FIXED", () => {
-  it("FAIL classification path references planProviderRetry (dead code today)", () => {
-    // Same static-grep idiom feature-start-network-retry.test.ts uses to pin
-    // that the fetch boundary routes through gitFetchWithRetry. The capacity
-    // recovery boundary must route through planProviderRetry.
-    expect(cliSource).toMatch(/planProviderRetry\(/);
+describe("[RED→FIXED] A1 provider-capacity-retry wired into the dispatch path", () => {
+  it("the seam calls planProviderRetry (no longer dead code)", () => {
+    // planProviderRetry now has a real call site inside runRoleStepWithProviderRetry.
+    expect(subAgentsSource).toMatch(/planProviderRetry\(/);
   });
 
-  it("FAIL path imports planProviderRetry / PROVIDER_RETRY_SESSION_CAP from halt-event-helpers", () => {
-    // The planner + session cap must be in scope where the FAIL classifier
-    // runs. Today neither symbol appears anywhere in cli.ts.
-    expect(cliSource).toMatch(/planProviderRetry/);
-    expect(cliSource).toMatch(/PROVIDER_RETRY_SESSION_CAP/);
-  });
-
-  it("FAIL path consumes providerRetryAttempts as the session budget", () => {
-    // types.ts declares phaseState.providerRetryAttempts (capped at
-    // PROVIDER_RETRY_SESSION_CAP) but cli.ts never reads or increments it.
-    // The wiring must thread it into planProviderRetry's sessionAttempts.
-    expect(cliSource).toMatch(/providerRetryAttempts/);
-  });
-
-  it("FAIL path no longer dead-halts a capacity verdict without consulting the backoff planner", () => {
-    // Pre-fix shape: classify the verdict, set classified=true, fall straight
-    // to `return "failed"` with no backoff sleep / re-spawn between. Post-fix
-    // a capacity/overloaded verdict reaches the planProviderRetry seam before
-    // any terminal `return "failed"`. Anchor on the planner being present in
-    // the same source that owns the FAIL ladder.
-    const classifierRungs = cliSource.indexOf(
-      "GSTACK_DISABLE_PROVIDER_CLASSIFIER",
+  it("the seam exists and is bounded by PROVIDER_RETRY_SESSION_CAP", () => {
+    expect(subAgentsSource).toMatch(
+      /export async function runRoleStepWithProviderRetry/,
     );
-    expect(classifierRungs).toBeGreaterThan(-1);
-    expect(cliSource).toMatch(/planProviderRetry/);
+    expect(subAgentsSource).toMatch(/PROVIDER_RETRY_SESSION_CAP/);
+  });
+
+  it("cli.ts dispatch routes role steps through the capacity-retry seam", () => {
+    // Same static-grep idiom feature-start-network-retry.test.ts uses to pin
+    // that the boundary routes through the retry helper.
+    expect(cliSource).toMatch(/runRoleStepWithProviderRetry\(/);
+  });
+
+  it("cli.ts threads providerRetryAttempts as the per-phase session budget", () => {
+    // types.ts declared phaseState.providerRetryAttempts but nothing wrote it.
+    // The wiring now reads it into the seam and accumulates what each step used.
+    expect(cliSource).toMatch(/providerRetryAttempts/);
+    expect(cliSource).toMatch(/sessionAttemptsConsumed/);
+  });
+
+  it("cli.ts wires the GSTACK_DISABLE_CAPACITY_RETRY kill switch", () => {
+    expect(cliSource).toMatch(/GSTACK_DISABLE_CAPACITY_RETRY/);
+  });
+
+  it("the FAIL classifier ladder still exists alongside the new dispatch-boundary retry", () => {
+    // The seam only intercepts capacity/overloaded at dispatch; every other
+    // provider kind still flows to the FAIL ladder, which must remain.
+    expect(cliSource).toContain("GSTACK_DISABLE_PROVIDER_CLASSIFIER");
+    expect(cliSource).toMatch(/runRoleStepWithProviderRetry\(/);
   });
 });
 
 // ---------------------------------------------------------------------------
-// RED #2 — the observable recovery contract. Drives the REAL planProviderRetry
-// through a faithful respawn loop (the loop the FAIL path must contain) with a
-// sleepMs spy + deterministic rng + canned 529 SubAgentResults. The contract
-// these assertions pin is currently UNREACHABLE from the orchestrator because
-// no production loop calls planProviderRetry. UNSKIP WHEN A1 IS FIXED.
+// RED #2 — the observable recovery contract, driven against the REAL seam.
 // ---------------------------------------------------------------------------
-describe.skip("[RED] A1 provider-capacity recovery contract (backoff + bounded retry) — UNSKIP WHEN A1 IS FIXED", () => {
-  let tmp: string;
-  let logPath: string;
-
-  beforeEach(() => {
-    tmp = mkTmp("gstack-a1-");
-    logPath = path.join(tmp, "role.log");
-    fs.writeFileSync(logPath, OVERLOAD_LOG);
-  });
-
-  afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
-  });
-
-  it("a clean PASS within budget completes the phase (no halt, no sleep)", () => {
-    // First 2 calls 529-overload, 3rd call PASS — recovery succeeds.
+describe("[RED→FIXED] A1 provider-capacity recovery contract (real seam)", () => {
+  it("a clean PASS within budget completes the step (recovered, no halt)", async () => {
+    // Two 529s then a PASS — recovery succeeds.
     const slept: number[] = [];
-    const out = runDesiredRetryLoop({
-      spawn: (call) => cannedResult(call < 2 ? "overload" : "pass", logPath),
-      sleepMs: (ms) => slept.push(ms),
-      rng: zeroJitterRng,
-    });
-    expect(out.outcome).toBe("completed");
-    // Two transient failures → two backoff sleeps before the PASS.
-    expect(out.providerRetryAttempts).toBe(2);
-    expect(slept.length).toBe(2);
-    for (const ms of slept) expect(ms).toBeGreaterThan(0);
+    const out = await runRoleStepWithProviderRetry(
+      sequenceSpawn(["overload", "overload", "pass"]),
+      retryOpts(slept),
+    );
+    expect(out.halted).toBe(false);
+    expect(out.haltReason).toBe("completed");
+    expect(out.result.exitCode).toBe(0);
+    expect(out.retries).toBe(2);
+    expect(out.sessionAttemptsConsumed).toBe(2);
+    expect(out.sleptMs.length).toBe(2);
+    for (const ms of out.sleptMs) expect(ms).toBeGreaterThan(0);
   });
 
-  it("each capacity retry sleeps the backoff schedule (growing, jitter-free)", () => {
-    // Three 529s then PASS — sleeps follow nextCapacityBackoffMs for attempts 1..3.
+  it("each capacity retry sleeps the escalating backoff schedule (jitter-free)", async () => {
+    // Three 529s then PASS — sleeps follow nextCapacityBackoffMs for 1..3.
     const slept: number[] = [];
-    const out = runDesiredRetryLoop({
-      spawn: (call) => cannedResult(call < 3 ? "overload" : "pass", logPath),
-      sleepMs: (ms) => slept.push(ms),
-      rng: zeroJitterRng,
-    });
-    expect(out.outcome).toBe("completed");
-    const expected = [
+    const out = await runRoleStepWithProviderRetry(
+      sequenceSpawn(["overload", "overload", "overload", "pass"]),
+      retryOpts(slept),
+    );
+    expect(out.halted).toBe(false);
+    expect(out.sleptMs).toEqual([
       nextCapacityBackoffMs(1, zeroJitterRng),
       nextCapacityBackoffMs(2, zeroJitterRng),
       nextCapacityBackoffMs(3, zeroJitterRng),
-    ];
-    expect(slept).toEqual(expected);
-    // Strictly growing (doubling) within the per-attempt backoff budget.
-    expect(slept[1]).toBeGreaterThan(slept[0]);
-    expect(slept[2]).toBeGreaterThan(slept[1]);
-    // Per-attempt cap is honored — no 4th retry is even attempted here.
+    ]);
+    expect(out.sleptMs[1]).toBeGreaterThan(out.sleptMs[0]);
+    expect(out.sleptMs[2]).toBeGreaterThan(out.sleptMs[1]);
     expect(PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS).toBe(3);
   });
 
-  it("halt fires ONLY after PROVIDER_RETRY_SESSION_CAP failures, not before", () => {
-    // Always-529: the session cap bounds the churn. The loop must NOT halt
-    // before the cap, and MUST halt at it.
+  it("a single always-529 step is bounded by the per-step backoff cap (3), not the session cap", async () => {
+    // CORRECTED invariant: a SINGLE step halts after the per-step backoff cap
+    // (3 escalating sleeps), NOT after the per-phase session cap (6). The
+    // session cap governs across steps (see the next test).
     const slept: number[] = [];
-    const out = runDesiredRetryLoop({
-      spawn: () => cannedResult("overload", logPath),
-      sleepMs: (ms) => slept.push(ms),
-      rng: zeroJitterRng,
-    });
-    expect(out.outcome).toBe("halted");
-    // providerRetryAttempts is incremented for every classified capacity
-    // failure, including the one that trips the cap; it must reach the cap
-    // and not exceed it.
-    expect(out.providerRetryAttempts).toBe(PROVIDER_RETRY_SESSION_CAP);
-    expect(out.providerRetryAttempts).not.toBeLessThan(
-      PROVIDER_RETRY_SESSION_CAP,
+    const out = await runRoleStepWithProviderRetry(
+      sequenceSpawn(["overload"]),
+      retryOpts(slept),
     );
-    // The halt reason names the session cap, not a generic convergence fail.
+    expect(out.halted).toBe(true);
+    expect(out.retries).toBe(PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS); // 3
+    expect(out.sessionAttemptsConsumed).toBe(
+      PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS,
+    );
+    expect(out.sleptMs.length).toBe(PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS);
+    expect(out.haltReason).toContain(
+      String(PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS),
+    );
+    expect(out.result.exitCode).toBe(1);
+  });
+
+  it("the per-phase session cap halts a step that starts with the budget nearly spent", async () => {
+    // A phase that already burned (cap - 1) provider retries gets exactly ONE
+    // more before the session cap fires — proving the budget threads across
+    // steps and that the halt reason names the session cap (6), not a per-step
+    // backoff exhaustion.
+    const slept: number[] = [];
+    const out = await runRoleStepWithProviderRetry(
+      sequenceSpawn(["overload"]),
+      retryOpts(slept, { sessionAttempts: PROVIDER_RETRY_SESSION_CAP - 1 }),
+    );
+    expect(out.halted).toBe(true);
+    expect(out.sleptMs.length).toBe(1);
+    expect(out.sessionAttemptsConsumed).toBe(1);
     expect(out.haltReason).toContain(String(PROVIDER_RETRY_SESSION_CAP));
   });
 
-  it("a genuine convergence failure (no provider banner) halts immediately — does NOT consume the retry budget", () => {
-    // Negative control: the retry loop must not turn a real red into endless
-    // capacity retries. A null verdict halts on the first failure.
+  it("a step that starts at the session cap halts immediately with zero retries", async () => {
     const slept: number[] = [];
-    const out = runDesiredRetryLoop({
-      spawn: () =>
-        ({
-          stdout: "GATE FAIL\nThe test pins behavior that is not implemented.",
-          stderr: "",
-          exitCode: 1,
-          timedOut: false,
-          stallKilled: false,
-          stallSilenceMs: 0,
-          exitSignal: null,
-          logPath,
-          durationMs: 1,
-          retries: 0,
-        }) as SubAgentResult,
-      sleepMs: (ms) => slept.push(ms),
-      rng: zeroJitterRng,
-    });
-    expect(out.outcome).toBe("halted");
-    expect(out.haltReason).toBe("convergence");
-    expect(out.providerRetryAttempts).toBe(0);
-    expect(slept.length).toBe(0);
+    const out = await runRoleStepWithProviderRetry(
+      sequenceSpawn(["overload"]),
+      retryOpts(slept, { sessionAttempts: PROVIDER_RETRY_SESSION_CAP }),
+    );
+    expect(out.halted).toBe(true);
+    expect(out.retries).toBe(0);
+    expect(out.sessionAttemptsConsumed).toBe(0);
+    expect(out.sleptMs.length).toBe(0);
+    expect(out.haltReason).toContain(String(PROVIDER_RETRY_SESSION_CAP));
+  });
+
+  it("a genuine convergence failure (no provider banner) is handed back without retry", async () => {
+    // Negative control: a real red must NOT become endless capacity retries.
+    const slept: number[] = [];
+    const out = await runRoleStepWithProviderRetry(
+      sequenceSpawn(["gatefail"]),
+      retryOpts(slept),
+    );
+    expect(out.halted).toBe(true);
+    expect(out.haltReason).toBe("non-provider failure");
+    expect(out.retries).toBe(0);
+    expect(out.sessionAttemptsConsumed).toBe(0);
+    expect(out.sleptMs.length).toBe(0);
+  });
+
+  it("an auth verdict halts without retry (A3 guard: auth never self-resolves)", async () => {
+    const slept: number[] = [];
+    const out = await runRoleStepWithProviderRetry(
+      sequenceSpawn(["auth"]),
+      retryOpts(slept),
+    );
+    expect(out.halted).toBe(true);
+    expect(out.retries).toBe(0);
+    expect(out.sleptMs.length).toBe(0);
+    expect(out.haltReason.toLowerCase()).toContain("auth");
+  });
+
+  it("a stall kill halts without retry (stall is not a capacity verdict)", async () => {
+    const slept: number[] = [];
+    const out = await runRoleStepWithProviderRetry(
+      sequenceSpawn(["stall"]),
+      retryOpts(slept),
+    );
+    expect(out.halted).toBe(true);
+    expect(out.retries).toBe(0);
+    expect(out.sleptMs.length).toBe(0);
+    expect(out.haltReason).toContain("stall");
+  });
+
+  it("the kill switch returns the first failure unretried (pre-fix behavior)", async () => {
+    const slept: number[] = [];
+    const out = await runRoleStepWithProviderRetry(
+      sequenceSpawn(["overload"]),
+      retryOpts(slept, { disabled: true }),
+    );
+    expect(out.halted).toBe(true);
+    expect(out.haltReason).toBe("capacity-retry disabled");
+    expect(out.retries).toBe(0);
+    expect(out.sleptMs.length).toBe(0);
+    expect(out.result.exitCode).toBe(1);
+  });
+
+  it("the per-phase budget accumulates across sequential steps up to the session cap", async () => {
+    // The wiring's core value: cli.ts threads the budget across role steps via
+    //   phaseState.providerRetryAttempts = (... ?? 0) + _cap.sessionAttemptsConsumed
+    // Reproduce that carry-forward across two seam calls and prove a phase
+    // can't exceed PROVIDER_RETRY_SESSION_CAP total provider-retry churn — so a
+    // `+ →  =` clobber regression in the wiring fails here.
+    const slept1: number[] = [];
+    const step1 = await runRoleStepWithProviderRetry(
+      sequenceSpawn(["overload"]),
+      retryOpts(slept1, { sessionAttempts: 0 }),
+    );
+    // Step 1 exhausts its per-step cap (3) starting from an empty budget.
+    expect(step1.sessionAttemptsConsumed).toBe(
+      PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS,
+    );
+    // The orchestrator carries that forward as the next step's starting budget.
+    const carried = 0 + step1.sessionAttemptsConsumed;
+    const slept2: number[] = [];
+    const step2 = await runRoleStepWithProviderRetry(
+      sequenceSpawn(["overload"]),
+      retryOpts(slept2, { sessionAttempts: carried }),
+    );
+    // Step 2 gets only the remaining budget, then the SESSION cap fires
+    // (not a per-step backoff exhaustion) — the halt reason names the cap (6).
+    expect(step2.haltReason).toContain(String(PROVIDER_RETRY_SESSION_CAP));
+    // Total provider-retry churn across the phase is bounded by the session cap.
+    expect(carried + step2.sessionAttemptsConsumed).toBe(
+      PROVIDER_RETRY_SESSION_CAP,
+    );
+  });
+
+  it("a watchdog kill that exits 0 is NOT treated as a PASS (stall guard, not bare exitCode===0)", async () => {
+    // The success check is `exitCode === 0 && !timedOut && !stallKilled`. A
+    // process the stall watchdog killed can still exit 0 on the way down; the
+    // seam must treat that as a failure (classify → stall → halt), not a
+    // completion. Pins the !timedOut && !stallKilled clause so a regression to
+    // a bare `exitCode === 0` success check fails CI.
+    const slept: number[] = [];
+    const out = await runRoleStepWithProviderRetry(
+      async () => ({ ...cannedResult("stall"), exitCode: 0 }) as SubAgentResult,
+      retryOpts(slept),
+    );
+    expect(out.halted).toBe(true);
+    expect(out.haltReason).not.toBe("completed");
+    expect(out.haltReason).toContain("stall");
+    expect(out.sleptMs.length).toBe(0);
   });
 });
