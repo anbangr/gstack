@@ -340,7 +340,7 @@ The suite scaffold (§3) is built and wired: 28 spec files under
 `build-skill-gate.yml`. The full build-skill gate is green (PIN specs pass,
 unfixed gaps committed as `describe.skip` REDs).
 
-**Fixed and green (RED → unskipped) — 16 of 24 fixable gaps:**
+**Fixed and green (RED → unskipped) — 21 of 24 fixable gaps:**
 
 | id   | fix                                                                                                                                                               | production touched                        |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
@@ -360,33 +360,37 @@ unfixed gaps committed as `describe.skip` REDs).
 | `G1` | a `RUN_TESTS` timeout is retryable (bounded) — `decideNextAction` re-issues `RUN_TESTS` for `finalStatus:"timeout"`, not FAIL                                     | `phase-runner.ts`                         |
 | `H1` | saveState rolls back `lastUpdatedAt` + cleans tmp on torn rename; gbrain-restore preserves the restored timestamp; sweep live-PID skip gated on a fresh heartbeat | `state.ts`, `cli.ts`                      |
 | `D5` | sweep Shape Z fails closed on an unreadable active-run record — a torn/truncated registry file no longer lets a concurrent build's live worktree be reaped        | `cli.ts`                                  |
+| `F2` | recurrence with a different snapshot archives the prior capture to `<queueDir>/collapsed/` + an `occurrences` counter (stable faultId; dedup/pairing intact)      | `halt-events.ts`                          |
+| `A3` | `PROVIDER_AUTH_RE` realigned with `AUTH_REQUIRED_RE`; primary auth failure is classified and does NOT blindly fan out to the backup                               | `halt-event-helpers.ts`, `sub-agents.ts`  |
+| `B3` | resumed run gets a stall-clock grace window (tracker records `lastSeenPid`; a pid change re-seeds instead of inheriting the dead clock)                           | `monitor.ts`                              |
+| `B2` | subagent-liveness probe walks the whole subtree (shell-wrapped grandchild counts), not just direct children                                                       | `monitor.ts`                              |
+| `E2` | sweep reaps leaked `os.tmpdir()/gstack-dual-*` worktrees + branches (staleness-gated so a live concurrent dual-impl is never destroyed)                           | `cli.ts`                                  |
 
 Each fix landed with its RED spec unskipped and the touched file's existing tests
-re-run green (zero regressions). Two existing tests that codified the old
-behavior were corrected alongside their fix: the D3 PIN (acquire TTL 1h→2h) and
-the sweep "skips live-PID records" test (now carries a fresh heartbeat, matching
-H1's heartbeat-gated live-skip).
+re-run green (zero regressions). Existing tests that had codified the old
+behavior were corrected alongside their fix: the D3 PIN (acquire TTL 1h→2h), the
+sweep "skips live-PID records" test (now carries a fresh heartbeat, matching
+H1's heartbeat-gated live-skip), and the F2 spec's 3rd assertion (stable faultId,
+not a discriminator). The pre-existing monitor-stale-subagent-child T-B1c/T-B1d
+load flake was also stabilized (poll for ps visibility + deterministic child reap).
 
-**Remaining REDs (8) — tracked `describe.skip` specs:**
+**Remaining REDs (3) — deferred to a dedicated `/build`:**
 
-- `A1` (provider-retry wiring) and `C1` (signal-handler unification) — **deferred
-  to a dedicated `/build`**. Hot-phase-loop / live-OS-signal surgery: A1 means
-  rewinding `decideNextAction` state per failed role (`codex-review`→`impl_done`,
-  `primary-impl`→`tests_red`, …); a wrong mapping yields "no new commit" hygiene
-  failures or an infinite loop in a real multi-hour build. C1 races two live OS
-  signal handlers. These are the genuinely dangerous ones; do them with the
-  A1/C1 specs as the gate, separately reviewed.
-- `F2` (faultId occurrence preservation) — cannot use the discriminator its spec's
-  3rd assertion prefers (folding `stdoutTail` into `computeFaultId` breaks the
-  load-bearing dedup / DETECTED↔RESOLVED pairing). Correct fix is the
-  collapse-counter (path b) + a spec correction dropping assertion 3.
-- `A3` (auth classify + no blind fallback), `B2`/`B3` (monitor subtree liveness /
-  stale-tracker grace), `E2` (dual-impl `/tmp` worktree reaper), `G2`
-  (feature-review needs-phases bound) —
-  localized; each tractable in a small batch with the per-file existing tests as
-  the regression guard. `G2`'s target (`runFeatureReviewIteration`) is internal /
-  not exported, so it drives via static-grep + the public entry.
+- `A1` (provider-retry wiring) and `C1` (signal-handler unification) — hot-phase-
+  loop / live-OS-signal surgery. A1 means rewinding `decideNextAction` state per
+  failed role (`codex-review`→`impl_done`, `primary-impl`→`tests_red`, …); a wrong
+  mapping yields "no new commit" hygiene failures or an infinite loop in a real
+  multi-hour build. C1 races two live OS signal handlers. Do them with the A1/C1
+  specs as the gate, separately reviewed.
+- `G2` (feature-review needs-phases bound) — **production is already bounded**
+  (cli.ts: `if (currentIter > cap)` in the run() loop, cap =
+  `featureReviewMaxIter`). The only gap is testability: the cap-firing logic is
+  inline in the 15K-line `run()` and has no importable seam, so the spec can't
+  drive the real loop yet. Not a safety gap; the fix is extracting that loop into
+  a unit-testable function (same hot-loop-extraction risk tier as A1), so it rides
+  the same dedicated `/build`.
 
-The honest state: the pre-release gate exists and is green today; **16 confirmed
-gaps are closed with zero regressions**; the remaining 8 are tracked, reproducible
-RED specs that each become a green checklist item as their fix lands.
+The honest state: the pre-release gate exists and is green today; **21 confirmed
+gaps are closed with zero regressions**; the remaining 3 are tracked, reproducible
+RED specs — A1/C1 are real fixes deferred for risk, and G2 is a testability-only
+gap over already-bounded production code.
