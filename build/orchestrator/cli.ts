@@ -4610,7 +4610,15 @@ function isCorruptRepoError(stderr: string): boolean {
   const text = stderr || "";
   return (
     text.includes("did not send all necessary objects") ||
-    text.includes("bad object refs/heads/")
+    text.includes("bad object refs/heads/") ||
+    // Corrupt / truncated loose object (E4): "error: object file
+    // .git/objects/ab/cd... is empty", "fatal: loose object <sha> is corrupt".
+    /object file .* is empty/i.test(text) ||
+    /loose object .* (?:is corrupt|is empty)/i.test(text) ||
+    // Corrupt or unparseable packed-refs (E4): "fatal: unexpected line in
+    // .git/packed-refs: ...", "...packed-refs ... is corrupt".
+    /unexpected line in .*packed-refs/i.test(text) ||
+    /packed-refs.* is corrupt/i.test(text)
   );
 }
 
@@ -4672,10 +4680,29 @@ export function quarantineMalformedRefs(cwd: string): {
     if (!fs.existsSync(dir)) continue;
     const walk = (relDir: string): void => {
       const absDir = path.join(dir, relDir);
-      for (const entry of fs.readdirSync(absDir)) {
+      let entries: string[];
+      try {
+        entries = fs.readdirSync(absDir);
+      } catch {
+        // Unreadable ref directory (perms, mid-walk race, FS error): the
+        // pre-fetch quarantine is best-effort and runs on every fetch of a
+        // multi-hour run — skip-and-continue rather than abort the whole run
+        // on a recoverable FS condition (E1).
+        return;
+      }
+      for (const entry of entries) {
         const absPath = path.join(absDir, entry);
         const relPath = relDir ? `${relDir}/${entry}` : entry;
-        const st = fs.statSync(absPath);
+        let st: fs.Stats;
+        try {
+          st = fs.statSync(absPath);
+        } catch {
+          // A dangling-symlink ref (statSync follows the link to a missing
+          // target -> ENOENT) or any other unstattable entry: skip it. A
+          // single broken loose ref must not crash the quarantine and take
+          // the entire build down at fetch time (E1).
+          continue;
+        }
         if (st.isDirectory()) {
           walk(relPath);
         } else {
@@ -4841,13 +4868,24 @@ export function syncFeatureBranchWithBase(
     encoding: "utf8",
   });
   if (checkout.status !== 0) {
-    return { ok: false, baseRef, error: checkout.stderr || checkout.stdout };
+    const cerr = checkout.stderr || checkout.stdout || "";
+    // On-disk object/ref corruption (a truncated loose object, damaged
+    // packed-refs) surfaces when git reads the object store on checkout, not
+    // just on fetch — classify it as GIT_REPO_CORRUPT with the recovery hint
+    // rather than an opaque checkout error (E4).
+    if (isCorruptRepoError(cerr)) return corruptRepoResult(cerr);
+    return { ok: false, baseRef, error: cerr };
   }
   const merge = spawnSync("git", ["merge", "--no-edit", baseRef], {
     cwd,
     encoding: "utf8",
   });
   if (merge.status === 0) return { ok: true, baseRef };
+  const mergeErr = merge.stderr || merge.stdout || "";
+  // A corrupt object discovered while merging is NOT a real conflict — git
+  // emits "object file .. is empty" / "loose object .. is corrupt". Surface
+  // the actionable corrupt-repo halt instead of mislabeling it a conflict (E4).
+  if (isCorruptRepoError(mergeErr)) return corruptRepoResult(mergeErr);
 
   const conflictResult = spawnSync(
     "git",
@@ -11705,7 +11743,16 @@ function classifyRecord(
   now: number,
 ): ClassifyResult {
   if (isPidAlive(record.pid) && record.status === "running") {
-    return { kind: "live" };
+    // PID liveness alone is not proof of life: after OS PID recycling, an
+    // abandoned record can match a live UNRELATED process and protect its
+    // leaked worktree forever (H1). Gate the live short-circuit on a fresh
+    // heartbeat too — a record whose lastUpdatedAt is older than the stale
+    // threshold is a genuine leak regardless of a coincidentally-live PID, so
+    // fall through to the worktree-based reap logic below.
+    const age = now - new Date(record.lastUpdatedAt).getTime();
+    if (!Number.isFinite(age) || age <= staleThresholdMs()) {
+      return { kind: "live" };
+    }
   }
 
   // Prefer the explicit worktreePath field. Records written before v1.40

@@ -607,6 +607,36 @@ function writeResumeCount(filePath: string, count: number): void {
   }
 }
 
+/**
+ * Sidecar recording the committed-phase count observed at the LAST auto-resume,
+ * so the next resume can tell whether the run made genuine forward progress
+ * since then. Lives next to the resume-count file (B1).
+ */
+function resumeProgressPath(stateDir: string, stateSlug: string): string {
+  return path.join(stateDir, `${stateSlug}.resume-progress`);
+}
+
+/** Returns the recorded committed-phase baseline, or -1 when none exists. */
+function readResumeProgress(filePath: string): number {
+  try {
+    const n = Number.parseInt(fs.readFileSync(filePath, "utf8").trim(), 10);
+    return Number.isFinite(n) && n >= 0 ? n : -1;
+  } catch {
+    return -1;
+  }
+}
+
+function writeResumeProgress(filePath: string, committedCount: number): void {
+  try {
+    const tmp = `${filePath}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, String(committedCount), { mode: 0o600 });
+    fs.renameSync(tmp, filePath);
+  } catch {
+    // Best-effort: a missed baseline write just means the next resume won't
+    // detect this round's progress and the cap stays conservative.
+  }
+}
+
 const DEFAULT_MAX_AUTO_RESUME = 3;
 
 function maxAutoResumeFromEnv(): number {
@@ -745,8 +775,8 @@ function readRunSnapshot(
   // worst-case subagent timeout. Conservative: applies to ALL phases,
   // not just the "current" one, since multiple phases could be in
   // flight via parallel features.
-  const anyPhaseRunning = (state?.phases ?? []).some((p) =>
-    typeof p?.status === "string" && p.status.endsWith("_running"),
+  const anyPhaseRunning = (state?.phases ?? []).some(
+    (p) => typeof p?.status === "string" && p.status.endsWith("_running"),
   );
   const baseStaleWindowMs = Math.max(3 * pollMs, 1_000);
   const staleWindowMs = anyPhaseRunning
@@ -1343,9 +1373,8 @@ export function evaluateMonitorOnce(
         // resume loop. The user's bd10c04c heartbeat-tracker fix prevents
         // false-progress signals during the cycle, but the cleanest stop
         // is to never start the cycle in the first place.
-        const stalemateStatus = (
-          (snapshot.state as any)?.planReview as any
-        )?.status;
+        const stalemateStatus = ((snapshot.state as any)?.planReview as any)
+          ?.status;
         if (
           stalemateStatus === "synth_failure_stalemate" ||
           stalemateStatus === "synth_failure"
@@ -1374,7 +1403,21 @@ export function evaluateMonitorOnce(
           snapshot.stateDir,
           snapshot.run.stateSlug,
         );
-        const priorCount = readResumeCount(counterPath);
+        // B1: the cap counts CONSECUTIVE failed resumes, not lifetime resumes.
+        // Compare the run's committed-phase count against the baseline recorded
+        // at the last resume. If the run advanced a phase since then, the prior
+        // resumes actually recovered, so reset the budget — otherwise three
+        // transient stalls spread over a long run would falsely trip the cap on
+        // a healthy build.
+        const progressPath = resumeProgressPath(
+          snapshot.stateDir,
+          snapshot.run.stateSlug,
+        );
+        const priorProgress = readResumeProgress(progressPath);
+        const rawCount = readResumeCount(counterPath);
+        const progressedSinceLastResume =
+          priorProgress >= 0 && snapshot.committedCount > priorProgress;
+        const priorCount = progressedSinceLastResume ? 0 : rawCount;
         const maxResumes = maxAutoResumeFromEnv();
         if (priorCount >= maxResumes) {
           const terminalEvent = runEvent(
@@ -1391,6 +1434,13 @@ export function evaluateMonitorOnce(
             terminalEvent,
           };
         }
+
+        // Record the committed-phase baseline for the NEXT resume's
+        // progress comparison. Written on every resume decision (even dry-run):
+        // unlike the counter, recording where the run was does not burn budget,
+        // and the dry-run monitor still needs the baseline so a later real tick
+        // can detect the progress.
+        writeResumeProgress(progressPath, snapshot.committedCount);
 
         let resumedPid = 0;
         if (opts.spawnResume !== false) {

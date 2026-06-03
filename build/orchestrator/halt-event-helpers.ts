@@ -27,7 +27,30 @@ function emit(
     lastTool?: string | null;
     lastBucket?: "fast" | "slow" | null;
   },
+  // Structured fields merged onto the snapshot for halts that carry
+  // machine-readable detail beyond the human-readable `message` (e.g. a quota
+  // reset time, A4). Optional last param so the other ~15 emit() callers are
+  // untouched.
+  resetAt?: string,
 ): string {
+  const snapshot = buildHaltSnapshot({
+    state,
+    stdoutLogPath: ctx.pointers.stdoutLog,
+    worktreePath: ctx.pointers.worktreePath,
+    phaseIndex,
+    featureIndex,
+    failureReason,
+    killReason: result?.killReason as
+      | "silence"
+      | "progress_gap"
+      | "stall"
+      | "auth_required"
+      | "startup_hang"
+      | undefined,
+    lastTool: result?.lastTool,
+    lastBucket: result?.lastBucket,
+  });
+  if (resetAt) snapshot.resetAt = resetAt;
   return emitHaltEvent(
     {
       kind,
@@ -36,23 +59,7 @@ function emit(
       severity: severityFor(kind),
       message,
       pointers: ctx.pointers,
-      snapshot: buildHaltSnapshot({
-        state,
-        stdoutLogPath: ctx.pointers.stdoutLog,
-        worktreePath: ctx.pointers.worktreePath,
-        phaseIndex,
-        featureIndex,
-        failureReason,
-        killReason: result?.killReason as
-          | "silence"
-          | "progress_gap"
-          | "stall"
-          | "auth_required"
-          | "startup_hang"
-          | undefined,
-        lastTool: result?.lastTool,
-        lastBucket: result?.lastBucket,
-      }),
+      snapshot,
     },
     { queueDir: ctx.queueDir },
   );
@@ -192,7 +199,20 @@ export function recordProviderQuotaExhausted(
   const msg = resetAt
     ? `${role}: ${evidence} · resets at ${resetAt}`
     : `${role}: ${evidence}`;
-  return emit("PROVIDER_QUOTA_EXHAUSTED", msg, ctx, state, phaseIdx);
+  // Pass resetAt structurally onto the snapshot (9th emit arg) so a supervisor
+  // can read it without re-parsing `message` (A4). Positions 6-8 are unused
+  // here (featureIndex / failureReason / result).
+  return emit(
+    "PROVIDER_QUOTA_EXHAUSTED",
+    msg,
+    ctx,
+    state,
+    phaseIdx,
+    undefined,
+    undefined,
+    undefined,
+    resetAt,
+  );
 }
 
 export function recordProviderOverloaded(

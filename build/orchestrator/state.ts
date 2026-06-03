@@ -35,6 +35,12 @@ export interface PersistOptions {
   noGbrain?: boolean;
   /** Optional logger. Default: silent. Used to surface gbrain warnings. */
   log?: (msg: string) => void;
+  /**
+   * Keep `state.lastUpdatedAt` as-is instead of stamping it to now (H1). Used
+   * by the gbrain-restore mirror in loadState so a cross-machine resume keeps
+   * the real last-write time and doesn't look brand-new to the stall detector.
+   */
+  preserveTimestamp?: boolean;
 }
 
 export type DeadLockCleanupStatus =
@@ -551,9 +557,11 @@ export function loadState(
   if (!fromBrain) return null;
   try {
     const parsed = migrateState(JSON.parse(fromBrain) as BuildState);
-    // Mirror back to local JSON so subsequent reads are fast and the
-    // local file is the canonical source.
-    saveState(parsed, { noGbrain: true });
+    // Mirror back to local JSON so subsequent reads are fast and the local file
+    // is the canonical source. preserveTimestamp keeps the restored
+    // lastUpdatedAt (H1): a cross-machine resume must not look brand-new to the
+    // stall detector — the real last write may be hours old.
+    saveState(parsed, { noGbrain: true, preserveTimestamp: true });
     opts.log?.(`resumed state from gbrain page "${slug}"`);
     return parsed;
   } catch {
@@ -571,12 +579,31 @@ export function loadState(
  */
 export function saveState(state: BuildState, opts: PersistOptions = {}): void {
   ensureStateDir();
-  state.lastUpdatedAt = new Date().toISOString();
+  // Stamp lastUpdatedAt for the write, but remember the prior value so a torn
+  // write can roll it back: advancing the timestamp for a write that never
+  // landed would tell the stall detector the run made progress it didn't (H1).
+  const prevLastUpdatedAt = state.lastUpdatedAt;
+  if (!opts.preserveTimestamp) {
+    state.lastUpdatedAt = new Date().toISOString();
+  }
   const finalPath = statePath(state.slug);
   const tmpPath = `${finalPath}.tmp.${process.pid}`;
   const serialized = JSON.stringify(state, null, 2) + "\n";
-  fs.writeFileSync(tmpPath, serialized, { mode: 0o600 });
-  fs.renameSync(tmpPath, finalPath);
+  try {
+    fs.writeFileSync(tmpPath, serialized, { mode: 0o600 });
+    fs.renameSync(tmpPath, finalPath);
+  } catch (err) {
+    // Torn write (e.g. ENOSPC at the atomic rename): roll back the in-memory
+    // timestamp and remove the temp orphan so a long run doesn't leak a
+    // `.tmp.<pid>` file per failed save. Rethrow — the caller decides.
+    state.lastUpdatedAt = prevLastUpdatedAt;
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // tmp may not have been created (writeFileSync failed) — nothing to clean.
+    }
+    throw err;
+  }
 
   // Best-effort gbrain mirror.
   if (opts.noGbrain) return;

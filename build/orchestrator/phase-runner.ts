@@ -437,6 +437,22 @@ export function decideNextAction(
       return { type: "DONE", phaseIndex: phaseState.index };
 
     case "failed":
+      // A RUN_TESTS TIMEOUT (suite hung: leaked port, flaky infra, wedged
+      // runner) is transient, not a real red. Allow a bounded retry of the
+      // suite instead of throwing away the whole phase on the first hang
+      // (G1) — a multi-hour build shouldn't die because one test run wedged.
+      // Only timeouts are retried; every other "failed" state (a genuine
+      // convergence failure) still terminates. Bounded by maxTestIterations.
+      if (
+        phaseState.testRun?.finalStatus === "timeout" &&
+        (phaseState.testRun?.iterations ?? 0) < maxTestIterations
+      ) {
+        return {
+          type: "RUN_TESTS",
+          phaseIndex: phaseState.index,
+          iteration: (phaseState.testRun?.iterations ?? 0) + 1,
+        };
+      }
       return {
         type: "FAIL",
         phaseIndex: phaseState.index,

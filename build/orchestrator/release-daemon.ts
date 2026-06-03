@@ -7,6 +7,7 @@ import {
   acquireRemoteReleaseLock,
   refreshRemoteReleaseLock,
   releaseRemoteReleaseLock,
+  RELEASE_LOCK_DEFAULT_TTL_MS,
   type ReleaseLockHandle,
 } from "./release-lock";
 import {
@@ -23,7 +24,10 @@ import {
 } from "./release-queue";
 import { landOnly, shipOnly } from "./ship";
 
-export const RELEASE_LOCK_TTL_MS = 2 * 60 * 60 * 1000;
+// Single source of truth lives in release-lock.ts so acquire and refresh
+// cannot drift apart (the steal-window bug). Re-exported here for existing
+// importers.
+export const RELEASE_LOCK_TTL_MS = RELEASE_LOCK_DEFAULT_TTL_MS;
 export const RELEASE_LOCK_HEARTBEAT_MS = 15 * 60 * 1000;
 
 /**
@@ -331,6 +335,25 @@ const SIGNAL_RELEASE_BUDGET_MS = 4000;
 
 const INFLIGHT_STATES = new Set(["claiming", "landing", "drift_repairing"]);
 
+// A record stranded in an in-flight state by a hard kill (SIGKILL/OOM/reboot)
+// goes stale: a live daemon refreshes lastUpdatedAt as it works, a dead one
+// cannot. After this window with no update AND no live owner in this process,
+// the daemon reclaims it (requeues) so the PR isn't abandoned forever (D1).
+// Generous so a genuinely-active land (which completes well inside it) is never
+// false-reclaimed.
+const RELEASE_INFLIGHT_STALE_MS = 30 * 60_000;
+
+function isInflightStale(
+  lastUpdatedAt: string | undefined,
+  nowMs: number,
+): boolean {
+  // An in-flight record with no heartbeat at all is already suspect.
+  if (!lastUpdatedAt) return true;
+  const t = Date.parse(lastUpdatedAt);
+  if (!Number.isFinite(t)) return true;
+  return nowMs - t >= RELEASE_INFLIGHT_STALE_MS;
+}
+
 /**
  * Revive all in-flight records back to "queued" so the next daemon
  * tick picks them up. Exported so the SIGTERM handler can call it AND
@@ -554,23 +577,42 @@ export function createReleaseLockHeartbeat(args: {
 } {
   const refresh = args.refresh ?? refreshRemoteReleaseLock;
   const log = args.log ?? (() => {});
+  const ttlMs = args.ttlMs ?? RELEASE_LOCK_TTL_MS;
+  const nowMs = () => (args.now?.() ?? new Date()).getTime();
   let handle = args.handle;
   let lostOwnership: string | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
+  // Anchor for the fail-closed window (D2). Construction counts as the last
+  // "known good" instant; every successful refresh moves it forward.
+  let lastSuccessAtMs = nowMs();
   const beat = () => {
     if (lostOwnership) return;
     const result = refresh({
       cwd: args.cwd,
       handle,
-      ttlMs: args.ttlMs ?? RELEASE_LOCK_TTL_MS,
+      ttlMs,
       now: args.now?.(),
     });
     if (result.ok) {
       handle = result.handle;
+      lastSuccessAtMs = nowMs();
       return;
     }
     log(`release lock heartbeat failed: ${result.error}`);
-    if (result.lostOwnership) lostOwnership = result.error;
+    if (result.lostOwnership) {
+      lostOwnership = result.error;
+      return;
+    }
+    // Fail closed on a "transient forever" (D2): a string of transient push
+    // failures where the remote ref still points at our commit used to log and
+    // continue indefinitely, so lostOwnership stayed null even after the
+    // on-disk lock's expiresAt lapsed — letting a second daemon steal the lock
+    // and double-land. Once more than ttlMs has elapsed since the last
+    // successful refresh, stop trusting the lock the rest of the fleet can
+    // already steal.
+    if (nowMs() - lastSuccessAtMs > ttlMs) {
+      lostOwnership = `release lock heartbeat: no successful refresh in ${ttlMs}ms (lock TTL lapsed; last error: ${result.error})`;
+    }
   };
   return {
     start() {
@@ -1107,6 +1149,12 @@ export async function processReleaseQueueRecord(
     });
   };
 
+  // Scratch worktree created by checkoutScratchWorktree's fallback (when the
+  // record's worktreePath is missing/disallowed). Tracked so the finally block
+  // reaps it; otherwise /tmp/gstack-release-daemon and the repo's
+  // .git/worktrees grow unbounded on a long-lived daemon (D4).
+  let scratchToReap: string | null = null;
+
   try {
     // Codex P1 fix: bail out before any expensive work if the signal
     // handler already interrupted us. Without this, a SIGTERM that
@@ -1117,6 +1165,9 @@ export async function processReleaseQueueRecord(
     // the next daemon's pickup) could then race on the same PR.
     if (isInterrupted()) return readCurrentFromDisk(current);
     const cwd = checkoutScratchWorktree(record, resolvedRepoPath, prefixes);
+    // The fallback returns the computed scratch path when it created a fresh
+    // worktree (vs honoring an existing record.worktreePath). Mark it for reap.
+    if (cwd === scratchWorktreePath(record)) scratchToReap = cwd;
     if (isInterrupted()) return readCurrentFromDisk(current);
     current = safeUpdate(current, {
       status: "landing",
@@ -1226,6 +1277,29 @@ export async function processReleaseQueueRecord(
     });
     activeLockReleases.delete(signalReleaseCallback);
     activeRecords.delete(record.runId);
+    // Reap the scratch worktree (D4). A long-lived daemon that lands many PRs
+    // through the scratch fallback otherwise leaks one /tmp worktree + one
+    // .git/worktrees administrative entry per land. Best-effort: remove the
+    // worktree, then prune any stale administrative entry. Failures here must
+    // not mask the record's terminal status.
+    if (scratchToReap) {
+      try {
+        spawnSync("git", ["worktree", "remove", "--force", scratchToReap], {
+          cwd: resolvedRepoPath,
+          encoding: "utf8",
+        });
+      } catch {
+        // best-effort
+      }
+      try {
+        spawnSync("git", ["worktree", "prune"], {
+          cwd: resolvedRepoPath,
+          encoding: "utf8",
+        });
+      } catch {
+        // best-effort
+      }
+    }
     // Clear the interrupt flag — this run is done. The natural-path
     // cleanup may have completed concurrently with revival; either way,
     // the flag served its purpose (blocking late terminal writes) and
@@ -1408,6 +1482,32 @@ export async function runReleaseDaemon(
     const candidates = discovery.records.filter(
       (record) => record.status === "queued",
     );
+    // Stale-in-flight reclaim (D1): a record stranded in an in-flight status
+    // (claiming/landing/drift_repairing) by a hard kill is invisible to the
+    // queued-only filter above (discoverQueuedRecords drops non-queued records)
+    // and to reviveActiveRecordsForSignal (the in-memory activeRecords snapshot
+    // died with the crashed process). Read the full queue, and for any in-flight
+    // record this process is NOT actively working (not in activeRecords) whose
+    // lastUpdatedAt is stale, requeue it so the next pass picks it up instead of
+    // abandoning the PR forever. Reads disk directly because discovery.records
+    // is pre-filtered to queued.
+    const reclaimNowMs = Date.now();
+    for (const onDisk of readReleaseQueueRecords(queueDir)) {
+      if (
+        INFLIGHT_STATES.has(onDisk.status) &&
+        !activeRecords.has(onDisk.runId) &&
+        isInflightStale(onDisk.lastUpdatedAt, reclaimNowMs)
+      ) {
+        const requeued = updateReleaseQueueRecord(queueDir, onDisk, {
+          status: "queued",
+          lastError: `reclaimed from stranded ${onDisk.status} (stale since ${onDisk.lastUpdatedAt ?? "unknown"})`,
+        });
+        log(
+          `[release-daemon] reclaimed stranded ${onDisk.status} record PR #${onDisk.prNumber} -> queued`,
+        );
+        if (requeued) candidates.push(requeued);
+      }
+    }
     // Early-block disallowed candidates so they're marked "blocked" in
     // the queue before any processor work happens. This is redundant
     // with the gate inside processReleaseQueueRecord (which is the
@@ -1506,7 +1606,14 @@ export function retryReleaseQueueRecord(
     (item) => item.prNumber === prNumber,
   );
   if (!record) return null;
-  if (record.status !== "blocked") return record;
+  // Rescue blocked records AND records stranded in an in-flight status by a
+  // hard kill (D1). Previously only `blocked` requeued, so a manual retry of a
+  // stuck `landing`/`claiming`/`drift_repairing` record was a silent no-op.
+  // All three in-flight → queued transitions are allowed (release-queue.ts
+  // ALLOWED_TRANSITIONS), so this never throws.
+  if (record.status !== "blocked" && !INFLIGHT_STATES.has(record.status)) {
+    return record;
+  }
   return updateReleaseQueueRecord(queueDir, record, {
     status: "queued",
     lastError: undefined,

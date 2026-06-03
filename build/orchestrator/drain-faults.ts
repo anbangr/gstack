@@ -1658,7 +1658,19 @@ export async function drainFaultsFromHaltEventsQueue(
       try {
         const inboxDir = opts.inboxDir ?? defaultInboxDir();
         fs.mkdirSync(inboxDir, { recursive: true });
-        const inboxName = `${isoDateUtc(now)}-halt-${he.faultId}.md`;
+        // Collision-avoidance suffix loop (F3): a same-UTC-day re-emit of the
+        // same faultId computes the identical base filename. A bare write would
+        // silently clobber the earlier triage signal yet still bump inboxFiled,
+        // so the filed count would over-report the files actually on disk. Walk
+        // -2, -3, ... (the same shape writeBugReport uses) so both day-of
+        // signals survive and inboxFiled matches what landed.
+        const inboxBase = `${isoDateUtc(now)}-halt-${he.faultId}`;
+        let inboxName = `${inboxBase}.md`;
+        let inboxSeq = 2;
+        while (fs.existsSync(path.join(inboxDir, inboxName))) {
+          inboxName = `${inboxBase}-${inboxSeq}.md`;
+          inboxSeq += 1;
+        }
         fs.writeFileSync(
           path.join(inboxDir, inboxName),
           renderInboxMarkdown(he, report, now),

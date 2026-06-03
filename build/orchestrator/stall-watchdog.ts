@@ -125,6 +125,20 @@ export interface StallWatchdogOptions {
   progressGapMs?: number;
 
   /**
+   * Absolute cap on a SINGLE uninterrupted tool invocation (a TOOL_START
+   * with no matching TOOL_END), in ms. Fires SIGTERM with
+   * killReason="tool_timeout". Opt-in: when undefined the cap is disabled and
+   * behavior is unchanged. Distinct from the silence / progress-gap arms —
+   * those are refreshed by a tool that re-announces itself (re-emits
+   * TOOL_START every few minutes under both windows), so a genuinely-hung
+   * slow tool can stay alive forever under them. This cap is the upper bound
+   * on a single invocation regardless of re-announcement (B5). The clock
+   * starts on the first TOOL_START of an invocation and is cleared by
+   * TOOL_END; a re-announce of the same in-progress tool does NOT reset it.
+   */
+  maxToolInvocationMs?: number;
+
+  /**
    * Max ms the watchdog tolerates startup-phase silence before firing
    * SIGTERM with killReason="startup_hang". Default 120_000. Set to 0 to
    * disable Phase A entirely (legacy stallMs applies from spawn).
@@ -427,7 +441,13 @@ export function attachStallWatchdog(
   const parseProgress = opts.parseProgress;
   const toolStallMs = opts.toolStallMs;
   const progressGapMs = opts.progressGapMs;
+  const maxToolInvocationMs = opts.maxToolInvocationMs;
   let currentToolBucket: "fast" | "slow" | null = null;
+  // When the CURRENT uninterrupted tool invocation began. Set on the first
+  // TOOL_START of an invocation, cleared on TOOL_END, NOT reset by a
+  // re-announce of the same still-running tool. Drives the absolute
+  // maxToolInvocationMs cap (B5).
+  let toolInvocationStartedAt: number | null = null;
   let lastClassifiedActivityAt: number | null = null;
   let lastClassifiedTool: string | null = null;
   // Sticky bucket — represents the bucket at the most recent classified
@@ -504,11 +524,21 @@ export function attachStallWatchdog(
         lastClassifiedBucket = evt.bucket;
         if (evt.event === "TOOL_START") {
           currentToolBucket = evt.bucket;
+          // Start the single-invocation clock only when no invocation is
+          // already in progress. A re-announce of a still-running tool (no
+          // intervening TOOL_END) must NOT reset it, or the absolute cap could
+          // never fire (B5).
+          if (toolInvocationStartedAt === null) {
+            toolInvocationStartedAt = clock.now();
+          }
         } else {
           // TOOL_END clears the bucket (the next tick uses the legacy
           // stallMs window until a new TOOL_START arrives). We do NOT
           // clear lastClassifiedBucket — it's sticky for halt-event quoting.
           currentToolBucket = null;
+          // The invocation completed — clear the absolute-cap clock so the
+          // next TOOL_START starts a fresh budget.
+          toolInvocationStartedAt = null;
         }
       }
     }
@@ -695,6 +725,48 @@ export function attachStallWatchdog(
         killReason = "progress_gap";
         try {
           opts.onStallKill?.(gap);
+        } catch {
+          // Callback errors are swallowed.
+        }
+        if (source.mode === "stream" || source.mode === "cpu") {
+          const pid = source.child.pid;
+          if (typeof pid === "number") {
+            killProcessAndGroup(pid, "SIGTERM");
+            killTimerHandle = clock.setTimeout(() => {
+              killProcessAndGroup(pid, "SIGKILL");
+            }, gracePeriodMs);
+          }
+          if (pollHandle !== null) {
+            clock.clearInterval(pollHandle);
+            pollHandle = null;
+          }
+          source.child.stdout?.off("data", onLine);
+          source.child.stderr?.off("data", onLine);
+        } else {
+          stop();
+        }
+      }
+    }
+
+    // Absolute single-tool-invocation cap arm (B5). Opt-in via
+    // maxToolInvocationMs. Independent of the silence and progress-gap arms:
+    // a hung slow tool that re-announces itself every few minutes keeps BOTH
+    // of those refreshed, so without this an invocation could run forever.
+    // toolInvocationStartedAt is set on the first TOOL_START and cleared by
+    // TOOL_END, so this measures one uninterrupted invocation regardless of
+    // re-announcement.
+    if (
+      !killed &&
+      parseProgress &&
+      maxToolInvocationMs !== undefined &&
+      toolInvocationStartedAt !== null
+    ) {
+      const invocationMs = clock.now() - toolInvocationStartedAt;
+      if (invocationMs >= maxToolInvocationMs) {
+        killed = true;
+        killReason = "tool_timeout";
+        try {
+          opts.onStallKill?.(invocationMs);
         } catch {
           // Callback errors are swallowed.
         }

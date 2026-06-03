@@ -199,6 +199,11 @@ describe("sweepOrphans", () => {
         worktreePath: wt,
         pid: process.pid, // current process is alive
         status: "running",
+        // A genuinely-live run has a FRESH heartbeat. The live-PID skip is now
+        // gated on heartbeat freshness too (H1): a live PID with a stale
+        // heartbeat is the PID-recycle leak and must be reaped, so the
+        // skip-the-live-run case carries a current lastUpdatedAt.
+        lastUpdatedAt: new Date().toISOString(),
       }),
     );
 

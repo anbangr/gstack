@@ -78,6 +78,13 @@ export interface HaltEvent {
     lastTool?: string | null;
     /** Last classified bucket at kill time. Null when never classified. */
     lastBucket?: "fast" | "slow" | null;
+    /**
+     * Machine-readable provider quota reset time, surfaced as a structured
+     * field (not just interpolated into `message`) so a supervisor / sleep-
+     * until-reset policy can read it without re-parsing prose. Present only on
+     * PROVIDER_QUOTA_EXHAUSTED halts that carried a parseable reset time (A4).
+     */
+    resetAt?: string;
   };
 }
 

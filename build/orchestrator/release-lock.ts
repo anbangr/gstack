@@ -3,6 +3,18 @@ import * as path from "node:path";
 import { safeRegistryKey } from "./registry";
 import { canonicalRepoIdentity } from "./release-identity";
 
+/**
+ * Default lifetime stamped into a remote release lock. ONE source of truth for
+ * both acquire and refresh: a daemon's first heartbeat (refresh) can be delayed
+ * past the acquire window by a sustained transient push failure, so the lock a
+ * daemon stamps at acquire time MUST live at least as long as the window the
+ * refresh path stamps. Otherwise a second daemon sees the initial lock expire
+ * before the first heartbeat lands and steals it, and two daemons race to land
+ * the same release. acquire and refresh therefore share this constant.
+ * `release-daemon.RELEASE_LOCK_TTL_MS` re-exports it.
+ */
+export const RELEASE_LOCK_DEFAULT_TTL_MS = 2 * 60 * 60 * 1000;
+
 export interface ReleaseLockPayload {
   ownerId: string;
   repoPath: string;
@@ -33,7 +45,11 @@ function runGit(
   args: string[],
   input?: string,
 ): SpawnSyncReturns<string> {
-  return run("git", args, { cwd, encoding: "utf8", ...(input ? { input } : {}) });
+  return run("git", args, {
+    cwd,
+    encoding: "utf8",
+    ...(input ? { input } : {}),
+  });
 }
 
 export function releaseLockRef(args: {
@@ -54,24 +70,26 @@ export function releaseLockRef(args: {
 }
 
 export function encodeReleaseLockPayload(payload: ReleaseLockPayload): string {
-  return [
-    "gstack release lock",
-    "",
-    JSON.stringify(payload, null, 2),
-    "",
-  ].join("\n");
+  return ["gstack release lock", "", JSON.stringify(payload, null, 2), ""].join(
+    "\n",
+  );
 }
 
-export function parseReleaseLockPayload(message: string): ReleaseLockPayload | null {
+export function parseReleaseLockPayload(
+  message: string,
+): ReleaseLockPayload | null {
   const start = message.indexOf("{");
   const end = message.lastIndexOf("}");
   if (start === -1 || end === -1 || end < start) return null;
   try {
-    const parsed = JSON.parse(message.slice(start, end + 1)) as ReleaseLockPayload;
+    const parsed = JSON.parse(
+      message.slice(start, end + 1),
+    ) as ReleaseLockPayload;
     if (
       typeof parsed.ownerId === "string" &&
       typeof parsed.repoPath === "string" &&
-      (typeof parsed.repoIdentity === "string" || parsed.repoIdentity === undefined) &&
+      (typeof parsed.repoIdentity === "string" ||
+        parsed.repoIdentity === undefined) &&
       typeof parsed.baseBranch === "string" &&
       typeof parsed.expiresAt === "string"
     ) {
@@ -89,22 +107,20 @@ function createLockCommit(args: {
   run: GitRunner;
 }): { ok: boolean; commit?: string; error?: string } {
   const tree = runGit(args.run, args.cwd, ["mktree"], "");
-  if (tree.status !== 0) return { ok: false, error: tree.stderr || tree.stdout };
+  if (tree.status !== 0)
+    return { ok: false, error: tree.stderr || tree.stdout };
   const commit = runGit(
     args.run,
     args.cwd,
     ["commit-tree", tree.stdout.trim()],
     encodeReleaseLockPayload(args.payload),
   );
-  if (commit.status !== 0) return { ok: false, error: commit.stderr || commit.stdout };
+  if (commit.status !== 0)
+    return { ok: false, error: commit.stderr || commit.stdout };
   return { ok: true, commit: commit.stdout.trim() };
 }
 
-function remoteRefSha(
-  cwd: string,
-  ref: string,
-  run: GitRunner,
-): string | null {
+function remoteRefSha(cwd: string, ref: string, run: GitRunner): string | null {
   const ls = runGit(run, cwd, ["ls-remote", "origin", ref]);
   if (ls.status !== 0 || !ls.stdout.trim()) return null;
   return ls.stdout.trim().split(/\s+/)[0] || null;
@@ -139,7 +155,9 @@ export function acquireRemoteReleaseLock(args: {
   ttlMs?: number;
   now?: Date;
   run?: GitRunner;
-}): { acquired: true; handle: ReleaseLockHandle } | { acquired: false; reason: string } {
+}):
+  | { acquired: true; handle: ReleaseLockHandle }
+  | { acquired: false; reason: string } {
   const run = args.run ?? (spawnSync as GitRunner);
   const repoIdentity = canonicalRepoIdentity({
     cwd: args.cwd,
@@ -148,7 +166,7 @@ export function acquireRemoteReleaseLock(args: {
   });
   const ref = releaseLockRef({ ...args, run });
   const now = args.now ?? new Date();
-  const ttlMs = args.ttlMs ?? 60 * 60 * 1000;
+  const ttlMs = args.ttlMs ?? RELEASE_LOCK_DEFAULT_TTL_MS;
   const payload: ReleaseLockPayload = {
     ownerId: args.ownerId,
     repoPath: path.resolve(args.repoPath),
@@ -159,12 +177,19 @@ export function acquireRemoteReleaseLock(args: {
   };
   const created = createLockCommit({ cwd: args.cwd, payload, run });
   if (!created.ok || !created.commit) {
-    return { acquired: false, reason: created.error ?? "could not create lock commit" };
+    return {
+      acquired: false,
+      reason: created.error ?? "could not create lock commit",
+    };
   }
 
   const existing = remoteRefSha(args.cwd, ref, run);
   if (!existing) {
-    const push = runGit(run, args.cwd, ["push", "origin", `${created.commit}:${ref}`]);
+    const push = runGit(run, args.cwd, [
+      "push",
+      "origin",
+      `${created.commit}:${ref}`,
+    ]);
     if (push.status === 0) {
       return {
         acquired: true,
@@ -178,7 +203,10 @@ export function acquireRemoteReleaseLock(args: {
         },
       };
     }
-    return { acquired: false, reason: push.stderr || push.stdout || "lock already held" };
+    return {
+      acquired: false,
+      reason: push.stderr || push.stdout || "lock already held",
+    };
   }
 
   const existingPayload = readRemotePayload(args.cwd, ref, existing, run);
@@ -209,7 +237,10 @@ export function acquireRemoteReleaseLock(args: {
     `${created.commit}:${ref}`,
   ]);
   if (steal.status !== 0) {
-    return { acquired: false, reason: steal.stderr || steal.stdout || "stale lock steal failed" };
+    return {
+      acquired: false,
+      reason: steal.stderr || steal.stdout || "stale lock steal failed",
+    };
   }
   return {
     acquired: true,
@@ -230,17 +261,27 @@ export function refreshRemoteReleaseLock(args: {
   ttlMs?: number;
   now?: Date;
   run?: GitRunner;
-}): { ok: true; handle: ReleaseLockHandle } | { ok: false; lostOwnership: boolean; error: string } {
+}):
+  | { ok: true; handle: ReleaseLockHandle }
+  | { ok: false; lostOwnership: boolean; error: string } {
   const run = args.run ?? (spawnSync as GitRunner);
   const current = remoteRefSha(args.cwd, args.handle.ref, run);
   if (!current) {
-    return { ok: false, lostOwnership: true, error: "release lock ref disappeared" };
+    return {
+      ok: false,
+      lostOwnership: true,
+      error: "release lock ref disappeared",
+    };
   }
   if (current !== args.handle.commit) {
-    return { ok: false, lostOwnership: true, error: "release lock is no longer owned by this daemon" };
+    return {
+      ok: false,
+      lostOwnership: true,
+      error: "release lock is no longer owned by this daemon",
+    };
   }
   const now = args.now ?? new Date();
-  const ttlMs = args.ttlMs ?? 2 * 60 * 60 * 1000;
+  const ttlMs = args.ttlMs ?? RELEASE_LOCK_DEFAULT_TTL_MS;
   const payload: ReleaseLockPayload = {
     ownerId: args.handle.ownerId,
     repoPath: args.handle.repoPath,
@@ -286,9 +327,16 @@ export function releaseRemoteReleaseLock(args: {
   const current = remoteRefSha(args.cwd, args.handle.ref, run);
   if (!current) return { ok: true };
   if (current !== args.handle.commit) {
-    return { ok: false, error: "release lock is no longer owned by this daemon" };
+    return {
+      ok: false,
+      error: "release lock is no longer owned by this daemon",
+    };
   }
-  const deleted = runGit(run, args.cwd, ["push", "origin", `:${args.handle.ref}`]);
+  const deleted = runGit(run, args.cwd, [
+    "push",
+    "origin",
+    `:${args.handle.ref}`,
+  ]);
   if (deleted.status !== 0) {
     return { ok: false, error: deleted.stderr || deleted.stdout };
   }

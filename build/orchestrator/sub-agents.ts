@@ -210,6 +210,16 @@ let _geminiAuthPromise:
 let _geminiAuthCache:
   | { ok: boolean; reason?: string; skipped?: boolean }
   | undefined;
+// When the cached gemini auth result was computed (ms). A positive result is
+// only trusted for GEMINI_AUTH_TTL_MS — a long run crosses token-expiry
+// boundaries, so a once-cached {ok:true} must be re-probed rather than served
+// forever (A2). Negative results are equally re-probed after the TTL so a
+// transient failure doesn't pin a false negative either.
+let _geminiAuthCacheAt = 0;
+// 10 minutes: long enough to spare a per-spawn re-probe on a healthy run,
+// short enough that a token that expires mid-run is caught well before it
+// wastes hours of sub-agent spawns.
+const GEMINI_AUTH_TTL_MS = 10 * 60_000;
 
 let _codexAuthPromise:
   | Promise<{ ok: boolean; reason?: string; skipped?: boolean }>
@@ -317,7 +327,10 @@ function probeAuthSync(
   }
 }
 
-export async function assertGeminiAuth(): Promise<{
+export async function assertGeminiAuth(opts?: {
+  now?: () => number;
+  ttlMs?: number;
+}): Promise<{
   ok: boolean;
   reason?: string;
   skipped?: boolean;
@@ -325,47 +338,46 @@ export async function assertGeminiAuth(): Promise<{
   if (process.env.GSTACK_DISABLE_AUTH_PREFLIGHT === "1") {
     return { ok: true, skipped: true };
   }
-  if (_geminiAuthCache) return _geminiAuthCache;
-  if (_geminiAuthPromise) return _geminiAuthPromise;
+  const nowMs = opts?.now ?? (() => Date.now());
+  const ttlMs = opts?.ttlMs ?? GEMINI_AUTH_TTL_MS;
+  // Serve the cached result only while it's fresh (A2). A long run crosses
+  // token-expiry boundaries, so a once-cached positive must be re-probed once
+  // the TTL lapses rather than served for the rest of the run. probeAuthSync is
+  // synchronous (spawnSync blocks), so the cache is populated before any other
+  // caller can interleave — no separate in-flight-promise dedup is needed.
+  if (_geminiAuthCache && nowMs() - _geminiAuthCacheAt < ttlMs) {
+    return _geminiAuthCache;
+  }
 
-  _geminiAuthPromise = (async () => {
-    const bin = geminiBin();
-    const primary = probeAuthSync(bin, ["auth", "status"], 5000);
-    if (primary.ok) {
-      _geminiAuthCache = primary;
-      return primary;
-    }
+  const bin = geminiBin();
+  const primary = probeAuthSync(bin, ["auth", "status"], 5000);
+  let result: { ok: boolean; reason?: string; skipped?: boolean };
+  if (primary.ok) {
+    result = primary;
+  } else if (primary.authRequired) {
     // Auth-required wins: do NOT fall through to --version because that
     // probe exits 0 on a broken-auth install and masks the real signal.
     // This is the p9 fix path — Gemini exited 0 on an auth prompt, the
     // --version fallback returned ok:true, and the orchestrator burned
     // a real phase budget on a provider that was never going to work.
-    if (primary.authRequired) {
-      const result = {
-        ok: false,
-        reason: `Gemini auth required (${primary.reason})`,
-      };
-      _geminiAuthCache = result;
-      return result;
-    }
+    result = { ok: false, reason: `Gemini auth required (${primary.reason})` };
+  } else {
     const fallback = probeAuthSync(bin, ["--version"], 5000);
-    if (fallback.ok) {
-      _geminiAuthCache = fallback;
-      return fallback;
-    }
-    const result = {
-      ok: false,
-      reason: `Gemini auth required (${primary.reason || fallback.reason})`,
-    };
-    _geminiAuthCache = result;
-    return result;
-  })();
-
-  return _geminiAuthPromise;
+    result = fallback.ok
+      ? fallback
+      : {
+          ok: false,
+          reason: `Gemini auth required (${primary.reason || fallback.reason})`,
+        };
+  }
+  _geminiAuthCache = result;
+  _geminiAuthCacheAt = nowMs();
+  return result;
 }
 
 export function _resetAuthPreflightForTests(): void {
   _geminiAuthCache = undefined;
+  _geminiAuthCacheAt = 0;
   _geminiAuthPromise = undefined;
   _codexAuthCache = undefined;
   _codexAuthPromise = undefined;

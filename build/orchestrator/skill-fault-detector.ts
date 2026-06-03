@@ -12,6 +12,7 @@ import {
   DEFAULT_MAX_TEST_ITERATIONS,
 } from "./phase-runner";
 import { safeJsonPathEval } from "./safe-jsonpath";
+import { isPidAlive } from "./active-runs";
 
 export interface DetectorInput {
   state: BuildState | null;
@@ -339,6 +340,32 @@ export function loadLearnedPatterns(): LearnedPattern[] {
   }
 }
 
+// Learned patterns are LLM-proposed and curated into learned-patterns.json by
+// the investigator — they are UNTRUSTED input run on the drain hot path. A
+// nested-quantifier regex like `(a*)*` matched against a long stdout tail
+// triggers catastrophic backtracking that spins the event loop past the 60s
+// drain `Promise.race` deadline; the heartbeat then freezes and the monitor
+// can stall-kill the build (F1). Reject the catastrophic shape at eval time
+// (returns false, never runs the regex) and cap the haystack as defense in
+// depth, so a learned regex can never freeze a multi-hour run.
+const NESTED_QUANTIFIER_RE = /\([^)]*[*+][^)]*\)[*+]/;
+const LEARNED_REGEX_INPUT_CAP = 8192;
+
+function safeLearnedRegexTest(pattern: string, text: string | null): boolean {
+  if (NESTED_QUANTIFIER_RE.test(pattern)) {
+    console.warn(
+      `[skill-fault-detector] skipping learned regex with catastrophic-backtracking shape (nested quantifier): ${pattern}`,
+    );
+    return false;
+  }
+  const haystack = text ?? "";
+  const capped =
+    haystack.length > LEARNED_REGEX_INPUT_CAP
+      ? haystack.slice(0, LEARNED_REGEX_INPUT_CAP)
+      : haystack;
+  return new RegExp(pattern).test(capped);
+}
+
 function applyLearnedPattern(
   lp: LearnedPattern,
   input: DetectorInput,
@@ -350,15 +377,18 @@ function applyLearnedPattern(
       case "stdout_contains":
         return stdoutContent?.includes(lp.pattern) ?? false;
       case "stdout_regex":
-        return new RegExp(lp.pattern).test(stdoutContent ?? "");
+        return safeLearnedRegexTest(lp.pattern, stdoutContent);
       case "failureReason_contains":
         return (input.state?.failureReason ?? "").includes(lp.pattern);
       case "failureReason_regex":
-        return new RegExp(lp.pattern).test(input.state?.failureReason ?? "");
+        return safeLearnedRegexTest(
+          lp.pattern,
+          input.state?.failureReason ?? "",
+        );
       case "plan_contains":
         return planContent?.includes(lp.pattern) ?? false;
       case "plan_regex":
-        return new RegExp(lp.pattern).test(planContent ?? "");
+        return safeLearnedRegexTest(lp.pattern, planContent);
       case "state_jsonpath":
         return safeJsonPathEval(input.state, lp.pattern).length > 0;
       default:
@@ -410,11 +440,41 @@ function acquireLock(lockPath: string): void {
   const spinDelay = 10;
   const maxWait = 5000;
   const start = Date.now();
+  let reclaimTried = false;
   while (true) {
     try {
       fs.writeFileSync(lockPath, String(process.pid), { flag: "wx" });
       return;
     } catch {
+      // Stale-lock reclaim (F4): a lock left by a process that crashed
+      // mid-write holds that process's (now dead) PID. Without reclaim, an
+      // orphaned lock freezes every detector tick of a RESUMED run for the
+      // full maxWait (5s) and then the throw is swallowed upstream, so the
+      // hit-count increment never lands. Reclaim ONCE — read the holder PID,
+      // and if it is a dead process (not us, not alive), unlink and retry
+      // immediately. The once-only guard avoids thrashing against a live
+      // competitor that legitimately keeps re-taking the lock.
+      if (!reclaimTried) {
+        reclaimTried = true;
+        let holder = NaN;
+        try {
+          holder = parseInt(fs.readFileSync(lockPath, "utf8").trim(), 10);
+        } catch {
+          // Unreadable lock contents — fall through to the spin/timeout path.
+        }
+        if (
+          Number.isInteger(holder) &&
+          holder !== process.pid &&
+          !isPidAlive(holder)
+        ) {
+          try {
+            fs.unlinkSync(lockPath);
+          } catch {
+            // Another worker reclaimed it first — fine, retry the wx write.
+          }
+          continue;
+        }
+      }
       if (Date.now() - start > maxWait) {
         throw new Error(`Could not acquire lock: ${lockPath}`);
       }
