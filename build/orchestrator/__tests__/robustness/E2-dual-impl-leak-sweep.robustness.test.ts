@@ -66,7 +66,7 @@ function git(
   };
 }
 
-describe.skip("[RED] E2 dual-impl-leak-sweep — UNSKIP WHEN E2 IS FIXED", () => {
+describe("[RED→FIXED] E2 dual-impl-leak-sweep", () => {
   // realpathSync canonicalizes /var/folders/... → /private/var/folders/... on
   // macOS so paths match what `git worktree list --porcelain` reports (git
   // resolves symlinks). Mirrors the sweep-orphans.test.ts beforeEach.
@@ -178,6 +178,16 @@ describe.skip("[RED] E2 dual-impl-leak-sweep — UNSKIP WHEN E2 IS FIXED", () =>
         .map((l) => l.trim())
         .filter(Boolean),
     ).toHaveLength(4);
+
+    // Age the dual dirs past the sweep stale threshold (default 24h). The reaper
+    // only reaps STALE dual dirs so it can never destroy a live concurrent
+    // dual-impl mid-build; a real crash's leaked dirs are reaped by a LATER
+    // sweep, so aging the mtime is the realistic shape.
+    const aged = new Date(Date.now() - 48 * 3600 * 1000);
+    for (const pair of [phase1, phase2]) {
+      const baseDir = path.dirname(pair.candidates.primary.worktreePath);
+      fs.utimesSync(baseDir, aged, aged);
+    }
 
     // --- Simulate the crash: teardownWorktrees is NEVER called. ---
     // Run the only reaper that exists today against an isolated registry +

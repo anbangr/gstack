@@ -12034,6 +12034,76 @@ export function sweepOrphans(
     stats.shapeZ += 1;
   }
 
+  // 4b. Tmpdir-aware dual-impl reaper (E2). Dual-impl worktrees live under
+  // os.tmpdir()/gstack-dual-<slug>-pN-<ts>/{primary,secondary} with
+  // gstack-dual-* tracking branches — NOT under ~/.gstack/build-worktrees, so
+  // the Shape Z walk above never sees them. An applyWinner failure or a hard
+  // crash that skips teardownWorktrees leaks the pair + branches forever.
+  // Reap ONLY stale dirs (mtime older than the stale threshold) so a live
+  // concurrent dual-impl is never destroyed mid-build.
+  const tmpRoot = os.tmpdir();
+  const dualStaleMs = staleThresholdMs();
+  let dualEntries: string[] = [];
+  try {
+    dualEntries = fs.readdirSync(tmpRoot);
+  } catch {
+    dualEntries = [];
+  }
+  for (const name of dualEntries) {
+    if (!name.startsWith("gstack-dual-")) continue;
+    const baseDir = path.join(tmpRoot, name);
+    let mtimeMs: number;
+    try {
+      const st = fs.statSync(baseDir);
+      if (!st.isDirectory()) continue;
+      mtimeMs = st.mtimeMs;
+    } catch {
+      continue;
+    }
+    // Fresh dir → may belong to a live dual-impl run; leave it alone.
+    if (now - mtimeMs <= dualStaleMs) continue;
+    for (const sub of ["primary", "secondary"]) {
+      const wt = path.join(baseDir, sub);
+      if (!fs.existsSync(wt)) continue;
+      // Find the owning repo via the worktree's git-common-dir, then drive the
+      // removal from there (git worktree remove must run from the main repo).
+      const common = spawnSync(
+        "git",
+        ["-C", wt, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        { encoding: "utf8" },
+      );
+      if (common.status !== 0 || typeof common.stdout !== "string") continue;
+      const mainRepo = path.dirname(common.stdout.trim());
+      const head = spawnSync(
+        "git",
+        ["-C", wt, "rev-parse", "--abbrev-ref", "HEAD"],
+        { encoding: "utf8" },
+      );
+      const branch =
+        head.status === 0 && typeof head.stdout === "string"
+          ? head.stdout.trim()
+          : "";
+      spawnSync("git", ["-C", mainRepo, "worktree", "remove", "--force", wt], {
+        encoding: "utf8",
+      });
+      if (branch.startsWith("gstack-dual-")) {
+        spawnSync("git", ["-C", mainRepo, "branch", "-D", branch], {
+          encoding: "utf8",
+        });
+      }
+      spawnSync("git", ["-C", mainRepo, "worktree", "prune"], {
+        encoding: "utf8",
+      });
+    }
+    try {
+      fs.rmSync(baseDir, { recursive: true, force: true });
+    } catch {
+      // best-effort
+    }
+    console.warn(`[sweep] reaped leaked dual-impl worktree dir: ${baseDir}`);
+    stats.shapeZ += 1;
+  }
+
   // 5. Final git worktree prune per repoPath to clean any registry stragglers.
   for (const repoPath of repoPaths) {
     pruneWorktrees(repoPath);
