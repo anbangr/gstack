@@ -43,6 +43,48 @@
  * Both invariants live in `describe.skip("[RED] ...")` blocks: the fix PR
  * wires `planProviderRetry` into the cli.ts FAIL path and removes `.skip`.
  *
+ * ── DEFERRAL RATIONALE (kept [RED]/.skip; G2 + C1 of this suite shipped) ──
+ *
+ * Unlike G2 (a behavior-preserving seam extraction) and C1 (verified by a
+ * real forked-process integration repro), A1 has NO airtight cli-level
+ * verification path within this suite's scope, and the fix is a layered-retry
+ * POLICY decision, not a wiring:
+ *
+ *   1. Two provider-retry layers ALREADY exist below the orchestrator FAIL
+ *      path: the sub-agent CLI's own `retryWithBackoff` (Gemini) / transport
+ *      retry (Codex) — see sub-agents.ts ~1029-1032 — and a one-shot Codex
+ *      429/403 transport re-spawn in `runCodexImpl` (sub-agents.ts ~2085-2121).
+ *      Wiring `planProviderRetry` into the FAIL path adds a THIRD,
+ *      orchestrator-level capacity backoff on top of those. The code comment
+ *      at sub-agents.ts:1029-1032 explicitly warns against conflating
+ *      subprocess capacity-stall with the outer convergence retry-cap; a third
+ *      layer composed wrongly produces very long DOOMED builds (3 layers ×
+ *      backoff) — the opposite of the robustness this gap targets.
+ *
+ *   2. A capacity 529 reaches the FAIL handler only AFTER the failure is
+ *      recorded on phaseState. For a retry to actually RE-RUN the role (not
+ *      just re-classify stale state and burn backoff sleeps before halting),
+ *      the failing role's phaseState must be reset so `decideNextAction`
+ *      re-issues it. That reset is role-specific (RUN_GEMINI /
+ *      RUN_CODEX_REVIEW / RUN_GEMINI_TEST_SPEC / RUN_DUAL_IMPL / RUN_TESTS …
+ *      each carry distinct counters) and is the genuinely risky edit to the
+ *      orchestrator's hot loop.
+ *
+ *   3. RED #1 is a static-grep on cli.ts; RED #2 drives the REAL planner
+ *      through a TEST-LOCAL loop (it does not touch cli.ts). Neither exercises
+ *      the actual orchestrator respawn-on-529 behavior — that needs a
+ *      build-forking integration harness that injects transient 529s and
+ *      asserts the role is re-dispatched then converges. No such harness
+ *      exists here, so "full suite green" is NOT airtight verification for A1.
+ *
+ * The correct fix is a focused follow-up: a single shared
+ * `runRoleStepWithProviderRetry(spawnFn)` seam at the dispatch boundary that
+ * composes with (does not duplicate) the existing CLI/transport retries, plus
+ * an integration test that injects 529s. Per the suite's discipline — ship
+ * what is verifiable airtight, leave the rest a documented RED — A1 stays
+ * skipped with this rationale rather than shipping an unverified hot-loop
+ * change. See docs/designs/BUILD_ROBUSTNESS_SUITE.md §7 / §A1.
+ *
  * Imports only symbols that exist today (the production dead code +
  * `classifyProviderFailure` + the `SubAgentResult` type + the cli.ts
  * source). No real LLM, no network, no spawn. Fake clock via the
