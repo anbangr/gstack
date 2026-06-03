@@ -502,6 +502,14 @@ interface HeartbeatTracker {
   lastSeenDrainProcessedCount?: number;
   /** Phase index seen on the last sidecar tick. Phase advance = real progress. */
   lastSeenPhase?: number;
+  /**
+   * PID of the process whose heartbeat last advanced this tracker. When the
+   * current sidecar's pid differs, the run was auto-resumed under a new process
+   * and the stall clock must NOT be inherited from the dead one — the first
+   * post-resume poll re-seeds lastChangedAt to grant a grace window (B3).
+   * Absent on pre-fix trackers (treated as a pid change → one-time grace).
+   */
+  lastSeenPid?: number;
   /** Wall-clock ms when either of the tracked signals last changed. */
   lastChangedAt: number;
 }
@@ -731,11 +739,25 @@ export function evaluateHeartbeatStall(
     (tracker.lastSeenPhase !== undefined &&
       sidecar.phase !== tracker.lastSeenPhase);
 
-  if (moved || !tracker) {
+  // Resume detection (B3): the tracker was advanced by a DIFFERENT (now dead)
+  // process. The run was auto-resumed, so the stall clock belongs to the dead
+  // process — do not inherit it. Re-seed the tracker (grant a grace window) on
+  // this first post-resume poll instead of escalating on a clock the resumed
+  // process never owned. Only a RECORDED-but-different pid signals a resume; a
+  // missing pid (pre-fix tracker) is conservatively treated as the same process
+  // so a genuine same-process stall still escalates. A genuine same-process
+  // stall keeps lastSeenPid === sidecar.pid and is unaffected.
+  const resumed =
+    tracker != null &&
+    tracker.lastSeenPid != null &&
+    tracker.lastSeenPid !== sidecar.pid;
+
+  if (moved || !tracker || resumed) {
     writeHeartbeatTracker(trackerPath, {
       lastSeenStateLastUpdatedAt: sidecar.stateLastUpdatedAt,
       lastSeenDrainProcessedCount: sidecar.drainProcessedCount,
       lastSeenPhase: sidecar.phase,
+      lastSeenPid: sidecar.pid,
       lastChangedAt: nowMs,
     });
     return { sidecar, stalledMs: 0 };

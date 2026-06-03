@@ -242,7 +242,7 @@ function setupResumedRun(opts: {
   return { data, run };
 }
 
-describe.skip("[RED] B3 monitor-stale-tracker-across-resume — UNSKIP WHEN B3 IS FIXED", () => {
+describe("[RED→FIXED] B3 monitor-stale-tracker-across-resume", () => {
   it("does NOT escalate on the resumed process's first poll when the tracker's stall clock was inherited from the dead process", () => {
     const N = 1; // lastSeenPhase replayed by the resumed process
     const K = 4; // lastSeenDrainProcessedCount replayed by the resumed process
@@ -274,6 +274,11 @@ describe.skip("[RED] B3 monitor-stale-tracker-across-resume — UNSKIP WHEN B3 I
         lastSeenStateLastUpdatedAt: staleStateAt,
         lastSeenDrainProcessedCount: K,
         lastSeenPhase: N,
+        // The DEAD process's pid: the tracker it left behind recorded its own
+        // (now-dead) pid. The resumed process's sidecar carries process.pid, so
+        // tracker.lastSeenPid !== sidecar.pid → the monitor recognizes a resume
+        // and grants a grace window instead of inheriting the dead clock.
+        lastSeenPid: 999999,
         lastChangedAt: Date.parse("2026-05-08T00:10:00.000Z"),
       }),
     );

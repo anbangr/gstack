@@ -57,15 +57,34 @@ describe("Bug B leg 1 — hasActiveSubagentChild", () => {
     fs.chmodSync(fakeBin, 0o755);
     let child: ChildProcess | null = null;
     try {
-      child = spawn(fakeBin, ["3"], { detached: false });
-      // Give the OS a moment to register the child in ps.
-      await new Promise((r) => setTimeout(r, 250));
-      expect(hasActiveSubagentChild(process.pid)).toBe(true);
+      // sleep 30 so the child stays alive across the whole poll window even on
+      // a loaded box; poll until ps registers it rather than a fixed wait (a
+      // 250ms wait flaked under load when ps was slow to report the new comm).
+      child = spawn(fakeBin, ["30"], { detached: false });
+      let seen = false;
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        if (hasActiveSubagentChild(process.pid)) {
+          seen = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      expect(seen).toBe(true);
     } finally {
       if (child && child.pid) {
+        // SIGKILL and AWAIT the child's exit (bounded) before returning. The
+        // child is `sleep 30`, so a bare SIGTERM-and-continue could leave this
+        // "codex" process alive into the next test, where T-B1d's negative
+        // hasActiveSubagentChild check would then see it and fail. Awaiting the
+        // exit guarantees it is reaped first.
+        const exited = new Promise<void>((resolve) => {
+          child!.once("exit", () => resolve());
+        });
         try {
-          process.kill(child.pid);
+          process.kill(child.pid, "SIGKILL");
         } catch {}
+        await Promise.race([exited, new Promise((r) => setTimeout(r, 2000))]);
       }
       try {
         fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -116,9 +135,7 @@ describe("Bug B static-grep wiring guards", () => {
 
   it("T-B5c: status-aware threshold multiplies by 30x when any phase is _running", () => {
     expect(monitorContent).toContain("anyPhaseRunning");
-    expect(monitorContent).toMatch(
-      /status\.endsWith\(['"]_running['"]\)/,
-    );
+    expect(monitorContent).toMatch(/status\.endsWith\(['"]_running['"]\)/);
     expect(monitorContent).toMatch(/baseStaleWindowMs\s*\*\s*30/);
   });
 });
