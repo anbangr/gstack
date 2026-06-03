@@ -307,8 +307,9 @@ const SUBAGENT_PROCESS_NAMES: ReadonlyArray<string> = [
 ];
 
 /**
- * Return true when the orchestrator at `orchPid` has at least one direct
- * child whose `comm` matches a recognized subagent CLI. Used by the stale
+ * Return true when the orchestrator at `orchPid` has at least one DESCENDANT
+ * (direct child OR deeper, e.g. a shell-wrapped grandchild) whose `comm`
+ * matches a recognized subagent CLI. Used by the stale
  * detector to suppress the `USER_ACTION_REQUIRED` escalation during
  * legitimate long Codex /qa or Claude /review calls (3-10 minutes is
  * normal), which otherwise burn supervisor escalations on every poll
@@ -324,31 +325,49 @@ const SUBAGENT_PROCESS_NAMES: ReadonlyArray<string> = [
 export function hasActiveSubagentChild(orchPid: number | null): boolean {
   if (orchPid == null || orchPid <= 0) return false;
   try {
-    const probe = spawnSync("ps", ["-e", "-o", "ppid=,comm="], {
+    const probe = spawnSync("ps", ["-e", "-o", "pid=,ppid=,comm="], {
       encoding: "utf8",
       timeout: 2000,
     });
     if (probe.status !== 0 || typeof probe.stdout !== "string") return false;
+    // Build the pid -> children map for the WHOLE process table, then walk the
+    // orchestrator's subtree. A recognized subagent is commonly a GRANDCHILD
+    // (orchestrator -> /bin/sh wrapper -> gemini), so a direct-child-only match
+    // (`ppid === orchPid`) misses it and the monitor false-escalates
+    // USER_ACTION_REQUIRED on a healthy long shell-wrapped call (B2).
+    const childrenByPpid = new Map<number, { pid: number; comm: string }[]>();
     for (const line of probe.stdout.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      // ppid is the first whitespace-separated token; comm is the rest.
-      const m = trimmed.match(/^(\d+)\s+(.+)$/);
+      // pid, ppid are the first two whitespace tokens; comm is the rest.
+      const m = trimmed.match(/^(\d+)\s+(\d+)\s+(.+)$/);
       if (!m) continue;
-      const ppid = Number(m[1]);
-      if (!Number.isInteger(ppid) || ppid !== orchPid) continue;
-      // `comm` may include a leading path or be wrapped in parens for
-      // kernel threads. Take the basename and strip parens.
+      const pid = Number(m[1]);
+      const ppid = Number(m[2]);
+      if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
+      // `comm` may include a leading path or be wrapped in parens for kernel
+      // threads. Take the basename and strip parens. Exact basename match —
+      // substring (`comm.includes(name)`) is a false-positive vector: a user
+      // script named `mycodex-wrapper` would silently suppress the stale alarm
+      // forever.
       const comm = path
-        .basename(m[2].replace(/^\(/, "").replace(/\)$/, ""))
+        .basename(m[3].replace(/^\(/, "").replace(/\)$/, ""))
         .toLowerCase();
-      // Exact basename match — substring (`comm.includes(name)`) is a
-      // false-positive vector: a user script named `mycodex-wrapper` would
-      // silently suppress the stale alarm forever. The CLIs we care about
-      // exec the binaries by their bare name (`codex`, `claude`, etc.); the
-      // basename strip above handles the path-prefix case.
-      if (SUBAGENT_PROCESS_NAMES.includes(comm)) {
-        return true;
+      const list = childrenByPpid.get(ppid);
+      if (list) list.push({ pid, comm });
+      else childrenByPpid.set(ppid, [{ pid, comm }]);
+    }
+    // Iterative DFS over descendants of orchPid. `seen` guards against pid
+    // reuse / cyclic ppid edges so the walk always terminates.
+    const stack: number[] = [orchPid];
+    const seen = new Set<number>([orchPid]);
+    while (stack.length > 0) {
+      const cur = stack.pop() as number;
+      for (const child of childrenByPpid.get(cur) ?? []) {
+        if (seen.has(child.pid)) continue;
+        seen.add(child.pid);
+        if (SUBAGENT_PROCESS_NAMES.includes(child.comm)) return true;
+        stack.push(child.pid);
       }
     }
     return false;

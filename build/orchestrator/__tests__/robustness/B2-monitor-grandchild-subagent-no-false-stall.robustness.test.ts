@@ -368,7 +368,7 @@ function spawnGrandchildSubagent(): { shell: ChildProcess; binPath: string } {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-describe.skip("[RED] B2 monitor-grandchild-subagent-no-false-stall — UNSKIP WHEN B2 IS FIXED", () => {
+describe("[RED→FIXED] B2 monitor-grandchild-subagent-no-false-stall", () => {
   it("does NOT emit USER_ACTION_REQUIRED when a live recognized subagent is a shell-wrapped grandchild of the orchestrator", async () => {
     if (process.platform === "win32") {
       // POSIX-only: the ps ppid/comm probe and process-group reaping don't apply
