@@ -64,3 +64,11 @@ jobs:
 
       - name: Run deterministic build skill gate
         run: bun run test:build-skill
+
+      - name: Run long-run robustness suite
+        # Redundant-but-named: these specs already ran under test:build-skill
+        # (they live in build/orchestrator/__tests__/), but a dedicated step
+        # surfaces a long-run robustness regression as its own labeled
+        # green/red in the CI log instead of being buried in the build-skill
+        # output. See docs/designs/BUILD_ROBUSTNESS_SUITE.md.
+        run: bun run test:build-robustness
