@@ -45,7 +45,7 @@ import {
  * `sweep-orphans-restart.test.ts` (no new fakes needed; this spec exercises
  * real filesystem + real git, so the helpers.ts time/spawn fakes don't apply).
  */
-describe.skip("[RED] D5 sweep-shape-z-protects-unreadable-record — UNSKIP WHEN D5 IS FIXED", () => {
+describe("[RED→FIXED] D5 sweep-shape-z-protects-unreadable-record", () => {
   let parentRepo: string;
   let buildWorktreesRoot: string;
   let registryDir: string;

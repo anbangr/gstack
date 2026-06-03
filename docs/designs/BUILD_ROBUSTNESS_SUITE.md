@@ -340,7 +340,7 @@ The suite scaffold (§3) is built and wired: 28 spec files under
 `build-skill-gate.yml`. The full build-skill gate is green (PIN specs pass,
 unfixed gaps committed as `describe.skip` REDs).
 
-**Fixed and green (RED → unskipped) — 15 of 24 fixable gaps:**
+**Fixed and green (RED → unskipped) — 16 of 24 fixable gaps:**
 
 | id   | fix                                                                                                                                                               | production touched                        |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
@@ -359,6 +359,7 @@ unfixed gaps committed as `describe.skip` REDs).
 | `B5` | opt-in absolute single-tool-invocation cap (`maxToolInvocationMs`) — a never-completing slow tool is killed (`tool_timeout`)                                      | `stall-watchdog.ts`                       |
 | `G1` | a `RUN_TESTS` timeout is retryable (bounded) — `decideNextAction` re-issues `RUN_TESTS` for `finalStatus:"timeout"`, not FAIL                                     | `phase-runner.ts`                         |
 | `H1` | saveState rolls back `lastUpdatedAt` + cleans tmp on torn rename; gbrain-restore preserves the restored timestamp; sweep live-PID skip gated on a fresh heartbeat | `state.ts`, `cli.ts`                      |
+| `D5` | sweep Shape Z fails closed on an unreadable active-run record — a torn/truncated registry file no longer lets a concurrent build's live worktree be reaped        | `cli.ts`                                  |
 
 Each fix landed with its RED spec unskipped and the touched file's existing tests
 re-run green (zero regressions). Two existing tests that codified the old
@@ -366,7 +367,7 @@ behavior were corrected alongside their fix: the D3 PIN (acquire TTL 1h→2h) an
 the sweep "skips live-PID records" test (now carries a fresh heartbeat, matching
 H1's heartbeat-gated live-skip).
 
-**Remaining REDs (9) — tracked `describe.skip` specs:**
+**Remaining REDs (8) — tracked `describe.skip` specs:**
 
 - `A1` (provider-retry wiring) and `C1` (signal-handler unification) — **deferred
   to a dedicated `/build`**. Hot-phase-loop / live-OS-signal surgery: A1 means
@@ -380,12 +381,12 @@ H1's heartbeat-gated live-skip).
   load-bearing dedup / DETECTED↔RESOLVED pairing). Correct fix is the
   collapse-counter (path b) + a spec correction dropping assertion 3.
 - `A3` (auth classify + no blind fallback), `B2`/`B3` (monitor subtree liveness /
-  stale-tracker grace), `D5` (sweep protects an unreadable record), `E2`
-  (dual-impl `/tmp` worktree reaper), `G2` (feature-review needs-phases bound) —
+  stale-tracker grace), `E2` (dual-impl `/tmp` worktree reaper), `G2`
+  (feature-review needs-phases bound) —
   localized; each tractable in a small batch with the per-file existing tests as
   the regression guard. `G2`'s target (`runFeatureReviewIteration`) is internal /
   not exported, so it drives via static-grep + the public entry.
 
-The honest state: the pre-release gate exists and is green today; **15 confirmed
-gaps are closed with zero regressions**; the remaining 9 are tracked, reproducible
+The honest state: the pre-release gate exists and is green today; **16 confirmed
+gaps are closed with zero regressions**; the remaining 8 are tracked, reproducible
 RED specs that each become a green checklist item as their fix lands.

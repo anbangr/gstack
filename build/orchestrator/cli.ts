@@ -12010,6 +12010,16 @@ export function sweepOrphans(
   for (const [wtPath, entry] of allWorktrees.entries()) {
     if (claimedWorktrees.has(wtPath)) continue;
     if (!wtPath.startsWith(buildWorktreesRoot)) continue;
+    // Fail closed (D5): an unclaimed worktree whose runId STILL has a record
+    // file on disk means readActiveRunRecords couldn't parse that file (a torn
+    // / truncated write or a transient read error caught it mid-build). The
+    // worktree may belong to a live concurrent build; there is no safe way to
+    // prove it orphaned when its registry record failed to read, so leave it.
+    if (
+      fs.existsSync(activeRunRecordPath(registryDir, path.basename(wtPath)))
+    ) {
+      continue;
+    }
     const remove = removeWorktreeForceWithTimeout(entry.repoPath, wtPath);
     if (!remove.ok) {
       console.warn(
