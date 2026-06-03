@@ -340,33 +340,34 @@ The suite scaffold (§3) is built and wired: 28 spec files under
 `build-skill-gate.yml`. The full build-skill gate is green (PIN specs pass,
 unfixed gaps committed as `describe.skip` REDs).
 
-**Fixed and green (RED → unskipped) — 23 of 24 fixable gaps:**
+**Fixed and green (RED → unskipped) — 24 of 24 fixable gaps:**
 
-| id   | fix                                                                                                                                                                  | production touched                        |
-| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| `B1` | monitor resume counter resets on committed-phase progress (consecutive-failed, not lifetime)                                                                         | `monitor.ts`                              |
-| `F1` | learned `*_regex` matchers reject nested-quantifier ReDoS at eval time + input cap                                                                                   | `skill-fault-detector.ts`                 |
-| `D1` | daemon reclaims a stale in-flight (`landing`/`claiming`/`drift_repairing`) record; `retryReleaseQueueRecord` rescues in-flight too                                   | `release-daemon.ts`                       |
-| `E1` | quarantine `walk()` skips an unstattable / dangling-symlink ref instead of throwing out of the fetch preflight                                                       | `cli.ts`                                  |
-| `A2` | `assertGeminiAuth` TTL+clock revalidation — a cached positive is re-probed after the TTL (no more hours on a dead token)                                             | `sub-agents.ts`                           |
-| `D2` | release-lock heartbeat fails closed once `> ttlMs` since the last successful refresh (no transient-forever)                                                          | `release-daemon.ts`                       |
-| `D3` | acquire + refresh share one `RELEASE_LOCK_DEFAULT_TTL_MS` (2h); steal-window closed                                                                                  | `release-lock.ts`, `release-daemon.ts`    |
-| `D4` | daemon reaps the scratch worktree (`git worktree remove`/`prune`) after a land via the scratch fallback                                                              | `release-daemon.ts`                       |
-| `E4` | corrupt-repo matcher widened (packed-refs / empty loose object) + applied on checkout/merge legs → `GIT_REPO_CORRUPT` + fsck hint                                    | `cli.ts`                                  |
-| `F3` | inbox auto-file suffix loop (`-2`,`-3`) — a same-UTC-day re-emit no longer clobbers the prior triage file                                                            | `drain-faults.ts`                         |
-| `F4` | detector `acquireLock` reclaims a dead-PID stale lock once (via `isPidAlive`) instead of spinning 5s and dropping the hit-count                                      | `skill-fault-detector.ts`                 |
-| `A4` | quota `resetAt` surfaced as a structured `HaltEvent.snapshot.resetAt` field, not just prose                                                                          | `halt-event-helpers.ts`, `halt-events.ts` |
-| `B5` | opt-in absolute single-tool-invocation cap (`maxToolInvocationMs`) — a never-completing slow tool is killed (`tool_timeout`)                                         | `stall-watchdog.ts`                       |
-| `G1` | a `RUN_TESTS` timeout is retryable (bounded) — `decideNextAction` re-issues `RUN_TESTS` for `finalStatus:"timeout"`, not FAIL                                        | `phase-runner.ts`                         |
-| `H1` | saveState rolls back `lastUpdatedAt` + cleans tmp on torn rename; gbrain-restore preserves the restored timestamp; sweep live-PID skip gated on a fresh heartbeat    | `state.ts`, `cli.ts`                      |
-| `D5` | sweep Shape Z fails closed on an unreadable active-run record — a torn/truncated registry file no longer lets a concurrent build's live worktree be reaped           | `cli.ts`                                  |
-| `F2` | recurrence with a different snapshot archives the prior capture to `<queueDir>/collapsed/` + an `occurrences` counter (stable faultId; dedup/pairing intact)         | `halt-events.ts`                          |
-| `A3` | `PROVIDER_AUTH_RE` realigned with `AUTH_REQUIRED_RE`; primary auth failure is classified and does NOT blindly fan out to the backup                                  | `halt-event-helpers.ts`, `sub-agents.ts`  |
-| `B3` | resumed run gets a stall-clock grace window (tracker records `lastSeenPid`; a pid change re-seeds instead of inheriting the dead clock)                              | `monitor.ts`                              |
-| `B2` | subagent-liveness probe walks the whole subtree (shell-wrapped grandchild counts), not just direct children                                                          | `monitor.ts`                              |
-| `E2` | sweep reaps leaked `os.tmpdir()/gstack-dual-*` worktrees + branches (staleness-gated so a live concurrent dual-impl is never destroyed)                              | `cli.ts`                                  |
-| `G2` | feature-review cap decision extracted to a pure, exported `featureReviewCapReached({iterationsConsumed,cap})`; run() routes through it so the bound is unit-tested   | `phase-runner.ts`, `cli.ts`               |
-| `C1` | interrupt cleanup is a `registerShutdownHook` (no early `process.exit`) inside the single signal path; the SIGTERM→grace→SIGKILL escalation now reaps trapped groups | `child-registry.ts`, `cli.ts`             |
+| id   | fix                                                                                                                                                                                                                                                                             | production touched                        |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| `B1` | monitor resume counter resets on committed-phase progress (consecutive-failed, not lifetime)                                                                                                                                                                                    | `monitor.ts`                              |
+| `F1` | learned `*_regex` matchers reject nested-quantifier ReDoS at eval time + input cap                                                                                                                                                                                              | `skill-fault-detector.ts`                 |
+| `D1` | daemon reclaims a stale in-flight (`landing`/`claiming`/`drift_repairing`) record; `retryReleaseQueueRecord` rescues in-flight too                                                                                                                                              | `release-daemon.ts`                       |
+| `E1` | quarantine `walk()` skips an unstattable / dangling-symlink ref instead of throwing out of the fetch preflight                                                                                                                                                                  | `cli.ts`                                  |
+| `A2` | `assertGeminiAuth` TTL+clock revalidation — a cached positive is re-probed after the TTL (no more hours on a dead token)                                                                                                                                                        | `sub-agents.ts`                           |
+| `D2` | release-lock heartbeat fails closed once `> ttlMs` since the last successful refresh (no transient-forever)                                                                                                                                                                     | `release-daemon.ts`                       |
+| `D3` | acquire + refresh share one `RELEASE_LOCK_DEFAULT_TTL_MS` (2h); steal-window closed                                                                                                                                                                                             | `release-lock.ts`, `release-daemon.ts`    |
+| `D4` | daemon reaps the scratch worktree (`git worktree remove`/`prune`) after a land via the scratch fallback                                                                                                                                                                         | `release-daemon.ts`                       |
+| `E4` | corrupt-repo matcher widened (packed-refs / empty loose object) + applied on checkout/merge legs → `GIT_REPO_CORRUPT` + fsck hint                                                                                                                                               | `cli.ts`                                  |
+| `F3` | inbox auto-file suffix loop (`-2`,`-3`) — a same-UTC-day re-emit no longer clobbers the prior triage file                                                                                                                                                                       | `drain-faults.ts`                         |
+| `F4` | detector `acquireLock` reclaims a dead-PID stale lock once (via `isPidAlive`) instead of spinning 5s and dropping the hit-count                                                                                                                                                 | `skill-fault-detector.ts`                 |
+| `A4` | quota `resetAt` surfaced as a structured `HaltEvent.snapshot.resetAt` field, not just prose                                                                                                                                                                                     | `halt-event-helpers.ts`, `halt-events.ts` |
+| `B5` | opt-in absolute single-tool-invocation cap (`maxToolInvocationMs`) — a never-completing slow tool is killed (`tool_timeout`)                                                                                                                                                    | `stall-watchdog.ts`                       |
+| `G1` | a `RUN_TESTS` timeout is retryable (bounded) — `decideNextAction` re-issues `RUN_TESTS` for `finalStatus:"timeout"`, not FAIL                                                                                                                                                   | `phase-runner.ts`                         |
+| `H1` | saveState rolls back `lastUpdatedAt` + cleans tmp on torn rename; gbrain-restore preserves the restored timestamp; sweep live-PID skip gated on a fresh heartbeat                                                                                                               | `state.ts`, `cli.ts`                      |
+| `D5` | sweep Shape Z fails closed on an unreadable active-run record — a torn/truncated registry file no longer lets a concurrent build's live worktree be reaped                                                                                                                      | `cli.ts`                                  |
+| `F2` | recurrence with a different snapshot archives the prior capture to `<queueDir>/collapsed/` + an `occurrences` counter (stable faultId; dedup/pairing intact)                                                                                                                    | `halt-events.ts`                          |
+| `A3` | `PROVIDER_AUTH_RE` realigned with `AUTH_REQUIRED_RE`; primary auth failure is classified and does NOT blindly fan out to the backup                                                                                                                                             | `halt-event-helpers.ts`, `sub-agents.ts`  |
+| `B3` | resumed run gets a stall-clock grace window (tracker records `lastSeenPid`; a pid change re-seeds instead of inheriting the dead clock)                                                                                                                                         | `monitor.ts`                              |
+| `B2` | subagent-liveness probe walks the whole subtree (shell-wrapped grandchild counts), not just direct children                                                                                                                                                                     | `monitor.ts`                              |
+| `E2` | sweep reaps leaked `os.tmpdir()/gstack-dual-*` worktrees + branches (staleness-gated so a live concurrent dual-impl is never destroyed)                                                                                                                                         | `cli.ts`                                  |
+| `G2` | feature-review cap decision extracted to a pure, exported `featureReviewCapReached({iterationsConsumed,cap})`; run() routes through it so the bound is unit-tested                                                                                                              | `phase-runner.ts`, `cli.ts`               |
+| `C1` | interrupt cleanup is a `registerShutdownHook` (no early `process.exit`) inside the single signal path; the SIGTERM→grace→SIGKILL escalation now reaps trapped groups                                                                                                            | `child-registry.ts`, `cli.ts`             |
+| `A1` | `runRoleStepWithProviderRetry` seam: a capacity/overloaded 529 backs off (30/60/120s) + re-spawns the role step, bounded per-step (3) + per-phase (6, via `providerRetryAttempts`); 4 single-impl dispatch sites routed through it; `GSTACK_DISABLE_CAPACITY_RETRY` kill switch | `sub-agents.ts`, `cli.ts`                 |
 
 Each fix landed with its RED spec unskipped and the touched file's existing tests
 re-run green (zero regressions). Existing tests that had codified the old
@@ -391,35 +392,50 @@ load flake was also stabilized (poll for ps visibility + deterministic child rea
   forked-process integration spec (now `[RED→FIXED]`, stable 5/5 in isolation)
   plus a static-grep guard pinning the production wiring.
 
-**Remaining RED (1) — `A1` provider-capacity-retry-wired, a documented deferral:**
+**Update (next pass): `A1` shipped — the highest-leverage gap is now closed.**
 
-- `A1` is the single highest-leverage finding (a transient 529 /
-  `RESOURCE_EXHAUSTED` kills a multi-hour build because `planProviderRetry` /
-  `PROVIDER_RETRY_SESSION_CAP` are dead code). It is held back deliberately — not
-  for lack of effort but because it has **no airtight cli-level verification** in
-  this suite's scope and is a layered-retry POLICY decision, not a wiring:
-  - Two provider-retry layers already exist BELOW the FAIL path — the sub-agent
-    CLI's own `retryWithBackoff` (Gemini) / transport retry (Codex) at
-    `sub-agents.ts:1029-1032`, and a one-shot Codex 429/403 re-spawn in
-    `runCodexImpl` (`sub-agents.ts:2085-2121`). A third orchestrator-level
-    backoff composed wrongly yields very long DOOMED builds (3 layers × backoff),
-    the opposite of the robustness this targets.
-  - A capacity 529 reaches the FAIL handler only after the failure is recorded;
-    for a retry to actually re-RUN the role (not re-classify stale state and burn
-    backoff before halting), the failing role's `phaseState` must be reset so
-    `decideNextAction` re-issues it — role-specific, risky hot-loop surgery.
-  - RED #1 is a static-grep on cli.ts; RED #2 drives the real planner through a
-    test-local loop (it never touches cli.ts). Neither exercises the actual
-    respawn-on-529 behavior, which needs a build-forking harness that injects
-    529s and asserts re-dispatch-then-converge.
-  - The correct fix is a focused follow-up: one shared
-    `runRoleStepWithProviderRetry(spawnFn)` seam at the dispatch boundary that
-    COMPOSES with the existing CLI/transport retries, plus an injection harness.
-    The full RED rationale lives in the A1 spec header.
+`A1` (provider-capacity-retry) was the single highest-leverage finding: a
+transient `529 Overloaded` / `RESOURCE_EXHAUSTED` killing a multi-hour build,
+with `planProviderRetry` / `PROVIDER_RETRY_SESSION_CAP` as a tested-but-unwired
+recovery subsystem. It was held back one pass for risk; it now ships as a seam
+that IS verifiable airtight, not the FAIL-handler state-rewind the original RED
+sketch implied.
 
-The honest state: the pre-release gate exists and is green today; **23 of 24
-confirmed gaps are closed with zero regressions**; the lone remaining gap is `A1`,
-a tracked, reproducible RED with its deferral rationale documented in-spec and
-here — shipped only when its dispatch-boundary seam and 529-injection harness can
-verify it airtight, rather than landing an unverified change to the orchestrator's
-hot retry loop.
+- **Seam, not FAIL-handler surgery.** The capacity retry lives at the dispatch
+  boundary in `runRoleStepWithProviderRetry(spawnRoleStep, opts)`
+  (`sub-agents.ts`), which re-spawns the role step on a capacity/overloaded
+  verdict — no `decideNextAction` state rewind, no role-specific `phaseState`
+  reset. Policy is delegated to the pure `planProviderRetry`: escalating backoff
+  bounded per-step by `PROVIDER_CAPACITY_BACKOFF_MAX_ATTEMPTS` (3) and per-phase
+  by `PROVIDER_RETRY_SESSION_CAP` (6, threaded via `phaseState.providerRetryAttempts`).
+  auth/quota/transport/stall halt (no re-spawn); a non-provider failure is handed
+  straight back to the existing FAIL ladder.
+- **Composition, stated honestly.** It is the third, outermost retry layer above
+  the sub-agent CLI's own `retryWithBackoff` / transport retry and `runCodexImpl`'s
+  one-shot 429/`noVerdict` re-spawn. Each outer re-spawn re-runs the full
+  `runRoleTask` primary→backup ladder, so subprocess count multiplies under a
+  sustained outage; that churn is bounded (the two caps) and spread across the
+  backoff windows, never a tight hammer. Suppressing the inner one-shot on a
+  classified capacity verdict (so the layers don't both retry the same transient)
+  is a documented optimization follow-up.
+- **Verifiable, and verified.** RED #2 now drives the REAL seam (fake spawn thunk +
+  sleep spy + zero-jitter rng), correcting an earlier spec assumption that
+  conflated the per-step cap (3) with the session cap (6). The work was designed
+  via a parallel-reader understanding pass and hardened by a 19-agent adversarial
+  review: it added cross-step budget-accumulation + watchdog-kill-guard tests,
+  fixed a real `resetPhaseStateForRedo` gap (a redone phase now gets a fresh
+  capacity-retry budget), and corrected the docstring's composition/A3 overclaims.
+- **Scoped deferrals (documented).** Wired into the four single-impl LLM dispatch
+  sites (RUN_GEMINI primary, RUN_GEMINI_FROM_REVIEW, RUN_GEMINI_TEST_SPEC,
+  RUN_GEMINI_FIX). NOT wired this pass: the dual-impl candidates (Promise.all
+  racing a shared session counter + per-iteration output-path collisions — and
+  dual-impl already has winner-takes-all resilience, so a single 529 doesn't kill
+  it), and the codex-review-gate / codex-feature-review paths (lower frequency,
+  separate dispatch fns). A `GSTACK_DISABLE_CAPACITY_RETRY=1` kill switch restores
+  the pre-fix dead-halt.
+
+The honest state: the pre-release gate exists and is green today; **all 24
+confirmed gaps are closed with zero regressions** (full orchestrator suite 2702
+pass / 0 fail; the only 2 skips are unrelated pre-existing). The remaining A1
+surface area — inner-retry suppression and the dual-impl / review-gate dispatch
+sites — is scoped and documented, not silently dropped.
