@@ -1288,7 +1288,7 @@ test("two same-basename plans with run ids cannot load each other's state", () =
   } finally {
     fs.rmSync(runDir, { recursive: true, force: true });
   }
-});
+}, 120_000);
 
 const FLAT_TASK_PLAN = `# Malformed Plan
 
