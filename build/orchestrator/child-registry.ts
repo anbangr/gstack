@@ -98,16 +98,24 @@ export function registerShutdownHook(hook: () => void): void {
 }
 
 /**
- * Cleanly shut down: run caller cleanup hooks, SIGTERM all live children, wait
- * briefly, SIGKILL survivors, then exit with a signal-appropriate code.
- * Exported for tests and for callers that want explicit cleanup without going
- * through the signal-handler path.
+ * Cleanly shut down: SIGTERM all live children, run caller cleanup hooks during
+ * the grace window, wait briefly, SIGKILL survivors, then exit with a
+ * signal-appropriate code. Exported for tests and for callers that want
+ * explicit cleanup without going through the signal-handler path.
  */
 export async function shutdownAndExit(signal: NodeJS.Signals): Promise<void> {
-  // Run caller cleanup FIRST so state/lock are durable even if the escalation
-  // below is slow. Swallow per-hook throws on purpose: this is a shutdown
-  // path, so one failing hook must NOT abort the remaining hooks or the
-  // SIGKILL escalation that reaps orphan-prone sub-agent groups.
+  // SIGTERM children FIRST, before running any caller hook. A hook does
+  // synchronous, potentially slow I/O (the orchestrator's hook calls saveState,
+  // which can shell out to `gbrain put` via spawnSync). If the hooks ran first
+  // and a supervisor SIGKILL'd this process during that window, the live
+  // sub-agent groups would be orphaned to init — the exact failure C1 closes.
+  // Delivering SIGTERM up front starts every child's graceful teardown
+  // immediately; the hooks then run inside the grace, and the SIGKILL
+  // escalation still fires after the 2s wait.
+  killAllChildren("SIGTERM");
+  // Run caller cleanup during the grace. Swallow per-hook throws on purpose:
+  // this is a shutdown path, so one failing hook must NOT abort the remaining
+  // hooks or the SIGKILL escalation below.
   for (const hook of shutdownHooks) {
     try {
       hook();
@@ -115,7 +123,6 @@ export async function shutdownAndExit(signal: NodeJS.Signals): Promise<void> {
       // best-effort shutdown cleanup — continue to the next hook + escalation
     }
   }
-  killAllChildren("SIGTERM");
   await sleep(2000);
   killAllChildren("SIGKILL");
   // 128 + signal number is the convention. SIGTERM=15, SIGINT=2, SIGHUP=1.
