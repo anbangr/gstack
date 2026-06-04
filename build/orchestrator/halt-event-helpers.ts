@@ -46,6 +46,7 @@ function emit(
       | "stall"
       | "auth_required"
       | "startup_hang"
+      | "tool_timeout"
       | undefined,
     lastTool: result?.lastTool,
     lastBucket: result?.lastBucket,
@@ -421,6 +422,9 @@ export function renderRoleStepFailure(
         break;
       case "startup_hang":
         reasonLabel = `no CPU and no output during startup window of ${ms}ms`;
+        break;
+      case "tool_timeout":
+        reasonLabel = `single tool invocation exceeded the ${ms}ms cap`;
         break;
       default:
         reasonLabel = `no output for ${ms}ms`;

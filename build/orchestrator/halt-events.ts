@@ -73,7 +73,8 @@ export interface HaltEvent {
       | "progress_gap"
       | "stall"
       | "auth_required"
-      | "startup_hang";
+      | "startup_hang"
+      | "tool_timeout";
     /** Last classified tool at kill time. Null when never classified. */
     lastTool?: string | null;
     /** Last classified bucket at kill time. Null when never classified. */
@@ -367,7 +368,8 @@ export interface BuildHaltSnapshotInput {
     | "progress_gap"
     | "stall"
     | "auth_required"
-    | "startup_hang";
+    | "startup_hang"
+    | "tool_timeout";
   lastTool?: string | null;
   lastBucket?: "fast" | "slow" | null;
 }
