@@ -1022,6 +1022,15 @@ sync code walk for them requires an explicit `--allow-reclone` opt-in.
   `assertCodexAuth()` probes (see `sub-agents.ts`).
 - `GSTACK_DISABLE_PROVIDER_CLASSIFIER=1` — Revert to pre-PR1b cap-hit
   behavior instead of `classifyProviderFailure()` (see `cli.ts`).
+- `GSTACK_DISABLE_CAPACITY_RETRY=1` — Skip the provider-capacity
+  backoff+retry seam (`runRoleStepWithProviderRetry` in `sub-agents.ts`,
+  wired via `capacityRetryOpts()` in `cli.ts`). By default (unset), a
+  capacity/overloaded 529 from a role step backs off (30/60/120s with
+  jitter) and re-spawns the step, bounded per-step (3) and per-phase (6,
+  tracked in `phaseState.providerRetryAttempts`). Setting `=1` hands the
+  first failure straight back to the normal FAIL path, restoring the
+  pre-A1 dead-halt behavior for operators who would rather halt immediately
+  in a degraded-provider scenario than wait through the backoff.
 - `GSTACK_INBOX_DIR` — Override the inbox directory for auto-filed bug
   reports written by `gstack-build investigate-finalize` and halt-event
   auto-files from `drainFaultsFromHaltEventsQueue` (default:
