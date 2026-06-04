@@ -9243,16 +9243,30 @@ async function runPhase(args: {
             `  ⚠ Primary implementor hit Codex context window limit before changing files; retrying with secondary implementor ${roleLabel(args.roles.secondaryImpl)}`,
           );
           fs.writeFileSync(outputFilePath, "");
-          result = await runRoleTask({
-            role: args.roles.secondaryImpl,
-            inputFilePath,
-            outputFilePath,
-            cwd,
-            slug: state.slug,
-            phaseNumber: phase.number,
-            iteration: action.iteration,
-            logPrefix: "secondary-impl-fallback",
-          });
+          // A1: the context-limit secondary fallback gets the same capacity
+          // backoff+retry as the primary, so a 529 on the fallback leg doesn't
+          // dead-halt either.
+          const _capS = await runRoleStepWithProviderRetry(
+            () =>
+              runRoleTask({
+                role: args.roles.secondaryImpl,
+                inputFilePath,
+                outputFilePath,
+                cwd,
+                slug: state.slug,
+                phaseNumber: phase.number,
+                iteration: action.iteration,
+                logPrefix: "secondary-impl-fallback",
+              }),
+            capacityRetryOpts(
+              phaseState.providerRetryAttempts ?? 0,
+              "secondary-impl-fallback",
+            ),
+          );
+          result = _capS.result;
+          phaseState.providerRetryAttempts =
+            (phaseState.providerRetryAttempts ?? 0) +
+            _capS.sessionAttemptsConsumed;
         }
       }
       result = await applyMutableAgentHygiene({
@@ -9382,16 +9396,28 @@ async function runPhase(args: {
             `  ⚠ Primary implementor re-run hit Codex context window limit before changing files; retrying with secondary implementor ${roleLabel(args.roles.secondaryImpl)}`,
           );
           fs.writeFileSync(outputFilePath, "");
-          result = await runRoleTask({
-            role: args.roles.secondaryImpl,
-            inputFilePath,
-            outputFilePath,
-            cwd,
-            slug: state.slug,
-            phaseNumber: phase.number,
-            iteration: action.iteration,
-            logPrefix: "secondary-impl-rerun-fallback",
-          });
+          // A1: capacity backoff+retry on the re-run secondary fallback too.
+          const _capSR = await runRoleStepWithProviderRetry(
+            () =>
+              runRoleTask({
+                role: args.roles.secondaryImpl,
+                inputFilePath,
+                outputFilePath,
+                cwd,
+                slug: state.slug,
+                phaseNumber: phase.number,
+                iteration: action.iteration,
+                logPrefix: "secondary-impl-rerun-fallback",
+              }),
+            capacityRetryOpts(
+              phaseState.providerRetryAttempts ?? 0,
+              "secondary-impl-rerun-fallback",
+            ),
+          );
+          result = _capSR.result;
+          phaseState.providerRetryAttempts =
+            (phaseState.providerRetryAttempts ?? 0) +
+            _capSR.sessionAttemptsConsumed;
         }
       }
       result = await applyMutableAgentHygiene({

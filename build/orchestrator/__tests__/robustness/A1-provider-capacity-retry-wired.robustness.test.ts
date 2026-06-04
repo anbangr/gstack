@@ -28,8 +28,9 @@
  *       self-resolve; transport/stall already had their one-shot inner retry.
  *     - a non-provider failure (real red / gate fail) → handed straight back so
  *       the existing FAIL ladder classifies + halts unchanged.
- *   cli.ts routes the four single-impl LLM dispatch sites (RUN_GEMINI primary,
- *   RUN_GEMINI_FROM_REVIEW re-impl, RUN_GEMINI_TEST_SPEC, RUN_GEMINI_FIX)
+ *   cli.ts routes the single-impl LLM dispatch sites (RUN_GEMINI primary,
+ *   RUN_GEMINI_FROM_REVIEW re-impl, RUN_GEMINI_TEST_SPEC, RUN_GEMINI_FIX, plus
+ *   the context-limit secondary-impl fallbacks for the two impl sites)
  *   through the seam via `capacityRetryOpts(...)`, threading
  *   phaseState.providerRetryAttempts as the running per-phase budget. The seam
  *   is purely additive: on a clean PASS the FAIL path never fires; on any
