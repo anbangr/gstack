@@ -33,6 +33,7 @@ import {
   registerShutdownHook,
   spawnSync,
 } from "./child-registry";
+import { stampRecoveryRef } from "./recovery-ref";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -4361,6 +4362,18 @@ function ensureOriginRetryBranch(args: {
     args.feature.branch || ownedFeatureBranch(args.state, args.feature)
   ).replace(/-followup-\d+$/, "");
   const branch = `${baseBranch}-followup-${args.feature.originVerificationAttempts ?? 1}`;
+  // Safety net: the build is about to switch its working branch off the prior
+  // feature branch onto a fresh-from-origin followup. If that prior branch
+  // carries reviewed-but-unlanded commits that live only on it, stamp a
+  // recovery ref so they stay reachable after the switch. No-op when unset.
+  const priorBranch = args.feature.branch;
+  if (priorBranch) {
+    stampRecoveryRef({
+      cwd: args.cwd,
+      ref: `refs/heads/${priorBranch}`,
+      reason: `origin-retry switch off ${priorBranch} -> ${branch}`,
+    });
+  }
   // Branch from origin/<base> (worktree-safe: syncLandedBase already fetched it).
   const checkout = spawnSync(
     "git",
@@ -16094,6 +16107,17 @@ function cleanupLocalMergedBranch(cwd: string, branch: string): void {
     },
   );
   if (noRemote || (merged.stdout || "").includes(branch)) {
+    // Safety net before the force-delete. `git branch -D` ignores unmerged
+    // status, and `noRemote` is true whenever the branch was never pushed
+    // (e.g. a single-branch shared feat/<prefix>), NOT only when it landed.
+    // Stamp the tip so a reviewed-but-unlanded commit survives gc and is
+    // recoverable by name instead of dangling. We checked out baseName above,
+    // so resolve the branch ref explicitly rather than HEAD.
+    stampRecoveryRef({
+      cwd,
+      ref: `refs/heads/${branch}`,
+      reason: `branch -D ${branch} (cleanupLocalMergedBranch, noRemote=${noRemote})`,
+    });
     spawnSync("git", ["branch", "-D", branch], { cwd, encoding: "utf8" });
   }
 }
