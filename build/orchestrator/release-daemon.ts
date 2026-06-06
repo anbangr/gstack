@@ -1,4 +1,5 @@
 import { spawnSync } from "./child-registry";
+import { stampRecoveryRef } from "./recovery-ref";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -851,6 +852,23 @@ function checkoutScratchWorktree(
     }
   };
   const resetWorktree = (cwd: string): void => {
+    // Safety net: when worktreePath is a real, caller-supplied landing
+    // worktree it may carry reviewed-but-unpushed commits ahead of
+    // origin/<featureBranch>; `reset --hard` would drop them with no surviving
+    // named ref. Stamp the pre-reset HEAD so those commits stay recoverable.
+    // Best-effort — never blocks the reset.
+    const head = spawnSync("git", ["rev-parse", "--verify", "HEAD"], {
+      cwd,
+      encoding: "utf8",
+    });
+    const headSha =
+      head.status === 0 ? String(head.stdout ?? "").trim() : undefined;
+    stampRecoveryRef({
+      cwd,
+      ref: "HEAD",
+      sha: headSha,
+      reason: `reset --hard ${remoteTrackingRef} (release-daemon scratch)`,
+    });
     const reset = spawnSync("git", ["reset", "--hard", remoteTrackingRef], {
       cwd,
       encoding: "utf8",

@@ -80,6 +80,7 @@ const MODULE_TEST_OWNERS: Record<string, string[]> = {
     "plan-review-prompts.test.ts",
     "plan-annotation-round-trip.test.ts",
   ],
+  "recovery-ref.ts": ["recovery-ref.test.ts"],
   "registry.ts": ["release-queue.test.ts", "active-runs.test.ts"],
   "resolve-git-dir.ts": ["resolve-git-dir.test.ts"],
   "release-daemon.ts": ["cli.test.ts", "release-daemon.test.ts"],
