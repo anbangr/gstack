@@ -1,7 +1,7 @@
 ---
 name: build
 preamble-tier: 4
-version: 1.35.0
+version: 1.36.0
 description: gstack autonomous execution skill.
 allowed-tools:
   - Bash
