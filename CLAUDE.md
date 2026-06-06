@@ -1018,6 +1018,20 @@ sync code walk for them requires an explicit `--allow-reclone` opt-in.
   `syncFeatureBranchWithBase`. Use this kill switch when you are
   intentionally working with refs that have non-standard names and do not
   want the orchestrator to move them to `.git/quarantine/`.
+- `GSTACK_DISABLE_RECOVERY_REF=1` — Skip the RC2 branch/commit safety net.
+  By default, before any branch reset/delete that could strand reviewed-but-
+  unlanded work, `stampRecoveryRef()` (`build/orchestrator/recovery-ref.ts`)
+  writes a `refs/gstack-recovery/<branch>-<ts>` ref at the tip so the commit
+  survives `git gc` and is recoverable by name (`git branch <new> <ref>`)
+  instead of dangling. Three sites are wired: `cleanupLocalMergedBranch`'s
+  `git branch -D` (the `noRemote` force-delete that orphaned single-branch
+  `feat/<prefix>` work), `ensureOriginRetryBranch`'s switch onto a fresh-from-
+  origin followup, and the release-daemon scratch `reset --hard`. The stamp is
+  best-effort and never blocks the underlying op; it changes WHICH branches get
+  deleted by exactly zero (no squash-cleanup regression). Recovery refs are not
+  auto-pruned — list them with `git for-each-ref refs/gstack-recovery/` and
+  delete with `git update-ref -d <ref>` once you're sure the work landed.
+  Setting `=1` disables stamping entirely (no recovery net).
 - `GSTACK_DISABLE_AUTH_PREFLIGHT=1` — Skip `assertGeminiAuth()` /
   `assertCodexAuth()` probes (see `sub-agents.ts`).
 - `GSTACK_DISABLE_PROVIDER_CLASSIFIER=1` — Revert to pre-PR1b cap-hit
