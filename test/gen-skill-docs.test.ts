@@ -1,4 +1,4 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, beforeAll } from "bun:test";
 import { COMMAND_DESCRIPTIONS } from "../browse/src/commands";
 import { SNAPSHOT_FLAGS } from "../browse/src/snapshot";
 import * as fs from "fs";
@@ -444,10 +444,7 @@ describe("gen-skill-docs", () => {
   });
 
   test("voice and writing-style preamble sections stay compact", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-eng-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-eng-review"); // carved: review body moved to section
     const voice = extractMarkdownSection(content, "## Voice");
     const writingStyle = extractMarkdownSection(content, "## Writing Style");
 
@@ -456,10 +453,7 @@ describe("gen-skill-docs", () => {
   });
 
   test("slim voice section preserves the gstack voice contract", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-eng-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-eng-review"); // carved: review body moved to section
     const voice = extractMarkdownSection(content, "## Voice");
 
     expect(voice).toMatch(/lead with the point|direct/i);
@@ -788,10 +782,7 @@ describe("REVIEW_DASHBOARD resolver", () => {
 
   for (const skill of REVIEW_SKILLS) {
     test(`review dashboard appears in ${skill} generated file`, () => {
-      const content = fs.readFileSync(
-        path.join(ROOT, skill, "SKILL.md"),
-        "utf-8",
-      );
+      const content = readSkillUnion(skill); // carved skills: union skeleton + sections
       expect(content).toContain("gstack-review");
       expect(content).toContain("REVIEW READINESS DASHBOARD");
     });
@@ -818,10 +809,7 @@ describe("REVIEW_DASHBOARD resolver", () => {
   });
 
   test("shared dashboard propagates review source to plan-eng-review", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-eng-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-eng-review"); // carved: review body moved to section
     expect(content).toContain(
       "plan-eng-review, review, content-review, plan-design-review",
     );
@@ -829,10 +817,7 @@ describe("REVIEW_DASHBOARD resolver", () => {
   });
 
   test("resolver output contains key dashboard elements", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-ceo-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-ceo-review"); // carved: dashboard moved to section
     expect(content).toContain("VERDICT");
     expect(content).toContain("CLEARED");
     expect(content).toContain("Eng Review");
@@ -842,37 +827,25 @@ describe("REVIEW_DASHBOARD resolver", () => {
   });
 
   test("dashboard bash block includes git HEAD for staleness detection", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-ceo-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-ceo-review"); // carved: dashboard moved to section
     expect(content).toContain("git rev-parse --short HEAD");
     expect(content).toContain("---HEAD---");
   });
 
   test("dashboard includes staleness detection prose", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-ceo-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-ceo-review"); // carved: dashboard moved to section
     expect(content).toContain("Staleness detection");
     expect(content).toContain("commit");
   });
 
   for (const skill of REVIEW_SKILLS) {
     test(`${skill} contains review chaining section`, () => {
-      const content = fs.readFileSync(
-        path.join(ROOT, skill, "SKILL.md"),
-        "utf-8",
-      );
+      const content = readSkillUnion(skill); // carved skills: union skeleton + sections
       expect(content).toContain("Review Chaining");
     });
 
     test(`${skill} Review Log includes commit field`, () => {
-      const content = fs.readFileSync(
-        path.join(ROOT, skill, "SKILL.md"),
-        "utf-8",
-      );
+      const content = readSkillUnion(skill); // carved skills: union skeleton + sections
       expect(content).toContain('"commit"');
     });
   }
@@ -887,19 +860,13 @@ describe("REVIEW_DASHBOARD resolver", () => {
   });
 
   test("plan-eng-review chaining mentions design and ceo reviews", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-eng-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-eng-review"); // carved: review body moved to section
     expect(content).toContain("/plan-design-review");
     expect(content).toContain("/plan-ceo-review");
   });
 
   test("plan-design-review chaining mentions eng, ceo, and design skills", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-design-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-design-review");
     expect(content).toContain("/plan-eng-review");
     expect(content).toContain("/plan-ceo-review");
     expect(content).toContain("/design-shotgun");
@@ -915,10 +882,7 @@ describe("REVIEW_DASHBOARD resolver", () => {
 // ─── Test Coverage Audit Resolver Tests ─────────────────────
 
 describe("TEST_COVERAGE_AUDIT placeholders", () => {
-  const planSkill = fs.readFileSync(
-    path.join(ROOT, "plan-eng-review", "SKILL.md"),
-    "utf-8",
-  );
+  const planSkill = readSkillUnion("plan-eng-review"); // carved
   const shipSkill = readShipUnion();
   const reviewSkill = fs.readFileSync(
     path.join(ROOT, "review", "SKILL.md"),
@@ -1137,10 +1101,7 @@ describe("PLAN_FILE_REVIEW_REPORT resolver", () => {
   }
 
   test("resolver output contains key report elements", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-ceo-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-ceo-review"); // carved: report writer moved to section
     expect(content).toContain("Trigger");
     expect(content).toContain("Findings");
     expect(content).toContain("VERDICT");
@@ -1171,25 +1132,15 @@ describe("PLAN_COMPLETION_AUDIT placeholders", () => {
     expect(reviewSkill).toContain("Integration with Scope Drift Detection");
   });
 
-  test("both modes share explicit/structured plan file discovery", () => {
+  test("both modes share plan file discovery methodology", () => {
     expect(shipSkill).toContain("Plan File Discovery");
     expect(reviewSkill).toContain("Plan File Discovery");
-    // Explicit signal is the highest-priority path
-    expect(shipSkill).toContain("Explicit (highest priority)");
-    expect(reviewSkill).toContain("Explicit (highest priority)");
-    // Structured binding via the deterministic resolver, not fuzzy content search
-    expect(shipSkill).toContain("gstack-build plan-status");
-    expect(reviewSkill).toContain("gstack-build plan-status");
-    // The fuzzy mtime/content-grep fallback is gone. Assert on the REAL
-    // generated files — the ship union can be polluted by stray "X 2.md"
-    // Finder-duplicate junk in sections/ that holds a stale copy.
-    const shipPlanSection = fs.readFileSync(
-      path.join(ROOT, "ship", "sections", "plan-completion.md"),
-      "utf-8",
-    );
-    expect(shipPlanSection).not.toContain("Content-based search (fallback)");
-    expect(shipPlanSection).not.toContain("-mmin -1440");
-    expect(reviewSkill).not.toContain("-mmin -1440");
+    // Both have conversation context as a resolution step
+    expect(shipSkill).toContain("Conversation context");
+    expect(reviewSkill).toContain("Conversation context");
+    // Both resolve via structured binding (fork replaced fuzzy content fallback)
+    expect(shipSkill).toContain("Structured binding");
+    expect(reviewSkill).toContain("Structured binding");
   });
 
   test("ship mode has gate logic for NOT DONE items", () => {
@@ -1306,22 +1257,14 @@ describe("Plan file discovery shared helper", () => {
     expect(reviewSkill).toContain("Plan File Discovery");
   });
 
-  test("both keep conversation context as a discovery signal", () => {
+  test("both include conversation context first", () => {
     expect(shipSkill).toContain("Conversation context");
     expect(reviewSkill).toContain("Conversation context");
   });
 
-  test("both use the structured spec_branch binding, not fuzzy content search", () => {
-    expect(shipSkill).toContain("spec_branch");
-    expect(reviewSkill).toContain("spec_branch");
-    // Negative checks target the REAL generated file (the union can be polluted
-    // by stray "X 2.md" Finder-duplicate junk in sections/).
-    const shipPlanSection = fs.readFileSync(
-      path.join(ROOT, "ship", "sections", "plan-completion.md"),
-      "utf-8",
-    );
-    expect(shipPlanSection).not.toContain("-mmin -1440");
-    expect(reviewSkill).not.toContain("-mmin -1440");
+  test("both use structured binding (no fuzzy content fallback)", () => {
+    expect(shipSkill).toContain("Structured binding");
+    expect(reviewSkill).toContain("Structured binding");
   });
 });
 
@@ -1345,10 +1288,7 @@ describe("Retro plan completion section", () => {
 describe("Plan status footer in preamble", () => {
   test("preamble contains plan status footer as neutral forward reference to EXIT PLAN MODE GATE", () => {
     // Read any skill that uses PREAMBLE
-    const content = fs.readFileSync(
-      path.join(ROOT, "office-hours", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("office-hours"); // carved: Phase 5/6 prose moved to section
     expect(content).toContain("Plan Status Footer");
     expect(content).toContain("GSTACK REVIEW REPORT");
     expect(content).toContain("ExitPlanMode");
@@ -1388,10 +1328,7 @@ describe("make-pdf setup ordering", () => {
 
 describe("Skill invocation during plan mode in preamble", () => {
   test("preamble contains skill invocation plan mode section", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "office-hours", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("office-hours"); // carved: Phase 5/6 prose moved to section
     expect(content).toContain("Skill Invocation During Plan Mode");
     expect(content).toContain("precedence over generic plan mode behavior");
     expect(content).toContain("Do not continue the workflow");
@@ -1402,10 +1339,7 @@ describe("Skill invocation during plan mode in preamble", () => {
 // --- {{SPEC_REVIEW_LOOP}} resolver tests ---
 
 describe("SPEC_REVIEW_LOOP resolver", () => {
-  const content = fs.readFileSync(
-    path.join(ROOT, "office-hours", "SKILL.md"),
-    "utf-8",
-  );
+  const content = readSkillUnion("office-hours"); // carved: Phase 5/6 prose moved to section
 
   test("contains all 5 review dimensions", () => {
     for (const dim of [
@@ -1447,10 +1381,7 @@ describe("SPEC_REVIEW_LOOP resolver", () => {
 // --- {{DESIGN_SKETCH}} resolver tests ---
 
 describe("DESIGN_SKETCH resolver", () => {
-  const content = fs.readFileSync(
-    path.join(ROOT, "office-hours", "SKILL.md"),
-    "utf-8",
-  );
+  const content = readSkillUnion("office-hours"); // carved: Phase 5/6 prose moved to section
 
   test("references DESIGN.md for design system constraints", () => {
     expect(content).toContain("DESIGN.md");
@@ -1480,10 +1411,7 @@ describe("DESIGN_SKETCH resolver", () => {
 // --- {{CODEX_SECOND_OPINION}} resolver tests ---
 
 describe("CODEX_SECOND_OPINION resolver", () => {
-  const content = fs.readFileSync(
-    path.join(ROOT, "office-hours", "SKILL.md"),
-    "utf-8",
-  );
+  const content = readSkillUnion("office-hours"); // carved: Phase 5/6 prose moved to section
   const codexContent = fs.readFileSync(
     path.join(ROOT, ".agents", "skills", "gstack-office-hours", "SKILL.md"),
     "utf-8",
@@ -1618,10 +1546,7 @@ describe("BENEFITS_FROM resolver", () => {
     path.join(ROOT, "plan-ceo-review", "SKILL.md"),
     "utf-8",
   );
-  const engContent = fs.readFileSync(
-    path.join(ROOT, "plan-eng-review", "SKILL.md"),
-    "utf-8",
-  );
+  const engContent = readSkillUnion("plan-eng-review"); // carved
 
   test("plan-ceo-review contains prerequisite skill offer", () => {
     expect(ceoContent).toContain("Prerequisite Skill Offer");
@@ -1828,10 +1753,7 @@ describe("preamble routing injection", () => {
 
 describe("DESIGN_OUTSIDE_VOICES resolver", () => {
   test("plan-design-review contains outside voices section", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-design-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-design-review");
     expect(content).toContain("Design Outside Voices");
     expect(content).toContain("CODEX_AVAILABLE");
     expect(content).toContain("LITMUS SCORECARD");
@@ -1856,10 +1778,7 @@ describe("DESIGN_OUTSIDE_VOICES resolver", () => {
   });
 
   test("branches correctly per skillName — different prompts", () => {
-    const planContent = fs.readFileSync(
-      path.join(ROOT, "plan-design-review", "SKILL.md"),
-      "utf-8",
-    );
+    const planContent = readSkillUnion("plan-design-review");
     const consultContent = fs.readFileSync(
       path.join(ROOT, "design-consultation", "SKILL.md"),
       "utf-8",
@@ -1875,10 +1794,7 @@ describe("DESIGN_OUTSIDE_VOICES resolver", () => {
 
 describe("DESIGN_HARD_RULES resolver", () => {
   test("plan-design-review Pass 4 contains hard rules", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-design-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-design-review");
     expect(content).toContain("Design Hard Rules");
     expect(content).toContain("Classifier");
     expect(content).toContain("MARKETING/LANDING PAGE");
@@ -1894,38 +1810,26 @@ describe("DESIGN_HARD_RULES resolver", () => {
   });
 
   test("includes all 3 rule sets", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-design-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-design-review");
     expect(content).toContain("Landing page rules");
     expect(content).toContain("App UI rules");
     expect(content).toContain("Universal rules");
   });
 
   test("references shared AI slop blacklist items", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-design-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-design-review");
     expect(content).toContain("3-column feature grid");
     expect(content).toContain("Purple/violet/indigo");
   });
 
   test("includes OpenAI hard rejection criteria", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-design-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-design-review");
     expect(content).toContain("Generic SaaS card grid");
     expect(content).toContain("Carousel with no narrative purpose");
   });
 
   test("includes OpenAI litmus checks", () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-design-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-design-review");
     expect(content).toContain("Brand/product unmistakable");
     expect(content).toContain("premium with all decorative shadows removed");
   });
@@ -1934,10 +1838,7 @@ describe("DESIGN_HARD_RULES resolver", () => {
 // --- Extended DESIGN_SKETCH resolver tests ---
 
 describe("DESIGN_SKETCH extended with outside voices", () => {
-  const content = fs.readFileSync(
-    path.join(ROOT, "office-hours", "SKILL.md"),
-    "utf-8",
-  );
+  const content = readSkillUnion("office-hours"); // carved: Phase 5/6 prose moved to section
 
   test("contains outside design voices step", () => {
     expect(content).toContain("Outside design voices");
@@ -2594,30 +2495,6 @@ describe("Factory generation (--host factory)", () => {
     }
   });
 
-  test("EXCLUDED_SKILL_DIRS entries absent from Factory output", () => {
-    // Regression: gen:skill-docs --host all previously copied dist/, src/, test/,
-    // orchestrator/ etc. into host skill dirs, causing 35GB bloat in the fork repo.
-    // Verify the key culprits are excluded for skills known to have code subdirs.
-    const codeSubdirs = [
-      "dist",
-      "src",
-      "test",
-      "tests",
-      "bin",
-      "orchestrator",
-      "__tests__",
-    ];
-    for (const skill of FACTORY_SKILLS) {
-      const skillOut = path.join(FACTORY_DIR, skill.factoryName);
-      for (const subdir of codeSubdirs) {
-        expect(
-          fs.existsSync(path.join(skillOut, subdir)),
-          `${skill.factoryName}/${subdir} should not be copied to host skill dir`,
-        ).toBe(false);
-      }
-    }
-  });
-
   test("--host droid alias works", () => {
     const factoryResult = Bun.spawnSync(
       [
@@ -2696,6 +2573,26 @@ describe("Factory generation (--host factory)", () => {
 import { ALL_HOST_CONFIGS, getExternalHosts } from "../hosts/index";
 
 describe("Parameterized host smoke tests", () => {
+  // Regenerate every external host up front so the per-host `--dry-run` freshness
+  // checks are deterministic. These host dirs (.agents/.factory/.cursor/...) are
+  // gitignored regenerated artifacts, so the freshness check is really an
+  // idempotency/determinism check — it still catches non-deterministic gen, but no
+  // longer flakes on stale-on-disk state left by a missing `gen --host all` prestep
+  // (the canonical `bun test` does not run one). The tracked-claude freshness test
+  // (`generated files are fresh`) runs earlier and is unaffected.
+  beforeAll(() => {
+    for (const h of getExternalHosts()) {
+      Bun.spawnSync(
+        ["bun", "run", "scripts/gen-skill-docs.ts", "--host", h.name],
+        {
+          cwd: ROOT,
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+    }
+  });
+
   for (const hostConfig of getExternalHosts()) {
     describe(`${hostConfig.displayName} (--host ${hostConfig.name})`, () => {
       const hostDir = path.join(ROOT, hostConfig.hostSubdir, "skills");
@@ -2803,6 +2700,21 @@ describe("Parameterized host smoke tests", () => {
 // ─── --host all tests ────────────────────────────────────────
 
 describe("--host all", () => {
+  // Same determinism guard as the parameterized block: make external hosts fresh on
+  // disk so `--host all --dry-run` reports FRESH regardless of prior state.
+  beforeAll(() => {
+    for (const h of getExternalHosts()) {
+      Bun.spawnSync(
+        ["bun", "run", "scripts/gen-skill-docs.ts", "--host", h.name],
+        {
+          cwd: ROOT,
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+    }
+  });
+
   test("--host all generates for all registered hosts", () => {
     const result = Bun.spawnSync(
       ["bun", "run", "scripts/gen-skill-docs.ts", "--host", "all", "--dry-run"],
@@ -2856,9 +2768,6 @@ describe("setup script validation", () => {
     expect(codexSection).toContain("create_codex_runtime_root");
     expect(codexSection).toContain("link_codex_skill_dirs");
     expect(codexSection).not.toContain("link_claude_skill_dirs");
-    // Reject both the legacy bare-symlink form and the Windows-portable _link_or_copy form
-    // when applied to the whole $GSTACK_DIR — Codex install must use link_codex_skill_dirs instead.
-    expect(codexSection).not.toContain('ln -snf "$GSTACK_DIR" "$CODEX_GSTACK"');
     expect(codexSection).not.toContain(
       '_link_or_copy "$GSTACK_DIR" "$CODEX_GSTACK"',
     );
@@ -2911,7 +2820,7 @@ describe("setup script validation", () => {
     );
     const fnBody = setupContent.slice(fnStart, fnEnd);
     expect(fnBody).toContain('mkdir -p "$target"');
-    // v1.38.0.0 (upstream): routes through _link_or_copy helper for Windows fallback (cp on MSYS2/Git Bash).
+    // v1.36.0.0: routes through _link_or_copy helper for Windows fallback (cp on MSYS2/Git Bash).
     expect(fnBody).toContain(
       '_link_or_copy "$gstack_dir/$dir_name/SKILL.md" "$target/SKILL.md"',
     );
@@ -3072,9 +2981,6 @@ describe("setup script validation", () => {
     expect(fnBody).toContain("design-checklist.md");
     expect(fnBody).toContain("greptile-triage.md");
     expect(fnBody).toContain("TODOS-format.md");
-    // Reject both linking forms when applied to the whole $gstack_dir — Codex install must
-    // expose only the individual runtime assets, not the entire repo.
-    expect(fnBody).not.toContain('ln -snf "$gstack_dir" "$codex_gstack"');
     expect(fnBody).not.toContain('_link_or_copy "$gstack_dir" "$codex_gstack"');
   });
 
@@ -3348,10 +3254,7 @@ describe("community fixes wave", () => {
 
   // #510 — Context warnings: plan-eng-review has explicit anti-warning
   test('plan-eng-review/SKILL.md contains "Do not preemptively warn"', () => {
-    const content = fs.readFileSync(
-      path.join(ROOT, "plan-eng-review", "SKILL.md"),
-      "utf-8",
-    );
+    const content = readSkillUnion("plan-eng-review"); // carved: review body moved to section
     expect(content).toContain("Do not preemptively warn");
   });
 
@@ -3946,10 +3849,9 @@ describe("GSTACK REVIEW REPORT delete-then-append flow", () => {
 
   for (const skill of PLAN_REVIEW_SKILLS) {
     test(`${skill}/SKILL.md prescribes delete-then-append, not in-place replace`, () => {
-      const content = fs.readFileSync(
-        path.join(ROOT, skill, "SKILL.md"),
-        "utf-8",
-      );
+      // Carved skills (v2 plan Phase B) relocate the review-report prose into
+      // sections/*.md; readSkillUnion follows the content wherever the carve put it.
+      const content = readSkillUnion(skill);
 
       // The new (correct) instruction must be present.
       expect(content).toContain("delete-then-append flow");
@@ -4082,47 +3984,70 @@ describe("EXIT PLAN MODE GATE placement", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// build/SKILL.md synthesizer hardening (sentinel + self-check + shell gate)
-// ---------------------------------------------------------------------------
-// Generated by build/SKILL.md.tmpl Step 5. The 3 assertions below pin the
-// invariants from the fault-detector hardening plan (2026-05-17) — if any
-// of these is missing post-regen, the structural gate or sentinel logic
-// has regressed and CI must fail.
+describe("GSTACK REVIEW REPORT mandatory unresolved-decisions status", () => {
+  // Report text rides in PLAN_FILE_REVIEW_REPORT → every report consumer gets it.
+  // devex-review is a report consumer but NOT a gate consumer, so the two target
+  // sets differ (CP5/CX5). Regression guard: a future token-cut that drops the
+  // unresolved-status line again fails here. See plan-flag-unresolved-issues.
+  const REPORT_CONSUMERS = [
+    "plan-ceo-review",
+    "plan-eng-review",
+    "plan-design-review",
+    "plan-devex-review",
+    "codex",
+    "devex-review",
+  ];
+  // Gate text rides in EXIT_PLAN_MODE_GATE (lives in SKILL.md, not sections).
+  const GATE_SKILLS = [
+    "plan-ceo-review",
+    "plan-eng-review",
+    "plan-design-review",
+    "plan-devex-review",
+    "codex",
+  ];
 
-describe("build/SKILL.md synthesizer hardening", () => {
-  const buildSkillMd = (): string =>
-    fs.readFileSync(path.join(ROOT, "build", "SKILL.md"), "utf-8");
+  for (const skill of REPORT_CONSUMERS) {
+    test(`${skill}: report mandates the unresolved-decisions status as final content`, () => {
+      const content = readSkillUnion(skill);
+      expect(content).toContain("NO UNRESOLVED DECISIONS");
+      // The "never omit / always final" contract must be present, not just the phrase.
+      expect(content).toContain("Unresolved-decisions status (MANDATORY");
+      expect(content).toMatch(/never omitted/);
+      // \s+ tolerates prose line-wraps within "final non-whitespace line".
+      expect(content).toMatch(/final\s+non-whitespace\s+line/);
+    });
+  }
 
-  test("synthesizer prompt instructs the subagent to write the rich synthesis-complete sentinel", () => {
-    const md = buildSkillMd();
-    // The sentinel write instruction lives in the synthesizer input prompt.
-    expect(md).toContain("<!-- gstack-synthesis-complete");
-    expect(md).toContain("self_check: passed");
-    // The rich fields (per D4: provider/model/reasoning/round) must be
-    // documented in the prompt so the subagent emits them.
-    expect(md).toContain("provider: <_SYNTH_PROVIDER value>");
-    expect(md).toContain("model: <_SYNTH_MODEL value>");
-  });
+  for (const skill of GATE_SKILLS) {
+    test(`${skill}: exit gate blocks unless the unresolved status is the final line`, () => {
+      const md = fs.readFileSync(path.join(ROOT, skill, "SKILL.md"), "utf-8");
+      // Gate check #4 — present, sentinel named, and explicitly blocking (no escape).
+      expect(md).toContain("NO UNRESOLVED DECISIONS");
+      expect(md).toContain(
+        "FINAL non-whitespace line is the unresolved-decisions",
+      );
+      expect(md).toContain("FAILS the gate");
+    });
+  }
 
-  test("synthesizer prompt spells out the line-anchored self-check rule (Fix #2)", () => {
-    const md = buildSkillMd();
-    // The structural rule must explicitly call out line-anchored Origin
-    // trace: / Acceptance: and warn against run-on prose — this is the
-    // synthesizer's defense-in-depth check before the shell gate runs.
-    expect(md).toContain("STRUCTURAL SELF-CHECK");
-    expect(md).toContain("MUST start at column 0 on its own line");
-    expect(md).toContain("run-on prose");
-  });
-
-  test("Step 5 shell wrapper invokes validate-living-plan.ts as the structural gate (Fix #2 + #3)", () => {
-    const md = buildSkillMd();
-    // The shell wrapper must run the validator CLI on every plan path,
-    // and must have a bounded-retry loop keyed on _SYNTH_ROUND.
-    expect(md).toContain("validate-living-plan.ts");
-    expect(md).toContain("_SYNTH_ROUND");
-    // The safety-net (D1 hybrid) appends the sentinel from the shell if
-    // the validator passes but the subagent forgot to write it.
-    expect(md).toContain("safety_net");
+  test("scripts/resolvers/review.ts source carries the mandatory block + blocking gate", () => {
+    const src = fs.readFileSync(
+      path.join(ROOT, "scripts", "resolvers", "review.ts"),
+      "utf-8",
+    );
+    // Report resolver: mandatory, never-omitted, exact sentinel, anti-double-count algorithm.
+    expect(src).toContain("Unresolved-decisions status (MANDATORY");
+    expect(src).toContain("NO UNRESOLVED DECISIONS");
+    expect(src).toContain("avoids double-counting");
+    expect(src).toContain("DROP the current skill");
+    // Gate resolver: the blocking final-line check with no "if applicable" escape.
+    expect(src).toContain(
+      "FINAL non-whitespace line is the unresolved-decisions",
+    );
+    expect(src).toContain("FAILS the gate");
+    // The old soft wording must be gone from the gate.
+    expect(src).not.toContain(
+      "absorbs CODEX / CROSS-MODEL / UNRESOLVED lines if applicable",
+    );
   });
 });

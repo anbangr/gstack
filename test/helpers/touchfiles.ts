@@ -32,6 +32,36 @@ export function matchGlob(file: string, pattern: string): boolean {
  * Each test lists the file patterns that, if changed, require the test to run.
  */
 export const E2E_TOUCHFILES: Record<string, string[]> = {
+  // Fork-local /build + /review E2E tests (preserved across the upstream merge).
+  "build-skill-cli-handoff": [
+    "build/SKILL.md.tmpl",
+    "build/SKILL.md",
+    "build/orchestrator/**",
+  ],
+  "build-step-transition-eval": [
+    "build/SKILL.md.tmpl",
+    "build/SKILL.md",
+    "build/orchestrator/**",
+  ],
+  "build-fault-investigator-e2e": [
+    "build/SKILL.md.tmpl",
+    "build/SKILL.md",
+    "build/orchestrator/**",
+  ],
+  "build-investigate-bug-report": [
+    "build/orchestrator/investigate-mode.ts",
+    "build/orchestrator/investigate-context.ts",
+    "build/orchestrator/investigate-report-writer.ts",
+    "build/orchestrator/investigate-lock.ts",
+    "build/orchestrator/investigator-dispatch.ts",
+    "build/SKILL.md.tmpl",
+    "build/SKILL.md",
+  ],
+  "review-prompt-scope-constraint": [
+    "build/orchestrator/cli.ts",
+    "build/SKILL.md.tmpl",
+    "test/skill-e2e-review-prompt-scope.test.ts",
+  ],
   // Browse core (+ test-server dependency)
   "browse-basic": ["browse/src/**", "browse/test/test-server.ts"],
   "browse-snapshot": ["browse/src/**", "browse/test/test-server.ts"],
@@ -265,12 +295,14 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
   // Real-PTY E2E batch (#6 new tests on the harness).
   // Each one tests behavior the SDK harness can't observe (rendered TTY,
   // numbered-option lists, multi-phase ordering, idempotency state echo).
-  "ask-user-question-format-pty": [
+  "auq-format-gate": [
     "plan-ceo-review/**",
     "scripts/resolvers/preamble/generate-ask-user-format.ts",
     "scripts/resolvers/preamble/generate-completeness-section.ts",
     "scripts/resolvers/preamble.ts",
-    "test/helpers/claude-pty-runner.ts",
+    "test/helpers/auq-sdk-capture.ts",
+    "test/helpers/session-runner.ts",
+    "test/helpers/llm-judge.ts",
   ],
   "plan-ceo-mode-routing": [
     "plan-ceo-review/**",
@@ -299,9 +331,33 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     "ship/**",
     "scripts/resolvers/sections.ts",
     "scripts/gen-skill-docs.ts",
-    "test/helpers/required-reads.ts",
-    "test/helpers/transcript-section-logger.ts",
-    "test/helpers/claude-pty-runner.ts",
+    "test/helpers/auq-sdk-capture.ts",
+    "test/helpers/session-runner.ts",
+  ],
+  "plan-ceo-section-loading": [
+    "plan-ceo-review/**",
+    "scripts/resolvers/sections.ts",
+    "scripts/gen-skill-docs.ts",
+    "test/helpers/auq-sdk-capture.ts",
+    "test/helpers/session-runner.ts",
+  ],
+  // Data-driven behavioral guard for the 'plan'/'prompt' carves (eng, design,
+  // devex, office-hours + future PR2 carves). One file iterating CARVE_GUARDS;
+  // the selector sets GSTACK_CARVE_SKILL=<name> to scope cost to the changed
+  // skill (D-CODEX A). Touching the registry/helper or sections.ts runs all.
+  "carve-section-loading": [
+    "plan-eng-review/**",
+    "plan-design-review/**",
+    "plan-devex-review/**",
+    "office-hours/**",
+    "document-release/**",
+    "design-consultation/**",
+    "cso/**",
+    "test/helpers/carve-guards.ts",
+    "scripts/resolvers/sections.ts",
+    "scripts/gen-skill-docs.ts",
+    "test/helpers/auq-sdk-capture.ts",
+    "test/helpers/session-runner.ts",
   ],
   "autoplan-chain-pty": [
     "autoplan/**",
@@ -804,6 +860,20 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     "browse/src/**",
   ],
 
+  // /diagram (diagram-render bundle consumers). Triplet = deterministic
+  // functional (gate); authoring quality = LLM-judged benchmark (periodic).
+  "diagram-triplet": [
+    "diagram/**",
+    "lib/diagram-render/**",
+    "browse/src/write-commands.ts",
+    "browse/src/read-commands.ts",
+  ],
+  "diagram-authoring-quality": [
+    "diagram/**",
+    "lib/diagram-render/**",
+    "test/helpers/llm-judge.ts",
+  ],
+
   // gstack-upgrade
   "gstack-upgrade-happy-path": ["gstack-upgrade/**"],
 
@@ -990,47 +1060,6 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     "scripts/resolvers/model-overlay.ts",
   ],
 
-  // Build skill E2E — periodic (non-deterministic LLM sessions, quality benchmarks)
-  "build-skill-cli-handoff": [
-    "build/SKILL.md.tmpl",
-    "build/SKILL.md",
-    "build/orchestrator/**",
-  ],
-  "build-step-transition-eval": [
-    "build/SKILL.md.tmpl",
-    "build/SKILL.md",
-    "build/orchestrator/**",
-  ],
-  "build-fault-investigator-e2e": [
-    "build/SKILL.md.tmpl",
-    "build/SKILL.md",
-    "build/orchestrator/**",
-  ],
-
-  // /build investigate subcommand E2E — periodic (non-deterministic LLM
-  // investigation; verifies the four-phase root-cause discipline end-to-end
-  // with a planted halt event and checks machine report + bug report output).
-  "build-investigate-bug-report": [
-    "build/orchestrator/investigate-mode.ts",
-    "build/orchestrator/investigate-context.ts",
-    "build/orchestrator/investigate-report-writer.ts",
-    "build/orchestrator/investigate-lock.ts",
-    "build/orchestrator/investigator-dispatch.ts",
-    "build/SKILL.md.tmpl",
-    "build/SKILL.md",
-  ],
-
-  // Build convergence E2E — real Codex verifies round-annotation contract.
-  // Layer 4 from the convergence design spec: drives runPlanReviewLoop with
-  // a real Codex planReviewer and a stub synth, asserts round 2 reRaises === 0.
-  // PR2 — Review prompt scope constraint. Paid eval (~$0.20/run).
-  // Fires when the review prompt body or hygiene gate changes.
-  "review-prompt-scope-constraint": [
-    "build/orchestrator/cli.ts",
-    "build/SKILL.md.tmpl",
-    "test/skill-e2e-review-prompt-scope.test.ts",
-  ],
-
   // /ios-qa — agent flow E2E. Daemon + stub StateServer + codegen
   // exercised end-to-end. The no-device path is gate-tier; the with-device
   // path requires GSTACK_HAS_IOS_DEVICE=1 and is periodic-tier.
@@ -1063,10 +1092,13 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
   // including --execute spawn. Periodic-tier — paid + non-deterministic.
   "spec-execute": ["spec/**", "test/skill-e2e-spec-execute.test.ts"],
 
-  // /office-hours brain-writeback path under fake gbrain CLI. Drives
-  // /office-hours with a regenerated SKILL.md that has the compressed
-  // GBRAIN_SAVE_RESULTS block + a fake gbrain on PATH; asserts the agent calls
-  // `gbrain put office-hours/<slug>` with valid YAML frontmatter.
+  // /office-hours brain-writeback path under fake gbrain CLI (v1.50.0.0
+  // T7). Drives /office-hours with a regenerated SKILL.md that has the
+  // compressed GBRAIN_SAVE_RESULTS block + a fake gbrain on PATH; asserts
+  // the agent calls `gbrain put office-hours/<slug>` with valid YAML
+  // frontmatter. Touched by anything that changes resolver output, gen
+  // pipeline, detection helper, refresh subcommand, or the on-demand
+  // docs the resolver points to.
   "office-hours-brain-writeback": [
     "scripts/resolvers/gbrain.ts",
     "scripts/gen-skill-docs.ts",
@@ -1078,10 +1110,11 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     "test/skill-e2e-office-hours-brain-writeback.test.ts",
   ],
 
-  // gbrain CLI real round-trip against a local PGLite store. Proves the gbrain
-  // CLI persistence contract gstack relies on — a `gbrain put` followed by
-  // `gbrain get` returns the body. Skips if VOYAGE_API_KEY is unset OR gbrain
-  // CLI not on PATH.
+  // gbrain CLI real round-trip against a local PGLite store (v1.50.0.0
+  // T11). Proves the gbrain CLI persistence contract gstack relies on —
+  // a `gbrain put` followed by `gbrain get` returns the body. Skips if
+  // VOYAGE_API_KEY is unset OR gbrain CLI not on PATH. Touched by the
+  // resolver (which emits the CLI shape) and the test itself.
   "gbrain-roundtrip-local": [
     "scripts/resolvers/gbrain.ts",
     "test/skill-e2e-gbrain-roundtrip-local.test.ts",
@@ -1093,6 +1126,12 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
  * Must have exactly the same keys as E2E_TOUCHFILES.
  */
 export const E2E_TIERS: Record<string, "gate" | "periodic"> = {
+  // Fork-local /build + /review E2E tests (preserved across the upstream merge).
+  "build-skill-cli-handoff": "periodic",
+  "build-step-transition-eval": "periodic",
+  "build-fault-investigator-e2e": "periodic",
+  "build-investigate-bug-report": "periodic",
+  "review-prompt-scope-constraint": "periodic",
   // Browse core — gate (if browse breaks, everything breaks)
   "browse-basic": "gate",
   "browse-snapshot": "gate",
@@ -1134,7 +1173,8 @@ export const E2E_TIERS: Record<string, "gate" | "periodic"> = {
   // Office Hours
   "office-hours-spec-review": "gate",
   // Brain-writeback E2E — periodic per cost (claude -p) + non-deterministic
-  // (model interprets the gbrain instruction).
+  // (model interprets the gbrain instruction). Matches nearby
+  // setup-gbrain-path4-* tier classification.
   "office-hours-brain-writeback": "periodic",
   // GBrain CLI round-trip — periodic per Voyage embedding cost (~$0.001/run)
   // and external-API-dependency (skips cleanly if VOYAGE_API_KEY unset).
@@ -1174,12 +1214,14 @@ export const E2E_TIERS: Record<string, "gate" | "periodic"> = {
   // Real-PTY E2E batch — tier classification:
   //   gate: cheap, deterministic, run on every PR
   //   periodic: long-running or expensive (>$3/run), run weekly
-  "ask-user-question-format-pty": "gate", // ~$0.50/run, single skill probe
+  "auq-format-gate": "gate", // ~$0.50/run, SDK capture, single skill probe
   "plan-ceo-mode-routing": "periodic", // ~$3/run, deep navigation through 8-12 prior AskUserQuestions
   "plan-design-with-ui-scope": "gate", // ~$0.80/run
   "budget-regression-pty": "gate", // free, library-only assertion
   "ship-idempotency-pty": "periodic", // ~$3/run, real /ship in plan mode
   "ship-section-loading": "periodic", // ~$3/run, real /ship; asserts section reads
+  "plan-ceo-section-loading": "periodic", // ~$3-5/run, real /plan-ceo-review; asserts section read
+  "carve-section-loading": "periodic", // ~$1-2/skill, data-driven; GSTACK_CARVE_SKILL scopes to one
   "autoplan-chain-pty": "periodic", // ~$8/run, all 3 phases sequential
 
   // Per-finding count + review-report-at-bottom — periodic because each
@@ -1318,6 +1360,10 @@ export const E2E_TIERS: Record<string, "gate" | "periodic"> = {
   "design-shotgun-session": "gate",
   "design-shotgun-full": "periodic",
 
+  // /diagram — triplet is deterministic functional, judge is a quality benchmark
+  "diagram-triplet": "gate",
+  "diagram-authoring-quality": "periodic",
+
   // gstack-upgrade
   "gstack-upgrade-happy-path": "gate",
 
@@ -1368,17 +1414,6 @@ export const E2E_TIERS: Record<string, "gate" | "periodic"> = {
   "overlay-harness-opus-4-7-fanout-toy": "periodic",
   "overlay-harness-opus-4-7-fanout-realistic": "periodic",
 
-  // Build skill E2E — periodic (non-deterministic LLM sessions, quality benchmarks)
-  "build-skill-cli-handoff": "periodic",
-  "build-step-transition-eval": "periodic",
-  "build-fault-investigator-e2e": "periodic",
-  // /build investigate subcommand E2E — periodic (planted halt event; LLM
-  // investigation output is non-deterministic; costs ~$0.50/run).
-  "build-investigate-bug-report": "periodic",
-
-  // PR2 — Review prompt scope constraint. Periodic (paid eval, ~$0.20/run).
-  "review-prompt-scope-constraint": "periodic",
-
   // /ios-qa daemon + codegen — no-device path runs every PR (no hardware
   // dependency, deterministic). with-device path requires GSTACK_HAS_IOS_DEVICE.
   "ios-qa-e2e": "gate",
@@ -1394,6 +1429,12 @@ export const E2E_TIERS: Record<string, "gate" | "periodic"> = {
  * LLM-judge test touchfiles — keyed by test description string.
  */
 export const LLM_JUDGE_TOUCHFILES: Record<string, string[]> = {
+  // Fork-local /build LLM-judge test (preserved across the upstream merge).
+  "build monitor-agent prompt contract": [
+    "build/SKILL.md.tmpl",
+    "build/SKILL.md",
+    "build/orchestrator/**",
+  ],
   "command reference table": [
     "SKILL.md",
     "SKILL.md.tmpl",
@@ -1521,13 +1562,6 @@ export const LLM_JUDGE_TOUCHFILES: Record<string, string[]> = {
     "review/SKILL.md",
     "review/SKILL.md.tmpl",
     "scripts/gen-skill-docs.ts",
-  ],
-
-  // Build skill
-  "build monitor-agent prompt contract": [
-    "build/SKILL.md.tmpl",
-    "build/SKILL.md",
-    "build/orchestrator/**",
   ],
 };
 
