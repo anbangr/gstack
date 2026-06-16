@@ -128,6 +128,14 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     maxSkeletonBytes: 90_000,
     minUnionBytes: 120_000,
     mustContain: ['VERSION', 'CHANGELOG', 'review', 'merge', 'PR'],
+    // Fork ship carries extra customizations on top of upstream, so the
+    // v1.58.1.0 Conductor AUQ-default-prose + one-way/continuation safety added
+    // to the always-loaded AskUserQuestion Format section lands the fork's ship
+    // union ~6.1% over the upstream v1.57.7.0 baseline (upstream's own ship stays
+    // under the strict 1.05; the fork's pre-existing additions stack on top).
+    // Expected fork growth, not bloat — matches the 1.08 headroom plan-ceo-review
+    // and the other Conductor-prose-bumped carves already use.
+    maxSizeRatio: 1.08,
   },
   'plan-ceo-review': {
     skill: 'plan-ceo-review',
