@@ -72,11 +72,26 @@ describe('Preamble composition order', () => {
 });
 
 describe('Conductor signal (preamble bash)', () => {
-  test('claude preamble emits CONDUCTOR_SESSION, gated on != headless (Issue 8)', () => {
+  test('claude preamble emits prose-question markers, gated on != headless (Issue 8)', () => {
     const out = generatePreamble(makeCtx('claude', 2, 'claude'));
+    expect(out).toContain('echo "PROSE_QUESTION_SESSION: true ($_PROSE_QUESTION_REASON)"');
     expect(out).toContain('echo "CONDUCTOR_SESSION: true"');
     // The emission must be suppressed when the session is headless (eval/CI
     // inside Conductor must BLOCK, not render prose to nobody).
-    expect(out).toMatch(/"\$_SESSION_KIND" != "headless"[\s\S]*CONDUCTOR_WORKSPACE_PATH[\s\S]*CONDUCTOR_PORT[\s\S]*CONDUCTOR_SESSION: true/);
+    expect(out).toMatch(/CONDUCTOR_WORKSPACE_PATH[\s\S]*CONDUCTOR_PORT[\s\S]*_PROSE_QUESTION_REASON="conductor"/);
+    expect(out).toMatch(/"\$_SESSION_KIND" != "headless"[\s\S]*"\$_PROSE_QUESTION_REASON" = "conductor"[\s\S]*CONDUCTOR_SESSION: true/);
+  });
+
+  test('claude preamble detects Antigravity Claude Code extension as prose-question host', () => {
+    const out = generatePreamble(makeCtx('claude', 2, 'claude'));
+    expect(out).toContain('_PROSE_QUESTION_REASON="antigravity-claude"');
+    expect(out).toMatch(/_HOST_CMD=\$\(ps -p "\$PPID" -o command=/);
+    expect(out).toMatch(/antigravity-ide\/extensions\/anthropic\\\.claude-code-/);
+  });
+
+  test('AskUserQuestion format treats prose-question sessions as no-tool path', () => {
+    const out = generatePreamble(makeCtx('claude', 2, 'claude'));
+    expect(out).toContain('if `PROSE_QUESTION_SESSION: true` or `CONDUCTOR_SESSION: true`');
+    expect(out).toContain("Antigravity's Claude remote-control host can render only a bare `AskUserQuestion` placeholder");
   });
 });

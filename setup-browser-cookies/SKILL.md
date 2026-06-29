@@ -45,11 +45,20 @@ echo "REPO_MODE: $REPO_MODE"
 _SESSION_KIND=$(~/.claude/skills/gstack/bin/gstack-session-kind 2>/dev/null || echo "interactive")
 case "$_SESSION_KIND" in spawned|headless|interactive) ;; *) _SESSION_KIND="interactive" ;; esac
 echo "SESSION_KIND: $_SESSION_KIND"
-# Conductor host: AskUserQuestion is unreliable here (native disabled, MCP
-# variant flaky), so skills render decisions as prose instead of calling the
-# tool. Gated on !headless so an eval/CI run INSIDE Conductor (GSTACK_HEADLESS)
-# still BLOCKs rather than rendering prose to nobody.
-if [ "$_SESSION_KIND" != "headless" ] && { [ -n "${CONDUCTOR_WORKSPACE_PATH:-}" ] || [ -n "${CONDUCTOR_PORT:-}" ]; }; then
+# Some hosts expose Claude Code but cannot render AskUserQuestion reliably.
+# Gated on !headless so eval/CI runs inside those hosts still BLOCK rather
+# than rendering prose to nobody.
+_HOST_CMD=$(ps -p "$PPID" -o command= 2>/dev/null || true)
+_PROSE_QUESTION_REASON=""
+if [ -n "${CONDUCTOR_WORKSPACE_PATH:-}" ] || [ -n "${CONDUCTOR_PORT:-}" ]; then
+  _PROSE_QUESTION_REASON="conductor"
+elif printf "%s" "$_HOST_CMD" | grep -q "/\.antigravity-ide/extensions/anthropic\.claude-code-"; then
+  _PROSE_QUESTION_REASON="antigravity-claude"
+fi
+if [ "$_SESSION_KIND" != "headless" ] && [ -n "$_PROSE_QUESTION_REASON" ]; then
+  echo "PROSE_QUESTION_SESSION: true ($_PROSE_QUESTION_REASON)"
+fi
+if [ "$_SESSION_KIND" != "headless" ] && [ "$_PROSE_QUESTION_REASON" = "conductor" ]; then
   echo "CONDUCTOR_SESSION: true"
 fi
 _LAKE_SEEN=$([ -f ~/.gstack/.completeness-intro-seen ] && echo "yes" || echo "no")
