@@ -133,9 +133,10 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // shared first-run-guidance preamble; the fork added Conductor + Antigravity
     // PROSE_QUESTION_SESSION default-prose + one-way/continuation safety to the
     // AskUserQuestion Format section. Together they land ship's union over the
-    // strict 1.05. 1.08 matches plan-ceo-review and the other prose-bumped carves.
+    // strict 1.05. With the Antigravity PROSE_QUESTION_SESSION rule also stacked on
+    // the shared AUQ Format section, the union lands ~9.3%. Ratio raised to 1.10.
     // Expected feature growth, not bloat.
-    maxSizeRatio: 1.08,
+    maxSizeRatio: 1.10,
   },
   'plan-ceo-review': {
     skill: 'plan-ceo-review',
@@ -177,8 +178,9 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // decision-memory nudge + the v1.57.4.0 Boil-the-Ocean rename) plus the
     // default-on Codex outside-voice (codexPreflight block + CODEX_MODE branch
     // prose, replacing the smaller opt-in question) land this at ~6.6% over the
-    // v1.53.0.0 baseline. Headroom for those intentional additions.
-    maxSizeRatio: 1.08,
+    // v1.53.0.0 baseline; v1.58.x adds the Antigravity PROSE_QUESTION_SESSION rule
+    // (~8.1%). Headroom for those intentional additions; ratio raised to 1.09.
+    maxSizeRatio: 1.09,
   },
   'plan-design-review': {
     skill: 'plan-design-review',

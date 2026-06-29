@@ -244,8 +244,10 @@ const MONOLITH_INVARIANTS: ParityInvariant[] = [
     // Fork: /review also carries the content-review mode (non-code-feature
     // deliverable review) the fork added to the Review Readiness Dashboard,
     // landing ~16% over the upstream v1.57.7.0 baseline. Expected fork growth,
-    // not bloat — ratio raised to 1.20 to accommodate it.
-    maxSizeRatio: 1.2,
+    // not bloat — ratio raised to 1.20 to accommodate it. v1.58.x stacks the
+    // Antigravity PROSE_QUESTION_SESSION rule (shared AUQ Format section) on top,
+    // landing ~21.2% — ratio raised to 1.22.
+    maxSizeRatio: 1.22,
     minBytes: 70_000,
   },
   {
@@ -264,8 +266,9 @@ const MONOLITH_INVARIANTS: ParityInvariant[] = [
     // Cross-cutting preamble growth (v1.57.2.0 AUQ-failure prose fallback ~2KB + the
     // cross-session decision-memory nudge) lands this skill just over the strict 1.05;
     // headroom for the shared preamble additions (matches the carved-skill overrides).
-    // v1.2.0 activation lift adds the first-run-guidance section on top.
-    maxSizeRatio: 1.09,
+    // v1.2.0 activation lift adds the first-run-guidance section on top; v1.58.x
+    // adds the Antigravity PROSE_QUESTION_SESSION rule (~9.6%). Ratio raised to 1.11.
+    maxSizeRatio: 1.11,
     minBytes: 30_000,
   },
   {
