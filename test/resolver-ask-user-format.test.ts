@@ -225,10 +225,11 @@ describe('generateAskUserFormat — runtime-failure prose fallback', () => {
     expect(out).toMatch(/must be sent as tool_use, not prose — unless the documented failure fallback/);
   });
 
-  test('OV2: the self-check "not writing prose" line carries the Conductor + fallback qualifiers', () => {
-    // After the Conductor-default-prose change, the exception is two-pronged:
-    // CONDUCTOR_SESSION makes prose the default, OR the documented failure fallback.
-    expect(out).toMatch(/not writing prose — unless `CONDUCTOR_SESSION: true`[\s\S]*OR the documented failure fallback applies/);
+  test('OV2: the self-check "not writing prose" line carries the prose-question + fallback qualifiers', () => {
+    // After the prose-question-host generalization (v1.58.x), the exception is
+    // two-pronged: PROSE_QUESTION_SESSION / CONDUCTOR_SESSION makes prose the
+    // default, OR the documented failure fallback.
+    expect(out).toMatch(/not writing prose — unless `PROSE_QUESTION_SESSION: true` or `CONDUCTOR_SESSION: true`[\s\S]*OR the documented failure fallback applies/);
   });
 
   // Conductor-default-prose contract (the proactive path, distinct from the
