@@ -128,13 +128,13 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     maxSkeletonBytes: 90_000,
     minUnionBytes: 120_000,
     mustContain: ['VERSION', 'CHANGELOG', 'review', 'merge', 'PR'],
-    // Fork ship carries extra customizations on top of upstream, so the
-    // v1.58.1.0 Conductor AUQ-default-prose + one-way/continuation safety added
-    // to the always-loaded AskUserQuestion Format section lands the fork's ship
-    // union ~6.1% over the upstream v1.57.7.0 baseline (upstream's own ship stays
-    // under the strict 1.05; the fork's pre-existing additions stack on top).
-    // Expected fork growth, not bloat — matches the 1.08 headroom plan-ceo-review
-    // and the other Conductor-prose-bumped carves already use.
+    // Both upstream and fork growth stack on ship's always-loaded sections:
+    // upstream v1.58.5.0 added the pre-push-guard install (#2077) on top of the
+    // shared first-run-guidance preamble; the fork added Conductor + Antigravity
+    // PROSE_QUESTION_SESSION default-prose + one-way/continuation safety to the
+    // AskUserQuestion Format section. Together they land ship's union over the
+    // strict 1.05. 1.08 matches plan-ceo-review and the other prose-bumped carves.
+    // Expected feature growth, not bloat.
     maxSizeRatio: 1.08,
   },
   'plan-ceo-review': {
@@ -169,7 +169,8 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       gateAfterStop: 'EXIT PLAN MODE GATE',
     },
     behavioral: 'plan',
-    maxSkeletonBytes: 62_000,
+    // v1.2.0 activation lift (shared first-run-guidance preamble) + #2077 ask-first scope gate.
+    maxSkeletonBytes: 67_000,
     minUnionBytes: 70_000,
     mustContain: ['Architecture', 'Code Quality', 'Test', 'Performance'],
     // Cross-cutting preamble growth (v1.57.2.0 AUQ-failure prose fallback + the
@@ -193,9 +194,11 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     behavioral: 'plan',
     // +Conductor AUQ-default-prose rule + one-way/continuation safety in the
     // always-loaded AskUserQuestion Format section.
-    maxSkeletonBytes: 84_000,
+    // v1.2.0 activation lift (shared first-run-guidance preamble) + #2077 ask-first scope gate.
+    maxSkeletonBytes: 88_000,
     minUnionBytes: 70_000,
     mustContain: ['design', 'visual'],
+    maxSizeRatio: 1.07,
   },
   'plan-devex-review': {
     skill: 'plan-devex-review',
@@ -211,7 +214,8 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     behavioral: 'plan',
     // +Conductor AUQ-default-prose rule + one-way/destructive prose safety +
     // continuation protocol in the always-loaded AskUserQuestion Format section.
-    maxSkeletonBytes: 78_000,
+    // v1.2.0 activation lift: first-run-guidance section in the shared preamble.
+    maxSkeletonBytes: 80_000,
     minUnionBytes: 70_000,
     mustContain: ['developer experience', 'Getting Started'],
     // Default-on Codex outside-voice (codexPreflight block + CODEX_MODE branch
@@ -232,9 +236,12 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       gateAfterStop: undefined,
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 96_000,
+    // v1.2.0 activation lift: first-run-guidance section in the shared preamble,
+    // plus the P1 office-hours closing handoff (AUQ that launches the next skill).
+    maxSkeletonBytes: 98_000,
     minUnionBytes: 70_000,
     mustContain: ['design doc', 'problem statement'],
+    maxSizeRatio: 1.07,
   },
   'document-release': {
     skill: 'document-release',
@@ -251,7 +258,8 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     behavioral: 'prompt',
     // +Conductor AUQ-default-prose rule + one-way/continuation safety in the
     // always-loaded AskUserQuestion Format section.
-    maxSkeletonBytes: 53_000,
+    // v1.2.0 activation lift: first-run-guidance section in the shared preamble.
+    maxSkeletonBytes: 56_000,
     minUnionBytes: 55_000,
     mustContain: ['CHANGELOG', 'Diataxis', 'coverage'],
     // Two intentional additions stack on this small skill: the AUQ-failure prose
@@ -278,7 +286,8 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     behavioral: 'prompt',
     // +Conductor AUQ-default-prose rule + one-way/continuation safety in the
     // always-loaded AskUserQuestion Format section.
-    maxSkeletonBytes: 67_000,
+    // v1.2.0 activation lift: first-run-guidance section in the shared preamble.
+    maxSkeletonBytes: 69_000,
     minUnionBytes: 72_000,
     mustContain: ['Typography', 'Color', 'Aesthetic Direction'],
     // Cross-cutting preamble growth (v1.57.2.0 AUQ-failure prose fallback ~2KB +
@@ -316,7 +325,8 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     behavioral: 'prompt',
     // +Conductor AUQ-default-prose rule + one-way/continuation safety in the
     // always-loaded AskUserQuestion Format section.
-    maxSkeletonBytes: 73_000,
+    // v1.2.0 activation lift: first-run-guidance section in the shared preamble.
+    maxSkeletonBytes: 75_000,
     minUnionBytes: 72_000,
     mustContain: ['OWASP', 'STRIDE', 'daily', 'comprehensive', 'verif'],
     // cso keeps its mode-dispatch + FP-filtering phases always-loaded, so the

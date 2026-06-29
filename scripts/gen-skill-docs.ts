@@ -95,10 +95,10 @@ function loadGbrainOverride(): { detected: boolean } {
     process.env.GSTACK_HOME || path.join(process.env.HOME || "", ".gstack");
   const detectionPath = path.join(stateDir, "gbrain-detection.json");
   try {
-    const json = JSON.parse(fs.readFileSync(detectionPath, "utf-8")) as {
-      gbrain_local_status?: string;
-    };
-    return { detected: json.gbrain_local_status === "ok" };
+    const json = JSON.parse(fs.readFileSync(detectionPath, 'utf-8')) as { gbrain_local_status?: string };
+    // "timeout" = slow-but-healthy engine (#1964) — same treatment as "ok",
+    // matching gstack-gbrain-detect --is-ok.
+    return { detected: json.gbrain_local_status === 'ok' || json.gbrain_local_status === 'timeout' };
   } catch {
     return { detected: false };
   }

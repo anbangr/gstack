@@ -72,6 +72,17 @@ fi
 if [ "$_SESSION_KIND" != "headless" ] && [ "$_PROSE_QUESTION_REASON" = "conductor" ]; then
   echo "CONDUCTOR_SESSION: true"
 fi
+_ACTIVATED=$([ -f ~/.gstack/.activated ] && echo "yes" || echo "no")
+_FIRST_LOOP_SHOWN=$([ -f ~/.gstack/.first-loop-tip-shown ] && echo "yes" || echo "no")
+echo "ACTIVATED: $_ACTIVATED"
+echo "FIRST_LOOP_SHOWN: $_FIRST_LOOP_SHOWN"
+# First-run project detection: run the detector ONLY on the first-ever skill run
+# (ACTIVATED=no, interactive) so it stays off the hot path for every run after.
+_FIRST_TASK=""
+if [ "$_ACTIVATED" = "no" ] && [ "$_SESSION_KIND" != "headless" ]; then
+  _FIRST_TASK=$(~/.claude/skills/gstack/bin/gstack-first-task-detect 2>/dev/null || true)
+fi
+echo "FIRST_TASK: $_FIRST_TASK"
 _LAKE_SEEN=$([ -f ~/.gstack/.completeness-intro-seen ] && echo "yes" || echo "no")
 echo "LAKE_INTRO: $_LAKE_SEEN"
 _TEL=$(~/.claude/skills/gstack/bin/gstack-config get telemetry 2>/dev/null || true)
@@ -240,6 +251,24 @@ touch ~/.gstack/.proactive-prompted
 ```
 
 Skip if `PROACTIVE_PROMPTED` is `yes`.
+
+## First-run guidance (one-time)
+
+If `ACTIVATED` is `no` (first skill run on this machine) AND the preamble printed a non-empty `FIRST_TASK:` value that is NOT `nongit`: show ONE short, project-specific line mapped from the token, as a heads-up, then CONTINUE with whatever the user actually asked — do NOT halt their task. Map the token: `greenfield` → "Fresh repo — shape it first with `/spec` or `/office-hours`." `code_node`/`code_python`/`code_rust`/`code_go`/`code_ruby`/`code_ios` → "There's code here — `/qa` to see it work, or `/investigate` if something's off." `branch_ahead` → "Unshipped work on this branch — `/review` then `/ship`." `dirty_default` → "Uncommitted changes — `/review` before committing." `clean_default` → "Pick one: `/spec`, `/investigate`, or `/qa`." Then substitute the token you saw for TASK_TOKEN and run (best-effort), and mark activated:
+```bash
+~/.claude/skills/gstack/bin/gstack-telemetry-log --event-type first_task_scaffold_shown --skill "TASK_TOKEN" --outcome shown 2>/dev/null || true
+touch ~/.gstack/.activated 2>/dev/null || true
+```
+
+If `ACTIVATED` is `no` but `FIRST_TASK:` is empty or `nongit` (headless, non-git, or nothing actionable): show nothing, just run `touch ~/.gstack/.activated 2>/dev/null || true`.
+
+Else if `ACTIVATED` is `yes` AND `FIRST_LOOP_SHOWN` is `no`: say once as a heads-up (then continue):
+
+> Tip: gstack pays off when you complete one loop — **plan → review → ship**. A common first loop: `/office-hours` or `/spec` to shape it, `/plan-eng-review` to lock it, then `/ship`.
+
+Then run `touch ~/.gstack/.first-loop-tip-shown 2>/dev/null || true`.
+
+Skip this section if `ACTIVATED` and `FIRST_LOOP_SHOWN` are both `yes`.
 
 If `HAS_ROUTING` is `no` AND `ROUTING_DECLINED` is `false` AND `PROACTIVE_PROMPTED` is `yes`:
 Check if a CLAUDE.md file exists in the project root. If it does not exist, create it.
@@ -789,6 +818,21 @@ Skills that run plan reviews (`/plan-*-review`, `/codex review`) include the EXI
 
 Review this plan thoroughly before making any code changes. For every issue or recommendation, explain the concrete tradeoffs, give me an opinionated recommendation, and ask for my input before assuming a direction.
 
+## Scope gate (FIRST — overrides everything below). This is a hard STOP.
+
+Before ANYTHING else in this skill — before the Design Doc Check, the office-hours prerequisite offer, Step 0, and any `git` / `Read` / `Grep` / `Glob` / `Bash` call — your VERY FIRST tool call MUST be AskUserQuestion, to confirm the review target. Do not run the Design Doc Check bash or explore the repo before the user answers.
+
+1. First tool call = AskUserQuestion (tool_use). Confirm what to review.
+2. Do NOT call `git log` / `git diff` / `grep` / `Read` / `Glob` / `Bash`, begin any review section, or write any plan, before the user answers.
+3. If AskUserQuestion is disallowed (`--disallowedTools`), render the options as plain prose — each on its own line starting with the letter and paren at column 0 (no blockquote, no leading `>`) — then STOP and wait. Use exactly this shape:
+
+What should I review?
+A) The current branch diff — the work in progress on this branch.
+B) A plan or design doc I'll paste or point you to.
+C) A specific file, directory, or path.
+
+Recommendation: A when a branch diff exists, otherwise B. Reply with A, B, or C. STOP and wait for the answer — only after the user picks do you run the Design Doc Check and Step 0 against that target.
+
 ## Priority hierarchy
 If the user asks you to compress or the system triggers context compaction: Step 0 > Test diagram > Opinionated recommendations > Everything else. Never skip Step 0 or the test diagram. Do not preemptively warn about context limits -- the system handles compaction automatically.
 
@@ -942,6 +986,9 @@ If a design doc is now found, read it and continue the review.
 If none was produced (user may have cancelled), proceed with standard review.
 
 ### Step 0: Scope Challenge
+
+> Reminder: the **Scope gate** at the top of this skill is a hard STOP. Do not run Step 0 until the user has answered it, and run it against the target they chose.
+
 Before reviewing anything, answer these questions:
 1. **What existing code already partially or fully solves each sub-problem?** Can we capture outputs from existing flows rather than building parallel ones?
 2. **What is the minimum set of changes that achieves the stated goal?** Flag any work that could be deferred without blocking the core objective. Be ruthless about scope creep.
